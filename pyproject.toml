@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-lifemodel"
+version = "0.0.0"
+description = "Personality-and-decision layer plugin on top of the Hermes agent body."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # Runtime deps are deliberately minimal: the plugin runs inside Hermes'
+    # own interpreter, so anything Hermes already provides is not vendored here.
+    "structlog",
+]
+
+# src-layout: distribution `hermes-lifemodel`, import package `lifemodel`.
+[tool.hatch.build.targets.wheel]
+packages = ["src/lifemodel"]
+
+# Dev toolchain (PEP 735). `uv sync` installs the `dev` group by default, so
+# `uv run ruff/mypy/pytest` work without an extra flag.
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-asyncio",
+    "mypy",
+    "ruff",
+    "pre-commit",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# The Hermes runtime is not a pip dependency — the plugin is loaded inside
+# Hermes' interpreter. Treat its packages as untyped so `mypy --strict` does
+# not fail on missing stubs for host-provided modules.
+[[tool.mypy.overrides]]
+module = [
+    "hermes.*",
+    "hermes_cli.*",
+    "cron.*",
+    "agent.*",
+    "tools.*",
+    "gateway.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=lifemodel --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["lifemodel"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
