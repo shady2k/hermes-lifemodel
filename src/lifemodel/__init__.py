@@ -17,6 +17,7 @@ from typing import Any
 
 from .debug import render_dump_for_dir
 from .events import EVENTS_FILENAME, EventSink
+from .heartbeat import register_heartbeat
 from .logging import EventTee, get_logger
 from .paths import state_dir
 
@@ -52,7 +53,8 @@ def register(ctx: Any) -> None:
     all logic lives in the Hermes-free submodules.
     """
     profile = str(getattr(ctx, "profile_name", "default") or "default")
-    sdir = state_dir(_hermes_home())
+    home = _hermes_home()
+    sdir = state_dir(home)
 
     # Tee structured events into a bounded on-disk sink so the debug command can
     # query them (HLA §12/§13) instead of scraping operator logs.
@@ -81,3 +83,14 @@ def register(ctx: Any) -> None:
         profile=profile,
         state_dir=str(sdir),
     )
+
+    # Register the ~1-minute heartbeat cron (roadmap 1.1, HLA D1). Best-effort:
+    # a host without the cron API (or any registration hiccup) must not break
+    # plugin load, and the registration is idempotent so repeated loads never
+    # duplicate the job. ``src`` = the plugin package's parent, added to the
+    # launcher shim's ``sys.path`` so Hermes' interpreter can import us.
+    src_dir = Path(__file__).resolve().parent.parent
+    try:
+        register_heartbeat(home, src_dir, logger=logger)
+    except Exception as exc:  # noqa: BLE001 - registration is best-effort (see above)
+        logger.info("heartbeat_registration_skipped", error=f"{type(exc).__name__}: {exc}")

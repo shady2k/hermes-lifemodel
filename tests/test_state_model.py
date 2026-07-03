@@ -15,6 +15,7 @@ from lifemodel.state import SCHEMA_VERSION, State, StateCorruptError
 def test_defaults_are_documented_and_current_schema() -> None:
     state = State()
     assert state.schema_version == SCHEMA_VERSION == 1
+    assert state.tick_count == 0
     assert state.pressure == 0.0
     assert state.energy == 1.0
     assert state.last_tick_at is None
@@ -36,12 +37,22 @@ def test_to_dict_puts_schema_version_first_as_a_header() -> None:
 
 def test_round_trip_through_dict_is_identity() -> None:
     state = State(
+        tick_count=42,
         pressure=3.5,
         energy=0.25,
         last_tick_at="2026-07-03T12:00:00Z",
         last_contact_at="2026-07-03T11:00:00Z",
     )
     assert State.from_dict(state.to_dict()) == state
+
+
+def test_tick_count_rejects_non_integer() -> None:
+    # tick_count is a strict integer counter; a bool (int subclass) or a float
+    # in the file signals corruption, not a valid count.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "tick_count": True})
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "tick_count": 1.5})
 
 
 def test_from_dict_tolerates_missing_optional_fields() -> None:

@@ -46,6 +46,10 @@ class State:
     schema_version: int = SCHEMA_VERSION
 
     # --- the being's persisted state (Phase 1 minimal; extend, don't rewrite) ---
+    #: Monotonic count of heartbeat ticks (roadmap 1.1). Bumped once per tick by
+    #: the tick orchestrator; the simplest proof that state persists *between*
+    #: ticks (a fresh store loads it, +1, commits). Never decreases.
+    tick_count: int = 0
     #: Accumulated drive to act. Persists between neuron ticks (roadmap 1.2/1.3):
     #: ticks add to it, a threshold crossing drains it.
     pressure: float = 0.0
@@ -79,6 +83,7 @@ class State:
         """
         return cls(
             schema_version=_as_int(data.get("schema_version", SCHEMA_VERSION), "schema_version"),
+            tick_count=_as_int(data.get("tick_count", 0), "tick_count"),
             pressure=_as_float(data.get("pressure", 0.0), "pressure"),
             energy=_as_float(data.get("energy", 1.0), "energy"),
             last_tick_at=_as_opt_str(data.get("last_tick_at"), "last_tick_at"),
