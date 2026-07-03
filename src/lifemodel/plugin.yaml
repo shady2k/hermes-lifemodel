@@ -1,0 +1,12 @@
+# hermes-lifemodel plugin manifest.
+#
+# Discovered by Hermes' PluginManager under ~/.hermes/plugins/lifemodel/
+# (dev install: a symlink to this package's src/lifemodel/, so edits track).
+# Loading is opt-in via `plugins.enabled` in ~/.hermes/config.yaml.
+name: lifemodel
+version: 0.0.0
+description: "Personality-and-decision layer on top of the Hermes agent body. MVP skeleton (task 0.1): registers a /lifemodel introspection command and resolves a per-profile state dir. No engine/neurons yet."
+author: hermes-lifemodel
+# Explicit standalone so the manifest parser skips memory/model-provider
+# auto-detection; loads only when enabled in config.
+kind: standalone
