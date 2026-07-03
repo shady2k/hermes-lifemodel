@@ -53,6 +53,14 @@ def test_from_dict_tolerates_missing_optional_fields() -> None:
     assert state == State()
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_from_dict_rejects_non_finite_floats(bad: float) -> None:
+    # Non-finite floats are not valid JSON and poison downstream comparisons;
+    # from_dict must reject them as corruption.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "pressure": bad})
+
+
 def test_from_dict_rejects_non_integer_schema_version() -> None:
     # from_dict validates the header type too (the store gates the *value*).
     with pytest.raises(StateCorruptError):

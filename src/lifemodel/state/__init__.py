@@ -7,7 +7,12 @@ errors. Everything here is Hermes-free and stdlib-only.
 
 from __future__ import annotations
 
-from .errors import StateCorruptError, StateError, StateSchemaError
+from .errors import (
+    StateCorruptError,
+    StateError,
+    StateSchemaError,
+    StateSerializationError,
+)
 from .json_store import JsonStateStore
 from .model import SCHEMA_VERSION, State
 from .port import StatePort
@@ -20,4 +25,5 @@ __all__ = [
     "StateError",
     "StatePort",
     "StateSchemaError",
+    "StateSerializationError",
 ]

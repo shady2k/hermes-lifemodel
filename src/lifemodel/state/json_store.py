@@ -12,10 +12,24 @@ on POSIX. A reader therefore never observes a half-written file, and a crash or
 error mid-write leaves the previous good ``state.json`` untouched; the temp
 file is cleaned up rather than left to linger.
 
+*Crash-safety vs. durability (Phase 1).* The Phase-1 guarantee is **integrity**:
+``state.json`` is never torn, partial, or lost to a half-completed write — a
+reader always sees either the whole previous state or the whole new one. Full
+**durability** of the very last commit (surviving power loss / OS crash in the
+window right after ``os.replace``) is only *best-effort*: the file's contents
+are ``fsync``ed before the rename, and the directory entry is ``fsync``ed
+best-effort afterwards (:meth:`_fsync_dir`), but that dir ``fsync`` is not
+portable everywhere and its failure is intentionally swallowed. Hard durability
+guarantees are Phase 7 (HLA §9).
+
 **Scope (deliberately Phase 1).** No lock, no merge/retry, no snapshot recovery,
-no migrations — those are Phase 7 (HLA §9). ``load`` handles exactly three
-cases: missing file → documented default; unsupported ``schema_version`` →
-:class:`StateSchemaError`; unparseable/malformed → :class:`StateCorruptError`.
+no migrations — those are Phase 7 (HLA §9). ``load`` maps every "cannot read the
+persisted state" case to a typed error: missing file → documented default;
+unsupported ``schema_version`` → :class:`StateSchemaError`; unparseable or
+malformed (bad JSON, invalid UTF-8, wrong shape/types, non-finite floats) →
+:class:`StateCorruptError`. ``commit`` refuses to persist a ``State`` that would
+not be valid JSON (a non-finite float) with :class:`StateSerializationError`,
+before touching the filesystem.
 """
 
 from __future__ import annotations
@@ -28,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from ..logging import EventLogger, get_logger
-from .errors import StateCorruptError, StateSchemaError
+from .errors import StateCorruptError, StateSchemaError, StateSerializationError
 from .model import SCHEMA_VERSION, State
 
 _STATE_FILENAME = "state.json"
@@ -51,12 +65,17 @@ class JsonStateStore:
         Missing file (or missing base dir) → the documented default ``State``
         (read is non-mutating; it never creates the directory). An unsupported
         ``schema_version`` raises :class:`StateSchemaError`; anything that
-        cannot be parsed/interpreted raises :class:`StateCorruptError`.
+        cannot be parsed/interpreted (invalid UTF-8, bad JSON, wrong shape or
+        types, non-finite floats) raises :class:`StateCorruptError`.
         """
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return State()
+        except UnicodeDecodeError as exc:
+            # Invalid bytes are malformed state, not an I/O error — honor the
+            # typed-error contract instead of letting UnicodeDecodeError escape.
+            raise StateCorruptError(f"{self._path} is not valid UTF-8: {exc}") from exc
 
         try:
             data: Any = json.loads(raw)
@@ -89,10 +108,24 @@ class JsonStateStore:
         the path, so the store owns first-write creation. On any failure the
         temp file is removed and the previous ``state.json`` is left intact;
         the error propagates to the caller.
-        """
-        self._base_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(state.to_dict(), indent=2, ensure_ascii=False) + "\n"
 
+        Fail-closed: the payload is serialized with ``allow_nan=False`` *before*
+        the filesystem is touched, so a non-finite float (which ``json`` would
+        emit as an invalid JSON token) raises :class:`StateSerializationError`
+        with nothing written and no temp file created.
+        """
+        try:
+            payload = (
+                json.dumps(state.to_dict(), indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+            )
+        except ValueError as exc:
+            # Out-of-range float (NaN/Infinity): refuse to persist poison. Raised
+            # before mkdir/mkstemp, so the previous good state.json is untouched.
+            raise StateSerializationError(
+                f"refusing to persist a State that is not valid JSON: {exc}"
+            ) from exc
+
+        self._base_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=self._base_dir, prefix=_TMP_PREFIX, suffix=_TMP_SUFFIX)
         tmp_path = Path(tmp_name)
         try:

@@ -19,6 +19,7 @@ Hermes and stays unit-testable in isolation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -99,7 +100,13 @@ def _as_int(value: object, field_name: str) -> int:
 def _as_float(value: object, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise StateCorruptError(f"field {field_name!r} must be a number, got {_type(value)}")
-    return float(value)
+    number = float(value)
+    # json.loads accepts the non-standard NaN/Infinity/-Infinity tokens by
+    # default; reject the resulting non-finite floats — they are not valid JSON
+    # and would poison downstream threshold comparisons.
+    if not math.isfinite(number):
+        raise StateCorruptError(f"field {field_name!r} must be finite, got {number}")
+    return number
 
 
 def _as_opt_str(value: object, field_name: str) -> str | None:

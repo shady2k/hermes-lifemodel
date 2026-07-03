@@ -24,6 +24,7 @@ from lifemodel.state import (
     JsonStateStore,
     State,
     StateCorruptError,
+    StateError,
     StatePort,
     StateSchemaError,
 )
@@ -139,6 +140,62 @@ def test_commit_survives_unavailable_directory_fsync(
     store.commit(State(pressure=1.0))
     assert store.load().pressure == 1.0
     assert _tmp_files(tmp_path) == []
+
+
+# --- Finding 1: non-finite floats must never poison persisted state ---
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field_name", ["pressure", "energy"])
+def test_commit_rejects_non_finite_float(tmp_path: Path, field_name: str, bad: float) -> None:
+    # Fail-closed: a non-finite value raises a typed StateError *before* any
+    # file is touched — no state.json is written, no temp file lingers.
+    store = JsonStateStore(tmp_path)
+    with pytest.raises(StateError):
+        store.commit(State(**{field_name: bad}))
+    assert not _state_json(tmp_path).exists()
+    assert _tmp_files(tmp_path) == []
+
+
+def test_failed_non_finite_commit_leaves_previous_state_intact(tmp_path: Path) -> None:
+    store = JsonStateStore(tmp_path)
+    store.commit(State(pressure=1.0))  # known-good baseline
+    good_bytes = _state_json(tmp_path).read_bytes()
+
+    with pytest.raises(StateError):
+        store.commit(State(pressure=float("nan")))
+
+    assert _state_json(tmp_path).read_bytes() == good_bytes
+    assert store.load().pressure == 1.0
+    assert _tmp_files(tmp_path) == []
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_load_rejects_non_finite_tokens(tmp_path: Path, token: str) -> None:
+    # json.loads accepts these non-standard tokens by default; the store must
+    # reject the resulting non-finite floats as corrupt.
+    _state_json(tmp_path).write_text(
+        f'{{"schema_version": {SCHEMA_VERSION}, "pressure": {token}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(StateCorruptError):
+        JsonStateStore(tmp_path).load()
+
+
+def test_normal_finite_floats_still_round_trip(tmp_path: Path) -> None:
+    store = JsonStateStore(tmp_path)
+    state = State(pressure=3.5, energy=0.0)
+    store.commit(state)
+    assert store.load() == state
+
+
+# --- Finding 2: invalid UTF-8 must honor the typed-error contract ---
+
+
+def test_load_invalid_utf8_raises_corrupt(tmp_path: Path) -> None:
+    _state_json(tmp_path).write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+    with pytest.raises(StateCorruptError):
+        JsonStateStore(tmp_path).load()
 
 
 def test_load_rejects_newer_schema_version(tmp_path: Path) -> None:
