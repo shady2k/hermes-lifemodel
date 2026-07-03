@@ -15,6 +15,7 @@ nothing from Hermes.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -60,12 +61,37 @@ class WakePacket:
         }
 
     def to_json(self) -> str:
-        """Render the compact JSON the neuron script writes to stdout (§11)."""
-        return json.dumps(self.to_dict(), ensure_ascii=False, allow_nan=False)
+        """Render the compact JSON the neuron script writes to stdout (§11).
+
+        Fail-closed on a non-finite float: ``allow_nan=False`` makes ``json``
+        refuse to emit a ``NaN``/``Infinity`` token (not valid JSON), surfaced as
+        a typed :class:`WakePacketError` *before* the packet crosses the process
+        boundary into the awakened turn (mirrors the state store's commit guard).
+        """
+        try:
+            return json.dumps(self.to_dict(), ensure_ascii=False, allow_nan=False)
+        except ValueError as exc:
+            raise WakePacketError(
+                f"refusing to emit a wake-packet that is not valid JSON: {exc}"
+            ) from exc
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> WakePacket:
-        """Rebuild a ``WakePacket`` from a parsed mapping, validating types."""
+        """Rebuild a ``WakePacket`` from a parsed mapping, validating strictly.
+
+        The wake-packet crosses the neuron ``--script`` process boundary, so it is
+        a *strict* bounded schema (mirrors the state store's rigor): the wire
+        ``version`` is gated *first* — an unsupported version raises
+        :class:`WakePacketSchemaError` rather than being read with this build's
+        field meanings — and every float must be finite (``NaN``/``Infinity`` are
+        rejected as :class:`WakePacketError`).
+        """
+        version = _as_int(data.get("version", WAKE_PACKET_VERSION), "version")
+        if version != WAKE_PACKET_VERSION:
+            raise WakePacketSchemaError(
+                f"wake-packet version={version} is not supported by this build "
+                f"(expects {WAKE_PACKET_VERSION})"
+            )
         return cls(
             reason=_as_str(data.get("reason"), "reason"),
             pressure_kind=_as_str(data.get("pressure_kind"), "pressure_kind"),
@@ -73,7 +99,7 @@ class WakePacket:
             energy=_as_float(data.get("energy", 1.0), "energy"),
             budget=_as_opt_float(data.get("budget"), "budget"),
             last_contact_at=_as_opt_str(data.get("last_contact_at"), "last_contact_at"),
-            version=_as_int(data.get("version", WAKE_PACKET_VERSION), "version"),
+            version=version,
         )
 
     @classmethod
@@ -114,7 +140,17 @@ class WakeDecision:
 
 
 class WakePacketError(ValueError):
-    """Raised when a wake-packet cannot be parsed from its JSON form."""
+    """Raised when a wake-packet cannot be parsed from (or emitted as) its JSON form."""
+
+
+class WakePacketSchemaError(WakePacketError):
+    """Raised when a wake-packet carries an unsupported wire ``version``.
+
+    Mirrors :class:`~lifemodel.state.errors.StateSchemaError`: an unknown version
+    fails loud rather than being interpreted with this build's field meanings.
+    Subclasses :class:`WakePacketError` so a caller catching the base type still
+    handles it.
+    """
 
 
 def _as_str(value: object, name: str) -> str:
@@ -132,7 +168,13 @@ def _as_opt_str(value: object, name: str) -> str | None:
 def _as_float(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise WakePacketError(f"'{name}' must be a number, got {type(value).__name__}")
-    return float(value)
+    number = float(value)
+    # json.loads accepts the non-standard NaN/Infinity/-Infinity tokens; reject
+    # the resulting non-finite floats — they are not valid JSON and would poison
+    # the awakened turn's threshold reads.
+    if not math.isfinite(number):
+        raise WakePacketError(f"'{name}' must be finite, got {number}")
+    return number
 
 
 def _as_opt_float(value: object, name: str) -> float | None:

@@ -16,6 +16,7 @@ from lifemodel.domain.wake import (
     WakeDecision,
     WakePacket,
     WakePacketError,
+    WakePacketSchemaError,
 )
 
 
@@ -70,6 +71,71 @@ def test_packet_accepts_explicit_null_budget_and_last_contact() -> None:
     )
     assert packet.budget is None
     assert packet.last_contact_at is None
+
+
+# --- Finding 3: the wake-packet is a strict cross-process schema ---
+
+
+def test_from_dict_rejects_unsupported_version() -> None:
+    # An unknown wire version fails loud with a typed schema error (mirrors the
+    # state store's StateSchemaError) rather than being read with this build's
+    # field meanings.
+    with pytest.raises(WakePacketSchemaError):
+        WakePacket.from_dict(
+            {
+                "reason": "r",
+                "pressure_kind": "k",
+                "pressure": 1.0,
+                "version": WAKE_PACKET_VERSION + 1,
+            }
+        )
+
+
+def test_unsupported_version_is_a_wake_packet_error() -> None:
+    # WakePacketSchemaError subclasses WakePacketError, so a caller catching the
+    # base type still handles an unsupported version.
+    with pytest.raises(WakePacketError):
+        WakePacket.from_dict({"reason": "r", "pressure_kind": "k", "pressure": 1.0, "version": 0})
+
+
+@pytest.mark.parametrize("field_name", ["pressure", "energy", "budget"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_from_dict_rejects_non_finite_floats(field_name: str, bad: float) -> None:
+    # Non-finite floats are not valid JSON and would poison the awakened turn's
+    # threshold reads; from_dict must reject them on parse.
+    payload: dict[str, object] = {"reason": "r", "pressure_kind": "k", "pressure": 1.0}
+    payload[field_name] = bad
+    with pytest.raises(WakePacketError):
+        WakePacket.from_dict(payload)
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_from_json_rejects_non_finite_tokens(token: str) -> None:
+    # json.loads accepts these non-standard tokens by default; from_json must
+    # reject the resulting non-finite floats as it crosses the process boundary.
+    text = '{"reason": "r", "pressure_kind": "k", "pressure": ' + token + "}"
+    with pytest.raises(WakePacketError):
+        WakePacket.from_json(text)
+
+
+def test_to_json_refuses_to_emit_a_non_finite_packet() -> None:
+    # Fail-closed on emit too: a non-finite float is refused (allow_nan=False)
+    # before the packet is written to the neuron script's stdout.
+    packet = WakePacket(reason="r", pressure_kind="k", pressure=float("inf"))
+    with pytest.raises(WakePacketError):
+        packet.to_json()
+
+
+def test_valid_packet_still_round_trips_after_hardening() -> None:
+    packet = WakePacket(
+        reason="haven't spoken in a while",
+        pressure_kind="connection",
+        pressure=1.4,
+        energy=0.8,
+        budget=0.5,
+        last_contact_at="2026-07-02T09:00:00Z",
+    )
+    assert WakePacket.from_json(packet.to_json()) == packet
 
 
 def test_stay_asleep_is_the_quiet_default() -> None:

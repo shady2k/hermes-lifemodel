@@ -41,15 +41,15 @@ def test_fake_state_store_defaults_and_round_trips() -> None:
 
 def test_fake_state_store_isolates_from_caller_mutation() -> None:
     store = FakeStateStore()
-    state = State(processed_signal_ids=["a"])
+    state = State(pressure=1.0)
     store.commit(state)
-    # Mutating the caller's object must not reach into the store.
-    state.processed_signal_ids.append("b")
-    assert store.load().processed_signal_ids == ["a"]
-    # ...and a loaded copy is likewise detached.
+    # Mutating the caller's object must not reach into the store (copy-in).
+    state.pressure = 99.0
+    assert store.load().pressure == 1.0
+    # ...and a loaded copy is likewise detached (copy-out).
     loaded = store.load()
-    loaded.processed_signal_ids.append("c")
-    assert store.load().processed_signal_ids == ["a"]
+    loaded.pressure = 42.0
+    assert store.load().pressure == 1.0
 
 
 def test_fake_signal_bus_matches_dedup_contract() -> None:

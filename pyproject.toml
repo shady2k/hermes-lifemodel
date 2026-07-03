@@ -7,11 +7,12 @@ name = "hermes-lifemodel"
 version = "0.0.0"
 description = "Personality-and-decision layer plugin on top of the Hermes agent body."
 requires-python = ">=3.11,<3.12"
-dependencies = [
-    # Runtime deps are deliberately minimal: the plugin runs inside Hermes'
-    # own interpreter, so anything Hermes already provides is not vendored here.
-    "structlog",
-]
+# Runtime deps are deliberately empty: the plugin is loaded inside Hermes' own
+# interpreter (from ~/.hermes/plugins/), not pip-installed into Hermes' venv, so
+# anything Hermes already provides is not vendored here. structlog in particular
+# is only an *optional* logging backend — logging.py falls back to a stdlib shim
+# when it is absent — so it is a dev/test dep (below), not a runtime dependency.
+dependencies = []
 
 # src-layout: distribution `hermes-lifemodel`, import package `lifemodel`.
 [tool.hatch.build.targets.wheel]
@@ -28,6 +29,9 @@ dev = [
     "mypy",
     "ruff",
     "pre-commit",
+    # Optional runtime backend, required by the tests so logging.py's structlog
+    # path (and structlog.testing.capture_logs) is still exercised off-host.
+    "structlog",
 ]
 
 [tool.ruff]

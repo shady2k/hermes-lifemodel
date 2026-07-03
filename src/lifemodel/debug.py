@@ -24,9 +24,9 @@ for a profile state dir. Stdlib only; imports no Hermes.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
-from .adapters.signal_bus import FileSignalBus
+from .composition import build_lifemodel
 from .domain.signal import Signal
 from .events import (
     EVENT_ACT_GATE,
@@ -36,7 +36,6 @@ from .events import (
     EVENTS_FILENAME,
     EventSink,
 )
-from .state.json_store import JsonStateStore
 from .state.model import State
 
 _NA = "n/a"
@@ -93,16 +92,24 @@ def render_debug_dump(
 
 
 def render_dump_for_dir(base_dir: Path) -> str:
-    """Wire the concrete read-only adapters for *base_dir* and render the dump.
+    """Build the graph via the composition root and render the dump (read-only).
 
     *base_dir* is the profile state dir (``lifemodel.paths.state_dir``). The
-    concrete readers are handed to :func:`render_debug_dump` typed as the narrow
-    read-only protocols, so the mutating methods they also happen to own
-    (``commit`` / ``consume_unprocessed``) are structurally out of reach.
+    object graph is assembled through the **single** composition root
+    (:func:`~lifemodel.composition.build_lifemodel`), so the debug dump always
+    reflects the same wiring/defaults the engine runs with — never a divergent
+    second graph. The collaborators are then handed to :func:`render_debug_dump`
+    typed only as the narrow read-only protocols, so the mutating methods they
+    also own (``commit`` / ``consume_unprocessed``) are structurally out of reach
+    at the render surface: debug reads, it never writes (HLA §9).
     """
+    lm = build_lifemodel(base_dir=base_dir)
     return render_debug_dump(
-        state=JsonStateStore(base_dir),
-        bus=FileSignalBus(base_dir),
+        # ``lm.state`` is a StatePort; narrowed to StateReader only ``load`` shows.
+        state=lm.state,
+        # The default bus is the FileSignalBus, whose read-only peek the debug
+        # path uses; narrowed to UnprocessedPeek, ``consume`` is out of reach.
+        bus=cast(UnprocessedPeek, lm.bus),
         events=EventSink(base_dir / EVENTS_FILENAME),
     )
 
@@ -119,7 +126,6 @@ def _state_section(state: StateReader) -> list[str]:
     out.append(f"  {'energy:':21} {current.energy}")
     out.append(f"  {'last_tick_at:':21} {_opt(current.last_tick_at)}")
     out.append(f"  {'last_contact_at:':21} {_opt(current.last_contact_at)}")
-    out.append(f"  {'processed_signal_ids:':21} {len(current.processed_signal_ids)}")
     return out
 
 

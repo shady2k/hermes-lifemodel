@@ -3,8 +3,8 @@
 Design constraints (HLA §4 / §13):
 
 * **Human-readable JSON, no heavy deps.** Every field is a JSON-native type
-  (number, string, list of strings, or ``null``), so ``json`` alone
-  round-trips a ``State`` with no custom encoder. Timestamps are ISO-8601 UTC
+  (number, string, or ``null``), so ``json`` alone round-trips a ``State`` with
+  no custom encoder. Timestamps are ISO-8601 UTC
   *strings* produced upstream by the clock (task 0.4's ``ClockPort``), not
   ``datetime`` objects — keeping the wire format trivial and diff-friendly.
 * **Extensible, not over-built (YAGNI).** Only the fields Phase 1 actually
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from .errors import StateCorruptError
@@ -58,10 +58,10 @@ class State:
     #: ISO-8601 UTC timestamp of the last outbound contact, for cooldown
     #: bookkeeping (roadmap 1.4). ``None`` until the being first reaches out.
     last_contact_at: str | None = None
-    #: Stable origin ids of already-processed signals, for dedup (HLA §10) so a
-    #: message is not counted twice. A plain list in Phase 1; TTL/eviction is a
-    #: later concern.
-    processed_signal_ids: list[str] = field(default_factory=list)
+    # NB: signal dedup does *not* live here. It is owned by the SignalBus
+    # consumed-ledger (``signals.consumed``), which persists "already consumed"
+    # independently of this State to avoid racing the tick's own commit — see
+    # :class:`~lifemodel.adapters.signal_bus.FileSignalBus`.
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -83,9 +83,6 @@ class State:
             energy=_as_float(data.get("energy", 1.0), "energy"),
             last_tick_at=_as_opt_str(data.get("last_tick_at"), "last_tick_at"),
             last_contact_at=_as_opt_str(data.get("last_contact_at"), "last_contact_at"),
-            processed_signal_ids=_as_str_list(
-                data.get("processed_signal_ids", []), "processed_signal_ids"
-            ),
         )
 
 
@@ -113,14 +110,6 @@ def _as_opt_str(value: object, field_name: str) -> str | None:
     if value is None or isinstance(value, str):
         return value
     raise StateCorruptError(f"field {field_name!r} must be a string or null, got {_type(value)}")
-
-
-def _as_str_list(value: object, field_name: str) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise StateCorruptError(
-            f"field {field_name!r} must be a list of strings, got {_type(value)}"
-        )
-    return list(value)
 
 
 def _type(value: object) -> str:

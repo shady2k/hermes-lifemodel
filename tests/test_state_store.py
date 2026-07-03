@@ -65,7 +65,6 @@ def test_round_trip_commit_then_load_is_equal(tmp_path: Path) -> None:
         energy=0.5,
         last_tick_at="2026-07-03T12:00:00Z",
         last_contact_at="2026-07-03T11:30:00Z",
-        processed_signal_ids=["turn-1", "turn-2"],
     )
     store.commit(state)
     assert store.load() == state

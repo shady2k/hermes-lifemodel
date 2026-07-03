@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from structlog.testing import capture_logs
 
 from lifemodel.debug import render_debug_dump, render_dump_for_dir
@@ -57,7 +58,6 @@ def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> N
             pressure=2.5,
             energy=0.8,
             last_tick_at="2026-07-03T12:00:00Z",
-            processed_signal_ids=["a", "b", "c"],
         )
     )
     bus = FakeSignalBus()
@@ -73,7 +73,8 @@ def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> N
     assert "0.8" in _line(dump, "energy:")
     assert "2026-07-03T12:00:00Z" in _line(dump, "last_tick_at:")
     assert "n/a" in _line(dump, "last_contact_at:")  # None → n/a
-    assert "3" in _line(dump, "processed_signal_ids:")
+    # dedup is not a State metric: the dump must not surface processed_signal_ids
+    assert "processed_signal_ids" not in dump
     # --- bus summary ---
     assert "1" in _line(dump, "unprocessed:")
     assert "incoming(msg-9)" in _line(dump, "recent:")
@@ -116,6 +117,27 @@ def test_render_dump_for_dir_leaves_files_byte_identical(tmp_path: Path) -> None
     assert after == before  # nothing on disk changed
     assert "1" in _line(dump, "unprocessed:")  # s2 still pending after the peek
     assert "3.0" in _line(dump, "pressure:")  # the committed state is reflected
+
+
+def test_render_dump_for_dir_routes_through_the_composition_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding 2: debug must build its object graph via the SINGLE composition
+    # root (build_lifemodel), not a divergent second wiring — so a later change
+    # to build_lifemodel's defaults is reflected by the debug dump automatically.
+    from lifemodel.composition import build_lifemodel as real_build
+
+    seen: list[Path] = []
+
+    def spy(*, base_dir: Path) -> object:
+        seen.append(base_dir)
+        return real_build(base_dir=base_dir)
+
+    monkeypatch.setattr("lifemodel.debug.build_lifemodel", spy)
+    dump = render_dump_for_dir(tmp_path)
+
+    assert seen == [tmp_path]  # built exactly once, through the composition root
+    assert str(SCHEMA_VERSION) in _line(dump, "schema_version:")  # and still renders
 
 
 def test_dump_on_empty_dir_is_clean(tmp_path: Path) -> None:

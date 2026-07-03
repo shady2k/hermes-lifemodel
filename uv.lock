@@ -96,9 +96,6 @@ wheels = [
 name = "hermes-lifemodel"
 version = "0.0.0"
 source = { editable = "." }
-dependencies = [
-    { name = "structlog" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -109,10 +106,10 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "structlog" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "structlog" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -123,6 +120,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "structlog" },
 ]
 
 [[package]]

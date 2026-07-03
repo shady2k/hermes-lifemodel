@@ -19,15 +19,14 @@ def test_defaults_are_documented_and_current_schema() -> None:
     assert state.energy == 1.0
     assert state.last_tick_at is None
     assert state.last_contact_at is None
-    assert state.processed_signal_ids == []
 
 
-def test_default_processed_ids_are_not_shared_between_instances() -> None:
-    # Guard against a mutable-default footgun: each State gets its own list.
-    a = State()
-    b = State()
-    a.processed_signal_ids.append("m1")
-    assert b.processed_signal_ids == []
+def test_no_processed_signal_ids_field() -> None:
+    # Finding 4: dedup ownership lives in the SignalBus consumed-ledger, not in
+    # State. The dead field is gone from the model and its serialized shape, so
+    # nothing surfaces it as an always-zero (misleading) dedup metric.
+    assert not hasattr(State(), "processed_signal_ids")
+    assert "processed_signal_ids" not in State().to_dict()
 
 
 def test_to_dict_puts_schema_version_first_as_a_header() -> None:
@@ -41,7 +40,6 @@ def test_round_trip_through_dict_is_identity() -> None:
         energy=0.25,
         last_tick_at="2026-07-03T12:00:00Z",
         last_contact_at="2026-07-03T11:00:00Z",
-        processed_signal_ids=["m1", "m2"],
     )
     assert State.from_dict(state.to_dict()) == state
 
@@ -74,8 +72,6 @@ def test_from_dict_rejects_non_integer_schema_version() -> None:
         {"schema_version": SCHEMA_VERSION, "energy": None},
         {"schema_version": SCHEMA_VERSION, "pressure": True},  # bool is not a number
         {"schema_version": SCHEMA_VERSION, "last_tick_at": 123},
-        {"schema_version": SCHEMA_VERSION, "processed_signal_ids": "m1"},
-        {"schema_version": SCHEMA_VERSION, "processed_signal_ids": [1, 2]},
     ],
 )
 def test_from_dict_rejects_wrong_field_types(payload: dict[str, object]) -> None:

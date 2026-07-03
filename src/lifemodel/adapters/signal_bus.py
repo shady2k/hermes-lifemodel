@@ -10,7 +10,7 @@ dir; tests inject a ``tmp_path``):
   ledger that makes ``consume_unprocessed`` idempotent across calls *and*
   restarts (HLA §10).
 
-**Why a dedicated ledger, not ``State.processed_signal_ids``.** The port's
+**Why a dedicated ledger, not the shared ``State``.** The port's
 ``consume_unprocessed()`` takes no arguments, so the bus must persist "consumed"
 itself. If it did so by loading and committing the shared ``State``, that write
 would race the tick's own ``State`` commit (the tick loads state *before* it
