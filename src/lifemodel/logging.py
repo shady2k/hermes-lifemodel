@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol, cast
 
+from .events import EventSink
+
 try:
     import structlog
 
@@ -29,6 +31,25 @@ class EventLogger(Protocol):
     """Minimal structlog-style logger surface used by the plugin."""
 
     def info(self, event: str, **fields: Any) -> Any: ...
+
+
+class EventTee:
+    """An :class:`EventLogger` that also records every event to an :class:`EventSink`.
+
+    This is the extension point that makes structured events *queryable* (HLA
+    §12/§13): each ``.info(event, **fields)`` is both forwarded to the wrapped
+    logger (operator logs, unchanged) and appended to the bounded on-disk sink
+    the debug command reads. The sink write is best-effort and comes first, so a
+    sink hiccup never blocks — nor is masked by — the real log call.
+    """
+
+    def __init__(self, base: EventLogger, sink: EventSink) -> None:
+        self._base = base
+        self._sink = sink
+
+    def info(self, event: str, **fields: Any) -> Any:
+        self._sink.emit(event, fields)  # best-effort; never raises
+        return self._base.info(event, **fields)
 
 
 class _StdlibEventLogger:

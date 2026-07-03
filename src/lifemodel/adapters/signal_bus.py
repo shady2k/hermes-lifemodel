@@ -64,23 +64,36 @@ class FileSignalBus(SignalBus):
         durably, and returns them in publish order. Idempotent across calls and
         restarts (HLA §10).
         """
-        consumed = self._read_committed_lines(self._consumed_path)
-        already: set[str] = set(consumed)
+        fresh = self._unprocessed()
+        if fresh:
+            self._append_lines(self._consumed_path, [s.origin_id for s in fresh])
+        self._log.info("signals_consumed", count=len(fresh))
+        return fresh
 
+    def peek_unprocessed(self) -> list[Signal]:
+        """Return the unprocessed signals **without** marking them (read-only).
+
+        The debug path (HLA §9/§12) inspects the bus but must never mutate it:
+        this shares :meth:`consume_unprocessed`'s computation but skips the
+        ledger append, so calling it leaves ``signals.consumed`` byte-identical
+        and a later real ``consume`` still returns the same signals.
+        """
+        return self._unprocessed()
+
+    def _unprocessed(self) -> list[Signal]:
+        """Signals not yet in the consumed ledger, deduped, in publish order.
+
+        The shared read core of :meth:`consume_unprocessed` (which then records
+        them) and :meth:`peek_unprocessed` (which does not).
+        """
+        seen: set[str] = set(self._read_committed_lines(self._consumed_path))
         fresh: list[Signal] = []
-        newly_consumed: list[str] = []
-        seen: set[str] = set(already)
         for raw in self._read_committed_lines(self._log_path):
             signal = Signal.from_dict(json.loads(raw))
             if signal.origin_id in seen:
                 continue
             seen.add(signal.origin_id)
             fresh.append(signal)
-            newly_consumed.append(signal.origin_id)
-
-        if newly_consumed:
-            self._append_lines(self._consumed_path, newly_consumed)
-        self._log.info("signals_consumed", count=len(fresh))
         return fresh
 
     def _append_line(self, path: Path, line: str) -> None:

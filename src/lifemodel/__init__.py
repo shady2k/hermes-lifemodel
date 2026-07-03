@@ -15,7 +15,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .logging import get_logger
+from .debug import render_dump_for_dir
+from .events import EVENTS_FILENAME, EventSink
+from .logging import EventTee, get_logger
 from .paths import state_dir
 
 __version__ = "0.0.0"
@@ -52,17 +54,27 @@ def register(ctx: Any) -> None:
     profile = str(getattr(ctx, "profile_name", "default") or "default")
     sdir = state_dir(_hermes_home())
 
-    def lifemodel_status(raw_args: str = "") -> str:
+    # Tee structured events into a bounded on-disk sink so the debug command can
+    # query them (HLA §12/§13) instead of scraping operator logs.
+    sink = EventSink(sdir / EVENTS_FILENAME)
+    logger = EventTee(get_logger("lifemodel"), sink)
+
+    def lifemodel_command(raw_args: str = "") -> str:
+        """`/lifemodel` — 'status' (default) or 'debug' (read-only inspection)."""
+        if raw_args.strip() == "debug":
+            # Owner introspection (NFR9): returned to the caller, never logged,
+            # and read-only (HLA §9) — no commit, no bus mutation.
+            return render_dump_for_dir(sdir)
         return _status_line(profile, sdir)
 
     ctx.register_command(
         "lifemodel",
-        lifemodel_status,
-        description="Show that the lifemodel plugin is loaded (profile + state dir).",
-        args_hint="status",
+        lifemodel_command,
+        description="Show plugin status, or 'debug' for a read-only state/event dump.",
+        args_hint="status | debug",
     )
 
-    get_logger("lifemodel").info(
+    logger.info(
         "plugin_registered",
         plugin="lifemodel",
         version=__version__,

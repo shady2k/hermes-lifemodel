@@ -94,6 +94,19 @@ class FakeSignalBus(SignalBus):
         self._log.append(signal)
 
     def consume_unprocessed(self) -> list[Signal]:
+        fresh = self._unprocessed()
+        self._consumed.update(s.origin_id for s in fresh)
+        return fresh
+
+    def peek_unprocessed(self) -> list[Signal]:
+        """Read-only view of the unprocessed signals — never marks them consumed.
+
+        Parity with :meth:`FileSignalBus.peek_unprocessed` so the debug path's
+        read-only bus inspection can be exercised with this fake.
+        """
+        return self._unprocessed()
+
+    def _unprocessed(self) -> list[Signal]:
         fresh: list[Signal] = []
         seen = set(self._consumed)
         for signal in self._log:
@@ -101,5 +114,4 @@ class FakeSignalBus(SignalBus):
                 continue
             seen.add(signal.origin_id)
             fresh.append(signal)
-        self._consumed.update(s.origin_id for s in fresh)
         return fresh

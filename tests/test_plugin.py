@@ -7,6 +7,7 @@ and ``ctx`` is a duck-typed recorder. No real Hermes package is imported.
 
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +18,7 @@ import structlog
 from structlog.testing import capture_logs
 
 import lifemodel
+from lifemodel.events import EVENTS_FILENAME
 
 
 class FakeCtx:
@@ -112,6 +114,40 @@ def test_register_defaults_profile_when_ctx_lacks_it(
     lifemodel.register(ctx)
 
     assert "default" in ctx.commands["lifemodel"]["handler"]("")
+
+
+def test_register_lifemodel_debug_subcommand_returns_dump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    # `/lifemodel debug` renders the read-only inspection dump (default state).
+    dump = handler("debug")
+    assert "debug dump" in dump
+    assert "schema_version:" in dump
+    assert "lock status:" in dump
+    # `/lifemodel` (and any other arg) still prints the status line.
+    assert "alive" in handler("")
+    assert "alive" in handler("status")
+    # args_hint advertises the new subcommand.
+    assert "debug" in ctx.commands["lifemodel"]["args_hint"]
+
+
+def test_register_tees_plugin_registered_into_events_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+
+    lifemodel.register(FakeCtx())
+
+    # The structured event landed in the queryable sink, not only the logs.
+    events_file = tmp_path / "lifemodel" / EVENTS_FILENAME
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    assert any(r["event"] == "plugin_registered" for r in records)
 
 
 def test_uses_the_configured_structlog_pipeline() -> None:
