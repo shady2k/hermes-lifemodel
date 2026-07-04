@@ -18,7 +18,7 @@ from lifemodel.adapters.clock import SystemClock
 from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.composition import LifeModel, build_lifemodel
-from lifemodel.core.aggregator import SilentAggregator
+from lifemodel.core.aggregator import ThresholdAggregator
 from lifemodel.core.neuron import Neuron, StubTimerNeuron
 from lifemodel.domain.signal import Signal
 from lifemodel.state.json_store import JsonStateStore
@@ -68,7 +68,7 @@ def test_builds_with_concrete_json_store_over_tmp_dir(tmp_path: Path) -> None:
     assert isinstance(lm.bus, FileSignalBus)
     assert isinstance(lm.clock, SystemClock)
     assert isinstance(lm.delivery, NoopDelivery)
-    assert isinstance(lm.aggregator, SilentAggregator)
+    assert isinstance(lm.aggregator, ThresholdAggregator)
     # Phase 1.2 replaced the empty default neuron list with the stub timer neuron.
     assert len(lm.neurons) == 1
     assert isinstance(lm.neurons[0], StubTimerNeuron)
@@ -95,7 +95,8 @@ def test_default_graph_is_exercisable_end_to_end(tmp_path: Path) -> None:
     consumed: Sequence[Signal] = lm.bus.consume_unprocessed()
     assert [s.origin_id for s in consumed] == ["m1"]
 
-    assert lm.aggregator.decide(consumed).wake is False
+    # Zero accumulated pressure is below the default threshold → stays quiet.
+    assert lm.aggregator.decide(consumed, pressure=0.0).wake is False
     _assert_no_hermes()
 
 

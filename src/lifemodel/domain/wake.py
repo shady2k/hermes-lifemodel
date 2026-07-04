@@ -39,6 +39,10 @@ class WakePacket:
     pressure_kind: str
     #: The pressure value that crossed the threshold.
     pressure: float
+    #: The threshold the pressure crossed, or ``None`` when unspecified. Carried
+    #: so the awakened turn sees *how far over* it woke (HLA §11: "which pressure
+    #: crossed the threshold").
+    threshold: float | None = None
     #: Current energy (HLA §4/§11); a slot the wake path reads.
     energy: float = 1.0
     #: Remaining cost budget, or ``None`` when budgeting is not yet wired.
@@ -55,6 +59,7 @@ class WakePacket:
             "reason": self.reason,
             "pressure_kind": self.pressure_kind,
             "pressure": self.pressure,
+            "threshold": self.threshold,
             "energy": self.energy,
             "budget": self.budget,
             "last_contact_at": self.last_contact_at,
@@ -96,6 +101,7 @@ class WakePacket:
             reason=_as_str(data.get("reason"), "reason"),
             pressure_kind=_as_str(data.get("pressure_kind"), "pressure_kind"),
             pressure=_as_float(data.get("pressure"), "pressure"),
+            threshold=_as_opt_float(data.get("threshold"), "threshold"),
             energy=_as_float(data.get("energy", 1.0), "energy"),
             budget=_as_opt_float(data.get("budget"), "budget"),
             last_contact_at=_as_opt_str(data.get("last_contact_at"), "last_contact_at"),

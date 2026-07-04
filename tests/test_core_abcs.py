@@ -58,10 +58,10 @@ def test_trivial_aggregator_impl_works() -> None:
     packet = WakePacket(reason="r", pressure_kind="k", pressure=1.0)
 
     class EagerAggregator(Aggregator):
-        def decide(self, signals: Sequence[Signal]) -> WakeDecision:
+        def decide(self, signals: Sequence[Signal], *, pressure: float) -> WakeDecision:
             return WakeDecision.wake_with(packet)
 
-    assert EagerAggregator().decide([]).wake is True
+    assert EagerAggregator().decide([], pressure=0.0).wake is True
 
 
 def test_trivial_act_gate_impl_works() -> None:
@@ -102,5 +102,6 @@ def test_silent_aggregator_never_wakes() -> None:
     agg = SilentAggregator()
     assert isinstance(agg, Aggregator)
     signals = [Signal(origin_id="a", kind="x", salience=99.0)]
-    assert agg.decide(signals) == WakeDecision.stay_asleep()
-    assert agg.decide([]).wake is False
+    # Never wakes, whatever the accumulated pressure — even far above any threshold.
+    assert agg.decide(signals, pressure=99.0) == WakeDecision.stay_asleep()
+    assert agg.decide([], pressure=10_000.0).wake is False

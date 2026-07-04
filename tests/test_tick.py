@@ -9,6 +9,7 @@ proves the neuron→bus→aggregator wiring is live so 1.2/1.3 only fill it in.
 
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +19,7 @@ import pytest
 
 import lifemodel.tick as tick_mod
 from lifemodel.composition import build_lifemodel
-from lifemodel.core.aggregator import Aggregator
+from lifemodel.core.aggregator import DEFAULT_WAKE_THRESHOLD, Aggregator, ThresholdAggregator
 from lifemodel.core.neuron import EVENT_NEURON_FIRED, Neuron, StubTimerNeuron
 from lifemodel.domain.signal import Signal
 from lifemodel.domain.wake import WakeDecision, WakePacket
@@ -51,14 +52,32 @@ class _EmitOnceNeuron(Neuron):
 
 
 class _RecordingAggregator(Aggregator):
-    """Captures the signals it was handed; always stays asleep (like Silent)."""
+    """Captures the signals and accumulated pressure it was handed; stays asleep."""
 
     def __init__(self) -> None:
         self.seen: list[Signal] = []
+        self.pressures: list[float] = []
 
-    def decide(self, signals: Any) -> WakeDecision:
+    def decide(self, signals: Any, *, pressure: float) -> WakeDecision:
         self.seen.extend(signals)
+        self.pressures.append(pressure)
         return WakeDecision.stay_asleep()
+
+
+class _ConstantAggregator(Aggregator):
+    """Returns a fixed decision regardless of pressure; records what it received.
+
+    Proves the tick *delegates* the wake call entirely — the orchestrator applies
+    no threshold of its own, so whatever this returns is what run_tick returns.
+    """
+
+    def __init__(self, decision: WakeDecision) -> None:
+        self._decision = decision
+        self.pressures: list[float] = []
+
+    def decide(self, signals: Any, *, pressure: float) -> WakeDecision:
+        self.pressures.append(pressure)
+        return self._decision
 
 
 def _build(**overrides: Any) -> Any:
@@ -169,6 +188,102 @@ def test_run_tick_accumulates_one_delta_into_pressure_each_tick() -> None:
     assert len(fired) == k  # the neuron fired once per tick
     ticks = [fields for event, fields in logger.calls if event == EVENT_TICK]
     assert all(t["wake"] is False for t in ticks)
+
+
+def test_run_tick_wakes_when_accumulated_pressure_crosses_threshold() -> None:
+    # 1.3 acceptance: below-threshold ticks accumulate silently until the crossing
+    # tick flips the wake gate. Drive the real run_tick harness with the real
+    # ThresholdAggregator + StubTimerNeuron; assert the gate progression and that
+    # the crossing line is a single JSON object that parses back into a WakePacket
+    # carrying reason + pressure + threshold.
+    store = FakeStateStore()
+    clock = FakeClock(_T0)
+    threshold = 3.0
+    lm = _build(
+        state=store,
+        clock=clock,
+        neurons=(StubTimerNeuron(delta=1.0),),
+        aggregator=ThresholdAggregator(threshold=threshold),
+    )
+
+    # Ticks 1 and 2: pressure 1.0, 2.0 — below threshold, gate stays asleep.
+    for _ in range(2):
+        decision = run_tick(lm, logger=_RecordingLogger())
+        assert decision.wake is False
+        assert json.loads(wake_gate_line(decision)) == {"wakeAgent": False}
+        clock.advance(timedelta(minutes=1))
+
+    # Tick 3: pressure reaches 3.0 == threshold → wake.
+    decision = run_tick(lm, logger=_RecordingLogger())
+    assert decision.wake is True
+    assert decision.packet is not None
+
+    line = wake_gate_line(decision)
+    gate = json.loads(line)  # a single, parseable JSON object
+    assert gate["wakeAgent"] is True
+
+    packet = WakePacket.from_dict(gate)  # parses back via the hardened schema
+    assert packet.reason
+    assert packet.pressure == 3.0
+    assert packet.threshold == threshold
+    assert store.load().pressure == 3.0  # committed, undrained (drain is 1.4)
+
+
+def test_run_tick_below_threshold_is_zero_llm_and_delivers_nothing() -> None:
+    # Below threshold → no wake, so nothing is delivered and no LLM path opens.
+    delivery = FakeDelivery()
+    lm = _build(
+        delivery=delivery,
+        neurons=(StubTimerNeuron(delta=1.0),),
+        aggregator=ThresholdAggregator(threshold=100.0),
+    )
+
+    decision = run_tick(lm, logger=_RecordingLogger())
+
+    assert decision.wake is False
+    assert json.loads(wake_gate_line(decision)) == {"wakeAgent": False}
+    assert delivery.sent == []
+
+
+def test_run_tick_decides_against_accumulated_pressure_not_transient_signal() -> None:
+    # The aggregator is handed the *accumulated* State.pressure (post-sum), not the
+    # bare per-tick delta — proving accumulate-happens-before-decide.
+    store = FakeStateStore(State(pressure=5.0))
+    agg = _RecordingAggregator()
+    lm = _build(state=store, neurons=(StubTimerNeuron(delta=2.0),), aggregator=agg)
+
+    run_tick(lm, logger=_RecordingLogger())
+
+    # 5.0 carried over + 2.0 this tick = 7.0 seen by decide().
+    assert agg.pressures == [7.0]
+
+
+def test_run_tick_delegates_the_wake_call_entirely_to_the_aggregator() -> None:
+    # The orchestrator holds no threshold: whatever the aggregator returns is
+    # what run_tick returns. A stub that wakes at pressure 0 proves the tick
+    # applies no suppression; a stub that sleeps at huge pressure proves it adds
+    # no wake logic of its own.
+    waker = _ConstantAggregator(
+        WakeDecision.wake_with(WakePacket(reason="x", pressure_kind="k", pressure=0.0))
+    )
+    lm_wake = _build(neurons=(), aggregator=waker)
+    assert run_tick(lm_wake, logger=_RecordingLogger()).wake is True
+    assert waker.pressures == [0.0]  # woke at zero pressure — no tick-side gate
+
+    sleeper = _ConstantAggregator(WakeDecision.stay_asleep())
+    lm_sleep = _build(
+        state=FakeStateStore(State(pressure=1_000.0)),
+        neurons=(),
+        aggregator=sleeper,
+    )
+    assert run_tick(lm_sleep, logger=_RecordingLogger()).wake is False  # slept at huge pressure
+
+
+def test_run_tick_source_holds_no_threshold_literal() -> None:
+    # The threshold decision lives in the aggregator, never in the orchestrator:
+    # run_tick's source carries no copy of the threshold value.
+    src = inspect.getsource(run_tick)
+    assert str(DEFAULT_WAKE_THRESHOLD) not in src
 
 
 def test_pressure_persists_across_a_fresh_graph_over_the_same_store() -> None:

@@ -138,6 +138,33 @@ def test_valid_packet_still_round_trips_after_hardening() -> None:
     assert WakePacket.from_json(packet.to_json()) == packet
 
 
+def test_threshold_field_round_trips_and_defaults_to_none() -> None:
+    # The 1.3 threshold field survives the hardened round-trip and is omitted
+    # (null) by default so older callers keep working.
+    assert WakePacket(reason="r", pressure_kind="k", pressure=1.0).threshold is None
+
+    packet = WakePacket(reason="r", pressure_kind="pressure", pressure=3.0, threshold=2.5)
+    assert packet.to_dict()["threshold"] == 2.5
+    assert WakePacket.from_json(packet.to_json()) == packet
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_threshold_must_be_finite(bad: float) -> None:
+    # threshold is a strict optional float — a non-finite value is rejected on
+    # parse just like pressure/energy/budget.
+    with pytest.raises(WakePacketError):
+        WakePacket.from_dict(
+            {"reason": "r", "pressure_kind": "k", "pressure": 1.0, "threshold": bad}
+        )
+
+
+def test_threshold_wrong_type_is_rejected() -> None:
+    with pytest.raises(WakePacketError):
+        WakePacket.from_dict(
+            {"reason": "r", "pressure_kind": "k", "pressure": 1.0, "threshold": "hi"}
+        )
+
+
 def test_stay_asleep_is_the_quiet_default() -> None:
     decision = WakeDecision.stay_asleep()
     assert decision.wake is False

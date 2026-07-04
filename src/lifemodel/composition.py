@@ -18,8 +18,11 @@ Two call sites this must serve (roadmap 0.4):
 For Phase 0.4 the defaults are the concrete :class:`SystemClock`,
 :class:`JsonStateStore`, and durable :class:`FileSignalBus`, with lightweight
 stubs where real behaviour is a later task: a :class:`NoopDelivery` (real
-gateway delivery is 1.4) and a pass-through :class:`SilentAggregator` (real
-thresholding is 1.3). Phase 1.2 landed the first neuron: the default neuron list
+gateway delivery is 1.4). Phase 1.3 replaced the pass-through aggregator with the
+real :class:`ThresholdAggregator`, which wakes once the accumulated pressure
+crosses its threshold (:class:`SilentAggregator` stays available for tests that
+want a guaranteed-quiet graph). Phase 1.2 landed the first neuron: the default
+neuron list
 is now a single :class:`StubTimerNeuron`, so every default graph accumulates
 pressure each tick (real behavioural neurons arrive in Phase 2+). The graph
 therefore constructs and is exercisable end-to-end now, and later tasks fill in
@@ -41,7 +44,7 @@ from pathlib import Path
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
-from .core.aggregator import Aggregator, SilentAggregator
+from .core.aggregator import Aggregator, ThresholdAggregator
 from .core.neuron import Neuron, StubTimerNeuron
 from .core.signal_bus import SignalBus
 from .logging import EventLogger
@@ -95,7 +98,7 @@ def build_lifemodel(
     resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_clock: ClockPort = clock or SystemClock()
     resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
-    resolved_aggregator: Aggregator = aggregator or SilentAggregator()
+    resolved_aggregator: Aggregator = aggregator or ThresholdAggregator()
     resolved_neurons: tuple[Neuron, ...] = (
         (StubTimerNeuron(logger=logger),) if neurons is None else tuple(neurons)
     )

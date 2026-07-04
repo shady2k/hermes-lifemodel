@@ -13,15 +13,15 @@ skips the agent entirely — no LLM, silent, zero cost; anything else wakes it a
 injects the script's full stdout as context (HLA D4). So this module prints
 **exactly one** JSON line to stdout, derived from the aggregator's decision.
 
-As of Phase 1.2 the graph carries one autonomic neuron
-(:class:`~lifemodel.core.neuron.StubTimerNeuron`) that accumulates pressure into
-state each tick, but still the pass-through
-:class:`~lifemodel.core.aggregator.SilentAggregator`, so the wake decision is
-always "stay asleep" → the gate is always ``{"wakeAgent": false}`` (every tick
-silent, zero LLM). The *shape* is the seam 1.3 (real thresholding aggregator)
-fills in: when the aggregator starts returning a waking decision from the grown
-pressure, this same code emits the wake-packet with ``wakeAgent: true`` — no
-rewrite (HLA §11).
+As of Phase 1.3 the graph carries one autonomic neuron
+(:class:`~lifemodel.core.neuron.StubTimerNeuron`) accumulating pressure into
+state each tick, and the real
+:class:`~lifemodel.core.aggregator.ThresholdAggregator`: while the accumulated
+pressure stays below its threshold the decision is "stay asleep" → the gate is
+``{"wakeAgent": false}`` (silent, zero LLM), and the tick the pressure crosses
+the threshold the aggregator returns a waking decision → this same code emits the
+wake-packet with ``wakeAgent: true`` — no rewrite of the tick (HLA §11). Draining
+the pressure, the cooldown, and single-fire on delivery are task 1.4.
 
 **stdout discipline.** Only the single wake-gate line is written to stdout;
 structured logs go to stderr (see :func:`~lifemodel.logging.configure`) and to
@@ -90,16 +90,19 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
 
     1. **Autonomic layer** — each neuron reads state and emits signals onto the
        bus. The first neuron (``StubTimerNeuron``) lands in 1.2.
-    2. **Aggregation layer** — consume the fresh signals and ask the aggregator
-       for a wake decision. ``SilentAggregator`` always stays asleep until 1.3.
-    3. **Heartbeat bookkeeping** — accumulate the consumed signals' pressure
-       *deltas* into ``State.pressure`` (each neuron owns the delta it emitted as
-       its ``salience``; the tick only *sums* them — no threshold/wake logic
-       lives here, that stays the aggregator's job in 1.3), advance ``tick_count``
-       and stamp ``last_tick_at`` from the injected clock, then commit atomically.
-       This is the single state writer of the tick (HLA §9); neurons never
-       persist.
-    4. **Observability** — emit the structured ``tick`` event so ``/lifemodel
+    2. **Accumulate** — sum the consumed signals' pressure *deltas* into
+       ``State.pressure`` (each neuron owns the delta it emitted as its
+       ``salience``; the tick only *sums* them — no threshold/wake logic lives
+       here). This happens *before* the decision so the aggregator weighs the
+       accumulated pressure, not just this tick's transient signals.
+    3. **Aggregation layer** — ask the aggregator for a wake decision against the
+       accumulated pressure. ``ThresholdAggregator`` wakes once it crosses the
+       threshold (1.3); the threshold call is entirely the aggregator's.
+    4. **Heartbeat bookkeeping** — advance ``tick_count`` and stamp
+       ``last_tick_at`` from the injected clock, then commit atomically. This is
+       the single state writer of the tick (HLA §9); neurons never persist. The
+       pressure is committed undrained — draining on wake is task 1.4.
+    5. **Observability** — emit the structured ``tick`` event so ``/lifemodel
        debug`` can answer "last tick" from the event sink (HLA §12).
     """
     state = lm.state.load()
@@ -109,14 +112,20 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
             lm.bus.publish(signal)
 
     signals = lm.bus.consume_unprocessed()
-    decision = lm.aggregator.decide(signals)
 
-    now = lm.clock.now()
     # Orchestration only: sum the deltas the neurons emitted (each carried as a
-    # signal's salience) into the persistent accumulator. Below-threshold pressure
-    # keeps growing tick over tick; whether it is enough to *wake* is the
-    # aggregator's call (1.3), never the tick's.
+    # signal's salience) into the persistent accumulator, *before* deciding — the
+    # aggregator weighs the accumulated ``State.pressure``, not just this tick's
+    # transient signals. Below-threshold pressure keeps growing tick over tick;
+    # whether it is enough to *wake* is the aggregator's call (1.3), never the
+    # tick's — no threshold literal lives here.
     state.pressure += sum((signal.salience for signal in signals), 0.0)
+    decision = lm.aggregator.decide(signals, pressure=state.pressure)
+
+    # NB (roadmap 1.4): the accumulated pressure is committed *as is* — the wake
+    # decision does not drain it here. Draining on delivery + cooldown is 1.4;
+    # this is the obvious seam for it (after decide, before commit).
+    now = lm.clock.now()
     state.tick_count += 1
     state.last_tick_at = now.isoformat()
     lm.state.commit(state)

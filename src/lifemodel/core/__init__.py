@@ -12,7 +12,7 @@ adapter. It holds the ABC extension points the system grows by subclassing:
 from __future__ import annotations
 
 from .act_gate import ActGate
-from .aggregator import Aggregator, SilentAggregator
+from .aggregator import Aggregator, SilentAggregator, ThresholdAggregator
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
 from .signal_bus import SignalBus
@@ -25,4 +25,5 @@ __all__ = [
     "ProcessingLayer",
     "SignalBus",
     "SilentAggregator",
+    "ThresholdAggregator",
 ]
