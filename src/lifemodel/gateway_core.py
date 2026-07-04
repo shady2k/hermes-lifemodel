@@ -141,6 +141,17 @@ def register_gateway_service(
     log = logger or get_logger("lifemodel.service")
     loop = getattr(runner, "_gateway_loop", None)
     if loop is None:
+        # At register()/discovery time the gateway startup is synchronous — no
+        # running loop yet, and runner._gateway_loop may be unset. Fall back to
+        # the currently running loop (works when this is called in-loop, e.g. from
+        # an on_session_start hook after startup completes).
+        try:
+            import asyncio
+
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+    if loop is None:
         log.info("gateway_service_unavailable", key=key, reason="no_loop")
         return False
     try:

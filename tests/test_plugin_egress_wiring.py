@@ -14,11 +14,15 @@ class FakeCtx:
 
     def __init__(self) -> None:
         self.commands: dict[str, Any] = {}
+        self.hooks: list[tuple[str, Callable[..., Any]]] = []
 
     def register_command(
         self, name: str, handler: Callable[..., Any], description: str = "", args_hint: str = ""
     ) -> None:
         self.commands[name] = handler
+
+    def register_hook(self, hook_name: str, callback: Callable[..., Any]) -> None:
+        self.hooks.append((hook_name, callback))
 
 
 def test_register_starts_service_when_home_origin_present(
@@ -65,3 +69,33 @@ def test_register_skips_service_but_registers_cron_without_home_origin(
     lifemodel.register(ctx)
     assert started == []  # service NOT started (no origin)
     assert heartbeat == [True]  # cron fallback registered
+
+
+def test_register_defers_service_to_session_start_when_no_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # At register() time there is no running loop (sync gateway startup), so the
+    # first register_gateway_service attempt fails; the plugin defers arming to the
+    # first on_session_start, where the loop is running.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "115679831")
+    monkeypatch.setattr(lifemodel, "default_runner_accessor", lambda: object())
+    monkeypatch.setattr(lifemodel, "register_heartbeat", lambda *a, **k: None)
+
+    attempts: list[int] = []
+
+    def _reg(runner: Any, key: str, factory: Any, **kw: Any) -> bool:
+        attempts.append(1)
+        return len(attempts) >= 2  # register-time fails; the deferred arm succeeds
+
+    monkeypatch.setattr(lifemodel, "register_gateway_service", _reg)
+
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+
+    assert any(h == "on_session_start" for h, _ in ctx.hooks)  # deferred
+    cb = next(cb for h, cb in ctx.hooks if h == "on_session_start")
+    cb()  # simulate first session start -> arms the service
+    assert len(attempts) == 2
+    cb()  # idempotent: does not re-register
+    assert len(attempts) == 2

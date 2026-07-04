@@ -121,6 +121,27 @@ def register(ctx: Any) -> None:
             started = register_gateway_service(
                 default_runner_accessor(), "lifemodel-egress", _factory, logger=logger
             )
+            if not started:
+                # register() runs during SYNCHRONOUS gateway startup — no event loop
+                # yet, so the service can't be scheduled here. Defer: arm it once, in
+                # the loop, on the first session start (register_gateway_service then
+                # falls back to the running loop). Idempotent — starts at most once.
+                armed = {"done": False}
+
+                def _arm_service(*_a: Any, **_k: Any) -> None:
+                    if armed["done"]:
+                        return
+                    if register_gateway_service(
+                        default_runner_accessor(), "lifemodel-egress", _factory, logger=logger
+                    ):
+                        armed["done"] = True
+                        logger.info("egress_service_armed_deferred")
+
+                try:
+                    ctx.register_hook("on_session_start", _arm_service)
+                    logger.info("egress_service_deferred", trigger="on_session_start")
+                except Exception as exc:  # noqa: BLE001 - best-effort
+                    logger.info("egress_service_defer_failed", error=f"{type(exc).__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001 - best-effort; never break load
             logger.info("egress_service_wiring_skipped", error=f"{type(exc).__name__}: {exc}")
 
