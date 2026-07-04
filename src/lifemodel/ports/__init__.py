@@ -20,9 +20,11 @@ from __future__ import annotations
 from ..state.port import StatePort
 from .clock import ClockPort
 from .delivery import DeliveryPort
+from .proactive import ProactiveEgressPort
 
 __all__ = [
     "ClockPort",
     "DeliveryPort",
+    "ProactiveEgressPort",
     "StatePort",
 ]
