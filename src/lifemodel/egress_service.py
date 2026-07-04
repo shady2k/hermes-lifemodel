@@ -16,6 +16,7 @@ from typing import Any
 
 from .composition import LifeModel
 from .domain.egress import ReachOutcome
+from .gateway_core import reachin_available
 from .impulse import compose_impulse
 from .logging import EventLogger
 from .ports.proactive import ProactiveEgressPort
@@ -125,6 +126,15 @@ async def proactive_service_loop(
         ):
             logger.info("proactive_service_loop_stop")
             return
+        if not reachin_available(runner):
+            # Reach-in not usable right now (version drift / adapters not wired):
+            # yield to the cron fallback by NOT ticking and NOT stamping liveness,
+            # so its freshness check sees us as absent and it takes over as the
+            # brain (spec §6 — avoids the deadlock where we defer cron but can't
+            # deliver ourselves).
+            logger.info("proactive_yield_to_cron")
+            await asyncio.sleep(interval_seconds)
+            continue
         busy = bool(getattr(runner, "_running_agents", None))
         try:
             run_proactive_tick(

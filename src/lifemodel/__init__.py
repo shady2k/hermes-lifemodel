@@ -20,7 +20,7 @@ from .composition import build_lifemodel
 from .debug import render_dump_for_dir
 from .egress_service import proactive_service_loop
 from .events import EVENTS_FILENAME, EventSink
-from .gateway_core import install_core_shim, reachin_available, register_gateway_service
+from .gateway_core import install_core_shim, register_gateway_service
 from .heartbeat import _resolve_home_origin, register_heartbeat
 from .logging import EventTee, get_logger
 from .paths import state_dir
@@ -98,9 +98,14 @@ def register(ctx: Any) -> None:
     # in either path must never break plugin load.
     install_core_shim(ctx, logger=logger)
 
+    # NOTE: do NOT gate on reachin_available() here — at register()/discovery time
+    # the runner's adapters are not wired yet (they land later in gateway startup),
+    # so reachin_available() is falsely False. Start the service whenever a home
+    # origin exists; the loop waits for _running (adapters ready by then) and yields
+    # to the cron fallback per-tick if reach-in ever proves unavailable at runtime.
     origin = _resolve_home_origin()
     started = False
-    if origin is not None and reachin_available(default_runner_accessor()):
+    if origin is not None:
         try:
             egress = ReachInEgress(runner_accessor=default_runner_accessor, logger=logger)
 

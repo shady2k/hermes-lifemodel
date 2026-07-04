@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
+
+import pytest
 
 from lifemodel.gateway_core import install_core_shim, register_gateway_service
 
@@ -45,3 +48,47 @@ def test_install_core_shim_adds_methods_best_effort() -> None:
     install_core_shim(ctx)  # must not raise
     assert hasattr(ctx, "inject_proactive_turn")
     assert hasattr(ctx, "register_gateway_service")
+
+
+def test_loop_yields_to_cron_when_reachin_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lifemodel import egress_service
+    from lifemodel.logging import get_logger
+
+    ticks: list[int] = []
+    monkeypatch.setattr(egress_service, "run_proactive_tick", lambda *a, **k: ticks.append(1))
+
+    class _Unavailable:
+        # "running" but reach-in NOT available (no ``adapters`` attr) -> yield to cron.
+        _running = True
+        _draining = False
+        _gateway_loop = object()
+        _running_agents: set[Any] = set()
+
+        def _build_process_event_source(self, evt: Any) -> Any:
+            return object()
+
+    class _Stop(Exception):
+        pass
+
+    calls = {"n": 0}
+
+    async def _fake_sleep(_secs: float) -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise _Stop()
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    async def _run() -> None:
+        with contextlib.suppress(_Stop):
+            await egress_service.proactive_service_loop(
+                build_lm=lambda: object(),
+                egress=object(),
+                target={},
+                runner_accessor=lambda: _Unavailable(),
+                logger=get_logger("t"),
+                interval_seconds=0.0,
+            )
+
+    asyncio.run(_run())
+    assert ticks == []  # never ticked — yielded to the cron fallback
