@@ -18,10 +18,15 @@ Two call sites this must serve (roadmap 0.4):
 For Phase 0.4 the defaults are the concrete :class:`SystemClock`,
 :class:`JsonStateStore`, and durable :class:`FileSignalBus`, with lightweight
 stubs where real behaviour is a later task: a :class:`NoopDelivery` (real
-gateway delivery is 1.4), an **empty neuron list** (the first neuron is 1.2), and
-a pass-through :class:`SilentAggregator` (real thresholding is 1.3). The graph
+gateway delivery is 1.4) and a pass-through :class:`SilentAggregator` (real
+thresholding is 1.3). Phase 1.2 landed the first neuron: the default neuron list
+is now a single :class:`StubTimerNeuron`, so every default graph accumulates
+pressure each tick (real behavioural neurons arrive in Phase 2+). The graph
 therefore constructs and is exercisable end-to-end now, and later tasks fill in
 implementations rather than reshape the wiring.
+
+Passing ``neurons`` explicitly — including an empty ``()`` — opts out of that
+default, so real Hermes wiring and the seam tests stay in full control.
 
 **This module imports no Hermes** — only Hermes-free adapters and the core — so
 the whole graph is constructible (and testable) with injected fakes off-host.
@@ -37,7 +42,7 @@ from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
 from .core.aggregator import Aggregator, SilentAggregator
-from .core.neuron import Neuron
+from .core.neuron import Neuron, StubTimerNeuron
 from .core.signal_bus import SignalBus
 from .logging import EventLogger
 from .ports.clock import ClockPort
@@ -71,7 +76,7 @@ def build_lifemodel(
     clock: ClockPort | None = None,
     delivery: DeliveryPort | None = None,
     aggregator: Aggregator | None = None,
-    neurons: Sequence[Neuron] = (),
+    neurons: Sequence[Neuron] | None = None,
     logger: EventLogger | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
@@ -81,12 +86,19 @@ def build_lifemodel(
     live under it. Every collaborator is overridable so ``register(ctx)`` can
     inject real Hermes adapters and tests can inject fakes — the wiring is the
     same, only the parts differ.
+
+    ``neurons`` defaults to a single :class:`StubTimerNeuron` (the Phase-1.2
+    autonomic layer). ``None`` means "take the default"; passing any sequence —
+    including an empty ``()`` — overrides it, so callers keep full control.
     """
     resolved_state: StatePort = state or JsonStateStore(base_dir, logger=logger)
     resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_clock: ClockPort = clock or SystemClock()
     resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
+    resolved_neurons: tuple[Neuron, ...] = (
+        (StubTimerNeuron(logger=logger),) if neurons is None else tuple(neurons)
+    )
 
     return LifeModel(
         state=resolved_state,
@@ -94,5 +106,5 @@ def build_lifemodel(
         clock=resolved_clock,
         delivery=resolved_delivery,
         aggregator=resolved_aggregator,
-        neurons=tuple(neurons),
+        neurons=resolved_neurons,
     )

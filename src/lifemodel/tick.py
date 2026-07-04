@@ -13,12 +13,15 @@ skips the agent entirely — no LLM, silent, zero cost; anything else wakes it a
 injects the script's full stdout as context (HLA D4). So this module prints
 **exactly one** JSON line to stdout, derived from the aggregator's decision.
 
-For Phase 1.1 the graph carries an **empty neuron list** and the pass-through
-:class:`~lifemodel.core.aggregator.SilentAggregator`, so the decision is always
-"stay asleep" → the gate is always ``{"wakeAgent": false}`` (every tick silent).
-The *shape* is the seam 1.2 (neurons) and 1.3 (real thresholding aggregator)
-fill in: when the aggregator starts returning a waking decision, this same code
-emits the wake-packet with ``wakeAgent: true`` — no rewrite (HLA §11).
+As of Phase 1.2 the graph carries one autonomic neuron
+(:class:`~lifemodel.core.neuron.StubTimerNeuron`) that accumulates pressure into
+state each tick, but still the pass-through
+:class:`~lifemodel.core.aggregator.SilentAggregator`, so the wake decision is
+always "stay asleep" → the gate is always ``{"wakeAgent": false}`` (every tick
+silent, zero LLM). The *shape* is the seam 1.3 (real thresholding aggregator)
+fills in: when the aggregator starts returning a waking decision from the grown
+pressure, this same code emits the wake-packet with ``wakeAgent: true`` — no
+rewrite (HLA §11).
 
 **stdout discipline.** Only the single wake-gate line is written to stdout;
 structured logs go to stderr (see :func:`~lifemodel.logging.configure`) and to
@@ -86,12 +89,16 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
     logic (roadmap "interfaces from day one"):
 
     1. **Autonomic layer** — each neuron reads state and emits signals onto the
-       bus. Empty in 1.1; the first neuron lands in 1.2.
+       bus. The first neuron (``StubTimerNeuron``) lands in 1.2.
     2. **Aggregation layer** — consume the fresh signals and ask the aggregator
        for a wake decision. ``SilentAggregator`` always stays asleep until 1.3.
-    3. **Heartbeat bookkeeping** — advance ``tick_count`` and stamp
-       ``last_tick_at`` from the injected clock, then commit atomically. This is
-       the single state writer of the tick (HLA §9); neurons never persist.
+    3. **Heartbeat bookkeeping** — accumulate the consumed signals' pressure
+       *deltas* into ``State.pressure`` (each neuron owns the delta it emitted as
+       its ``salience``; the tick only *sums* them — no threshold/wake logic
+       lives here, that stays the aggregator's job in 1.3), advance ``tick_count``
+       and stamp ``last_tick_at`` from the injected clock, then commit atomically.
+       This is the single state writer of the tick (HLA §9); neurons never
+       persist.
     4. **Observability** — emit the structured ``tick`` event so ``/lifemodel
        debug`` can answer "last tick" from the event sink (HLA §12).
     """
@@ -105,6 +112,11 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
     decision = lm.aggregator.decide(signals)
 
     now = lm.clock.now()
+    # Orchestration only: sum the deltas the neurons emitted (each carried as a
+    # signal's salience) into the persistent accumulator. Below-threshold pressure
+    # keeps growing tick over tick; whether it is enough to *wake* is the
+    # aggregator's call (1.3), never the tick's.
+    state.pressure += sum((signal.salience for signal in signals), 0.0)
     state.tick_count += 1
     state.last_tick_at = now.isoformat()
     lm.state.commit(state)
@@ -113,6 +125,7 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
         EVENT_TICK,
         tick_count=state.tick_count,
         last_tick_at=state.last_tick_at,
+        pressure=state.pressure,
         signals=len(signals),
         wake=decision.wake,
     )

@@ -19,7 +19,7 @@ import pytest
 import lifemodel.tick as tick_mod
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.aggregator import Aggregator
-from lifemodel.core.neuron import Neuron
+from lifemodel.core.neuron import EVENT_NEURON_FIRED, Neuron, StubTimerNeuron
 from lifemodel.domain.signal import Signal
 from lifemodel.domain.wake import WakeDecision, WakePacket
 from lifemodel.events import EVENT_TICK, EVENTS_FILENAME, EventSink
@@ -140,6 +140,72 @@ def test_run_tick_wires_neurons_through_bus_to_aggregator() -> None:
     assert [s.origin_id for s in aggregator.seen] == ["sig-1"]
 
 
+def test_run_tick_accumulates_one_delta_into_pressure_each_tick() -> None:
+    # 1.2 engine validation: the stub neuron owns a fixed delta; run_tick sums
+    # the consumed signals' deltas into State.pressure. K ticks → K*delta, the
+    # number PERSISTS between ticks (loaded from the committed state, not
+    # recomputed from zero), bookkeeping still advances, a neuron_fired event is
+    # recorded each tick, and the wake gate stays asleep the whole time (0 LLM).
+    store = FakeStateStore()
+    clock = FakeClock(_T0)
+    logger = _RecordingLogger()
+    delta = 2.0
+    neuron = StubTimerNeuron(delta=delta, logger=logger)
+    lm = _build(state=store, clock=clock, neurons=(neuron,))
+
+    k = 3
+    for i in range(k):
+        decision = run_tick(lm, logger=logger)
+        assert decision.wake is False  # wake gate stays {"wakeAgent": false}
+        assert store.load().pressure == (i + 1) * delta  # grows + persists
+        clock.advance(timedelta(minutes=1))
+
+    final = store.load()
+    assert final.pressure == k * delta
+    assert final.tick_count == k
+    assert final.last_tick_at == (_T0 + timedelta(minutes=k - 1)).isoformat()
+
+    fired = [fields for event, fields in logger.calls if event == EVENT_NEURON_FIRED]
+    assert len(fired) == k  # the neuron fired once per tick
+    ticks = [fields for event, fields in logger.calls if event == EVENT_TICK]
+    assert all(t["wake"] is False for t in ticks)
+
+
+def test_pressure_persists_across_a_fresh_graph_over_the_same_store() -> None:
+    # Persistence proof: a *new* LifeModel (fresh bus/clock) over the same
+    # committed store keeps accumulating from the persisted pressure, not from
+    # zero — the number lives in State, not in the process.
+    store = FakeStateStore()
+    delta = 1.0
+    lm1 = _build(state=store, clock=FakeClock(_T0), neurons=(StubTimerNeuron(delta=delta),))
+    run_tick(lm1, logger=_RecordingLogger())
+    assert store.load().pressure == delta
+
+    lm2 = _build(
+        state=store,
+        clock=FakeClock(_T0 + timedelta(minutes=1)),
+        neurons=(StubTimerNeuron(delta=delta),),
+    )
+    run_tick(lm2, logger=_RecordingLogger())
+    assert store.load().pressure == 2 * delta  # continued, not reset
+
+
+def test_default_neuron_signal_is_distinct_each_tick_so_dedup_never_collapses() -> None:
+    # The stub neuron's origin_id is tied to tick_count, so a persistent dedup
+    # ledger never swallows a later tick's impulse — every tick contributes.
+    store = FakeStateStore()
+    clock = FakeClock(_T0)
+    bus = FakeSignalBus()
+    lm = _build(state=store, bus=bus, clock=clock, neurons=(StubTimerNeuron(delta=1.0),))
+
+    run_tick(lm, logger=_RecordingLogger())
+    clock.advance(timedelta(minutes=1))
+    run_tick(lm, logger=_RecordingLogger())
+
+    # Two ticks, two distinct origin ids logged on the shared bus → pressure 2.0.
+    assert store.load().pressure == 2.0
+
+
 def test_wake_gate_line_stays_asleep_is_wakeagent_false() -> None:
     line = wake_gate_line(WakeDecision.stay_asleep())
     assert json.loads(line) == {"wakeAgent": False}
@@ -181,6 +247,34 @@ def test_main_prints_wake_gate_and_persists_across_ticks(
     tick_events = [r for r in records if r.get("event") == EVENT_TICK]
     assert [r["tick_count"] for r in tick_events] == [1, 2]
     assert all(r["wake"] is False for r in tick_events)
+
+
+def test_main_default_neuron_accumulates_pressure_and_stays_asleep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # End-to-end via the real entrypoint: the DEFAULT graph now wires the stub
+    # timer neuron (both call sites get it), so State.pressure grows one delta
+    # per tick, a neuron_fired event lands in the sink, and the wake gate stays
+    # {"wakeAgent": false} — zero LLM.
+    monkeypatch.setattr(tick_mod, "_hermes_home", lambda: tmp_path)
+
+    assert main() == 0
+    assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
+    assert main() == 0
+    assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
+
+    sdir = tmp_path / "lifemodel"
+    state = json.loads((sdir / "state.json").read_text(encoding="utf-8"))
+    assert state["tick_count"] == 2
+    assert state["pressure"] == 2.0  # default delta 1.0, accumulated over 2 ticks
+
+    records = [
+        json.loads(line)
+        for line in (sdir / EVENTS_FILENAME).read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    fired = [r for r in records if r.get("event") == EVENT_NEURON_FIRED]
+    assert len(fired) == 2  # the wired-in neuron fired each tick
 
 
 def test_main_stdout_last_line_is_readable_by_the_scheduler_gate(

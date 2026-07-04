@@ -87,6 +87,32 @@ def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> N
     assert "n/a" in _line(dump, "lock status:")
 
 
+def test_dump_reflects_pressure_accumulated_by_real_ticks(tmp_path: Path) -> None:
+    # Acceptance (roadmap 1.2): after real ticks the debug dump shows the grown
+    # pressure (state section) and the last tick (events section) — read-only,
+    # and built through the same composition root the engine runs with.
+    from datetime import UTC, datetime, timedelta
+
+    from lifemodel.composition import build_lifemodel
+    from lifemodel.logging import EventTee, get_logger
+    from lifemodel.testing.fakes import FakeClock
+    from lifemodel.tick import run_tick
+
+    sink = EventSink(tmp_path / EVENTS_FILENAME)
+    logger = EventTee(get_logger("lifemodel.tick.test"), sink)
+    clock = FakeClock(datetime(2026, 7, 4, 12, 0, tzinfo=UTC))
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock, logger=logger)
+
+    run_tick(lm, logger=logger)
+    clock.advance(timedelta(minutes=1))
+    run_tick(lm, logger=logger)
+
+    dump = render_dump_for_dir(tmp_path)
+
+    assert "2.0" in _line(dump, "pressure:")  # default delta 1.0 × 2 ticks
+    assert "tick_count=2" in _line(dump, "last tick:")  # last tick reflected
+
+
 def test_dump_is_read_only_never_commits_state(tmp_path: Path) -> None:
     state = SpyStateStore(State(pressure=1.0))
     bus = FakeSignalBus()

@@ -19,7 +19,7 @@ from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.composition import LifeModel, build_lifemodel
 from lifemodel.core.aggregator import SilentAggregator
-from lifemodel.core.neuron import Neuron
+from lifemodel.core.neuron import Neuron, StubTimerNeuron
 from lifemodel.domain.signal import Signal
 from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
@@ -69,8 +69,18 @@ def test_builds_with_concrete_json_store_over_tmp_dir(tmp_path: Path) -> None:
     assert isinstance(lm.clock, SystemClock)
     assert isinstance(lm.delivery, NoopDelivery)
     assert isinstance(lm.aggregator, SilentAggregator)
-    assert lm.neurons == ()
+    # Phase 1.2 replaced the empty default neuron list with the stub timer neuron.
+    assert len(lm.neurons) == 1
+    assert isinstance(lm.neurons[0], StubTimerNeuron)
     _assert_no_hermes()
+
+
+def test_explicit_empty_neurons_overrides_the_stub_default(tmp_path: Path) -> None:
+    # Passing neurons explicitly (even empty) opts out of the default — the seam
+    # tests that need a bare graph, and later real wiring, stay in control.
+    lm = build_lifemodel(base_dir=tmp_path, neurons=())
+
+    assert lm.neurons == ()
 
 
 def test_default_graph_is_exercisable_end_to_end(tmp_path: Path) -> None:
