@@ -83,9 +83,24 @@ def inject_proactive_turn(
         log.info("reachin_unavailable", reason="not_running_or_draining")
         return ReachOutcome.UNAVAILABLE
     try:
+        # Resolve the lane. Prefer the session_store origin via session_key (the
+        # reliable path the spike proved); also pass chat_type so the fallback path
+        # in _build_process_event_source can still build a SessionSource when the
+        # session isn't in the store (it returns None without a chat_type).
+        # INTERIM: the DM session_key format ("agent:main:<platform>:<chat_type>:<chat_id>")
+        # and the "dm" default are hardcoded for the home DM lane — the upstream
+        # primitive will resolve this generically (spec §8).
+        platform = target.get("platform")
+        chat_id = target.get("chat_id")
+        chat_type = target.get("chat_type") or "dm"
+        session_key = target.get("session_key")
+        if not session_key and platform and chat_id:
+            session_key = f"agent:main:{platform}:{chat_type}:{chat_id}"
         evt = {
-            "platform": target.get("platform"),
-            "chat_id": target.get("chat_id"),
+            "session_key": session_key,
+            "platform": platform,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
             "thread_id": target.get("thread_id"),
         }
         source = runner._build_process_event_source(evt)

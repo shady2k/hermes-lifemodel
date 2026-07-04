@@ -75,7 +75,13 @@ def test_inject_builds_internal_event_and_schedules_on_loop() -> None:
     )
 
     assert outcome is ReachOutcome.DELIVERED
-    assert runner.built_with == {"platform": "telegram", "chat_id": "115679831", "thread_id": None}
+    assert runner.built_with == {
+        "session_key": "agent:main:telegram:dm:115679831",
+        "platform": "telegram",
+        "chat_id": "115679831",
+        "chat_type": "dm",
+        "thread_id": None,
+    }
     assert len(scheduled) == 1
     coro, loop = scheduled[0]
     assert loop is runner._gateway_loop
