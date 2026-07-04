@@ -23,6 +23,7 @@ wrapper that imports ``cron.jobs`` and delegates. Stdlib only in the tested core
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,45 @@ def write_shim(home: Path, src_dir: Path) -> Path:
     return shim_path
 
 
+def _resolve_home_origin() -> dict[str, str | None] | None:
+    """Build the cron job ``origin`` for the author's Telegram home DM/thread lane.
+
+    ``attach_to_session=True`` alone is a *silent no-op* for the heartbeat: the
+    job is registered programmatically at gateway startup, so it has no
+    ``origin`` of its own, and Hermes only mirrors a cron delivery into a
+    session when the delivery target equals the job's origin conversation —
+    see ``_target_matches_origin`` (cron/scheduler.py:430), which compares
+    exactly ``platform`` / ``chat_id`` / ``thread_id`` (chat_id as ``str``).
+    An origin-less home-channel fallback is deliberately treated as a broadcast
+    and never mirrored, so the being's proactive wake never reached the user's
+    DM session — on reply it confabulated (lm-dlw root cause).
+
+    Stamping the home channel here makes target==origin, which lets the existing
+    ``mirror_to_session`` path write the wake turn into the session the user's
+    reply loads. The dict shape mirrors the keys ``_target_matches_origin``
+    checks and the canonical stamp ``cronjob_tools._origin_from_env``: just
+    ``platform`` / ``chat_id`` / ``thread_id``. ``user_id``/``chat_name`` are
+    intentionally omitted — they are not compared by ``_target_matches_origin``,
+    are sourced from live session env we do not have at registration time, and
+    are harmless for a DM/shared session anyway.
+
+    Reads Hermes' Telegram env convention (``chat_id`` from
+    ``TELEGRAM_HOME_CHANNEL``, optional ``thread_id`` from
+    ``TELEGRAM_HOME_CHANNEL_THREAD_ID``). Returns ``None`` when the home channel
+    is unset/empty so a misconfigured or non-Telegram host degrades gracefully
+    to today's broadcast behavior — :func:`ensure_heartbeat_job` must never
+    crash on a missing env var (it runs on every plugin load).
+    """
+    chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL")
+    if not chat_id:
+        return None
+    return {
+        "platform": "telegram",
+        "chat_id": chat_id,
+        "thread_id": os.environ.get("TELEGRAM_HOME_CHANNEL_THREAD_ID") or None,
+    }
+
+
 def _existing_heartbeat(list_jobs: ListJobs) -> dict[str, Any] | None:
     """Return the already-registered heartbeat job, or ``None`` (incl. disabled).
 
@@ -165,8 +205,14 @@ def ensure_heartbeat_job(
     * **author / home channel only, no third parties** — ``deliver`` routes to the
       author's origin/home channel (:data:`AUTHOR_DELIVER`);
     * **the wake message lands in the conversation** — ``attach_to_session=True``
-      mirrors the woken turn into the origin chat's session, so the main session
-      remembers its own outreach instead of confabulating on reply (lm-dlw);
+      opts the job into delivery mirroring, and ``origin=_resolve_home_origin()``
+      pins the home DM/thread lane so the delivery target equals the job's origin
+      conversation — the gate ``_target_matches_origin`` (cron/scheduler.py:430)
+      requires before ``mirror_to_session`` will write the woken turn into the
+      session the user's reply loads. ``attach_to_session`` alone is a silent
+      no-op for a programmatic (origin-less) job; without the stamped origin a
+      proactive wake is a broadcast and the main session confabulates on reply
+      (lm-dlw);
     * the **≤ 1 message per cycle + cooldown** rails live in the tick's drain
       (:func:`lifemodel.tick.run_tick`), which gates the wake itself.
 
@@ -189,12 +235,18 @@ def ensure_heartbeat_job(
         no_agent=False,
         deliver=deliver,
         enabled_toolsets=list(NO_TOOLS_ENABLED_TOOLSETS),
-        # lm-dlw: mirror the woken turn's message into the origin chat's session.
-        # Cron replies live only in the cron job's own session unless this is set;
-        # with it, the scheduler appends the turn as an assistant message in the
-        # origin conversation (cron/scheduler.py ~L407-419), so the main session
-        # remembers its own proactive outreach instead of confabulating on reply.
+        # lm-dlw: opt into delivery mirroring AND pin the home DM/thread lane as
+        # the job's origin. ``attach_to_session=True`` alone is a silent no-op
+        # for a job registered programmatically (no origin): the scheduler only
+        # mirrors a cron delivery when its target == the job's origin
+        # conversation — ``_target_matches_origin`` (cron/scheduler.py:430) — at
+        # which point ``mirror_to_session`` appends the woken turn as a labelled
+        # USER-role message in the origin session, so the main session remembers
+        # its own proactive outreach instead of confabulating on reply.
+        # ``_resolve_home_origin()`` returns ``None`` when the home channel env
+        # is unset, degrading to today's broadcast behavior without crashing.
         attach_to_session=True,
+        origin=_resolve_home_origin(),
     )
     log.info("heartbeat_registered", job_id=job.get("id"), name=HEARTBEAT_JOB_NAME)
     return job

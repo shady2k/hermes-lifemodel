@@ -12,12 +12,15 @@ import compileall
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from lifemodel.heartbeat import (
     AUTHOR_DELIVER,
     HEARTBEAT_JOB_NAME,
     HEARTBEAT_SCHEDULE,
     NO_TOOLS_ENABLED_TOOLSETS,
     SHIM_FILENAME,
+    _resolve_home_origin,
     ensure_heartbeat_job,
     render_shim,
     write_shim,
@@ -42,6 +45,7 @@ class FakeCron:
         deliver: str | None = None,
         enabled_toolsets: list[str] | None = None,
         attach_to_session: bool | None = None,
+        origin: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         job = {
             "id": f"job{len(self.jobs)}",
@@ -53,6 +57,7 @@ class FakeCron:
             "deliver": deliver,
             "enabled_toolsets": enabled_toolsets,
             "attach_to_session": attach_to_session,
+            "origin": origin,
             "enabled": True,
         }
         self.jobs.append(job)
@@ -127,6 +132,74 @@ def test_heartbeat_job_attaches_wake_message_to_session(tmp_path: Path) -> None:
 
     assert len(cron.create_calls) == 1
     assert cron.create_calls[0]["attach_to_session"] is True
+
+
+def test_heartbeat_job_stamps_home_channel_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # lm-dlw: attach_to_session=True is a SILENT NO-OP for a job registered
+    # programmatically at startup, because such a job has origin=null and Hermes
+    # only mirrors a cron delivery when the delivery target == the job's origin
+    # conversation (_target_matches_origin, cron/scheduler.py:430). So we must
+    # ALSO stamp origin pointing at the author's home DM/thread lane, built from
+    # Hermes' Telegram env convention. The exact dict shape is verified against
+    # _target_matches_origin (compares platform/chat_id/thread_id only) and
+    # cronjob_tools._origin_from_env (canonical key names).
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "987654")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "321")
+
+    cron = FakeCron()
+    _ensure(tmp_path, cron)
+
+    assert len(cron.create_calls) == 1
+    call = cron.create_calls[0]
+    assert call["attach_to_session"] is True
+    assert call["origin"] == {
+        "platform": "telegram",
+        "chat_id": "987654",
+        "thread_id": "321",
+    }
+
+
+def test_heartbeat_job_has_no_origin_when_home_channel_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Graceful degradation: a misconfigured or non-Telegram host has no home
+    # channel env. register() must NOT crash — it falls back to today's behavior
+    # (an origin-less job whose wake is a broadcast, not session-mirrored).
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", raising=False)
+
+    cron = FakeCron()
+
+    # Must not raise.
+    _ensure(tmp_path, cron)
+
+    assert len(cron.create_calls) == 1
+    assert cron.create_calls[0]["origin"] is None
+
+
+def test_resolve_home_origin_thread_id_is_optional_when_channel_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # thread_id is optional (a plain DM has no topic thread). The home channel
+    # alone is enough to build an origin; thread_id degrades to None, which
+    # _target_matches_origin treats as "origin does not pin a thread".
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "987654")
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", raising=False)
+
+    origin = _resolve_home_origin()
+
+    assert origin == {"platform": "telegram", "chat_id": "987654", "thread_id": None}
+
+
+def test_resolve_home_origin_returns_none_when_home_channel_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "321")  # ignored w/o channel
+
+    assert _resolve_home_origin() is None
 
 
 def test_production_registration_delivers_to_author_origin(tmp_path: Path) -> None:
