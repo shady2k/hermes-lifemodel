@@ -135,7 +135,13 @@ async def proactive_service_loop(
             logger.info("proactive_yield_to_cron")
             await asyncio.sleep(interval_seconds)
             continue
-        busy = bool(getattr(runner, "_running_agents", None))
+        # INTERIM: no busy-skip. runner._running_agents stays truthy while a session
+        # is merely OPEN (not actively mid-turn), so it wrongly reported "busy" on
+        # every tick and blocked delivery entirely. The reach-in primitive is robust
+        # to an active turn (Hermes merge/FIFO semantics), so we inject regardless.
+        # A precise per-session in-flight check belongs to the upstream primitive
+        # (spec §5/§8).
+        busy = False
         try:
             run_proactive_tick(
                 build_lm(), egress, target, logger=logger, cooldown=cooldown, busy=busy
