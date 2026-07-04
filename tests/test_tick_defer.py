@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.aggregator import ThresholdAggregator
@@ -9,7 +9,7 @@ from lifemodel.state.model import State
 from lifemodel.testing.fakes import FakeClock, FakeSignalBus, FakeStateStore
 from lifemodel.tick import SERVICE_LIVENESS_MAX_AGE, run_tick, service_is_alive
 
-_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=timezone.utc)
+_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=UTC)
 
 
 def test_service_alive_when_stamp_fresh() -> None:
@@ -19,7 +19,9 @@ def test_service_alive_when_stamp_fresh() -> None:
 
 def test_service_dead_when_stamp_stale_or_absent() -> None:
     assert service_is_alive(State(), now=_T0) is False
-    stale = State(egress_service_alive_at=(_T0 - SERVICE_LIVENESS_MAX_AGE - timedelta(seconds=1)).isoformat())
+    stale = State(
+        egress_service_alive_at=(_T0 - SERVICE_LIVENESS_MAX_AGE - timedelta(seconds=1)).isoformat()
+    )
     assert service_is_alive(stale, now=_T0) is False
 
 

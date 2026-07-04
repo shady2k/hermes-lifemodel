@@ -53,8 +53,8 @@ def run_proactive_tick(
     state.pressure += sum((signal.salience for signal in signals), 0.0)
 
     decision = lm.aggregator.decide(signals, pressure=state.pressure)
-    in_cooldown = (
-        state.cooldown_until is not None and now < datetime.fromisoformat(state.cooldown_until)
+    in_cooldown = state.cooldown_until is not None and now < datetime.fromisoformat(
+        state.cooldown_until
     )
 
     outcome = ReachOutcome.SKIPPED_BUSY  # default "did not reach out this tick"

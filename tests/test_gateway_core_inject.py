@@ -9,7 +9,9 @@ _TARGET = {"platform": "telegram", "chat_id": "115679831", "thread_id": None}
 
 
 class _Source:
-    def __init__(self, platform: str = "telegram", chat_id: str = "115679831", profile: str = "") -> None:
+    def __init__(
+        self, platform: str = "telegram", chat_id: str = "115679831", profile: str = ""
+    ) -> None:
         self.platform = platform
         self.chat_id = chat_id
         self.profile = profile
@@ -83,12 +85,16 @@ def test_inject_builds_internal_event_and_schedules_on_loop() -> None:
 def test_inject_unavailable_when_no_source() -> None:
     runner = _FakeRunner(source=None)
     runner._source = None  # _build_process_event_source returns None -> lane unknown
-    outcome = inject_proactive_turn(runner, _TARGET, "hi", make_event=_make_event, schedule=lambda c, l: None)
+    outcome = inject_proactive_turn(
+        runner, _TARGET, "hi", make_event=_make_event, schedule=lambda c, loop: None
+    )
     assert outcome is ReachOutcome.UNAVAILABLE
 
 
 def test_inject_unavailable_when_draining() -> None:
     runner = _FakeRunner()
     runner._draining = True
-    outcome = inject_proactive_turn(runner, _TARGET, "hi", make_event=_make_event, schedule=lambda c, l: None)
+    outcome = inject_proactive_turn(
+        runner, _TARGET, "hi", make_event=_make_event, schedule=lambda c, loop: None
+    )
     assert outcome is ReachOutcome.UNAVAILABLE

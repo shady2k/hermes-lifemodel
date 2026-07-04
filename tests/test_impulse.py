@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lifemodel.domain.wake import WakePacket
 from lifemodel.impulse import IMPULSE_LABEL_PREFIX, compose_impulse
 
-_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=timezone.utc)
+_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=UTC)
 
 
 def _packet() -> WakePacket:
@@ -29,4 +29,4 @@ def test_impulse_reports_whole_hours_of_silence() -> None:
 def test_impulse_handles_unknown_last_contact() -> None:
     text = compose_impulse(_packet(), now=_T0, last_contact_at=None)
     assert text.startswith(IMPULSE_LABEL_PREFIX)
-    assert "/" != text.strip()[0]
+    assert text.strip()[0] != "/"

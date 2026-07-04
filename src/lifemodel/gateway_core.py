@@ -172,7 +172,9 @@ def install_core_shim(ctx: Any, *, logger: EventLogger | None = None) -> None:
 
         cls = type(ctx)
 
-        def _ctx_inject(self: Any, target: Mapping[str, str | None], prompt: str, **kw: Any) -> ReachOutcome:
+        def _ctx_inject(
+            self: Any, target: Mapping[str, str | None], prompt: str, **kw: Any
+        ) -> ReachOutcome:
             return inject_proactive_turn(default_runner_accessor(), target, prompt, **kw)
 
         def _ctx_register(self: Any, key: str, coro_factory: Callable[[], Any], **kw: Any) -> bool:

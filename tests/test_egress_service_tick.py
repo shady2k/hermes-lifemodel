@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.aggregator import ThresholdAggregator
@@ -10,7 +10,7 @@ from lifemodel.logging import get_logger
 from lifemodel.state.model import State
 from lifemodel.testing.fakes import FakeClock, FakeSignalBus, FakeStateStore
 
-_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=timezone.utc)
+_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=UTC)
 _TARGET = {"platform": "telegram", "chat_id": "1", "thread_id": None}
 
 
@@ -61,7 +61,7 @@ def test_failed_delivery_keeps_pressure() -> None:
     outcome = run_proactive_tick(lm, egress, _TARGET, logger=get_logger("t"))
     assert outcome is ReachOutcome.FAILED
     st = lm.state.load()
-    assert st.pressure == 28.0        # NOT drained — retry next tick
+    assert st.pressure == 28.0  # NOT drained — retry next tick
     assert st.last_contact_at is None
 
 

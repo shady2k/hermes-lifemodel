@@ -92,10 +92,7 @@ def main() -> int:
         target = {"platform": "telegram", "chat_id": "115679831", "thread_id": None}
         outcome = inject_proactive_turn(runner, target, "[probe] reach-in impulse")
         delivered = done.wait(timeout=5.0)
-        _log(
-            f"[reach-in] outcome={outcome.value} captured={captured} "
-            f"adapter_ran={delivered}"
-        )
+        _log(f"[reach-in] outcome={outcome.value} captured={captured} adapter_ran={delivered}")
     finally:
         loop.call_soon_threadsafe(loop.stop)
         loop_thread.join(timeout=5.0)

@@ -22,15 +22,10 @@ def _hours_silent(now: datetime, last_contact_at: datetime | None) -> int | None
     return max(0, int(delta.total_seconds() // 3600))
 
 
-def compose_impulse(
-    packet: WakePacket, *, now: datetime, last_contact_at: datetime | None
-) -> str:
+def compose_impulse(packet: WakePacket, *, now: datetime, last_contact_at: datetime | None) -> str:
     """Return the internal-labeled user text that seeds the proactive turn."""
     hours = _hours_silent(now, last_contact_at)
-    if hours is None:
-        window = "давно не общались"
-    else:
-        window = f"около {hours} ч тишины"
+    window = "давно не общались" if hours is None else f"около {hours} ч тишины"
     body = (
         "Прошло время без разговора по-человечески "
         f"({window}). Если есть, чем поделиться от себя — "

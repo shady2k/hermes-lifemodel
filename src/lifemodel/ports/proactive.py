@@ -10,7 +10,8 @@ thread_id}`` (as produced by :func:`lifemodel.heartbeat._resolve_home_origin`).
 
 from __future__ import annotations
 
-from typing import Mapping, Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import Protocol, runtime_checkable
 
 from ..domain.egress import ReachOutcome
 

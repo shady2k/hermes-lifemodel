@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -51,7 +52,9 @@ def test_register_falls_back_to_cron_when_unavailable(
 
     started: list[str] = []
     heartbeat: list[bool] = []
-    monkeypatch.setattr(lifemodel, "register_gateway_service", lambda *a, **k: started.append("x") or True)
+    monkeypatch.setattr(
+        lifemodel, "register_gateway_service", lambda *a, **k: started.append("x") or True
+    )
     monkeypatch.setattr(lifemodel, "register_heartbeat", lambda *a, **k: heartbeat.append(True))
 
     ctx = FakeCtx()
