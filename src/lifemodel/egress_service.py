@@ -10,8 +10,9 @@ this on a timer lands in task 7.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
+from typing import Any
 
 from .composition import LifeModel
 from .domain.egress import ReachOutcome
@@ -82,3 +83,53 @@ def run_proactive_tick(
     lm.state.commit(state)
     logger.info("proactive_tick", pressure=state.pressure, outcome=outcome.value)
     return outcome
+
+
+async def proactive_service_loop(
+    *,
+    build_lm: Callable[[], LifeModel],
+    egress: ProactiveEgressPort,
+    target: Mapping[str, str | None],
+    runner_accessor: Callable[[], Any | None],
+    logger: EventLogger,
+    interval_seconds: float = 60.0,
+    cooldown: timedelta = DEFAULT_WAKE_COOLDOWN,
+) -> None:
+    """Supervised in-process brain: tick every interval until shutdown.
+
+    Waits for the gateway to finish starting (``_running`` True / adapters wired),
+    then loops: each *interval_seconds* it runs one :func:`run_proactive_tick`
+    (marking the session busy if the gateway has an active turn) and stamps
+    liveness. It self-guards on ``_running``/``_draining`` and exits cleanly on
+    shutdown; a tick error is logged and swallowed so one bad tick can't kill the
+    loop (spec §3.2 — runner-owned, isolated, cancellable).
+    """
+    import asyncio
+
+    # Wait for the gateway to finish starting (adapters wired, _running True).
+    for _ in range(600):  # ~5 min cap; then proceed best-effort
+        runner = runner_accessor()
+        if runner is not None and getattr(runner, "_running", False):
+            break
+        if runner is not None and getattr(runner, "_draining", False):
+            return
+        await asyncio.sleep(0.5)
+
+    logger.info("proactive_service_loop_started", interval=interval_seconds)
+    while True:
+        runner = runner_accessor()
+        if (
+            runner is None
+            or getattr(runner, "_draining", False)
+            or not getattr(runner, "_running", False)
+        ):
+            logger.info("proactive_service_loop_stop")
+            return
+        busy = bool(getattr(runner, "_running_agents", None))
+        try:
+            run_proactive_tick(
+                build_lm(), egress, target, logger=logger, cooldown=cooldown, busy=busy
+            )
+        except Exception as exc:  # noqa: BLE001 - a tick error must not kill the loop
+            logger.info("proactive_tick_error", error=f"{type(exc).__name__}: {exc}")
+        await asyncio.sleep(interval_seconds)
