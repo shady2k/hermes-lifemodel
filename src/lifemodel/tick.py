@@ -51,6 +51,7 @@ from .domain.wake import WakeDecision
 from .events import EVENT_TICK, EVENT_TICK_FAILED, EVENTS_FILENAME, EventSink
 from .logging import EventLogger, EventTee, configure, get_logger
 from .paths import state_dir
+from .state.model import State
 
 #: How long after a wake the being stays quiet before it may wake again (roadmap
 #: 1.4). A wall-clock duration compared against ``State.cooldown_until``: while it
@@ -59,6 +60,33 @@ from .paths import state_dir
 #: §7). A sane default; a disk-backed, hot-reloadable value plugs in here later
 #: (same seam as the aggregator's threshold) without reshaping ``run_tick``.
 DEFAULT_WAKE_COOLDOWN = timedelta(minutes=30)
+
+#: How long after a liveness stamp the cron heartbeat still considers the
+#: in-process egress service "alive" and defers to it (lm-64s, spec §6). ~3× the
+#: service's 60s tick interval: as long as the in-proc brain keeps stamping, the
+#: cron stays out of the way; once the stamp goes stale the cron takes over as the
+#: fallback brain. ``None`` / unparseable stamps are treated as "dead" (fail-over).
+SERVICE_LIVENESS_MAX_AGE = timedelta(minutes=3)
+
+
+def service_is_alive(
+    state: State, *, now: datetime, max_age: timedelta = SERVICE_LIVENESS_MAX_AGE
+) -> bool:
+    """True if the in-process egress service stamped liveness within *max_age*.
+
+    The cron heartbeat calls this before ticking: a fresh stamp means the
+    in-process service owns the brain (it ticks pressure + decides reach-out
+    itself), so the cron defers to avoid two brains writing state at once. Stale
+    or absent stamps fall back to the cron path. Unparseable stamps are treated as
+    dead rather than raising — fail-over to cron, never a mid-cron crash.
+    """
+    stamp = state.egress_service_alive_at
+    if stamp is None:
+        return False
+    try:
+        return now - datetime.fromisoformat(stamp) <= max_age
+    except ValueError:
+        return False
 
 
 def _hermes_home() -> Path:
@@ -137,6 +165,17 @@ def run_tick(
     the next tick sees no pressure + an open cooldown → no second message.
     """
     state = lm.state.load()
+    now = lm.clock.now()
+
+    # Liveness watchdog (lm-64s, spec §6): while the in-process egress service is
+    # alive it owns the brain (it ticks pressure + decides reach-out itself), so
+    # the cron heartbeat defers here — before any accumulation — and stays a silent
+    # fallback. Pressure is left untouched; the in-proc service is the sole writer
+    # while alive. When the stamp goes stale/absent the cron takes over as the
+    # fallback brain and falls through to the normal tick below.
+    if service_is_alive(state, now=now):
+        logger.info(EVENT_TICK, deferred="service_alive", pressure=state.pressure)
+        return WakeDecision.stay_asleep()
 
     for neuron in lm.neurons:
         for signal in neuron.tick(state):
@@ -151,7 +190,6 @@ def run_tick(
     # whether it is enough to *wake* is the aggregator's call (1.3), never the
     # tick's — no threshold literal lives here.
     state.pressure += sum((signal.salience for signal in signals), 0.0)
-    now = lm.clock.now()
     proposed = lm.aggregator.decide(signals, pressure=state.pressure)
 
     # Cooldown guard (roadmap 1.4): honour a wake only when no cooldown is active.

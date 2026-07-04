@@ -70,6 +70,12 @@ class State:
     #: Additive field — the schema stays v1 because :meth:`from_dict` defaults it
     #: when absent, so state files written before 1.4 load unchanged.
     cooldown_until: str | None = None
+    #: ISO-8601 UTC liveness stamp of the in-process proactive-egress service
+    #: (lm-64s). While it is fresh (within ``SERVICE_LIVENESS_MAX_AGE``) the cron
+    #: heartbeat defers to the in-process brain — it owns ticking while alive — and
+    #: takes over as the fallback brain when the stamp goes stale/absent (spec §6).
+    #: Additive: the schema stays v1 (``from_dict`` defaults it when absent).
+    egress_service_alive_at: str | None = None
     # NB: signal dedup does *not* live here. It is owned by the SignalBus
     # consumed-ledger (``signals.consumed``), which persists "already consumed"
     # independently of this State to avoid racing the tick's own commit — see
@@ -107,6 +113,9 @@ class State:
             # stays an opaque display string — it is never parsed or compared.
             last_contact_at=_as_opt_iso(data.get("last_contact_at"), "last_contact_at"),
             cooldown_until=_as_opt_iso(data.get("cooldown_until"), "cooldown_until"),
+            egress_service_alive_at=_as_opt_iso(
+                data.get("egress_service_alive_at"), "egress_service_alive_at"
+            ),
         )
 
 
