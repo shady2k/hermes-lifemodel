@@ -39,6 +39,7 @@ in tests with injected fakes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from dataclasses import replace
@@ -47,7 +48,7 @@ from pathlib import Path
 
 from .composition import LifeModel, build_lifemodel
 from .domain.wake import WakeDecision
-from .events import EVENT_TICK, EVENTS_FILENAME, EventSink
+from .events import EVENT_TICK, EVENT_TICK_FAILED, EVENTS_FILENAME, EventSink
 from .logging import EventLogger, EventTee, configure, get_logger
 from .paths import state_dir
 
@@ -204,16 +205,39 @@ def main() -> int:
     **stderr** first (:func:`configure`) so the only thing on **stdout** is the
     single wake-gate line. Exits 0; the scheduler reads the gate, not the exit
     code, to decide whether to wake.
+
+    **Fail closed (safety).** Hermes does *not* stay silent when a cron
+    ``--script`` exits non-zero: it injects a "Script Error" prompt and **wakes
+    the agent**, delivering a crash message to the user (``cron/scheduler.py``
+    ``_run_job_script`` → ``_build_job_prompt``). So a crash on a would-be-wake
+    tick would otherwise fire an unintended, undrained, repeating delivery. We
+    therefore catch **any** unhandled exception, emit the stay-asleep gate
+    (``{"wakeAgent": false}``) and exit 0 — Hermes stays silent, nothing is
+    delivered, and because the failing tick never committed, a clean wake retries
+    on a later healthy tick (a delayed real message beats a delivered crash). The
+    error is recorded to stderr and, best-effort, to the on-disk event sink.
     """
-    configure()
-    sdir = state_dir(_hermes_home())
-    sink = EventSink(sdir / EVENTS_FILENAME)
-    logger = EventTee(get_logger("lifemodel.tick"), sink)
-    lm = build_lifemodel(base_dir=sdir, logger=logger)
+    # Resolve the safe gate line and a base logger up front, with operations that
+    # cannot raise, so failure reporting and the stay-asleep fallback are always
+    # available. Rendering the stay-asleep gate is pure JSON and cannot fail.
+    # ``logger`` starts stderr-only and is upgraded to the sink-teed one once the
+    # sink exists, so a ``tick_failed`` record lands wherever we got to.
+    safe_gate = wake_gate_line(WakeDecision.stay_asleep())  # {"wakeAgent": false}
+    logger: EventLogger = get_logger("lifemodel.tick")
+    line = safe_gate
+    try:
+        configure()
+        sdir = state_dir(_hermes_home())
+        sink = EventSink(sdir / EVENTS_FILENAME)
+        logger = EventTee(logger, sink)
+        lm = build_lifemodel(base_dir=sdir, logger=logger)
+        line = wake_gate_line(run_tick(lm, logger=logger))
+    except Exception as exc:  # noqa: BLE001 - fail closed: a crash must NOT wake
+        line = safe_gate  # keep the stay-asleep gate — Hermes stays silent (see above)
+        with contextlib.suppress(Exception):  # observability must never re-raise
+            logger.info(EVENT_TICK_FAILED, error=f"{type(exc).__name__}: {exc}")
 
-    decision = run_tick(lm, logger=logger)
-
-    sys.stdout.write(wake_gate_line(decision) + "\n")
+    sys.stdout.write(line + "\n")
     sys.stdout.flush()
     return 0
 

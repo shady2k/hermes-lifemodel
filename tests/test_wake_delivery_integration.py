@@ -41,11 +41,13 @@ _REQUIRED_CHECKS = (
     "woken_turn_received_wake_packet",
     "exactly_one_delivery_to_author",
     "woken_turn_is_text_only_no_tools",
+    "woken_turn_tool_schema_is_empty",
     "pressure_drained_on_wake",
     "cooldown_opened_on_wake",
     "cooldown_vetoes_second_fire",
     "below_threshold_zero_llm",
     "exactly_one_llm_call_total",
+    "crash_fails_closed_silent",
 )
 
 
@@ -87,6 +89,7 @@ def test_wake_delivery_loop_on_isolated_hermes(tmp_path: Path) -> None:
     # Spot-check the headline numbers directly (defence in depth over the flags).
     assert payload["delivery_count"] == 1, payload
     assert payload["resolved_toolsets"] == [], "woken turn must have zero tools"
+    assert payload["tool_schema_names"] == [], "the real tool schema must be empty (text-only)"
     assert payload["llm_constructions"] == 1, "exactly one wake => exactly one LLM turn"
     assert payload["wake_tick_index"] is not None
 

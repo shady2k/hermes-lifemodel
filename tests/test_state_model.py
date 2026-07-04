@@ -86,6 +86,27 @@ def test_cooldown_until_accepts_valid_iso_forms() -> None:
         )
 
 
+@pytest.mark.parametrize("field", ["cooldown_until", "last_contact_at"])
+def test_iso_fields_reject_timezone_naive_values(field: str) -> None:
+    # FINDING 2: a tz-naive value parses fine via fromisoformat but the tick
+    # compares it against the clock's aware UTC ``now`` → TypeError mid-tick. The
+    # engine's instant fields must be tz-AWARE, so a naive value is rejected as
+    # corruption at load, never left to crash (or, under fail-closed main, wedge)
+    # the tick.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, field: "2026-07-04T12:00:00"})
+
+
+def test_last_contact_at_accepts_aware_iso() -> None:
+    aware = "2026-07-04T12:00:00+00:00"
+    assert (
+        State.from_dict(
+            {"schema_version": SCHEMA_VERSION, "last_contact_at": aware}
+        ).last_contact_at
+        == aware
+    )
+
+
 def test_tick_count_rejects_non_integer() -> None:
     # tick_count is a strict integer counter; a bool (int subclass) or a float
     # in the file signals corruption, not a valid count.

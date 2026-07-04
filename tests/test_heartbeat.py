@@ -111,6 +111,30 @@ def test_heartbeat_job_wires_phase_1_4_minimal_safety(tmp_path: Path) -> None:
     assert "tool" in prompt  # "do not use any tools"
 
 
+def test_production_registration_delivers_to_author_origin(tmp_path: Path) -> None:
+    # FINDING 4: the integration forces deliver="local" for no-outbound safety, so
+    # the PRODUCTION author route is asserted here at the config layer instead. The
+    # real registration call shape (no deliver override — exactly what
+    # register_heartbeat passes) must create the job with deliver="origin", i.e.
+    # the author's origin/home channel, never a third party.
+    cron = FakeCron()
+    src_dir = tmp_path / "plugin" / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+
+    job = ensure_heartbeat_job(
+        home=tmp_path,
+        src_dir=src_dir,
+        create_job=cron.create_job,
+        list_jobs=cron.list_jobs,
+        # NB: no `deliver=` — mirrors register_heartbeat's production call, which
+        # relies on the AUTHOR_DELIVER default.
+    )
+
+    assert len(cron.create_calls) == 1
+    assert cron.create_calls[0]["deliver"] == "origin"
+    assert job["deliver"] == AUTHOR_DELIVER == "origin"
+
+
 def test_ensure_is_idempotent(tmp_path: Path) -> None:
     # The footgun: register() runs on every load. Calling ensure repeatedly must
     # never create a second heartbeat.

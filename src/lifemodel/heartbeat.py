@@ -59,7 +59,19 @@ _HEARTBEAT_PROMPT = (
 #: normalization, and the scheduler's ``_resolve_cron_enabled_toolsets`` resolves
 #: it to ``[]`` (no native toolsets, no MCP), so ``get_tool_definitions`` hands the
 #: agent zero tools. Verified against cron/scheduler.py + model_tools.py; the
-#: integration test asserts the real resolver returns ``[]`` for this job.
+#: integration test asserts the real resolver returns ``[]`` AND that
+#: ``get_tool_definitions`` yields an empty schema for this job.
+#:
+#: RESIDUAL CAVEAT (outside the plugin's control): ``model_tools.get_tool_definitions``
+#: force-appends the ``kanban`` toolset to *any* non-``None`` allowlist — including
+#: our empty one — whenever ``HERMES_KANBAN_TASK`` is set in the scheduler process
+#: (``model_tools.py`` ~L369). A normal gateway/cron process does not set that env
+#: var, so the empty-toolset floor holds; but a being whose cron scheduler runs
+#: inside a kanban-dispatched worker context could still be offered kanban tools.
+#: That is a Hermes-env concern the plugin cannot override per-job — there is no
+#: supported ``enabled_toolsets`` value or ``create_job`` argument that suppresses
+#: it. The text-only cognition PROMPT ("do not use any tools") is the
+#: defense-in-depth backstop for that residual.
 NO_TOOLS_ENABLED_TOOLSETS = ("no_mcp",)
 
 #: Where a woken turn's one message is delivered (roadmap 1.4 "author/home channel

@@ -95,12 +95,17 @@ class State:
             pressure=_as_float(data.get("pressure", 0.0), "pressure"),
             energy=_as_float(data.get("energy", 1.0), "energy"),
             last_tick_at=_as_opt_str(data.get("last_tick_at"), "last_tick_at"),
-            last_contact_at=_as_opt_str(data.get("last_contact_at"), "last_contact_at"),
-            # cooldown_until is the one timestamp the engine *parses and branches
-            # on* (the wake cooldown, see ``lifemodel.tick.run_tick``), so unlike
-            # the opaque ``last_*`` strings it is validated as a real ISO-8601
-            # instant here — a malformed value is corruption caught loud at load,
-            # not a mid-tick ``fromisoformat`` crash that would fail open to waking.
+            # last_contact_at and cooldown_until are the timestamps the engine
+            # threads into datetime comparisons (the wake cooldown, see
+            # ``lifemodel.tick.run_tick``; the contact time flows into the
+            # wake-packet). They are validated here as timezone-*aware* ISO-8601
+            # instants: a malformed value — or a tz-*naive* one that would raise
+            # ``TypeError`` when compared against the clock's aware ``now`` — is
+            # corruption caught loud at load, never a mid-tick crash. (With the
+            # fail-closed ``main`` such a crash would wedge the being silent rather
+            # than fire; either way it must not reach the tick.) ``last_tick_at``
+            # stays an opaque display string — it is never parsed or compared.
+            last_contact_at=_as_opt_iso(data.get("last_contact_at"), "last_contact_at"),
             cooldown_until=_as_opt_iso(data.get("cooldown_until"), "cooldown_until"),
         )
 
@@ -132,17 +137,26 @@ def _as_opt_str(value: object, field_name: str) -> str | None:
 
 
 def _as_opt_iso(value: object, field_name: str) -> str | None:
-    # A str-or-null *and* a parseable ISO-8601 timestamp when present. The value
+    # A str-or-null *and* a timezone-AWARE ISO-8601 instant when present. The value
     # is kept as its original string (the on-disk shape stays a string, HLA §4);
-    # parsing here only validates it so downstream comparisons never raise.
+    # parsing here validates it so downstream comparisons never raise. The
+    # tz-aware requirement is load-bearing: the tick compares the clock's aware
+    # UTC ``now`` against ``cooldown_until``, and a naive value would raise
+    # ``TypeError: can't compare offset-naive and offset-aware datetimes`` — so a
+    # naive value is rejected as corruption at load, not left to crash the tick.
     text = _as_opt_str(value, field_name)
-    if text is not None:
-        try:
-            datetime.fromisoformat(text)
-        except ValueError as exc:
-            raise StateCorruptError(
-                f"field {field_name!r} must be an ISO-8601 timestamp, got {text!r}"
-            ) from exc
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise StateCorruptError(
+            f"field {field_name!r} must be an ISO-8601 timestamp, got {text!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StateCorruptError(
+            f"field {field_name!r} must be a timezone-aware timestamp, got naive {text!r}"
+        )
     return text
 
 

@@ -41,6 +41,7 @@ EVENTS_FILENAME = "events.jsonl"
 #: and the debug reader share these names so "last tick / wake / act / dream"
 #: line up. Kept here because the sink is the events' home.
 EVENT_TICK = "tick"
+EVENT_TICK_FAILED = "tick_failed"
 EVENT_WAKE_DECISION = "wake_decision"
 EVENT_ACT_GATE = "act_gate"
 EVENT_DREAM_RUN = "dream_run"

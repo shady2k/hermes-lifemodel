@@ -23,7 +23,8 @@ from lifemodel.core.aggregator import DEFAULT_WAKE_THRESHOLD, Aggregator, Thresh
 from lifemodel.core.neuron import EVENT_NEURON_FIRED, Neuron, StubTimerNeuron
 from lifemodel.domain.signal import Signal
 from lifemodel.domain.wake import WakeDecision, WakePacket
-from lifemodel.events import EVENT_TICK, EVENTS_FILENAME, EventSink
+from lifemodel.events import EVENT_TICK, EVENT_TICK_FAILED, EVENTS_FILENAME, EventSink
+from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
 from lifemodel.testing.fakes import FakeClock, FakeDelivery, FakeSignalBus, FakeStateStore
 from lifemodel.tick import main, run_tick, wake_gate_line
@@ -428,3 +429,69 @@ def test_sink_reads_back_the_last_tick(tmp_path: Path) -> None:
     last = sink.read()[-1]
     assert last["event"] == EVENT_TICK
     assert last["tick_count"] == 1
+
+
+def _events_in(sdir: Path) -> list[dict[str, Any]]:
+    """Read the on-disk event sink under *sdir* (the profile state dir)."""
+    text = (sdir / EVENTS_FILENAME).read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line]
+
+
+def test_main_fails_closed_when_the_tick_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # FINDING 1 (fail CLOSED): Hermes wakes the agent + delivers a "Script Error"
+    # message when a cron --script exits non-zero, so ANY unhandled exception in
+    # the tick must still print {"wakeAgent": false} and exit 0 — a crash must
+    # never wake or deliver. Here run_tick raises; main() must stay silent.
+    monkeypatch.setattr(tick_mod, "_hermes_home", lambda: tmp_path)
+
+    def _boom(*args: Any, **kwargs: Any) -> WakeDecision:
+        raise RuntimeError("simulated tick failure")
+
+    monkeypatch.setattr(tick_mod, "run_tick", _boom)
+
+    assert main() == 0  # exit 0 → Hermes reads the gate, not a crash
+    gate = _last_gate_line(capsys.readouterr().out)
+    assert gate == {"wakeAgent": False}
+    assert gate.get("wakeAgent", True) is False  # scheduler rule: False => skip agent
+
+    records = _events_in(tmp_path / "lifemodel")
+    assert any(r.get("event") == EVENT_TICK_FAILED for r in records)  # error recorded
+    assert not any(r.get("event") == EVENT_TICK for r in records)  # tick never completed
+
+
+def test_main_commit_failure_on_a_wake_tick_stays_silent_and_undrained(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # FINDING 1 realistic scenario: a would-be-wake tick whose commit() raises
+    # (e.g. state dir unwritable / disk full). Without the fail-closed guard the
+    # script would crash, Hermes would wake cognition, and it would deliver a
+    # crash message with pressure NOT drained — repeating every run. With the
+    # guard: {"wakeAgent": false}, exit 0, and the on-disk state is left UNDRAINED
+    # so a clean wake retries on a later healthy tick.
+    monkeypatch.setattr(tick_mod, "_hermes_home", lambda: tmp_path)
+    sdir = tmp_path / "lifemodel"
+
+    # Seed pressure at/above the default wake threshold so this tick WOULD wake.
+    seed = JsonStateStore(sdir)
+    seed.commit(State(pressure=15.0))  # DEFAULT_WAKE_THRESHOLD is 10.0
+
+    # Now make every commit fail — the tick will decide to wake, drain in-memory,
+    # then blow up trying to persist.
+    def _fail_commit(self: Any, state: State) -> None:
+        raise OSError("simulated unwritable state dir")
+
+    monkeypatch.setattr(JsonStateStore, "commit", _fail_commit)
+
+    assert main() == 0
+    assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
+
+    # On-disk state is unchanged (the failing commit never wrote): pressure stays
+    # at the seeded value, so the wake is retried later rather than lost.
+    persisted = json.loads((sdir / "state.json").read_text(encoding="utf-8"))
+    assert persisted["pressure"] == 15.0  # undrained
+    assert persisted.get("cooldown_until") is None  # no cooldown opened
+
+    records = _events_in(sdir)
+    assert any(r.get("event") == EVENT_TICK_FAILED for r in records)

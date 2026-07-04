@@ -174,12 +174,27 @@ def main() -> int:
     threshold = float(DEFAULT_WAKE_THRESHOLD)
     _log(f"[setup] job id={job['id']} deliver={job['deliver']} threshold={threshold}")
 
-    # No-tools rail, proven with the REAL resolver: our ["no_mcp"] job resolves to
-    # an empty toolset, so the woken agent is handed zero tools.
+    # No-tools rail (FINDING 3), proven at TWO layers with the REAL Hermes code:
+    #  (1) the scheduler resolver reduces our ["no_mcp"] job to an empty toolset;
+    #  (2) the tool-definition layer then yields a genuinely EMPTY tool schema for
+    #      that empty allowlist — so the woken agent is handed zero tools.
+    # Residual (documented): model_tools force-appends `kanban` to any non-None
+    # allowlist when HERMES_KANBAN_TASK is set; a normal cron process does not set
+    # it, so we clear it here to prove the real floor deterministically.
+    os.environ.pop("HERMES_KANBAN_TASK", None)
     resolved_toolsets = _resolve_cron_enabled_toolsets(job, {})
+    from cron.scheduler import _resolve_cron_disabled_toolsets
+    from model_tools import get_tool_definitions
+
+    tool_schema = get_tool_definitions(
+        enabled_toolsets=resolved_toolsets,
+        disabled_toolsets=_resolve_cron_disabled_toolsets({}),
+        quiet_mode=True,
+    )
+    tool_names = [t.get("function", {}).get("name") for t in tool_schema]
     _log(
         f"[setup] enabled_toolsets stored={job.get('enabled_toolsets')} "
-        f"resolved={resolved_toolsets}"
+        f"resolved={resolved_toolsets} tool_schema_size={len(tool_names)} names={tool_names[:8]}"
     )
 
     # --- Drive real ticks until the crossing tick wakes. ----------------------
@@ -246,6 +261,34 @@ def main() -> int:
     }
     _log(f"[cooldown probe] forced pressure>={threshold}, result={cooldown_probe}")
 
+    # --- FINDING 1+2 end-to-end: a crashing tick FAILS CLOSED through the real ---
+    # --script subprocess. Corrupt state.json with a tz-naive cooldown_until (also
+    # pressure far above threshold): the tick's state load raises StateCorruptError,
+    # yet the shim must still exit 0 with {"wakeAgent": false} so the REAL scheduler
+    # stays silent — no wake, no crash-message delivery. Proven via the real
+    # _run_job_script + _parse_wake_gate. This is the last probe (it leaves state
+    # corrupt on purpose).
+    from cron.scheduler import _parse_wake_gate, _run_job_script
+
+    (state_dir(home) / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pressure": threshold + 99.0,
+                "cooldown_until": "2026-07-04T12:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    fc_ok, fc_out = _run_job_script(job["script"])
+    fc_last = next((ln for ln in reversed(fc_out.splitlines()) if ln.strip()), "")
+    fail_closed = (
+        fc_ok  # script exited 0 despite the internal crash
+        and _parse_wake_gate(fc_out) is False  # scheduler would skip the agent
+        and json.loads(fc_last) == {"wakeAgent": False}
+    )
+    _log(f"[fail-closed probe] script_ok={fc_ok} last_line={fc_last!r} fail_closed={fail_closed}")
+
     # --- Assemble checks. -----------------------------------------------------
     pre_wake = ticks[:-1] if wake_tick_index is not None else ticks
     wake_rec = ticks[-1] if wake_tick_index is not None else None
@@ -270,8 +313,10 @@ def main() -> int:
         "exactly_one_delivery_to_author": len(deliveries) == 1
         and deliveries[0][0] == "local"
         and deliveries[0][1] == _CANNED_MESSAGE,
-        # 5b. text-only: the woken agent was handed ZERO tools (real resolver)
+        # 5b. text-only: the woken agent was handed ZERO tools — proven at the
+        #     real resolver AND the real tool-definition layer (FINDING 3).
         "woken_turn_is_text_only_no_tools": resolved_toolsets == [],
+        "woken_turn_tool_schema_is_empty": tool_names == [],
         # 6. drained to 0 on the wake, cooldown opened, and the cooldown vetoes a
         #    forced above-threshold second fire (no 2nd delivery / no LLM)
         "pressure_drained_on_wake": wake_rec is not None and wake_rec["pressure"] == 0.0,
@@ -283,6 +328,9 @@ def main() -> int:
         and all(t["delivered"] == 0 for t in pre_wake),
         # exactly one LLM construction across the whole run (the single wake)
         "exactly_one_llm_call_total": len(_StubAgent.constructions) == 1,
+        # a crashing tick fails CLOSED end-to-end (silent gate, exit 0) — the real
+        # scheduler would NOT wake/deliver on a corrupt-state crash.
+        "crash_fails_closed_silent": fail_closed,
     }
 
     passed = all(checks.values())
@@ -294,10 +342,12 @@ def main() -> int:
         "threshold": threshold,
         "wake_tick_index": wake_tick_index,
         "resolved_toolsets": resolved_toolsets,
+        "tool_schema_names": tool_names,
         "delivery_count": len(deliveries),
         "delivered": deliveries,
         "llm_constructions": len(_StubAgent.constructions),
         "cooldown_probe": cooldown_probe,
+        "fail_closed_probe": {"script_ok": fc_ok, "last_line": fc_last},
         "checks": checks,
         "ticks": ticks,
     }
