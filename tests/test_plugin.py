@@ -68,7 +68,7 @@ def test_register_adds_lifemodel_command(monkeypatch: pytest.MonkeyPatch, tmp_pa
     line = entry["handler"]("")
     assert "alive" in line
     assert "test-being" in line
-    assert str(tmp_path / "lifemodel") in line
+    assert str(tmp_path / "workspace" / "lifemodel") in line
 
 
 def test_register_emits_plugin_registered_event(
@@ -84,7 +84,7 @@ def test_register_emits_plugin_registered_event(
     assert len(events) == 1
     event = events[0]
     assert event["profile"] == "test-being"
-    assert event["state_dir"] == str(tmp_path / "lifemodel")
+    assert event["state_dir"] == str(tmp_path / "workspace" / "lifemodel")
     assert event["version"] == lifemodel.__version__
 
 
@@ -145,7 +145,7 @@ def test_register_tees_plugin_registered_into_events_sink(
     lifemodel.register(FakeCtx())
 
     # The structured event landed in the queryable sink, not only the logs.
-    events_file = tmp_path / "lifemodel" / EVENTS_FILENAME
+    events_file = tmp_path / "workspace" / "lifemodel" / EVENTS_FILENAME
     records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
     assert any(r["event"] == "plugin_registered" for r in records)
 
