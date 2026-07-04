@@ -41,6 +41,7 @@ class FakeCron:
         no_agent: bool = False,
         deliver: str | None = None,
         enabled_toolsets: list[str] | None = None,
+        attach_to_session: bool | None = None,
     ) -> dict[str, Any]:
         job = {
             "id": f"job{len(self.jobs)}",
@@ -51,6 +52,7 @@ class FakeCron:
             "no_agent": no_agent,
             "deliver": deliver,
             "enabled_toolsets": enabled_toolsets,
+            "attach_to_session": attach_to_session,
             "enabled": True,
         }
         self.jobs.append(job)
@@ -109,6 +111,22 @@ def test_heartbeat_job_wires_phase_1_4_minimal_safety(tmp_path: Path) -> None:
     assert "author" in prompt
     assert "one" in prompt
     assert "tool" in prompt  # "do not use any tools"
+
+
+def test_heartbeat_job_attaches_wake_message_to_session(tmp_path: Path) -> None:
+    # lm-dlw: a proactive wake fires from cron, whose reply lives only in the
+    # cron job's own session unless attach_to_session=True — then the scheduler
+    # mirrors the woken turn into the origin chat (cron/scheduler.py ~L407-419,
+    # persisted only when explicitly set per cron/jobs.py ~L1011-1015). Without
+    # it the main session has amnesia about its own outreach and confabulates.
+    # Assert the flag is wired structurally at registration, like the other
+    # Phase-1.4 rails.
+    cron = FakeCron()
+
+    _ensure(tmp_path, cron)
+
+    assert len(cron.create_calls) == 1
+    assert cron.create_calls[0]["attach_to_session"] is True
 
 
 def test_production_registration_delivers_to_author_origin(tmp_path: Path) -> None:

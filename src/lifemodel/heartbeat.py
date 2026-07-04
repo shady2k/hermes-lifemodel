@@ -164,6 +164,9 @@ def ensure_heartbeat_job(
       so the woken turn is handed zero tools (:data:`NO_TOOLS_ENABLED_TOOLSETS`);
     * **author / home channel only, no third parties** — ``deliver`` routes to the
       author's origin/home channel (:data:`AUTHOR_DELIVER`);
+    * **the wake message lands in the conversation** — ``attach_to_session=True``
+      mirrors the woken turn into the origin chat's session, so the main session
+      remembers its own outreach instead of confabulating on reply (lm-dlw);
     * the **≤ 1 message per cycle + cooldown** rails live in the tick's drain
       (:func:`lifemodel.tick.run_tick`), which gates the wake itself.
 
@@ -186,6 +189,12 @@ def ensure_heartbeat_job(
         no_agent=False,
         deliver=deliver,
         enabled_toolsets=list(NO_TOOLS_ENABLED_TOOLSETS),
+        # lm-dlw: mirror the woken turn's message into the origin chat's session.
+        # Cron replies live only in the cron job's own session unless this is set;
+        # with it, the scheduler appends the turn as an assistant message in the
+        # origin conversation (cron/scheduler.py ~L407-419), so the main session
+        # remembers its own proactive outreach instead of confabulating on reply.
+        attach_to_session=True,
     )
     log.info("heartbeat_registered", job_id=job.get("id"), name=HEARTBEAT_JOB_NAME)
     return job
