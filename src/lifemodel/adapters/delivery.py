@@ -1,11 +1,14 @@
 """``NoopDelivery`` — a do-nothing :class:`DeliveryPort` stub (HLA §7/§13).
 
-The walking skeleton needs *a* delivery to wire, but the real Hermes-gateway
-adapter is Phase 1.4. This stub lets the object graph construct and run without
-speaking to the world: it accepts a ``send`` and drops it, logging a structured
-event so a debug trace still shows the intent (HLA §12, NFR9). Swap in the real
-gateway adapter at the composition root — nothing else changes. Stdlib + our own
-logging only; no Hermes.
+The walking skeleton needs *a* delivery to wire. In Phase 1.4 the *proactive*
+outbound is delivered by Hermes' cron when the wake gate flips (``deliver``, HLA
+§7/D4), **not** through this port — so this stub stays the default and the
+``DeliveryPort`` remains the seam for a future *direct*-from-cognition send. It
+lets the object graph construct and run without speaking to the world: it accepts
+a ``send`` and drops it, logging a structured event so a debug trace still shows
+the intent (HLA §12, NFR9). Swap in a real adapter at the composition root when
+that direct path lands — nothing else changes. Stdlib + our own logging only; no
+Hermes.
 """
 
 from __future__ import annotations

@@ -6,9 +6,15 @@ quiet-hours, budget and cooldown, then returns a
 :class:`~lifemodel.domain.act.Decision`. Enforcement of actions in the world is
 Hermes' sandbox+approvals (HLA §7); this gate is *our* restraint over speech.
 
-Contract only. The minimal Phase-1.4 gate (author/home channel · ≤1 message per
-threshold cycle · cooldown · text-only) and the fuller Phase-2.3 gate implement
-this — they do not redesign it.
+Contract only. Phase 1.4's minimal-safety rails do **not** run through this gate:
+in the wake-gate architecture (HLA D1/D4) the proactive turn is a Hermes cron
+agent, so there is no in-process seam to call ``allow`` at delivery time. Those
+rails are instead enforced *structurally* — author/home channel + text-only via
+the cron job's ``deliver`` / ``enabled_toolsets`` (see :mod:`lifemodel.heartbeat`),
+and ≤ 1 message per cycle + cooldown via the tick's drain
+(:func:`lifemodel.tick.run_tick`, which gates the wake itself). This ``ActGate``
+is the seam for the fuller Phase-2.3 per-turn speak/silent gate (the ``[SILENT]``
+path), which will implement this contract rather than redesign it.
 """
 
 from __future__ import annotations

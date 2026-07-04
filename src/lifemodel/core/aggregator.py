@@ -82,10 +82,13 @@ class ThresholdAggregator(Aggregator):
     hot-reloadable threshold source plugs into later (HLA "thresholds from disk")
     without reshaping this interface.
 
-    Scope note (roadmap 1.3 vs 1.4): the decision does **not** drain the
-    pressure, cool down, or single-fire — so above threshold every tick keeps
-    deciding "wake". Draining on delivery, the cooldown, and the one-message
-    limit are task 1.4; this class deliberately leaves that seam untouched.
+    Scope note (roadmap 1.3 vs 1.4): the aggregator stays a *pure thalamus* —
+    pressure vs threshold — and never drains, cools down, or single-fires. So on
+    its own, above threshold it keeps deciding "wake" every tick. The drain, the
+    cooldown veto, and the one-message-per-cycle limit are task 1.4 and live in
+    the orchestrator (:func:`lifemodel.tick.run_tick`), which threads ``now`` +
+    the stored cooldown around this call — this interface is deliberately left
+    untouched (no ``now``/cooldown args here).
     """
 
     def __init__(self, *, threshold: float = DEFAULT_WAKE_THRESHOLD) -> None:

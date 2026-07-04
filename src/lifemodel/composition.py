@@ -16,9 +16,13 @@ Two call sites this must serve (roadmap 0.4):
   takes the Hermes-free defaults below.
 
 For Phase 0.4 the defaults are the concrete :class:`SystemClock`,
-:class:`JsonStateStore`, and durable :class:`FileSignalBus`, with lightweight
-stubs where real behaviour is a later task: a :class:`NoopDelivery` (real
-gateway delivery is 1.4). Phase 1.3 replaced the pass-through aggregator with the
+:class:`JsonStateStore`, and durable :class:`FileSignalBus`, with a
+:class:`NoopDelivery` stub for the ``DeliveryPort``. Note the Phase-1.4 *proactive*
+outbound does **not** go through this port: on a wake the tick prints
+``wakeAgent: true`` and Hermes' cron delivers the woken turn's message via the
+gateway (``deliver``, HLA §7/D4). The ``DeliveryPort`` stays the seam for a future
+*direct*-from-cognition delivery path, so ``NoopDelivery`` remains the default.
+Phase 1.3 replaced the pass-through aggregator with the
 real :class:`ThresholdAggregator`, which wakes once the accumulated pressure
 crosses its threshold (:class:`SilentAggregator` stays available for tests that
 want a guaranteed-quiet graph). Phase 1.2 landed the first neuron: the default

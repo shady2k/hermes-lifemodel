@@ -20,6 +20,7 @@ def test_defaults_are_documented_and_current_schema() -> None:
     assert state.energy == 1.0
     assert state.last_tick_at is None
     assert state.last_contact_at is None
+    assert state.cooldown_until is None
 
 
 def test_no_processed_signal_ids_field() -> None:
@@ -42,8 +43,47 @@ def test_round_trip_through_dict_is_identity() -> None:
         energy=0.25,
         last_tick_at="2026-07-03T12:00:00Z",
         last_contact_at="2026-07-03T11:00:00Z",
+        cooldown_until="2026-07-03T11:30:00Z",
     )
     assert State.from_dict(state.to_dict()) == state
+
+
+def test_cooldown_until_is_additive_and_schema_stays_v1() -> None:
+    # cooldown_until (roadmap 1.4) is a new optional field; a file written before
+    # it existed (only the header + pre-1.4 fields) still loads under schema v1,
+    # defaulting cooldown_until to None — additive, no version bump.
+    legacy = {
+        "schema_version": SCHEMA_VERSION,
+        "tick_count": 7,
+        "pressure": 2.0,
+        "energy": 1.0,
+        "last_tick_at": "2026-07-03T12:00:00Z",
+        "last_contact_at": None,
+    }
+    state = State.from_dict(legacy)
+    assert state.cooldown_until is None
+    assert state.tick_count == 7
+
+
+def test_cooldown_until_rejects_wrong_type() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "cooldown_until": 123})
+
+
+def test_cooldown_until_rejects_unparseable_iso() -> None:
+    # cooldown_until is the one timestamp the engine parses/branches on, so a
+    # malformed string is corruption caught loud at load — never a mid-tick crash.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "cooldown_until": "not-a-timestamp"})
+
+
+def test_cooldown_until_accepts_valid_iso_forms() -> None:
+    # Both an explicit +00:00 offset and the 'Z' suffix parse (Python 3.11+).
+    for ts in ("2026-07-04T12:00:00+00:00", "2026-07-04T12:00:00Z"):
+        assert (
+            State.from_dict({"schema_version": SCHEMA_VERSION, "cooldown_until": ts}).cooldown_until
+            == ts
+        )
 
 
 def test_tick_count_rejects_non_integer() -> None:

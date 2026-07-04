@@ -37,12 +37,39 @@ HEARTBEAT_SCHEDULE = "every 1m"
 SHIM_FILENAME = "lifemodel_heartbeat.py"
 #: Subdir of the profile home where Hermes resolves cron ``--script`` paths.
 SCRIPTS_DIR_NAME = "scripts"
-#: Woken-agent prompt. Unused in 1.1 (the gate never wakes the agent); a real
-#: proactive prompt is 1.4. Kept short and text-only.
+#: Woken-agent prompt (roadmap 1.4). When the wake gate flips ``wakeAgent=true``
+#: the scheduler wakes the agent with the neuron script's stdout — the wake-packet
+#: — injected above this instruction (HLA D4). A thin, text-only cognition prompt:
+#: send ONE brief message to the author, no tools, no third parties. Real
+#: personality/soul is Phase 3; this is only enough to prove the loop breathes.
 _HEARTBEAT_PROMPT = (
-    "lifemodel heartbeat: the being's pressure crossed its threshold. "
-    "Consider whether to reach out; keep it brief and text-only."
+    "You woke because your accumulated pressure crossed its wake threshold — the "
+    "wake reason and the pressure that crossed are in the script output injected "
+    "above. Send ONE short, plain-text message to the author noting that you "
+    "reached out. Text only: do not use any tools and do not take any world "
+    "actions, and address only the author — no third parties. Keep it to a "
+    "sentence or two."
 )
+
+#: Toolsets the woken cognition turn is restricted to — an effectively EMPTY set,
+#: i.e. NO tools (the Phase-1.4 text-only floor). Passed as ``enabled_toolsets`` to
+#: ``create_job``. We use the ``no_mcp`` sentinel rather than a literal ``[]``
+#: because ``create_job`` normalizes an empty list back to ``None`` ("load all
+#: default tools") — the opposite of what we want. ``["no_mcp"]`` survives that
+#: normalization, and the scheduler's ``_resolve_cron_enabled_toolsets`` resolves
+#: it to ``[]`` (no native toolsets, no MCP), so ``get_tool_definitions`` hands the
+#: agent zero tools. Verified against cron/scheduler.py + model_tools.py; the
+#: integration test asserts the real resolver returns ``[]`` for this job.
+NO_TOOLS_ENABLED_TOOLSETS = ("no_mcp",)
+
+#: Where a woken turn's one message is delivered (roadmap 1.4 "author/home channel
+#: ONLY · no third parties"). ``"origin"`` delivers back to whoever/wherever this
+#: concerns; for a job created programmatically at ``register()`` (no origin) the
+#: scheduler falls back to the configured *home* channel — the author — and never
+#: to a third party. Safe by default: with no home channel configured it simply
+#: skips delivery. The integration overrides this to ``"local"`` (captured, no
+#: outbound) so no real message can leave during testing.
+AUTHOR_DELIVER = "origin"
 
 #: Structural types for the slice of the Hermes cron API we use, so the tested
 #: core takes injected callables (real or fake) instead of importing ``cron``.
@@ -108,16 +135,28 @@ def ensure_heartbeat_job(
     create_job: CreateJob,
     list_jobs: ListJobs,
     logger: EventLogger | None = None,
-    deliver: str = "local",
+    deliver: str = AUTHOR_DELIVER,
 ) -> dict[str, Any]:
     """Ensure exactly one heartbeat cron job exists; return it (idempotent).
 
     Always refreshes the launcher shim, then registers the cron job **only if**
     no job with the stable name already exists — so calling this on every plugin
     load never duplicates the heartbeat. The job carries both a ``script`` (our
-    tick) and ``no_agent=False``, so the scheduler runs the script first and can
-    wake the agent later (1.3+) when the wake gate flips; today the gate is
-    always ``wakeAgent=false`` (zero LLM).
+    tick) and ``no_agent=False``, so the scheduler runs the script first and, once
+    the wake gate flips ``wakeAgent=true`` (1.3+), wakes the agent with the wake
+    packet injected as context (HLA D4).
+
+    The Phase-1.4 minimal-safety rails are wired **structurally** here:
+
+    * **text-only / no tools** — ``enabled_toolsets`` resolves to an empty set,
+      so the woken turn is handed zero tools (:data:`NO_TOOLS_ENABLED_TOOLSETS`);
+    * **author / home channel only, no third parties** — ``deliver`` routes to the
+      author's origin/home channel (:data:`AUTHOR_DELIVER`);
+    * the **≤ 1 message per cycle + cooldown** rails live in the tick's drain
+      (:func:`lifemodel.tick.run_tick`), which gates the wake itself.
+
+    *deliver* is injectable so the integration test can force ``"local"`` (a
+    captured, non-outbound sink) and never touch a real channel.
     """
     log = logger or get_logger("lifemodel.heartbeat")
     write_shim(home, src_dir)
@@ -134,6 +173,7 @@ def ensure_heartbeat_job(
         script=SHIM_FILENAME,
         no_agent=False,
         deliver=deliver,
+        enabled_toolsets=list(NO_TOOLS_ENABLED_TOOLSETS),
     )
     log.info("heartbeat_registered", job_id=job.get("id"), name=HEARTBEAT_JOB_NAME)
     return job

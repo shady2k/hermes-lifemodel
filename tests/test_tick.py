@@ -224,9 +224,9 @@ def test_run_tick_wakes_when_accumulated_pressure_crosses_threshold() -> None:
 
     packet = WakePacket.from_dict(gate)  # parses back via the hardened schema
     assert packet.reason
-    assert packet.pressure == 3.0
+    assert packet.pressure == 3.0  # the packet records the pressure that crossed
     assert packet.threshold == threshold
-    assert store.load().pressure == 3.0  # committed, undrained (drain is 1.4)
+    assert store.load().pressure == 0.0  # drained on wake (roadmap 1.4)
 
 
 def test_run_tick_below_threshold_is_zero_llm_and_delivers_nothing() -> None:

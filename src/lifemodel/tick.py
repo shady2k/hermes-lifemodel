@@ -20,8 +20,11 @@ state each tick, and the real
 pressure stays below its threshold the decision is "stay asleep" → the gate is
 ``{"wakeAgent": false}`` (silent, zero LLM), and the tick the pressure crosses
 the threshold the aggregator returns a waking decision → this same code emits the
-wake-packet with ``wakeAgent: true`` — no rewrite of the tick (HLA §11). Draining
-the pressure, the cooldown, and single-fire on delivery are task 1.4.
+wake-packet with ``wakeAgent: true`` — no rewrite of the tick (HLA §11). Phase 1.4
+closes the loop: on a wake the tick **drains** the pressure, stamps the contact,
+and opens a **cooldown** that vetoes the next would-be wakes (single-fire, ≤ 1
+message per threshold cycle); the message itself is sent by Hermes' cron when it
+wakes the agent (delivery = gateway, HLA §7 / D4).
 
 **stdout discipline.** Only the single wake-gate line is written to stdout;
 structured logs go to stderr (see :func:`~lifemodel.logging.configure`) and to
@@ -38,6 +41,8 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .composition import LifeModel, build_lifemodel
@@ -45,6 +50,14 @@ from .domain.wake import WakeDecision
 from .events import EVENT_TICK, EVENTS_FILENAME, EventSink
 from .logging import EventLogger, EventTee, configure, get_logger
 from .paths import state_dir
+
+#: How long after a wake the being stays quiet before it may wake again (roadmap
+#: 1.4). A wall-clock duration compared against ``State.cooldown_until``: while it
+#: is active the tick stays asleep even above threshold, so at most one message
+#: fires per threshold cycle. Cooldown/quiet-hours are *ours*, not Hermes' (HLA
+#: §7). A sane default; a disk-backed, hot-reloadable value plugs in here later
+#: (same seam as the aggregator's threshold) without reshaping ``run_tick``.
+DEFAULT_WAKE_COOLDOWN = timedelta(minutes=30)
 
 
 def _hermes_home() -> Path:
@@ -80,7 +93,9 @@ def wake_gate_line(decision: WakeDecision) -> str:
     return json.dumps(gate, ensure_ascii=False)
 
 
-def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
+def run_tick(
+    lm: LifeModel, *, logger: EventLogger, cooldown: timedelta = DEFAULT_WAKE_COOLDOWN
+) -> WakeDecision:
     """Run one heartbeat tick over the assembled graph and return the decision.
 
     Hermes-free and side-effecting only through the injected collaborators, so a
@@ -98,12 +113,27 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
     3. **Aggregation layer** — ask the aggregator for a wake decision against the
        accumulated pressure. ``ThresholdAggregator`` wakes once it crosses the
        threshold (1.3); the threshold call is entirely the aggregator's.
-    4. **Heartbeat bookkeeping** — advance ``tick_count`` and stamp
+    4. **Drain + cooldown + single-fire (roadmap 1.4)** — an active cooldown
+       *vetoes* a would-be wake (stay asleep even above threshold), so at most one
+       message fires per threshold cycle. When a wake is honoured we **drain**
+       ``State.pressure`` to zero, stamp ``last_contact_at``, and open a fresh
+       ``cooldown_until = now + cooldown``. The threshold call stays the
+       aggregator's; the cooldown is *ours* (HLA §7 "quiet-hours/cooldown —
+       наши"), enforced here as an orchestration guard rather than by widening
+       the pure-threshold aggregator. The emitted wake-packet is enriched with
+       the *prior* contact time (HLA §11) before it is overwritten.
+    5. **Heartbeat bookkeeping** — advance ``tick_count`` and stamp
        ``last_tick_at`` from the injected clock, then commit atomically. This is
-       the single state writer of the tick (HLA §9); neurons never persist. The
-       pressure is committed undrained — draining on wake is task 1.4.
-    5. **Observability** — emit the structured ``tick`` event so ``/lifemodel
+       the single state writer of the tick (HLA §9); neurons never persist.
+    6. **Observability** — emit the structured ``tick`` event so ``/lifemodel
        debug`` can answer "last tick" from the event sink (HLA §12).
+
+    Delivery is *not* here: on a wake this tick prints ``wakeAgent: true`` and
+    Hermes' cron wakes the agent and delivers via the gateway (HLA §7 "decision —
+    ours, delivery — gateway"; D1/D4). Draining on the *wake decision* (not on a
+    delivery ack) is deliberate: the tick is the single state writer and cannot
+    observe the async gateway send, and draining here is exactly what guarantees
+    the next tick sees no pressure + an open cooldown → no second message.
     """
     state = lm.state.load()
 
@@ -120,12 +150,34 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
     # whether it is enough to *wake* is the aggregator's call (1.3), never the
     # tick's — no threshold literal lives here.
     state.pressure += sum((signal.salience for signal in signals), 0.0)
-    decision = lm.aggregator.decide(signals, pressure=state.pressure)
-
-    # NB (roadmap 1.4): the accumulated pressure is committed *as is* — the wake
-    # decision does not drain it here. Draining on delivery + cooldown is 1.4;
-    # this is the obvious seam for it (after decide, before commit).
     now = lm.clock.now()
+    proposed = lm.aggregator.decide(signals, pressure=state.pressure)
+
+    # Cooldown guard (roadmap 1.4): honour a wake only when no cooldown is active.
+    # While ``now < cooldown_until`` we stay asleep even above threshold — this is
+    # the "≤ 1 message per threshold cycle" + cooldown rail. Threading ``now`` +
+    # the stored cooldown here keeps the aggregator a pure thalamus (pressure vs
+    # threshold) and the time/cooldown policy in the orchestrator (HLA §7).
+    in_cooldown = state.cooldown_until is not None and now < datetime.fromisoformat(
+        state.cooldown_until
+    )
+
+    if proposed.wake and proposed.packet is not None and not in_cooldown:
+        # Enrich the packet with the PRIOR contact time (HLA §11: the wake-packet
+        # carries "last contact") before we overwrite ``last_contact_at`` below.
+        decision = WakeDecision.wake_with(
+            replace(proposed.packet, last_contact_at=state.last_contact_at)
+        )
+        # Drain on wake: reset the drive, stamp the contact, open the cooldown.
+        state.pressure = 0.0
+        state.last_contact_at = now.isoformat()
+        state.cooldown_until = (now + cooldown).isoformat()
+    else:
+        # Below threshold, or vetoed by an active cooldown — stay silent (zero
+        # LLM). Pressure is committed as-is so it keeps accumulating toward the
+        # next cycle; the cooldown (if any) stays untouched.
+        decision = WakeDecision.stay_asleep()
+
     state.tick_count += 1
     state.last_tick_at = now.isoformat()
     lm.state.commit(state)
@@ -137,6 +189,8 @@ def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
         pressure=state.pressure,
         signals=len(signals),
         wake=decision.wake,
+        in_cooldown=in_cooldown,
+        cooldown_until=state.cooldown_until,
     )
     return decision
 

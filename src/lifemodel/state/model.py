@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
 
 from .errors import StateCorruptError
@@ -62,6 +63,13 @@ class State:
     #: ISO-8601 UTC timestamp of the last outbound contact, for cooldown
     #: bookkeeping (roadmap 1.4). ``None`` until the being first reaches out.
     last_contact_at: str | None = None
+    #: ISO-8601 UTC timestamp the current wake-cooldown expires at (roadmap 1.4).
+    #: Stamped ``now + COOLDOWN`` when a wake drains the pressure; while
+    #: ``now < cooldown_until`` the tick stays asleep even above threshold, so at
+    #: most one message fires per threshold cycle. ``None`` until the first wake.
+    #: Additive field — the schema stays v1 because :meth:`from_dict` defaults it
+    #: when absent, so state files written before 1.4 load unchanged.
+    cooldown_until: str | None = None
     # NB: signal dedup does *not* live here. It is owned by the SignalBus
     # consumed-ledger (``signals.consumed``), which persists "already consumed"
     # independently of this State to avoid racing the tick's own commit — see
@@ -88,6 +96,12 @@ class State:
             energy=_as_float(data.get("energy", 1.0), "energy"),
             last_tick_at=_as_opt_str(data.get("last_tick_at"), "last_tick_at"),
             last_contact_at=_as_opt_str(data.get("last_contact_at"), "last_contact_at"),
+            # cooldown_until is the one timestamp the engine *parses and branches
+            # on* (the wake cooldown, see ``lifemodel.tick.run_tick``), so unlike
+            # the opaque ``last_*`` strings it is validated as a real ISO-8601
+            # instant here — a malformed value is corruption caught loud at load,
+            # not a mid-tick ``fromisoformat`` crash that would fail open to waking.
+            cooldown_until=_as_opt_iso(data.get("cooldown_until"), "cooldown_until"),
         )
 
 
@@ -115,6 +129,21 @@ def _as_opt_str(value: object, field_name: str) -> str | None:
     if value is None or isinstance(value, str):
         return value
     raise StateCorruptError(f"field {field_name!r} must be a string or null, got {_type(value)}")
+
+
+def _as_opt_iso(value: object, field_name: str) -> str | None:
+    # A str-or-null *and* a parseable ISO-8601 timestamp when present. The value
+    # is kept as its original string (the on-disk shape stays a string, HLA §4);
+    # parsing here only validates it so downstream comparisons never raise.
+    text = _as_opt_str(value, field_name)
+    if text is not None:
+        try:
+            datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise StateCorruptError(
+                f"field {field_name!r} must be an ISO-8601 timestamp, got {text!r}"
+            ) from exc
+    return text
 
 
 def _type(value: object) -> str:

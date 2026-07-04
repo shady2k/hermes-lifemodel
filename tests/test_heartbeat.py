@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from lifemodel.heartbeat import (
+    AUTHOR_DELIVER,
     HEARTBEAT_JOB_NAME,
     HEARTBEAT_SCHEDULE,
+    NO_TOOLS_ENABLED_TOOLSETS,
     SHIM_FILENAME,
     ensure_heartbeat_job,
     render_shim,
@@ -38,6 +40,7 @@ class FakeCron:
         script: str | None = None,
         no_agent: bool = False,
         deliver: str | None = None,
+        enabled_toolsets: list[str] | None = None,
     ) -> dict[str, Any]:
         job = {
             "id": f"job{len(self.jobs)}",
@@ -47,6 +50,7 @@ class FakeCron:
             "script": script,
             "no_agent": no_agent,
             "deliver": deliver,
+            "enabled_toolsets": enabled_toolsets,
             "enabled": True,
         }
         self.jobs.append(job)
@@ -83,6 +87,28 @@ def test_ensure_creates_heartbeat_when_absent(tmp_path: Path) -> None:
     assert job["no_agent"] is False
     # The launcher shim exists under the profile's scripts dir.
     assert (tmp_path / "scripts" / SHIM_FILENAME).is_file()
+
+
+def test_heartbeat_job_wires_phase_1_4_minimal_safety(tmp_path: Path) -> None:
+    # The woken turn must be text-only (no tools), author/home-channel only, and
+    # carry the cognition prompt — the Phase-1.4 rails wired structurally at
+    # registration (the ≤1/cycle + cooldown rails live in the tick's drain).
+    cron = FakeCron()
+
+    job = _ensure(tmp_path, cron)
+
+    # No tools: the empty-set sentinel (a literal [] would normalize to "all
+    # tools"); the real scheduler resolves ["no_mcp"] to an empty toolset.
+    assert job["enabled_toolsets"] == list(NO_TOOLS_ENABLED_TOOLSETS)
+    assert job["enabled_toolsets"] == ["no_mcp"]
+    # Author / home channel only, no third parties.
+    assert job["deliver"] == AUTHOR_DELIVER == "origin"
+    # A real, text-only cognition instruction that addresses only the author and
+    # forbids tools.
+    prompt = job["prompt"].lower()
+    assert "author" in prompt
+    assert "one" in prompt
+    assert "tool" in prompt  # "do not use any tools"
 
 
 def test_ensure_is_idempotent(tmp_path: Path) -> None:
