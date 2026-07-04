@@ -351,7 +351,7 @@ def test_main_prints_wake_gate_and_persists_across_ticks(
     assert main() == 0
     assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
 
-    sdir = tmp_path / "lifemodel"
+    sdir = tmp_path / "workspace" / "lifemodel"
     state = json.loads((sdir / "state.json").read_text(encoding="utf-8"))
     assert state["tick_count"] == 2
 
@@ -379,7 +379,7 @@ def test_main_default_neuron_accumulates_pressure_and_stays_asleep(
     assert main() == 0
     assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
 
-    sdir = tmp_path / "lifemodel"
+    sdir = tmp_path / "workspace" / "lifemodel"
     state = json.loads((sdir / "state.json").read_text(encoding="utf-8"))
     assert state["tick_count"] == 2
     assert state["pressure"] == 2.0  # default delta 1.0, accumulated over 2 ticks
@@ -456,7 +456,7 @@ def test_main_fails_closed_when_the_tick_raises(
     assert gate == {"wakeAgent": False}
     assert gate.get("wakeAgent", True) is False  # scheduler rule: False => skip agent
 
-    records = _events_in(tmp_path / "lifemodel")
+    records = _events_in(tmp_path / "workspace" / "lifemodel")
     assert any(r.get("event") == EVENT_TICK_FAILED for r in records)  # error recorded
     assert not any(r.get("event") == EVENT_TICK for r in records)  # tick never completed
 
@@ -471,7 +471,7 @@ def test_main_commit_failure_on_a_wake_tick_stays_silent_and_undrained(
     # guard: {"wakeAgent": false}, exit 0, and the on-disk state is left UNDRAINED
     # so a clean wake retries on a later healthy tick.
     monkeypatch.setattr(tick_mod, "_hermes_home", lambda: tmp_path)
-    sdir = tmp_path / "lifemodel"
+    sdir = tmp_path / "workspace" / "lifemodel"
 
     # Seed pressure at/above the default wake threshold so this tick WOULD wake.
     seed = JsonStateStore(sdir)
