@@ -1,91 +1,100 @@
 # Proactive-contact desire model — design spec
 
 **Bead:** [lm-x43](../../) — Mathematical model of proactive-contact desire (dynamics + simulation + calibration)
-**Status:** draft — rev.2 (2026-07-05). Rev.1 folded Codex instrument-honesty fixes (thread `019f2eec`); rev.2 folds the full design session: desire-lifecycle with `ack`/dedup, timing as a cognition verdict, bounded `0..100` neuron scale, neuron-owned deprivation duration, and corrected science + v2 form (Codex thread `019f2f26`). Consolidation bead: [lm-27h].
-**Scope:** the DESIRE model + its simulation only. No Hermes plugin code in this task — that is a separate epic that consumes whatever this task certifies. Product "what" lives in `business-requirements.md` (FR2/FR3/FR6); architecture "how" in `hla.md` (§2.1, §11); this spec formalises and *simulates* them.
+**Status:** draft — **rev.3 (2026-07-05)**. rev.1 folded Codex instrument-honesty fixes (thread `019f2eec`); rev.2 folded the desire-lifecycle + bounded-scale design session; **rev.3 reframes the whole model as a homeostatic controller with a (v2) learned set-point, grounded in four convergent literatures, and answers the one-vs-two-variable question with that grounding** (web literature sweep + Codex adversarial review, thread `019f316e`). Consolidation bead: [lm-27h].
+**Scope:** the DESIRE model + its simulation only. No Hermes plugin code in this task. Product "what" lives in `business-requirements.md` (FR2/FR3/FR6); architecture "how" in `hla.md` (§2.1, §11); this spec formalises and *simulates* them.
+
+**rev.3 headline.** We could never *derive* a constant answer to "after a conversation, how many hours until it proactively writes again?" — because there is **no universal constant**. The right rhythm is individual and must be *learned per relationship*. This is not our failure; it is consistent with established findings (Niv et al.: optimal action latency is context-dependent, not fixed; Matthews & Tye: the social set-point is individual and plastic). Consequently the model splits cleanly:
+
+- **v1 (this task — mechanics built & certified; one calibration step remains):** the *fast drive* + the *desire lifecycle* + the *hard safety envelope* — a well-mannered being with a **fixed, conservative set-point** (a documented prior, explicitly **not** a calibrated truth). It never drums, never interrupts. The 54-test mechanics are green; the last v1 step is the shared-prior feasibility check (§9).
+- **v2 (separate epic, [lm-27h]/new):** *adaptation* — a bounded **learned set-point** and a separate **rhythm/availability estimator** that make the being learn *this* person, slowly, inside hard clamps. Designed here (§10) so it is not lost; **not implemented here**.
 
 ---
 
 ## 1. Goal
 
-A minimal, science-grounded, **simulatable** model of how the *desire to make proactive contact* arises and is resolved, validated by simulation **before** any plugin code. Output: a certified model + a pure-Python simulation harness + calibrated constants + an empirical answer to *one vs. two state variables*.
+A minimal, science-grounded, **simulatable** model of how the *desire to make proactive contact* arises and is resolved, validated by simulation **before** any plugin code.
 
-The live system today (HEAD `0881ebc`) ships the proactive-egress **delivery** layer but its **decision** layer misbehaves (real Telegram log 2026-07-04: the being proactive-messaged one minute after the user greeted, then drummed every 30 min, each time voicing "nothing to add"). This task does not touch delivery. It rebuilds the *when to reach out, when to stay silent, when to hold* decision as a model provable in simulation.
+Framed precisely (rev.3): the being is a **homeostatic controller** for social connection (Matthews & Tye 2019). A cheap drive senses the deficit between perceived connection and a *set-point* and produces an urge; at threshold it *wakes* cognition; cognition (the LLM) *judges*. In **v1** the set-point is a fixed conservative prior. In **v2** it is *learned* — which is the honest resolution of the one-vs-two-variable question (§8).
+
+The live system today (HEAD `0881ebc`) ships the proactive-egress **delivery** layer; its **decision** layer misbehaved (real Telegram log 2026-07-04: proactive message one minute after the user greeted, then a "nothing to add" drum every 30 min). This task rebuilds the *when to reach out / stay silent / hold* decision as a model provable in simulation. It does not touch delivery.
 
 ## 2. Non-negotiable principles
 
-1. **URGE ≠ ACTION.** A cheap, zero-LLM drive produces pressure; at threshold the aggregation layer *creates a desire* and wakes cognition. An expensive, context-aware LLM then *judges* — **fulfill / defer / reject** — from the full session context and what it knows about the user. Threshold-crossing **never** deterministically sends a message. The model cannot speak; only cognition can.
-2. **Logic lives in a layer, not in a neuron** (project convention). The neuron is a thin sensor: it *measures* (bounded pressure + how long it has been over threshold) and *emits*, but it does not *decide*. Desire creation, dedup, hold, and escalation live in the aggregation layer; the verdict lives in cognition.
-3. **Hard structural gates are separate from the drive.** "Don't interrupt an active conversation", "don't wake while a turn is in flight", "don't re-wake right after a reject" are *policy*, not *dynamics*. They gate **whether to wake cognition**, not whether it is a good moment — that (mood, the user's rhythm) is cognition's verdict, because the knowledge lives in the LLM/Hermes, not in a cheap neuron.
-4. **A desire has a lifecycle and is remembered.** Repeated threshold-crossings do **not** spawn duplicate wakes: the aggregation layer holds one desire and **dedups** further signals against it (`ack`). A desire cognition chose to **defer** is *held*, not dropped, and re-presented later — so the being never forgets an intention and never drums.
-5. **Calibrate, do not guess.** Constants are fit by grid-search against labelled traces with an explicit objective. No coefficient is taken on faith.
-6. **Minimal set first.** Start with one continuous drive variable. Add a second only if simulation proves the invariants cannot otherwise be met.
+1. **URGE ≠ ACTION.** A cheap, zero-LLM drive produces pressure; at threshold the aggregation layer *creates a desire* and wakes cognition. An expensive, context-aware LLM then *judges* — **fulfill / defer / reject**. Threshold-crossing **never** sends a message.
+2. **Logic lives in a layer, not in a neuron** (project convention). The neuron is a thin sensor: it *measures* (bounded pressure + how long over threshold) and *emits*; it does not *decide*.
+3. **Hard structural gates are separate from the drive.** "Don't interrupt", "don't wake in-flight", "don't re-wake right after a reject" are *policy*, not *dynamics*.
+4. **A desire has a lifecycle and is remembered.** Repeated crossings do not spawn duplicate wakes (dedup / `ack`); a *deferred* desire is held and re-presented, never forgotten, never drummed.
+5. **The safety envelope is fixed; only comfort is learned** (rev.3). Whatever v2 learns, a hard-coded envelope never moves: never-interrupt (`W`), no-wake-in-flight, dedup, growing reject-backoff, internal-impulse exclusion, a per-window send cap, and "threshold wakes cognition, never sends." Learning adjusts *latency/eagerness inside* the envelope — never *permission* to violate it. This is the "something basic" underneath adaptation.
+6. **Calibrate honestly, do not guess, do not overclaim.** v1 ships a *conservative prior* to be verified for feasibility across every scenario (not truth) — the mechanics are certified, the shared-prior check is the last v1 step (§9). Fitting the set-point to a real person is v2, and even there the simulation proves the *mechanism*, never "calibrated to humans" (§10).
+7. **Minimal set first (YAGNI).** v1 is one continuous drive with a fixed set-point. The second (learned) variable is added in v2 *because the science and the "no universal constant" result point to it* — argued from the literature, not assumed, and not certified by v1 (which ships one variable).
 
 ## 3. Science grounding
 
-Grouped by the exact phenomenon each model licenses. **All are inspiration and constraint, not validation** (Codex review, thread `019f2f26`): they establish *that* a mechanism is biologically real; they do not certify our equations. Constants are earned from simulation (§9), not from citations.
+Four convergent literatures describe systems of this shape and map closely onto ours. **All are inspiration and constraint, not validation** (Codex `019f2f26`/`019f316e`): they establish *that* a mechanism is biologically real and give us its *shape/equations*; they do not certify our constants, nor do they prove that *our* second variable must be exactly `s`. Constants are a prior (v1) or learned (v2), never taken from a citation.
 
-- **Bounded rise from deprivation** — **Hull, drive-reduction / homeostatic drive (1943).** Deprivation builds a drive; the drive motivates reducing behaviour; satisfaction discharges it. The cleanest historical template for "silence accumulates a bounded urge, contact discharges it." *Caveat:* old behaviourist theory; physiological drives fit better than social longing — we borrow the shape, not the ontology.
-- **Quality, not just frequency** — **Baumeister & Leary 1995, "The need to belong."** A fundamental motivation requiring *frequent, positive* interactions in stable bonds. Motivates the `q_event` classifier (§6): a genuine two-way exchange satiates more than a low-effort ack. *Caveat:* not dynamics.
-- **Deficit as an aversive signal; chronic deficit → withdrawal** — **Cacioppo / Hawkley & Cacioppo 2010.** Loneliness is an aversive signal of perceived disconnection: acutely it motivates reconnection; chronically it biases toward social-threat hypervigilance, worse sleep/health, and **withdrawal**. Closest domain fit. Grounds both the rise *and* the deferred v2 withdrawal twist (§8). *Caveat:* not an equation for proactive-contact desire.
-- **Cost of sustained wanting; threshold/mood shift** — **Allostasis & allostatic load (Sterling & Eyer 1988; McEwen 1998).** Stability-through-change: chronic regulatory activation carries cumulative "wear and tear" that shifts physiology, mood, and resilience. This is the grounding for "sustained wanting depletes energy and moves later thresholds" and ties the drive to the Energy/dreaming layer (BRD FR21). *Caveat:* not social-contact-specific; does not by itself predict a rise-then-fall curve.
-- **Analogies only, with explicit caveats:** **opponent-process (Solomon & Corbit 1974)** — delayed counter-regulation of an affective state; native paradigm is a stimulus *present then removed*, **not** a sustained unmet deficit. **Habituation / neural adaptation (Thompson & Spencer 1966)** — response decrement to a *repeated/persistent* stimulus; silence is the *absence* of a stimulus, so this fits only if we reframe repeated *failed outreach* as the stimulus. Cite as engineering analogies, never as proof that "unmet desire decays on its own." **Ego-depletion is deliberately avoided** (replication crisis).
-- **Bistable relationship climate (v2 escalation only)** — **Abplanalp, Maimone & Green 2025, *NPP*, "Viewing social isolation as a complex dynamical system."** Latent connectedness `Z` on a double-well potential `V(Z)=¼Z⁴−½aZ²−bZ`, `dZ = (−Z³+aZ+b)dt + σ dW` — two basins (connected/isolated), a tipping point, hysteresis. Powerful but **overpowered** for our v2: it needs dense longitudinal data (~365 d × 5 obs/d) to identify and only earns its keep if bistability/tipping is *proven* necessary. **Reserved as a *further* escalation, not the first second-variable** (§8).
+- **Social homeostasis — Matthews & Tye 2019; individual differences — Frontiers 2023.** The *structure*: a **detector → control-center (holding a set-point) → effector**; loneliness is the *error signal* between perceived contact and the set-point; the effector adjusts effort to seek contact. This is our neuron / aggregation / cognition stack almost 1:1. Crucially the set-point is **individual and plastic** — "calibrated via complex and continuous interactions between genetics and life experiences," and "extreme acute or chronic exposures could result in a new set point." → grounds *both* the v1 controller *and* the v2 learned set-point.
+- **Homeostatic Reinforcement Learning — Keramati & Gutkin 2011/2014.** The *math* of drive + reward. Drive is distance from set-point, `D(H)=Σ|hᵢ*−hᵢ|^m`; **reward = drive reduction**, `r = D(Hₜ) − D(Hₜ₊₁)`; with discounting this favours *earlier* drive reduction — a formal basis for latency pressure (the temporal "when"). Their base set-point is **fixed**; making it *adaptive/learned* is their explicitly-named future extension (it explains tolerance/addiction). → grounds our urge semantics (v1) and names our v2 second variable.
+- **Allostasis / active inference — (interoception-as-modeling 2022; social-allostasis 2025).** Set-points are **adjusted predictively, ahead of need** — the organism learns a model and pre-tunes regulation. Formally, shifting a *prior preference* = shifting the set-point. → motivates predictive pre-tuning; the v2 *rhythm* hazard estimator (§10) is our engineering formalism for it, not something this literature prescribes.
+- **Average-reward-rate / tonic dopamine — Niv, Daw & Dayan 2007.** The optimal **latency to act** is set by the long-run average reward rate as an *opportunity-cost-of-time*. → the formal statement that "when to reach out" is **context-dependent, not a constant** — the reason a fixed `T_urge` cannot exist.
+
+Retained as **analogy only**, with caveats (from rev.2): Hull drive-reduction (borrow the shape, not the behaviourist ontology); Baumeister & Leary "need to belong" (quality not frequency → the `q_event` classifier); Cacioppo/Hawkley loneliness-as-aversive-signal and the chronic-withdrawal twist (grounds the *optional* v2 load term `a(t)`, §10); allostatic load (sustained wanting has a cost). Opponent-process and habituation are engineering analogies, never proof that "unmet desire decays on its own." Ego-depletion is avoided (replication crisis). The Abplanalp double-well is **not** adopted — a leaky integrator (or, per Codex, a hazard model) is the right first tool, not a bistable-with-hysteresis model that needs dense longitudinal data.
 
 ## 4. Architecture (where things live)
 
 ```
                   ┌──────────────────────────────────────────────────────────┐
- inbound exchange │  NEURON (autonomic, 0 LLM) — a thin sensor               │
- (user message ──►│   u ∈ [0,100]: +α in silence (saturating), satiates on   │
-  via plugin hook)│   real contact; emits {intensity u, duration_over_θ}      │
-                  │   measures, does NOT decide. Params on disk, hot-reload.  │
+ inbound exchange │  NEURON (autonomic, 0 LLM) — a thin sensor (DETECTOR)    │
+ (user message ──►│   u = deviation of perceived connection from set-point s  │
+  via plugin hook)│   u ∈ [0,100]: rises in silence, satiates on real contact │
+                  │   emits {intensity u, duration_over_θ}; measures, no decide│
+                  │   v1: set-point s = fixed conservative prior (on disk).    │
                   └──────────────────────────────────────────────────────────┘
                                           │ signal
                                           ▼
                   ┌──────────────────────────────────────────────────────────┐
-                  │  AGGREGATION (0 LLM) — owns the desire lifecycle          │
+                  │  AGGREGATION (0 LLM) — the desire lifecycle (CONTROL CTR) │
                   │   first crossing + structural gates pass → create ONE     │
                   │   contact-desire → WAKE. Repeat crossings deduped (ack).  │
                   │   deferred desire: held; re-woken on release condition.   │
                   └──────────────────────────────────────────────────────────┘
-                                          │ WAKE (desire, not a drain)
+                                          │ WAKE (desire)
                                           ▼
                   ┌──────────────────────────────────────────────────────────┐
-                  │  COGNITION (LLM) — the verdict, by what Hermes knows      │
-                  │   FULFILL (send) / DEFER (hold, wrong moment) /           │
-                  │   REJECT (nothing to say → NO_REPLY + backoff)            │
+                  │  COGNITION (LLM) — the verdict (EFFECTOR gate)            │
+                  │   FULFILL (send) / DEFER (hold) / REJECT (nothing to say) │
                   └──────────────────────────────────────────────────────────┘
+
+   v2 (separate epic, dashed — NOT built here):
+     • learned set-point s   ← bounded slow adaptation, inside hard clamps
+     • rhythm/availability estimator h(t) ← a hazard model, feeds release/defer
+     • optional withdrawal/load a(t)      ← Cacioppo suppressive term, later
 ```
 
-The neuron and the aggregation layer are **ours** (cheap, zero-LLM, simulatable without Hermes). Cognition is the LLM and is **out of scope for this model** — the harness *scripts* its verdict (§9). The model guarantees the *machinery* (when it wakes, that a held desire is remembered and re-presented, that it never drums); the *quality* of the verdict and of the wake-packet framing is the soul/prompt concern (bead `lm-pbm`), tested by real logs, not here.
+The neuron and aggregation layer are **ours** (cheap, zero-LLM, simulatable without Hermes). Cognition is the LLM, **out of scope** — the harness *scripts* its verdict (§9). The model guarantees the *machinery* (when it wakes, that a held desire is remembered, that it never drums); verdict *quality* is the soul/prompt concern (bead `lm-pbm`).
 
-## 5. The model (v1 — one continuous drive)
+## 5. The v1 model (one continuous drive, fixed conservative set-point)
 
 **Neuron state** (per relationship lane):
-- `u ∈ [0, 100]` — the contact-pressure intensity (a **drive/deficit** neuron → unipolar `0..100`; valenced neurons like mood are `−100..100`, out of scope here). The scale is a property of the neuron type, declared on the base `Neuron`.
-- `duration_over_θ` — how long `u` has been ≥ `θ`, in time. A **separate field the neuron owns** (its own measurement), because a saturated `u` pinned near 100 no longer carries "how long." This duration, not the pinned value, feeds deferred-desire escalation (§7).
+- `u ∈ [0, 100]` — the contact-pressure intensity, read as `u = D(deficit; s)`, the deviation of perceived connection from the set-point `s`. A drive/deficit neuron → unipolar `0..100` (valenced neurons like mood are `−100..100`, out of scope). In v1 `s` is a **fixed conservative prior**; the dynamics below evolve `u`.
+- `duration_over_θ` — how long `u` has been ≥ `θ`, a separate field the neuron owns (a pinned-near-100 `u` no longer carries "how long"). Feeds deferred-desire escalation (§7).
 
 **Dynamics** (discrete time, tick `Δt`; "genuine silence" = no exchange event in the lane this tick):
+- **Rise in genuine silence:** `u ← u + Δt·α` (linear-with-clip), or saturating `u ← u + Δt·α·(1 − u/100)` — kept as a swept knob (§11).
+- **Satiation on a positive exchange:** `u ← max(0, u − β·q_event)`, only for `q_event > 0` (§6).
+- **Reset on real contact:** when cognition **fulfills** (a message is sent), that is contact → `u` satiates and `duration_over_θ` resets. **Deferring or rejecting does NOT reset `u`** — no contact happened, the deficit honestly persists.
 
-- **Rise in genuine silence:** saturating toward the ceiling, `u ← u + Δt·α·(1 − u/100)` (default), or linear-with-clip `u ← min(100, u + Δt·α)` — kept as a swept knob (§11). Saturating is the default because the bound is real (you cannot want infinitely *hard*), and marginal urgency flattens near the ceiling.
-- **Satiation on a positive exchange:** `u ← max(0, u − β·q_event)`, only for `q_event > 0` (§6). `β` is calibrated in scale units so a genuine two-way exchange (`q=1`) drops `u` well below `θ` (a real conversation discharges the drive); an ack (`q=0.5`) discharges half as much.
-- **Reset on real contact:** when cognition **fulfills** (a message is actually sent), that is contact → `u` satiates as an exchange and `duration_over_θ` resets. **Deferring or rejecting does NOT reset `u`** — no contact happened, so the deficit honestly persists.
+**Threshold + desire creation (aggregation):** when `u` first crosses `θ` and the structural gates (§7) pass, aggregation **creates one desire and wakes cognition**. No per-tick "drain": the anti-drum guarantee is the desire **dedup** (`ack`) + reject-backoff, not zeroing `u`.
 
-**Threshold + desire creation (aggregation):** when `u` first crosses `θ` and the structural gates (§7) pass, aggregation **creates one contact-desire and wakes cognition**. There is **no per-tick "drain"**: the anti-drum guarantee is the desire **dedup** (`ack`) + the reject-backoff, not zeroing `u`. (This *removes* rev.1's drain-fork entirely — see §11.)
+**Desire lifecycle (aggregation owns it):** create → wake once; dedup/`ack` while live; fulfill → satiate + reset + resolve; defer → *held*, re-woken on a release condition (§7); reject → cleared + growing backoff.
 
-**Desire lifecycle (aggregation owns it):**
-- **create** → wake cognition (once).
-- **dedup / `ack`** → while a desire is live (active or deferred), further threshold-crossings are absorbed: no duplicate desire, no re-wake.
-- **fulfill** → message sent → `u` satiates, `duration_over_θ` resets, desire resolved (leaves residue, BRD FR3).
-- **defer** → desire *held*; `u` not reset; re-woken when a **release condition** holds (§7): observed presence, high learned availability, or long-enough deprivation.
-- **reject** → desire cleared + a **growing backoff** so high `u` does not immediately recreate it.
+**v1 constants (a documented prior, not a truth):** `α` (rise rate), `θ` (threshold), `β` (satiation), plus the §7 policy constants. All are **disk config, hot-reloadable** (BRD NFR5). v1 calibration = confirm *one shared conservative set* satisfies every invariant on every scenario (§9); it is a safe starting envelope that v2 learning adapts, **never claimed as the right rhythm for any real person**.
 
-**v1 constants:** `α` (rise rate), `θ` (threshold on the `0..100` scale), `β` (satiation magnitude). Plus the policy constants in §7. All are **disk config, hot-reloadable** (BRD NFR5) — the sim *calibrates* them; the plugin *loads* them.
+> **Scale & sim note.** The product/plugin scale is `u ∈ [0,100]` (this section's narrative). The *certified simulation* (`src/lifemodel/sim/`) uses a **normalized** scale (`θ = 1`, `β = 1`, `u_max = ∞`) — the mechanics are scale-free, so the normalized harness and the 0..100 plugin are the same model at different units (a v1 open question, §12, is confirming the ceiling never binds). `Drive.drain()` remains in the sim as a retained primitive but is **not** used by the rev.3 lifecycle: the anti-drum guarantee is dedup + growing backoff, never a drain (rev.2 removed the drain-fork).
 
 ## 6. The `q_event` exchange-quality classifier
 
-An *exchange event* in a lane is classified into a quality `q`:
+An exchange event in a lane is classified into a quality `q`:
 
 | event in the lane                                          | `q`   |
 |------------------------------------------------------------|-------|
@@ -94,138 +103,116 @@ An *exchange event* in a lane is classified into a quality `q`:
 | assistant monologue / internal proactive wake              |  0.0  |
 | conflict / explicit rejection / "busy"                     | −0.5  |
 
-For the simulation, `q` is read from the trace's label column. For the plugin (out of scope), `q` is inferred from the `pre_gateway_dispatch` hook + `post_llm_call` heuristics. **Internal proactive impulses never count as user contact** (`q = 0`, not positive) — load-bearing: it is what stops the being satiating itself.
+For the simulation, `q` is read from the trace label. For the plugin (out of scope), `q` is inferred from hooks. **Internal proactive impulses never count as user contact** (`q = 0`) — load-bearing: it stops the being satiating itself. Satiation uses `β · max(q, 0)`. First contact after long silence still counts `+1.0`. An **ignored question** is the *absence* of an event (an `awaiting_answer` timer at the wake-decision, scenario 4), never a `q_event`.
 
-Satiation uses `β · max(q, 0)`. A genuine two-way (`q=1`) drops `u` below `θ`; an ack (`q=0.5`) drops half as much; `β` is calibrated (§9).
+## 7. Hard structural gates + release conditions (the fixed safety envelope)
 
-> **First contact after long silence** (a `two_way` with no immediately-preceding assistant turn) still counts `+1.0` — the "following assistant activity" wording is descriptive, not a gate; any genuine user inbound satiates.
->
-> An **ignored question** (the being asked, the user never answered) is the *absence* of an event, not a `q_event` — handled by an `awaiting_answer` timer at the wake-decision (scenario 4), never by this classifier.
+**Structural gates** decide whether an urge may *wake* cognition. They are policy, outside the drive, and (rev.3) **hard-coded forever** — the learnable v2 parameters live *inside* these, never replace them:
 
-## 7. Hard structural gates + release conditions
+1. **`active_silence_window` (`W`):** no wake if `now − last_exchange_at < W` (most recent exchange of any role). The anti-drum / don't-interrupt lever.
+2. **`no-wake-while-in-flight`:** no wake if a turn is running/queued.
+3. **`reject-backoff` (`R`) — growing, not fixed.** After a **reject**, suppress a new desire for `R_n = min(R_max, R₀·kⁿ)`, `n = consecutive rejects`, unless a new exchange occurs. A fixed `R` merely relabels the drum period; growth is the requirement. A new user exchange clears the reject record and satiates. (`reject_count` is policy memory, not a drive variable — §8.)
+4. **internal-impulse exclusion:** internal proactive impulses never satiate, never update the clock, never reset gates.
+5. **(rev.3) per-window send cap + minimum inter-send interval — a *plugin/runtime* safety, not a certified sim gate.** An absolute ceiling on visible proactive sends per window; cheap insurance that survives any learned parameter. It lives at the egress/delivery layer, **outside** this model's harness — listed here so the envelope reads complete, but it is **not** among the §9 certified invariants and is implemented in the plugin epic, not this task.
 
-**Structural gates** decide whether an urge is allowed to *wake* cognition (create/re-present a desire). They are policy, outside the drive dynamics:
+**Release of a *deferred* desire** (held, not dropped) is met by **any** of: observed presence (the user is demonstrably active), high learned availability (v2 rhythm estimator; v1 scripts it), or deprivation escalation (`duration_over_θ` past a bar → re-present, anti-neglect).
 
-1. **`active_silence_window` (`W`):** no wake if `now − last_exchange_at < W` in the lane (most recent exchange of **any** role). The "don't interrupt an active conversation" gate and primary anti-drum lever.
-2. **`no-wake-while-in-flight`:** no wake if a turn is running or queued in the lane.
-3. **`reject-backoff` (`R`) — growing, not fixed.** After cognition **rejects** (NO_REPLY, "nothing to say"), suppress a new contact-desire for `R_n = min(R_max, R₀·kⁿ)`, `n = consecutive rejects` (+ optional jitter), *unless* a new exchange occurs. A fixed `R` merely relabels the drum period to `max(recross-time, R)` and still drums; growing is the v1 requirement. A new user exchange clears the reject record and satiates `u`. (`reject_count` is **policy memory, not a second drive variable** — §8.)
-4. **internal-impulse exclusion:** internal proactive impulses are never exchanges (§6): they neither satiate nor update the clock nor reset gates.
+**Timing/appropriateness is the cognition verdict, not a gate.** Whether *now* is a good moment (mood, the user's rhythm) needs knowledge in the LLM/Hermes; the cheap gates only decide *whether to wake*.
 
-**Release of a *deferred* desire** (distinct from reject-backoff — a deferred desire is *held*, not dropped) is met by **any** of:
-- **observed presence** — the user messaged / is demonstrably active (we wait for a sign of life, we do not guess a schedule);
-- **high learned availability** — the being's learned estimate of when this person is reachable (part of receptivity, BRD FR5) is high now;
-- **deprivation escalation** — `duration_over_θ` has grown past a bar, so a held intention is re-presented rather than forgotten (the anti-neglect fallback).
+## 8. The one-vs-two-variable question — answered for the product architecture
 
-**Timing/appropriateness is NOT a structural gate — it is the cognition verdict.** Whether *now* is a good moment (mood, the user's rhythm) needs knowledge that lives in the LLM/Hermes: mood is read from the conversation context, rhythm from observed activity; with no data yet, common social norms. The cheap gates only decide *whether to wake*; *is it appropriate* is decided by the woken cognition. Dedup/`ack` keep wake frequency low, so an occasional LLM wake that concludes "not now → defer" is rare and justified.
+**What "one variable" honestly means.** The v1 drive is one *continuous* variable `u` (plus the neuron's own `duration_over_θ`), accompanied by bounded **policy memory** (`last_exchange_at`, desire status, `reject_count`, `declined_at`, `in_flight`). Policy memory is **not** a second drive variable; it does not accumulate a deficit or feed the threshold. So the question is precise: *does the drive need a second **continuous** variable?*
 
-## 8. The core tension the simulation must resolve
+**Answer (rev.3, grounded): yes — a slow, LEARNED set-point `s` — and it is deferred to v2.** The evidence is not "v1 invariants failed" (they pass, §9). The evidence is stronger and comes from the science + the problem itself:
 
-Two failure modes trade off:
+1. **"When" is not a universal constant** (Niv, Daw & Dayan 2007). A single fixed `α/θ` encodes one universal rhythm; the optimal latency is context/relationship-dependent. So a *fixed* drive cannot be *right* for two different people — it can only be *safe* (conservative). v1 is deliberately safe, not right.
+2. **The social set-point is individual and plastic** (Matthews & Tye; Frontiers 2023) and **making it adaptive is HRRL's named extension** (Keramati & Gutkin). The correct second variable is therefore a **learned set-point**, not the rev.2 guess of a leaky "load `a(t)`."
 
-- **Drumming** (today's bug): firing on a fixed cadence regardless of conversation. Killed by gates 1 + 3, satiation-on-exchange, and desire **dedup** (`ack`).
-- **Neglect**: never reaching out even after long genuine silence. Guarded by `eventual_wake_after_long_deprivation` and by deferred-desire deprivation-escalation.
+**Three separated quantities (Codex correction — do NOT collapse into one).**
 
-**What "one variable" honestly means.** The drive is exactly one *continuous* variable `u` (plus the neuron's own `duration_over_θ` measurement). It is accompanied by **policy memory** — bounded discrete bookkeeping the aggregation needs: `last_exchange_at`, `desire status` (active/deferred), `reject_count`, `declined_at`, `in_flight`. Policy memory is **not** a second drive variable; it does not accumulate a deficit or feed the threshold rule. Conflating the two would let the harness "certify one variable" while steering on hidden state. So the §8 question is precise: *does the **drive** need a second **continuous** variable* over and above bounded policy memory?
+| quantity | plain meaning | learns? | phase |
+|---|---|---|---|
+| `u` (fast) | urge = deviation of connection from set-point `s` | no (dynamics) | v1 ✅ |
+| `s = τ*` (slow) | *how much silence this bond tolerates* — a contact half-life (one orientation, fixed) | yes, **inside hard clamps** | v2 |
+| `h(t)` | *when* contact is welcome — a rhythm/availability hazard | yes (observational) | v2 |
+| `a(t)` | withdrawal/load after repeated rejection (Cacioppo) | yes, separate & optional | v2+ (only if evidence demands) |
 
-**If v1 fails, the second variable is a slow leaky "allostatic load / withdrawal" `a(t)`, NOT the Abplanalp double-well** (Codex `019f2f26`). Recommended form:
+`s = τ*` answers "how long a silence is comfortable for this bond?"; `h(t)` answers "is *now* a welcome moment?"; they correlate but differ (a chatty user may tolerate short silences yet hate a 3am ping). `a(t)` answers "has trying become costly?" and is a *separate* suppressive term — the set-point does **not** replace it (both may be needed eventually; neither is in v1). `s` is pinned to **one orientation** (tolerated-silence, so a *larger* `s` = *rarer* contact) to keep its clamps unambiguous (§10).
 
-```
-du/dt = α·(1 − u/100)·silence − β·q⁺(t)
-da/dt = ( load(u, reject_count, q⁻) − a ) / τ_a          # slow leaky integrator
-θ_eff = θ₀ + λ·a          # or   effective_urge = u − γ·a ;   energy = E₀ − η·a
-```
+**Two learning signals, treated differently (Codex):** the user's own inter-contact intervals are **dense observational** evidence → update `h(t)` directly and `s = τ*` only through a slower aggregate (§10). Outreach outcomes (warm/ack/reject/ignored) are **sparse, censored, confounded** causal evidence → update policy value slowly, with **rejection updating faster (suppressive) than warmth updates upward**. User silence after outreach is not clean credit assignment and must not be treated as reward.
 
-`a` rises when `u` stays high without resolution / after repeated rejects / after negative events, and recovers after good contact — a lagged counter-regulation that opponent-process, adaptation, and allostasis all point to, and that a leaky integrator captures directly (the double-well is only for *bistable climate with tipping/hysteresis*, added later if proven). `a` also couples to the Energy layer (BRD FR21).
+**Direction-conflict note (kept from rev.2):** withdrawal (`a`) *raises* the effective threshold; a deteriorating-bond intuition *lowers* it. They are opposite and must be modelled separately or as an explicit non-monotone effect, decided on real traces in v2 — never hidden under one variable.
 
-> **Direction conflict to resolve on traces (Codex catch).** The **withdrawal** intuition **raises** the threshold (chronic unmet wanting → withdraw/suppress). The original climate-`Z` intuition **lowers** it (deteriorating bond → reach out more to avoid neglect). These are **opposite**. They must be modelled separately or as an explicit non-monotone `θ_eff(a)`, and decided by simulation — never hidden under one variable untested.
+## 9. Simulation harness (v1 mechanics — built & certified)
 
-**This is decided by simulation, not opinion.** The user's "rise-then-fall + energy cost" is a strong *candidate* v2 fork, not grounds to pre-commit `a` (or `Z`) into v1.
-
-## 9. Simulation harness (the deliverable that certifies the model)
-
-**Pure Python, no Hermes dependency**, under `src/lifemodel/sim/` (Hermes-free, but inside the ruff/mypy-strict/pytest/coverage gate; the certified drive + aggregation later inform the real `core/Neuron` + `Aggregator`). Trace rows:
+**Pure Python, no Hermes**, under `src/lifemodel/sim/` (inside the ruff/mypy-strict/pytest/coverage gate). Built: `drive.py`, `quality.py`, `wake.py`, `aggregation.py`, `harness.py`; **54 tests green**, ruff+mypy clean. Trace rows:
 
 ```
 time, lane, actor=user|assistant|proactive_internal, text, label, cognition_verdict, user_available
 ```
 
-- `label ∈ {two_way, ack, monologue, rejection}` drives `q_event`.
-- **`cognition_verdict ∈ {—, fulfill, defer, reject}` is the scripted stand-in for the LLM** on a generated wake — cognition is out of scope, so the trace scripts what it decided. Without it, the fulfill/defer/reject paths and every backoff/hold scenario are untestable.
-- **`user_available ∈ {—, yes, no}`** scripts the presence/availability the release conditions (§7) and cognition read — so "don't contact at a bad moment" and "release when present" are drivable.
+`label ∈ {two_way, ack, monologue, rejection}` drives `q_event`. `cognition_verdict ∈ {—, fulfill, defer, reject}` scripts the (out-of-scope) LLM per wake. `user_available ∈ {—, yes, no}` scripts presence/availability. The harness ticks the neuron, lets aggregation create/dedup/hold/re-present, applies the scripted verdict, and records per tick `u`, `duration_over_θ`, `last_exchange_at`, desire status, `reject_count`, `exchange_clock`, and the wake outcome.
 
-The harness ticks the neuron, lets aggregation create/dedup/hold/re-present desires, applies the scripted verdict, and records per tick: `u`, `duration_over_θ`, `last_exchange_at`, desire status, `reject_count`, gate/release states, and the wake outcome (`no_wake_silence_window` / `no_wake_in_flight` / `no_wake_reject_backoff` / `deduped_ack` / `WAKE`).
-
-**Model invariants** (this harness owns them; asserted numerically over every scenario):
+**Model invariants (asserted numerically over every scenario):**
 
 ```
-no_proactive_within_active_window          # no wake within W of any exchange in the lane
-no_wake_while_in_flight                     # no wake while a turn is running/queued
-user_message_satiates_and_resets            # inbound exchange drops u, clears desire + reject record
-acked_urge_does_not_refire                  # while a desire is live/deferred, repeat crossings create NO new wake
-deferred_intention_releases                 # a deferred desire is re-presented on presence OR deprivation-escalation
-inter_wake_intervals_grow_without_evidence  # repeated rejects with no new exchange → non-decreasing wake gaps
-eventual_wake_after_long_deprivation        # ≥1 wake within a declared deadline Y of clean silence
-threshold_means_wake_not_send               # each wake == one cognition verdict; sends ≤ wakes (defer/reject send nothing)
-internal_impulse_is_not_user_contact        # proactive_internal rows never satiate u / never reset gates
+no_proactive_within_active_window          no wake within W of any exchange
+no_wake_while_in_flight                     no wake while a turn runs/queued
+user_message_satiates_and_resets            inbound exchange drops u, clears desire + reject record
+acked_urge_does_not_refire                  while a desire is live/deferred, repeat crossings create NO new wake
+deferred_intention_releases                 a deferred desire re-presents on presence OR deprivation-escalation
+inter_wake_intervals_grow_without_evidence  repeated rejects, no new exchange → non-decreasing wake gaps
+eventual_wake_after_long_deprivation        ≥1 wake within a declared deadline Y of clean silence
+threshold_means_wake_not_send               each wake = one verdict; sends ≤ wakes
+internal_impulse_is_not_user_contact        proactive_internal rows never satiate / never reset gates
+reject_or_defer_delivers_nothing            a scripted defer/reject emits no visible message
+no_contact_when_scripted_unavailable        no fulfill while user_available=no
 ```
 
-**Integration stubs** (delivery/cognition layer, out of scope; asserted against the *scripted* verdict/availability, kept here to keep traces honest, moved to the plugin epic):
+**Scenarios (all 8 green):** (1) the 2026-07-04 failing log — no wake inside `W`, reject backoff grows 30→60, **no drum** *(the regression)*; (2) active back-and-forth → never wakes; (3) dormant-healthy bond → one wake then growing backoff, eventual re-wake; (4) question-then-disappear → no drum; (5) overnight/multi-day silence → `eventual_wake` within Y; (6) bad-moment defer + presence release; (7) gateway restart persists a deferred desire, no spurious wake; (8) user returns after a reject → backoff cleared + satiated.
 
-```
-reject_or_defer_delivers_nothing            # a scripted defer/reject emits no visible message
-no_contact_when_scripted_unavailable        # no fulfill while user_available=no (cognition's call, scripted)
-```
+**v1 calibration = feasibility of a conservative prior, not a search for truth — and it is the one piece of v1 still to do.** The 54 tests certify the *mechanics*, but each scenario currently uses its own `α` (`0.5`, `0.25`, `0.01`, …); they do **not** yet prove one shared prior. Remaining v1 deliverable: confirm a single shared conservative set `{α, θ, β, W, r0, k}` satisfies **every** invariant on **every** scenario. Because most gates are `α`-independent once `u ≥ θ`, "widest margin" would otherwise collapse to the degenerate never-wake optimum (`θ→100`); to constrain it, add per-scenario **wake-latency bands** (a *should-wake-by* deadline and a *should-stay-silent-until* floor) as soft targets *alongside* the hard invariants. Report the chosen shared prior and its margins. The grid-search-for-the-one-true-constant is *retired* — there is no such constant (§8); this is only a feasibility + latency-band check documenting a safe starting envelope.
 
-`inter_wake_intervals_grow_without_evidence`, `eventual_wake_after_long_deprivation`, and `deferred_intention_releases` pin the drum-vs-neglect tension numerically. `Y` is a **declared constant per scenario**, never implicit.
+## 10. v2 adaptation design (deferred epic — designed here, NOT implemented)
 
-**Scenarios** (traces the harness drives):
+The learning layer that makes the being learn *this* person. **Bounded, slow, and outside the safety envelope.**
 
-1. **The failing 2026-07-04 log** — user at 21:57, (broken) proactive at 21:58 must be **forbidden** (within `W`); 22:28 / 22:58 "nothing to add" scripted as `reject` must yield growing backoff, no drum. *The regression test.*
-2. **Active back-and-forth**, gaps under `W`: never a proactive wake.
-3. **Dormant-but-healthy bond:** after clean silence, exactly one wake; scripted `reject` → no fixed-period re-wake (growing backoff); eventual re-wake if silence continues.
-4. **Question-then-disappear:** at most one gentle follow-up after a separate `awaiting_answer` delay; must not drum.
-5. **Overnight / multi-day silence:** `eventual_wake_after_long_deprivation` holds.
-6. **Bad-moment defer + presence release:** wake while `user_available=no` → scripted `defer` → **held, no re-fire** (`acked_urge_does_not_refire`); later `user_available=yes` → `deferred_intention_releases` fires and it is delivered.
-7. **Gateway restart** with persisted `u` / `duration_over_θ` / desire status: state survives, no spurious wake on reload.
-8. **User returns after a reject:** new exchange clears backoff and satiates; conversation resumes.
+**What is learned, and its clamps.**
+- **Set-point `s = τ*`** (tolerated silence / contact half-life — the interval of silence this bond finds comfortable before contact is welcome; larger `τ*` ⇒ rarer contact): a slow parameter moved by evidence, hard-clamped to `[τ_min = polite minimum interval, τ_max = neglect bound]`. Learning adjusts the comfortable interval *inside* the clamp; it can never drop below `τ_min` (spam) or exceed `τ_max` (abandonment).
+- **Rhythm/availability `h(t)`** — a **constrained contextual hazard/survival model** (Codex's cleaner formalism for "when"): `P(contact welcome | time-since-exchange, local time-of-day, weekday pattern, recent warmth/rejects, relationship prior)`. Learned observationally from *when the user themselves is active*; feeds the release/defer decision, never the safety gates.
+- **`a(t)`** (optional, latest): a separate slow suppressive load after repeated failure/rejection; added only if traces demand it.
 
-**Calibration — feasibility first, objective second.** A naive "minimise weighted violations, false-interrupt ×10" has a trivial optimum: push `θ→100` / `α→0` / `W→∞` and never wake. So:
+**Learning rules (honest about signal quality).**
+- Observational (dense): user-initiated inter-contact intervals update `h(t)` **directly**, and update `s = τ*` only through a *slower aggregate* (so one busy week does not reset the bond's comfort).
+- Causal (sparse/censored): update policy value from outreach outcomes slowly; **asymmetric** — rejection suppresses faster than warmth emboldens; treat post-outreach silence as censored, not as reward.
+- Reward = drive reduction (HRRL): a fulfilled outreach that produced a genuine two-way is rewarding *iff* it reduced the deficit without friction.
 
-1. **Feasible region = every model invariant passes** (hard constraints), including `eventual_wake_after_long_deprivation` within `Y` and `inter_wake_intervals_grow_without_evidence`. Never-waking **violates** `eventual_wake` → *infeasible*, not merely costly. Parameter ranges are bounded (`0 < θ < 100`, `α > 0`, finite `W`, `R₀`, `k`, `R_max`, release bars).
-2. **Within the feasible region**, minimise the soft objective: false-interrupt count weighted an order of magnitude over outreach *latency* (whether it ever happens is guaranteed by stage 1).
+**Simulation = mechanism recovery, not human calibration (Codex).** An **oracle** generates a *known* latent user rhythm (archetypes: chatty / reserved / nocturnal / bursty). Assert, over the learning run: (a) the estimator **recovers** the latent rhythm within bounds; (b) it **reduces regret** versus the fixed conservative prior; (c) **all v1 invariants still hold throughout learning** (the envelope is never violated while adapting). We validate the *mechanism*; we make **no** claim of being "calibrated to real humans."
 
-Grid-search sweeps `{α, θ, β, W}` **× the residual knobs** (`rise ∈ {saturating, linear}`, `backoff ∈ {growing, fixed}` — fixed retained only to *demonstrate* it drums). **Report precision/recall separately** on labelled should-wake / should-stay-silent moments, the chosen constants, per-scenario invariant pass/fail, and residual margin. If the feasible region is **empty** for the single-`u` model, that emptiness is the §8 evidence for the slow variable `a`.
+**Out of the v2 epic's own scope:** the real receptivity/availability estimator's production wiring, and the cognition/soul quality — those are their own beads.
 
-**The empirical answer, with evidence:** does single-`u` satisfy every invariant on every scenario at some calibrated setting? Yes → v1 ships one variable, `a`/`Z` deferred. No → document the failing invariant/scenario and show that the leaky-load `a(t)` (§8) resolves it → v2 design input.
+## 11. Out of scope (explicit)
 
-## 10. Out of scope (explicit)
+- Hermes plugin implementation (the `pre_gateway_dispatch` inbound hook, neuron/aggregation wiring into the tick, per-neuron bounded-scale + duration state, `NO_REPLY` reject wiring, streaming-disable for internal events, busy-owner fix). → the plugin epic consuming this model.
+- The cognition verdict + wake-packet framing (LLM/soul quality) — bead `lm-pbm`.
+- **All of §10 (v2 adaptation) implementation** — a separate epic; only its *design* is in scope here.
+- Multi-transport continuity (bead `lm-pin`); component fault-isolation (BRD FR28, a runtime concern).
 
-- Hermes plugin implementation: the `pre_gateway_dispatch` inbound hook, the neuron/aggregation wiring into the tick, per-neuron bounded-scale + duration state (Phase 2, replacing the single global `State.pressure`), the `NO_REPLY` reject instruction + scoped `transform_llm_output` safety net, disabling streaming for internal proactive events, fixing the split `busy` ownership. → separate epic consuming this model.
-- **The cognition verdict itself and the wake-packet framing** (first-person self-attribution + recent context + options) — the LLM/soul quality, bead `lm-pbm`; tested by real logs, not simulated here.
-- The **learned-availability / receptivity model** (how the being infers when the user is reachable) — the sim scripts `user_available`; the real estimator is its own component (BRD FR5).
-- Multi-transport continuity (bead `lm-pin`).
-- **Component fault-isolation (BRD FR28)** — a plugin-runtime concern: a failing neuron is caught and skipped (zero contribution), never crashing the tick; fail-open for sensors/drives, fail-closed for safety. In the pure model a "failed" neuron is simply no-signal; the being adapts on the remaining drives.
-- The slow variable `a(t)` / `Z(t)` *implementation* — only its *necessity* is in scope (§8), decided by simulation.
+## 12. Open questions (swept by the harness / decided in v2, not by opinion)
 
-## 11. Open questions to resolve during implementation
-
-Swept by the harness, not decided by opinion:
-
-- **Removed: the rev.1 drain-fork.** The anti-drum guarantee is now desire **dedup** (`ack`) + reject-backoff, not zeroing `u` on wake — so `drain_on_write / drain_on_wake / no_drain_on_decline` are gone. `u` resets only on **real contact** (fulfill).
-- **Rise form:** saturating `α(1−u/100)` (default) vs linear-with-clip — swept; decide by which meets invariants at calmer constants.
-- **Reject backoff shape:** growing is the v1 requirement (§7 gate 3); `fixed` retained only to demonstrate it drums. Sub-question: `k`, `R_max` from calibration.
-- **Release-condition tuning:** the deprivation-escalation bar for a deferred desire, and how learned-availability combines with observed presence (OR vs weighted) — swept; the sim scripts `user_available`, calibration sets the bar.
-- **Negative-event handling:** a `rejection` (`q=−0.5`) — merely fail to satiate (current), or feed the v2 load `a` / raise the threshold for a window (Cacioppo withdrawal)? Defer to v2 unless scenario evidence demands it.
-- **One vs. two variables / threshold-direction conflict (§8):** single-`u` vs `u + a(t)`; and if `a`, whether it **raises** (withdrawal) or **lowers** (climate) the threshold — resolved on traces, never assumed.
-- **Global vs per-lane (near-moot today):** desire is per-lane; a global daily-cap / cooldown (BRD FR6 "бюджет обращений") is cheap insurance against multi-lane spam but the live being has one lane. Add only if a multi-lane scenario shows lanes co-firing.
+- **Rise form:** linear-with-clip (v1 default) vs saturating `α(1−u/100)` — swept; decide by which meets invariants at calmer constants.
+- **Reject-backoff shape:** growing is required; `k`, `R_max` from the v1 feasibility check.
+- **v1 conservative prior:** which shared `{α, θ, β, W, r0, k}` gives the widest invariant **+ latency-band** margin (§9) — the documented starting envelope for v2.
+- **v2 set-point clamps:** where exactly `s_min`/`s_max` sit; how `h(t)` combines with observed presence (OR vs weighted).
+- **v2 second-variable direction:** does `a(t)` (withdrawal, raises threshold) get added alongside `s`, and does any effect *lower* the threshold — resolved on real traces, never assumed.
+- **Global vs per-lane:** desire is per-lane; a global daily-cap (BRD FR6) is cheap multi-lane insurance — add only if a multi-lane scenario shows lanes co-firing.
 
 ## References
 
-- Hull, C. L. 1943, *Principles of Behavior* (drive-reduction / homeostatic drive).
-- Baumeister & Leary 1995, *The need to belong* — https://psycnet.apa.org/record/1995-29052-001
-- Hawkley & Cacioppo 2010, *Loneliness matters* (Ann. Behav. Med.); Cacioppo et al., *Evolutionary Mechanisms for Loneliness* — https://pmc.ncbi.nlm.nih.gov/articles/PMC3855545/
-- Sterling & Eyer 1988, *Allostasis: a new paradigm to explain arousal pathology*; McEwen 1998, *Protective and damaging effects of stress mediators* (NEJM) — allostatic load.
-- Solomon & Corbit 1974, *An opponent-process theory of motivation* (Psychol. Rev. 81(2):119-145) — analogy only. Thompson & Spencer 1966, *Habituation* (Psychol. Rev. 73(1):16-43) — analogy only.
-- Abplanalp, Maimone & Green 2025, *Viewing social isolation as a complex dynamical system* — https://www.nature.com/articles/s44277-025-00051-y (v2 bistability escalation only).
-- Codex design consults: capability facts `019f2ed7` / `019f2ed9`; instrument-honesty review `019f2eec`; science + v2-form review `019f2f26`.
+- **Keramati & Gutkin** 2011 (NIPS), 2014 (eLife) — Homeostatic reinforcement learning — https://pmc.ncbi.nlm.nih.gov/articles/PMC4270100/
+- **Matthews & Tye** 2019 — Neural mechanisms of social homeostasis — https://nyaspubs.onlinelibrary.wiley.com/doi/10.1111/nyas.14016 ; **Individual differences in social homeostasis**, Frontiers 2023 — https://www.frontiersin.org/journals/behavioral-neuroscience/articles/10.3389/fnbeh.2023.1068609/full
+- **Niv, Daw & Dayan** 2007 — Tonic dopamine: opportunity costs and the control of response vigor — https://link.springer.com/article/10.1007/s00213-006-0502-4
+- **Interoception as modeling, allostasis as control** 2022 — https://pmc.ncbi.nlm.nih.gov/articles/PMC9270659/
+- Hull 1943 (drive-reduction); Baumeister & Leary 1995 (need to belong); Hawkley & Cacioppo 2010 (loneliness); Sterling & Eyer 1988 / McEwen 1998 (allostatic load) — analogy/constraint only.
+- Codex consults: capability facts `019f2ed7`/`019f2ed9`; instrument-honesty `019f2eec`; science + v2-form `019f2f26`; **rev.3 adversarial review `019f316e`**.
 - Prior egress design: `docs/superpowers/specs/2026-07-04-lifemodel-proactive-egress-design.md`.
