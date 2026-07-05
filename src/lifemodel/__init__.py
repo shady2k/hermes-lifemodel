@@ -22,7 +22,7 @@ from .egress_service import proactive_service_loop
 from .events import EVENTS_FILENAME, EventSink
 from .gateway_core import install_core_shim, register_gateway_service
 from .heartbeat import _resolve_home_origin, register_heartbeat
-from .hooks import make_post_llm_observer
+from .hooks import make_inbound_observer, make_post_llm_observer
 from .logging import EventTee, get_logger
 from .paths import state_dir
 
@@ -113,6 +113,25 @@ def register(ctx: Any) -> None:
         logger.info("post_llm_observer_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
         logger.info("post_llm_observer_registration_skipped", error=f"{type(exc).__name__}: {exc}")
+
+    # --- Inbound observation wiring (Task 6, spec §4/§6) ----------------------
+    # RC1: the being is currently deaf to inbound user messages. On a genuine
+    # user message, satiate the drive + stamp last_exchange_at + clear the
+    # reject record + resolve any live desire, so silence resets on real
+    # contact. Wired on pre_gateway_dispatch (SPIKE, see lifemodel.hooks module
+    # docstring): it fires once per incoming MessageEvent, and the host itself
+    # never invokes it for our own injected proactive impulse (internal=True
+    # skips the hook entirely at the call site) — disjoint from the
+    # post_llm_call verdict path by host guarantee, reinforced defensively in
+    # the observer via the impulse-label prefix. Best-effort: a host without
+    # pre_gateway_dispatch in VALID_HOOKS, or any wiring hiccup, must not break
+    # load.
+    try:
+        inbound_lm = build_lifemodel(base_dir=sdir, logger=logger)
+        ctx.register_hook("pre_gateway_dispatch", make_inbound_observer(inbound_lm))
+        logger.info("inbound_observer_registered")
+    except Exception as exc:  # noqa: BLE001 - best-effort; never break load
+        logger.info("inbound_observer_registration_skipped", error=f"{type(exc).__name__}: {exc}")
 
     # NOTE: do NOT gate on reachin_available() here — at register()/discovery time
     # the runner's adapters are not wired yet (they land later in gateway startup),

@@ -29,7 +29,7 @@ import pytest
 
 from lifemodel.composition import LifeModel, build_lifemodel
 from lifemodel.core.aggregator import SilentAggregator
-from lifemodel.hooks import _is_no_reply, make_post_llm_observer
+from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
 from lifemodel.impulse import IMPULSE_LABEL_PREFIX
 from lifemodel.state.model import State
 from lifemodel.testing.fakes import FakeClock, FakeSignalBus, FakeStateStore
@@ -61,6 +61,20 @@ def make_lm_no_pending() -> LifeModel:
     return build_lifemodel(
         base_dir=Path("/unused"),
         state=FakeStateStore(State(last_tick_at=_T0.isoformat())),
+        bus=FakeSignalBus(),
+        clock=FakeClock(_T0),
+        aggregator=SilentAggregator(),
+        neurons=(),
+    )
+
+
+def make_lm_high_u() -> LifeModel:
+    """A ``LifeModel`` whose urge (``u``) is well above zero, no desire pending —
+    used only to make satiation-by-inbound-contact observable (Task 6), not to
+    exercise the wake gate itself (that's ``core/decision``'s job)."""
+    return build_lifemodel(
+        base_dir=Path("/unused"),
+        state=FakeStateStore(State(u=50.0, last_tick_at=_T0.isoformat())),
         bus=FakeSignalBus(),
         clock=FakeClock(_T0),
         aggregator=SilentAggregator(),
@@ -160,6 +174,83 @@ def test_impulse_text_ignored_when_nothing_pending() -> None:
     assert s.decline_count == 0
 
 
+# --- make_inbound_observer (Task 6) -------------------------------------------
+
+
+class _FakeInboundEvent:
+    """Minimal stand-in for ``gateway.platforms.base.MessageEvent`` — only the
+    two attributes ``make_inbound_observer`` reads (see the SPIKE notes in
+    ``lifemodel.hooks``'s module docstring)."""
+
+    def __init__(self, text: str, *, internal: bool = False) -> None:
+        self.text = text
+        self.internal = internal
+
+
+def _fake_inbound(*, text: str, internal: bool = False) -> dict[str, Any]:
+    """Reproduce the real ``pre_gateway_dispatch`` kwargs (``gateway/run.py``
+    ~L8650): ``invoke_hook("pre_gateway_dispatch", event=event, gateway=self,
+    session_store=self.session_store)``."""
+    return {
+        "event": _FakeInboundEvent(text, internal=internal),
+        "gateway": None,
+        "session_store": None,
+    }
+
+
+def test_inbound_user_message_satiates_and_stamps() -> None:
+    lm = make_lm_high_u()
+    before_u = lm.state.load().u
+    make_inbound_observer(lm)(**_fake_inbound(text="привет"))
+    s = lm.state.load()
+    assert s.last_exchange_at is not None
+    assert s.u < before_u
+
+
+def test_inbound_ignores_own_impulse() -> None:
+    lm = make_lm_high_u()
+    make_inbound_observer(lm)(**_fake_inbound(text=f"{IMPULSE_LABEL_PREFIX} filler impulse text"))
+    s = lm.state.load()
+    assert s.last_exchange_at is None
+    assert s.u == 50.0
+
+
+def test_inbound_ignores_internal_event() -> None:
+    # Defense-in-depth: the host itself already skips internal events before
+    # ever invoking pre_gateway_dispatch (gateway/run.py `if not is_internal:`
+    # — see the module docstring), but the observer must not rely on that
+    # forever being true.
+    lm = make_lm_high_u()
+    make_inbound_observer(lm)(**_fake_inbound(text="hi", internal=True))
+    s = lm.state.load()
+    assert s.last_exchange_at is None
+    assert s.u == 50.0
+
+
+def test_inbound_clears_desire_and_reject_on_genuine_contact() -> None:
+    lm = build_lifemodel(
+        base_dir=Path("/unused"),
+        state=FakeStateStore(
+            State(
+                u=99.0,
+                desire_status="active",
+                declined_at=_T0.isoformat(),
+                decline_count=3,
+                last_tick_at=_T0.isoformat(),
+            )
+        ),
+        bus=FakeSignalBus(),
+        clock=FakeClock(_T0),
+        aggregator=SilentAggregator(),
+        neurons=(),
+    )
+    make_inbound_observer(lm)(**_fake_inbound(text="hey, how are you?"))
+    s = lm.state.load()
+    assert s.desire_status == "none"
+    assert s.declined_at is None
+    assert s.decline_count == 0
+
+
 # --- register(ctx) wiring smoke test ------------------------------------------
 
 
@@ -206,3 +297,31 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     persisted = json.loads(state_file.read_text())
     assert persisted["desire_status"] == "none"
     assert persisted["decline_count"] == 1
+
+
+def test_register_wires_pre_gateway_dispatch_hook(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import lifemodel
+
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    monkeypatch.setattr(lifemodel, "register_heartbeat", lambda *a, **k: None)
+
+    ctx = _FakeCtx()
+    lifemodel.register(ctx)  # must not raise even without a real Hermes host
+
+    matches = [cb for name, cb in ctx.hooks if name == "pre_gateway_dispatch"]
+    assert len(matches) == 1
+
+    # Genuinely wired (not a stub): a real inbound message satiates a
+    # persisted state file, not just an in-memory fake.
+    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(State(u=50.0, last_tick_at=_T0.isoformat()).to_dict()))
+
+    matches[0](**_fake_inbound(text="hey there"))
+
+    persisted = json.loads(state_file.read_text())
+    assert persisted["last_exchange_at"] is not None
+    assert persisted["u"] < 50.0

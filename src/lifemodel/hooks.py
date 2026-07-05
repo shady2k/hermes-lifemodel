@@ -55,6 +55,32 @@ SPIKE findings (read-only against ``~/.hermes/hermes-agent``, hermes-agent
   This has **not** been exercised against a real running Hermes turn (no live
   session in this environment) — treat it as the one field-verification item
   before relying on this in production.
+
+Task 6 (inbound observation) SPIKE findings — read-only against the same host:
+
+* ``pre_gateway_dispatch`` **is** in ``VALID_HOOKS`` (``hermes_cli/plugins.py``
+  line 173) and is *preferred* over ``pre_llm_call`` per the plan: it fires
+  **once per incoming** ``MessageEvent``, inside ``GatewayRunner._handle_message``
+  (``gateway/run.py`` ~line 8650), via
+  ``invoke_hook("pre_gateway_dispatch", event=event, gateway=self,
+  session_store=self.session_store)`` — again a ``cb(**kwargs)`` call.
+* **Load-bearing:** the host itself gates this invocation on
+  ``if not is_internal:`` (``is_internal = bool(getattr(event, "internal",
+  False))``), *before* any hook fires — and our own proactive impulse is
+  injected via ``gateway_core.inject_proactive_turn`` -> ``_default_make_event``
+  as ``MessageEvent(..., internal=True)``, dispatched through the very same
+  ``adapter.handle_message`` -> ``_handle_message`` path (``adapter`` is wired
+  with ``set_message_handler(self._handle_message)`` at ``gateway/run.py``
+  ~line 6841). So the host *never* invokes ``pre_gateway_dispatch`` for our own
+  nudge at all — disjointness from the post_llm_call verdict path is a host
+  guarantee here, not something this module has to enforce alone. This module
+  still checks ``event.internal`` and the
+  :data:`~lifemodel.impulse.IMPULSE_LABEL_PREFIX` text defensively (belt and
+  suspenders — cheap, and robust if that host guarantee ever changes).
+* Return contract: ``None`` = normal dispatch, a dict with
+  ``{"action": "skip"|"rewrite"|"allow"}`` influences flow. This observer only
+  *observes* — it always returns ``None`` so it can never itself skip/rewrite a
+  genuine inbound message.
 """
 
 from __future__ import annotations
@@ -63,7 +89,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .composition import LifeModel
-from .core.decision import apply_verdict
+from .core.decision import apply_verdict, observe_exchange
 from .impulse import IMPULSE_LABEL_PREFIX
 from .sim.aggregation import Verdict
 
@@ -124,6 +150,50 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
             return
         verdict = Verdict.REJECT if _is_no_reply(assistant_response) else Verdict.FULFILL
         apply_verdict(state, verdict, now=lm.clock.now())
+        lm.state.commit(state)
+
+    return _observer
+
+
+def _is_own_impulse(text: str) -> bool:
+    """True when *text* is our own composed proactive impulse (spec §6).
+
+    Belt-and-suspenders alongside ``event.internal`` (see the module
+    docstring's Task 6 SPIKE notes): the being must never treat its own nudge
+    as user contact.
+    """
+    return text.strip().startswith(IMPULSE_LABEL_PREFIX)
+
+
+def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
+    """Return a ``pre_gateway_dispatch`` handler that observes genuine user contact.
+
+    On a genuine inbound user message: satiates the drive, stamps
+    ``last_exchange_at``, clears the reject record, and resolves any live
+    desire (:func:`~lifemodel.core.decision.observe_exchange` with
+    ``actor="user", label="two_way"``) — so silence resets on real contact
+    (RC1: the being now *hears* the user).
+
+    Accepts the real Hermes kwargs shape (``invoke_hook`` calls ``cb(**kwargs)``
+    with ``event``, ``gateway``, ``session_store`` — see the SPIKE notes above),
+    reading only ``event.text`` / ``event.internal``; every other kwarg is
+    accepted and ignored. Two turns are ignored, never touching state: an
+    internal/synthetic event (``event.internal``, or missing ``event``
+    entirely — defensive), and our own composed impulse text (the
+    :data:`~lifemodel.impulse.IMPULSE_LABEL_PREFIX` marker) — so the being
+    never satiates its own urge with its own nudge, and never double-counts
+    with the ``post_llm_call`` verdict path. Always returns ``None`` (normal
+    dispatch) — this observer never skips or rewrites the message.
+    """
+
+    def _observer(*, event: Any = None, **_ignored: Any) -> None:
+        if event is None or getattr(event, "internal", False):
+            return
+        text = getattr(event, "text", "") or ""
+        if _is_own_impulse(text):
+            return
+        state = lm.state.load()
+        observe_exchange(state, actor="user", label="two_way", now=lm.clock.now())
         lm.state.commit(state)
 
     return _observer
