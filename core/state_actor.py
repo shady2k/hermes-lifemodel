@@ -7,6 +7,10 @@ one patch, applies it atomically with :func:`dataclasses.replace`, and commits
 (checkpoints) exactly once — and only if something actually changed (spec §6:
 "Checkpoint — это интент, который state-actor генерирует сам в конце тика, если
 были мутации"). Intents it does not own (e.g. ``EmitSignal``) are ignored here.
+
+State is loaded lazily on first access (``.state`` or ``.apply``) so that
+constructing an actor never raises — the composition root can wire one
+without forcing a store read.
 """
 
 from __future__ import annotations
@@ -36,13 +40,18 @@ class StateActor:
         logger: EventLogger | None = None,
     ) -> None:
         self._store = store
-        self._state = state if state is not None else store.load()
+        self._provided_state = state
+        self._state: State | None = None
         self._log = logger
         self._checkpoint_id = 0
 
     @property
     def state(self) -> State:
         """The current in-memory state (last committed, or the initial load)."""
+        if self._state is None:
+            self._state = (
+                self._provided_state if self._provided_state is not None else self._store.load()
+            )
         return self._state
 
     def apply(self, intents: Sequence[Intent]) -> State:
@@ -56,9 +65,9 @@ class StateActor:
                         raise UnknownStateField(name)
                     patch[name] = value
         if not patch:
-            return self._state
+            return self.state
 
-        new_state = replace(self._state, **patch)
+        new_state = replace(self.state, **patch)
         self._store.commit(new_state)
         self._state = new_state
         self._checkpoint_id += 1

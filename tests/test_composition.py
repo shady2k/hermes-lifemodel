@@ -19,7 +19,10 @@ from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.composition import LifeModel, build_lifemodel
 from lifemodel.core.aggregator import SilentAggregator
+from lifemodel.core.coreloop import CoreLoop
 from lifemodel.core.neuron import Neuron
+from lifemodel.core.registry import ComponentRegistry
+from lifemodel.core.state_actor import StateActor
 from lifemodel.domain.signal import Signal
 from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
@@ -112,3 +115,25 @@ def test_lifemodel_graph_is_frozen(tmp_path: Path) -> None:
     except AttributeError:
         return
     raise AssertionError("LifeModel should be frozen")
+
+
+def test_build_wires_registry_state_actor_and_coreloop(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path)
+    assert isinstance(lm.registry, ComponentRegistry)
+    assert isinstance(lm.state_actor, StateActor)
+    assert isinstance(lm.coreloop, CoreLoop)
+
+
+def test_default_registry_is_empty(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path)
+    assert lm.registry.enabled() == ()
+
+
+def test_coreloop_tick_is_inert_but_bookkeeps(tmp_path: Path) -> None:
+    # Empty registry: a tick runs no components but still checkpoints the
+    # bookkeeping bump — proves the wired seam works without touching the
+    # live path.
+    lm = build_lifemodel(base_dir=tmp_path)
+    report = lm.coreloop.tick()
+    assert report.ran == ()
+    assert lm.state.load().tick_count == 1

@@ -55,8 +55,11 @@ from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
 from .core.aggregator import Aggregator, SilentAggregator
+from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
+from .core.registry import ComponentRegistry
 from .core.signal_bus import SignalBus
+from .core.state_actor import StateActor
 from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
@@ -79,6 +82,9 @@ class LifeModel:
     delivery: DeliveryPort
     aggregator: Aggregator
     neurons: tuple[Neuron, ...] = field(default_factory=tuple)
+    registry: ComponentRegistry = field(default_factory=ComponentRegistry)
+    state_actor: StateActor | None = None
+    coreloop: CoreLoop | None = None
 
 
 def build_lifemodel(
@@ -91,6 +97,7 @@ def build_lifemodel(
     aggregator: Aggregator | None = None,
     neurons: Sequence[Neuron] | None = None,
     logger: EventLogger | None = None,
+    registry: ComponentRegistry | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -113,6 +120,16 @@ def build_lifemodel(
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
+    resolved_registry: ComponentRegistry = registry if registry is not None else ComponentRegistry()
+    resolved_state_actor = StateActor(resolved_state, logger=logger)
+    resolved_coreloop = CoreLoop(
+        registry=resolved_registry,
+        state_actor=resolved_state_actor,
+        bus=resolved_bus,
+        clock=resolved_clock,
+        logger=logger,
+    )
+
     return LifeModel(
         state=resolved_state,
         bus=resolved_bus,
@@ -120,4 +137,7 @@ def build_lifemodel(
         delivery=resolved_delivery,
         aggregator=resolved_aggregator,
         neurons=resolved_neurons,
+        registry=resolved_registry,
+        state_actor=resolved_state_actor,
+        coreloop=resolved_coreloop,
     )
