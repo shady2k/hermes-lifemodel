@@ -2,12 +2,17 @@
 
 Runs the enabled components each tick, isolated so no component fault can crash
 the heart: every ``step`` call is wrapped; an exception skips that component and
-counts toward a per-component circuit-breaker ("живёт без органа"). Successful
-components' signals are published to the durable bus immediately (spec §7.4);
-their state intents are collected and handed — together with the tick's own
-bookkeeping — to the single :class:`StateActor` for one atomic checkpoint.
+counts toward a per-component circuit-breaker ("живёт без органа").
 
-Phase A runs *every* enabled component each tick. Energy budgeting (which gates
+Signal dataflow (spec §7.4): durable external inputs are consumed from the bus
+**once** at tick start; each component then sees those inputs plus every
+transient signal emitted by earlier components this tick (``EmitSignal`` is
+threaded in-tick, **not** re-published — a signal recomputed every tick must not
+be re-consumed and double-counted). State intents are collected and handed —
+together with the tick's own bookkeeping — to the single :class:`StateActor` for
+one atomic checkpoint.
+
+Phase B1 runs *every* enabled component each tick. Energy budgeting (which gates
 the expensive cognition layer) slots into the per-component loop in Phase C.
 """
 
