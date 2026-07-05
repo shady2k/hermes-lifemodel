@@ -55,9 +55,10 @@ from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
 from .core.aggregator import Aggregator, SilentAggregator
+from .core.contact_neuron import ContactNeuron
 from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
-from .core.registry import ComponentRegistry
+from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
 from .core.state_actor import StateActor
 from .log import EventLogger
@@ -65,6 +66,10 @@ from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
 from .state.json_store import JsonStateStore
 from .state.port import StatePort
+
+CONTACT_ALPHA = 1.0 / 240.0
+CONTACT_BETA = 1.0
+CONTACT_U_MAX = 100.0
 
 
 @dataclass(frozen=True)
@@ -121,6 +126,11 @@ def build_lifemodel(
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
     resolved_registry: ComponentRegistry = registry if registry is not None else ComponentRegistry()
+    try:
+        resolved_registry.manifest("contact")
+    except UnknownComponent:
+        contact = ContactNeuron(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
+        resolved_registry.register(contact, ComponentManifest(id=contact.id, type="neuron"))
     resolved_state_actor = StateActor(resolved_state, logger=logger)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,

@@ -19,10 +19,12 @@ from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.composition import LifeModel, build_lifemodel
 from lifemodel.core.aggregator import SilentAggregator
+from lifemodel.core.contact_neuron import ContactNeuron
 from lifemodel.core.coreloop import CoreLoop
 from lifemodel.core.neuron import Neuron
 from lifemodel.core.registry import ComponentRegistry
 from lifemodel.core.state_actor import StateActor
+from lifemodel.core.taxonomy import exchange_signal
 from lifemodel.domain.signal import Signal
 from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
@@ -124,16 +126,62 @@ def test_build_wires_registry_state_actor_and_coreloop(tmp_path: Path) -> None:
     assert isinstance(lm.coreloop, CoreLoop)
 
 
-def test_default_registry_is_empty(tmp_path: Path) -> None:
+def test_default_registry_contains_contact_neuron(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
-    assert lm.registry.enabled() == ()
+    ids = tuple(c.id for c in lm.registry.enabled())
+    assert ids == ("contact",)
 
 
-def test_coreloop_tick_is_inert_but_bookkeeps(tmp_path: Path) -> None:
-    # Empty registry: a tick runs no components but still checkpoints the
-    # bookkeeping bump — proves the wired seam works without touching the
-    # live path.
+def test_coreloop_tick_bookkeeps_and_runs_contact(tmp_path: Path) -> None:
+    # Contact neuron runs but is a no-op (last_tick_at=None → dt=0, no signals → no satiate).
+    # Tick still checkpoints the bookkeeping bump — proves the wired seam works.
     lm = build_lifemodel(base_dir=tmp_path)
     report = lm.coreloop.tick()
-    assert report.ran == ()
+    assert report.ran == ("contact",)
     assert lm.state.load().tick_count == 1
+
+
+# --- Phase B1: ContactNeuron wiring ---
+
+
+class _FixedClock:
+    def __init__(self, moment: datetime) -> None:
+        self._m = moment
+
+    def now(self) -> datetime:
+        return self._m
+
+
+def test_contact_neuron_is_registered_enabled(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = [c.id for c in lm.registry.enabled()]
+    assert "contact" in ids
+    assert any(isinstance(c, ContactNeuron) for c in lm.registry.enabled())
+
+
+def test_pipeline_tick_rises_u_and_persists(tmp_path: Path) -> None:
+    # Seed last_tick_at 240 min before the clock; one tick should rise u to ~1.0.
+    from lifemodel.state.json_store import JsonStateStore
+    from lifemodel.state.model import State
+
+    store = JsonStateStore(tmp_path)
+    store.commit(State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    lm = build_lifemodel(
+        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    )
+    lm.coreloop.tick()
+    assert abs(store.load().u - 1.0) < 1e-9
+
+
+def test_pipeline_tick_satiates_on_inbound_exchange(tmp_path: Path) -> None:
+    from lifemodel.state.json_store import JsonStateStore
+    from lifemodel.state.model import State
+
+    store = JsonStateStore(tmp_path)
+    store.commit(State(u=1.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    lm = build_lifemodel(
+        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 0, 0, tzinfo=UTC))
+    )
+    lm.bus.publish(exchange_signal(origin_id="e-1", actor="user", label="two_way", timestamp=None))
+    lm.coreloop.tick()
+    assert store.load().u == 0.0  # satiated by the two_way exchange
