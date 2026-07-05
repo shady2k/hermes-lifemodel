@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from .act_gate import ActGate
 from .aggregator import Aggregator, SilentAggregator
+from .component import Component, TickContext
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
@@ -23,6 +24,7 @@ __all__ = [
     "ActGate",
     "Aggregator",
     "CheckpointState",
+    "Component",
     "EmitSignal",
     "Intent",
     "Layer",
@@ -31,6 +33,7 @@ __all__ = [
     "SignalBus",
     "SilentAggregator",
     "StateActor",
+    "TickContext",
     "UnknownStateField",
     "UpdateState",
 ]
