@@ -54,6 +54,7 @@ from pathlib import Path
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
+from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
 from .core.contact_neuron import ContactNeuron
 from .core.coreloop import CoreLoop
@@ -64,12 +65,14 @@ from .core.state_actor import StateActor
 from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
+from .sim.wake import GateParams
 from .state.json_store import JsonStateStore
 from .state.port import StatePort
 
 CONTACT_ALPHA = 1.0 / 240.0
 CONTACT_BETA = 1.0
 CONTACT_U_MAX = 100.0
+CONTACT_PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,18 @@ def build_lifemodel(
     except UnknownComponent:
         contact = ContactNeuron(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
         resolved_registry.register(contact, ComponentManifest(id=contact.id, type="neuron"))
+    try:
+        resolved_registry.manifest("contact-aggregation")
+    except UnknownComponent:
+        aggregation = ContactAggregation(
+            params=CONTACT_PARAMS,
+            theta=CONTACT_PARAMS.theta_u,
+            beta=CONTACT_BETA,
+            u_max=CONTACT_U_MAX,
+        )
+        resolved_registry.register(
+            aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
+        )
     resolved_state_actor = StateActor(resolved_state, logger=logger)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,
