@@ -30,10 +30,17 @@ from .state_actor import StateActor, UnknownStateField
 from .taxonomy import (
     KIND_CONTACT,
     KIND_EXCHANGE,
+    KIND_IN_FLIGHT,
+    KIND_VERDICT,
     contact_signal,
+    contact_value,
     exchange_signal,
+    in_flight_signal,
+    is_in_flight,
     is_kind,
     read_exchange,
+    read_verdict,
+    verdict_signal,
 )
 from .timeutil import minutes_between
 
@@ -51,6 +58,8 @@ __all__ = [
     "Intent",
     "KIND_CONTACT",
     "KIND_EXCHANGE",
+    "KIND_IN_FLIGHT",
+    "KIND_VERDICT",
     "Layer",
     "Neuron",
     "ProcessingLayer",
@@ -63,8 +72,13 @@ __all__ = [
     "UnknownStateField",
     "UpdateState",
     "contact_signal",
+    "contact_value",
     "exchange_signal",
+    "in_flight_signal",
+    "is_in_flight",
     "is_kind",
     "minutes_between",
     "read_exchange",
+    "read_verdict",
+    "verdict_signal",
 ]

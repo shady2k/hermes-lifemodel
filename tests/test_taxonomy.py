@@ -5,11 +5,22 @@ import pytest
 from lifemodel.core.taxonomy import (
     KIND_CONTACT,
     KIND_EXCHANGE,
+    KIND_IN_FLIGHT,
+    KIND_VERDICT,
     contact_signal,
+    contact_value,
     exchange_signal,
+    in_flight_signal,
+    is_in_flight,
     is_kind,
     read_exchange,
+    read_verdict,
+    verdict_signal,
 )
+from lifemodel.core.taxonomy import (
+    contact_signal as _contact_signal,
+)
+from lifemodel.sim.aggregation import Verdict
 
 
 def test_contact_signal_carries_value_and_delta() -> None:
@@ -42,3 +53,31 @@ def test_read_exchange_rejects_bad_payload() -> None:
     sig = Signal(origin_id="e-2", kind=KIND_EXCHANGE, payload={"actor": "user"})  # missing label
     with pytest.raises(ValueError):
         read_exchange(sig)
+
+
+def test_verdict_signal_roundtrips() -> None:
+    sig = verdict_signal(origin_id="v-1", verdict=Verdict.FULFILL, timestamp=None)
+    assert sig.kind == KIND_VERDICT
+    assert read_verdict(sig) is Verdict.FULFILL
+
+
+def test_read_verdict_rejects_bad_value() -> None:
+    from lifemodel.domain.signal import Signal
+
+    with pytest.raises(ValueError):
+        read_verdict(Signal(origin_id="v-2", kind=KIND_VERDICT, payload={"verdict": "nope"}))
+
+
+def test_in_flight_signal_and_reader() -> None:
+    busy = in_flight_signal(origin_id="f-1", value=True, timestamp=None)
+    idle = in_flight_signal(origin_id="f-2", value=False, timestamp=None)
+    assert busy.kind == KIND_IN_FLIGHT
+    assert is_in_flight([idle, busy]) is True
+    assert is_in_flight([idle]) is False
+    assert is_in_flight([]) is False
+
+
+def test_contact_value_reads_transient_signal_or_default() -> None:
+    c = _contact_signal(origin_id="c-9", value=2.5, delta=0.1, timestamp=None)
+    assert contact_value([c], default=0.0) == 2.5
+    assert contact_value([], default=1.23) == 1.23
