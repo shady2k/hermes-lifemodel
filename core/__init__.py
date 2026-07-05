@@ -17,6 +17,12 @@ from .component import Component, TickContext
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
+from .registry import (
+    ComponentManifest,
+    ComponentRegistry,
+    DuplicateComponent,
+    UnknownComponent,
+)
 from .signal_bus import SignalBus
 from .state_actor import StateActor, UnknownStateField
 
@@ -25,6 +31,9 @@ __all__ = [
     "Aggregator",
     "CheckpointState",
     "Component",
+    "ComponentManifest",
+    "ComponentRegistry",
+    "DuplicateComponent",
     "EmitSignal",
     "Intent",
     "Layer",
@@ -34,6 +43,7 @@ __all__ = [
     "SilentAggregator",
     "StateActor",
     "TickContext",
+    "UnknownComponent",
     "UnknownStateField",
     "UpdateState",
 ]
