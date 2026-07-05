@@ -26,6 +26,14 @@ from .registry import (
 )
 from .signal_bus import SignalBus
 from .state_actor import StateActor, UnknownStateField
+from .taxonomy import (
+    KIND_CONTACT,
+    KIND_EXCHANGE,
+    contact_signal,
+    exchange_signal,
+    is_kind,
+    read_exchange,
+)
 
 __all__ = [
     "ActGate",
@@ -38,6 +46,8 @@ __all__ = [
     "DuplicateComponent",
     "EmitSignal",
     "Intent",
+    "KIND_CONTACT",
+    "KIND_EXCHANGE",
     "Layer",
     "Neuron",
     "ProcessingLayer",
@@ -49,4 +59,8 @@ __all__ = [
     "UnknownComponent",
     "UnknownStateField",
     "UpdateState",
+    "contact_signal",
+    "exchange_signal",
+    "is_kind",
+    "read_exchange",
 ]
