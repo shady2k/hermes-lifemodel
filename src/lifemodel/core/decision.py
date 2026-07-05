@@ -42,9 +42,15 @@ BASE_PARAMS = GateParams(theta_u=THETA, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
 #: would otherwise sit forever with ``pending_proactive_id`` set. Because
 #: ``decide_reachout`` dedups every further urge against a live desire (the
 #: anti-drum guarantee), that would silence the being permanently. This is the
-#: timeout after which such a stale pending verdict is released *silently* (no
-#: reject — a lost verdict is not cognition's "nothing to say") so a fresh urge
-#: can wake again.
+#: timeout after which such a stale pending verdict is recovered — as a
+#: :data:`~lifemodel.sim.aggregation.Verdict.REJECT` (no contact happened, so
+#: it backs off exactly like a real decline), **not** a free release: a free
+#: release would let a high-``u`` being re-wake in the very same tick, and if
+#: the verdict hook is totally broken that relaunches a proactive turn every
+#: ``PENDING_TIMEOUT_MIN`` forever — the original fixed-cadence drum, merely
+#: relabeled. Routing it through the existing reject-backoff means repeated
+#: lost verdicts grow the suppression gap (``r0``, ``r0·k``, ``r0·k²``, …)
+#: instead of drumming at a fixed cadence.
 PENDING_TIMEOUT_MIN = 30.0
 
 
@@ -87,18 +93,21 @@ def decide_reachout(state: State, *, now: datetime, busy: bool) -> ReachoutDecis
 
     STALE-PENDING RECOVERY (before anything else): an ``active`` desire whose
     ``pending_proactive_since`` is older than :data:`PENDING_TIMEOUT_MIN` means
-    the ``post_llm_call`` verdict never arrived — release it silently (no
-    reject recorded) so the anti-drum dedup above does not silence the being
-    forever waiting on a verdict that is never coming.
+    the ``post_llm_call`` verdict never arrived — recover it as a
+    :data:`~lifemodel.sim.aggregation.Verdict.REJECT` (no contact happened, so
+    it must back off like a real decline) rather than releasing it for free.
+    A free release would let a high-``u`` being re-wake in this very same
+    tick; routing it through ``apply_verdict`` instead means the growing
+    reject-backoff gate vetoes an immediate re-wake, and repeated lost
+    verdicts grow the suppression gap rather than drumming at a fixed
+    ``PENDING_TIMEOUT_MIN`` cadence.
     """
     if (
         state.desire_status == "active"
         and state.pending_proactive_since is not None
         and _minutes_between(state.pending_proactive_since, now) >= PENDING_TIMEOUT_MIN
     ):
-        state.desire_status = "none"
-        state.pending_proactive_id = None
-        state.pending_proactive_since = None
+        apply_verdict(state, Verdict.REJECT, now=now)
 
     dt = _minutes_between(state.last_tick_at, now)
     drive = Drive(alpha=ALPHA, beta=BETA, u_max=U_MAX, u=state.u)
