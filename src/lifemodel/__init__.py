@@ -22,6 +22,7 @@ from .egress_service import proactive_service_loop
 from .events import EVENTS_FILENAME, EventSink
 from .gateway_core import install_core_shim, register_gateway_service
 from .heartbeat import _resolve_home_origin, register_heartbeat
+from .hooks import make_post_llm_observer
 from .logging import EventTee, get_logger
 from .paths import state_dir
 
@@ -97,6 +98,21 @@ def register(ctx: Any) -> None:
     # fallback brain when it is not. Everything here is best-effort — a failure
     # in either path must never break plugin load.
     install_core_shim(ctx, logger=logger)
+
+    # --- Verdict feedback wiring (Task 5, spec §5/§7) -------------------------
+    # Resolves the pending proactive desire from the FINAL LLM output
+    # (NO_REPLY -> reject + growing backoff, real text -> fulfill) via the
+    # post_llm_call lifecycle hook — this is the anti-drum guarantee: a wake
+    # that produces nothing genuine to say never queues a duplicate reach-out.
+    # See lifemodel.hooks for the SPIKE findings (real payload shape) and the
+    # correlation-needs-field-verification caveat. Best-effort: a host without
+    # post_llm_call in VALID_HOOKS, or any wiring hiccup, must not break load.
+    try:
+        verdict_lm = build_lifemodel(base_dir=sdir, logger=logger)
+        ctx.register_hook("post_llm_call", make_post_llm_observer(verdict_lm))
+        logger.info("post_llm_observer_registered")
+    except Exception as exc:  # noqa: BLE001 - best-effort; never break load
+        logger.info("post_llm_observer_registration_skipped", error=f"{type(exc).__name__}: {exc}")
 
     # NOTE: do NOT gate on reachin_available() here — at register()/discovery time
     # the runner's adapters are not wired yet (they land later in gateway startup),
