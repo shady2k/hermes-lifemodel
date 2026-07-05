@@ -61,7 +61,7 @@ def test_load_when_base_dir_absent_returns_default_state(tmp_path: Path) -> None
 def test_round_trip_commit_then_load_is_equal(tmp_path: Path) -> None:
     store = JsonStateStore(tmp_path)
     state = State(
-        pressure=2.75,
+        u=2.75,
         energy=0.5,
         last_tick_at="2026-07-03T12:00:00Z",
         last_contact_at="2026-07-03T11:30:00Z",
@@ -72,7 +72,7 @@ def test_round_trip_commit_then_load_is_equal(tmp_path: Path) -> None:
 
 def test_commit_creates_base_dir_and_human_readable_json(tmp_path: Path) -> None:
     base = tmp_path / "profile-home" / "lifemodel"
-    JsonStateStore(base).commit(State(pressure=1.0))
+    JsonStateStore(base).commit(State(u=1.0))
 
     path = _state_json(base)
     assert path.exists()
@@ -86,7 +86,7 @@ def test_commit_creates_base_dir_and_human_readable_json(tmp_path: Path) -> None
 
 def test_commit_leaves_no_temp_file_behind(tmp_path: Path) -> None:
     store = JsonStateStore(tmp_path)
-    store.commit(State(pressure=1.0))
+    store.commit(State(u=1.0))
     assert _tmp_files(tmp_path) == []
     assert _state_json(tmp_path).exists()
 
@@ -103,7 +103,7 @@ def test_mid_write_failure_leaves_previous_state_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = JsonStateStore(tmp_path)
-    store.commit(State(pressure=1.0))  # a known-good baseline
+    store.commit(State(u=1.0))  # a known-good baseline
     good_bytes = _state_json(tmp_path).read_bytes()
 
     def boom(*_a: object, **_k: object) -> None:
@@ -111,12 +111,12 @@ def test_mid_write_failure_leaves_previous_state_intact(
 
     monkeypatch.setattr(os, "replace", boom)
     with pytest.raises(OSError, match="simulated disk failure"):
-        store.commit(State(pressure=999.0))
+        store.commit(State(u=999.0))
 
     # The previous good file is byte-for-byte intact...
     assert _state_json(tmp_path).read_bytes() == good_bytes
     # ...the partial write never became observable...
-    assert store.load().pressure == 1.0
+    assert store.load().u == 1.0
     # ...and the temp file was cleaned up, not left lingering.
     assert _tmp_files(tmp_path) == []
 
@@ -136,8 +136,8 @@ def test_commit_survives_unavailable_directory_fsync(
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", selective_open)
-    store.commit(State(pressure=1.0))
-    assert store.load().pressure == 1.0
+    store.commit(State(u=1.0))
+    assert store.load().u == 1.0
     assert _tmp_files(tmp_path) == []
 
 
@@ -145,7 +145,7 @@ def test_commit_survives_unavailable_directory_fsync(
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
-@pytest.mark.parametrize("field_name", ["pressure", "energy"])
+@pytest.mark.parametrize("field_name", ["u", "energy"])
 def test_commit_rejects_non_finite_float(tmp_path: Path, field_name: str, bad: float) -> None:
     # Fail-closed: a non-finite value raises a typed StateError *before* any
     # file is touched — no state.json is written, no temp file lingers.
@@ -158,14 +158,14 @@ def test_commit_rejects_non_finite_float(tmp_path: Path, field_name: str, bad: f
 
 def test_failed_non_finite_commit_leaves_previous_state_intact(tmp_path: Path) -> None:
     store = JsonStateStore(tmp_path)
-    store.commit(State(pressure=1.0))  # known-good baseline
+    store.commit(State(u=1.0))  # known-good baseline
     good_bytes = _state_json(tmp_path).read_bytes()
 
     with pytest.raises(StateError):
-        store.commit(State(pressure=float("nan")))
+        store.commit(State(u=float("nan")))
 
     assert _state_json(tmp_path).read_bytes() == good_bytes
-    assert store.load().pressure == 1.0
+    assert store.load().u == 1.0
     assert _tmp_files(tmp_path) == []
 
 
@@ -174,7 +174,7 @@ def test_load_rejects_non_finite_tokens(tmp_path: Path, token: str) -> None:
     # json.loads accepts these non-standard tokens by default; the store must
     # reject the resulting non-finite floats as corrupt.
     _state_json(tmp_path).write_text(
-        f'{{"schema_version": {SCHEMA_VERSION}, "pressure": {token}}}',
+        f'{{"schema_version": {SCHEMA_VERSION}, "u": {token}}}',
         encoding="utf-8",
     )
     with pytest.raises(StateCorruptError):
@@ -183,7 +183,7 @@ def test_load_rejects_non_finite_tokens(tmp_path: Path, token: str) -> None:
 
 def test_normal_finite_floats_still_round_trip(tmp_path: Path) -> None:
     store = JsonStateStore(tmp_path)
-    state = State(pressure=3.5, energy=0.0)
+    state = State(u=3.5, energy=0.0)
     store.commit(state)
     assert store.load() == state
 
@@ -199,7 +199,7 @@ def test_load_invalid_utf8_raises_corrupt(tmp_path: Path) -> None:
 
 def test_load_rejects_newer_schema_version(tmp_path: Path) -> None:
     _state_json(tmp_path).write_text(
-        json.dumps({"schema_version": SCHEMA_VERSION + 1, "pressure": 0.0}),
+        json.dumps({"schema_version": SCHEMA_VERSION + 1, "u": 0.0}),
         encoding="utf-8",
     )
     with pytest.raises(StateSchemaError):
@@ -208,9 +208,7 @@ def test_load_rejects_newer_schema_version(tmp_path: Path) -> None:
 
 def test_load_rejects_unknown_older_schema_version(tmp_path: Path) -> None:
     # No migrations in Phase 1: any non-matching version fails loud, not silent.
-    _state_json(tmp_path).write_text(
-        json.dumps({"schema_version": 0, "pressure": 0.0}), encoding="utf-8"
-    )
+    _state_json(tmp_path).write_text(json.dumps({"schema_version": 0, "u": 0.0}), encoding="utf-8")
     with pytest.raises(StateSchemaError):
         JsonStateStore(tmp_path).load()
 
@@ -228,14 +226,14 @@ def test_load_non_object_json_raises_corrupt(tmp_path: Path) -> None:
 
 
 def test_load_missing_schema_version_raises_corrupt(tmp_path: Path) -> None:
-    _state_json(tmp_path).write_text(json.dumps({"pressure": 0.0}), encoding="utf-8")
+    _state_json(tmp_path).write_text(json.dumps({"u": 0.0}), encoding="utf-8")
     with pytest.raises(StateCorruptError):
         JsonStateStore(tmp_path).load()
 
 
 def test_store_does_not_import_hermes(tmp_path: Path) -> None:
     store = JsonStateStore(tmp_path)
-    store.commit(State(pressure=1.0))
+    store.commit(State(u=1.0))
     store.load()
     assert "hermes_constants" not in sys.modules
     assert not any(m == "hermes" or m.startswith("hermes.") for m in sys.modules)

@@ -31,10 +31,11 @@ decide — the in-process service uses :mod:`lifemodel.core.decision` (which
 reconstructs the certified ``sim`` primitives from ``State`` directly, bypassing
 this ``Aggregator``/``Neuron`` seam entirely). So the live default aggregator is
 now :class:`SilentAggregator` (never wakes, whatever it is asked to decide —
-matching "cron never decides") and the live default neuron list is empty.
-:class:`ThresholdAggregator` and :class:`StubTimerNeuron` remain defined and are
-still exercised by their own unit tests, but neither is wired as a default here
-any more; a later cleanup task removes them if they end up fully orphaned.
+matching "cron never decides") and the live default neuron list is empty. The
+old ``ThresholdAggregator``/``StubTimerNeuron`` defaults were removed outright
+by Task 8's cleanup pass once confirmed fully orphaned — the ``Aggregator`` and
+``Neuron`` ABCs (plus ``SilentAggregator``) remain as the extension seam for any
+future subclass.
 
 Passing ``neurons`` or ``aggregator`` explicitly — including an empty ``()`` —
 opts out of the default, so real Hermes wiring and the seam tests stay in full
