@@ -1,15 +1,17 @@
-"""Unit tests for the heartbeat tick entrypoint (roadmap 1.1).
+"""Unit tests for the heartbeat tick entrypoint (roadmap 1.1; Task 4: watchdog).
 
-These drive the tick with injected fakes (``FakeClock`` / ``FakeStateStore`` /
-``FakeSignalBus``) — no Hermes, no LLM. They assert the walking-skeleton
-contract: the tick loads state, advances it, commits, emits a ``tick`` event,
-stays asleep (``{"wakeAgent": false}``), and persists across runs. A seam test
-proves the neuron→bus→aggregator wiring is live so 1.2/1.3 only fill it in.
+These drive the tick with injected fakes (``FakeClock`` / ``FakeStateStore``) —
+no Hermes, no LLM. Per the wire-desire-model plan (Task 4), the in-process
+egress service is the sole decision brain — this cron tick never wakes, however
+mature the persisted urge is. What remains: it (1) defers entirely, writing
+nothing, while the in-process service's liveness stamp is fresh, (2) otherwise
+advances ``tick_count``/``last_tick_at`` and commits (pure bookkeeping, zero
+LLM), (3) always emits the ``{"wakeAgent": false}`` gate line, and (4) fails
+closed on any crash so Hermes never wakes on a tick error.
 """
 
 from __future__ import annotations
 
-import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,9 +21,6 @@ import pytest
 
 import lifemodel.tick as tick_mod
 from lifemodel.composition import build_lifemodel
-from lifemodel.core.aggregator import DEFAULT_WAKE_THRESHOLD, Aggregator, ThresholdAggregator
-from lifemodel.core.neuron import EVENT_NEURON_FIRED, Neuron, StubTimerNeuron
-from lifemodel.domain.signal import Signal
 from lifemodel.domain.wake import WakeDecision, WakePacket
 from lifemodel.events import EVENT_TICK, EVENT_TICK_FAILED, EVENTS_FILENAME, EventSink
 from lifemodel.state.json_store import JsonStateStore
@@ -42,43 +41,7 @@ class _RecordingLogger:
         self.calls.append((event, dict(fields)))
 
 
-class _EmitOnceNeuron(Neuron):
-    """A stub neuron that emits exactly one signal per tick (seam probe only)."""
-
-    def __init__(self, origin_id: str) -> None:
-        self._origin_id = origin_id
-
-    def tick(self, state: State) -> list[Signal]:
-        return [Signal(origin_id=self._origin_id, kind="probe")]
-
-
-class _RecordingAggregator(Aggregator):
-    """Captures the signals and accumulated pressure it was handed; stays asleep."""
-
-    def __init__(self) -> None:
-        self.seen: list[Signal] = []
-        self.pressures: list[float] = []
-
-    def decide(self, signals: Any, *, pressure: float) -> WakeDecision:
-        self.seen.extend(signals)
-        self.pressures.append(pressure)
-        return WakeDecision.stay_asleep()
-
-
-class _ConstantAggregator(Aggregator):
-    """Returns a fixed decision regardless of pressure; records what it received.
-
-    Proves the tick *delegates* the wake call entirely — the orchestrator applies
-    no threshold of its own, so whatever this returns is what run_tick returns.
-    """
-
-    def __init__(self, decision: WakeDecision) -> None:
-        self._decision = decision
-        self.pressures: list[float] = []
-
-    def decide(self, signals: Any, *, pressure: float) -> WakeDecision:
-        self.pressures.append(pressure)
-        return self._decision
+NULL_LOGGER = _RecordingLogger()
 
 
 def _build(**overrides: Any) -> Any:
@@ -93,6 +56,33 @@ def _build(**overrides: Any) -> Any:
     }
     params.update(overrides)
     return build_lifemodel(**params)
+
+
+def make_lm_high_u() -> Any:
+    """``u`` well past ``THETA``, past the active-silence window, no reject — the
+    state that WOULD wake if this were the egress path's ``decide_reachout``.
+    Proves the cron watchdog stays silent regardless of how mature the urge is —
+    the in-process service is the only brain that ever decides to wake."""
+    return _build(
+        state=FakeStateStore(
+            State(u=50.0, last_exchange_at=(_T0 - timedelta(minutes=20)).isoformat())
+        )
+    )
+
+
+def test_run_tick_never_wakes_even_with_a_mature_urge() -> None:
+    # Task 4 acceptance: cron is a silent watchdog — it never wakes, whatever
+    # state it finds (that call belongs solely to the in-process service).
+    lm = make_lm_high_u()
+
+    decision = run_tick(lm, logger=NULL_LOGGER)
+
+    assert decision.wake is False
+    assert lm.state.load().last_tick_at is not None  # still ticks bookkeeping
+
+
+def test_cron_gate_line_is_always_stay_asleep() -> None:
+    assert wake_gate_line(run_tick(make_lm_high_u(), logger=NULL_LOGGER)) == '{"wakeAgent": false}'
 
 
 def test_run_tick_advances_state_and_commits() -> None:
@@ -137,8 +127,8 @@ def test_run_tick_emits_tick_event_with_bookkeeping() -> None:
 
 
 def test_run_tick_never_wakes_and_never_delivers() -> None:
-    # Below-threshold contract (HLA §1): no wake, so nothing is delivered and no
-    # LLM path is entered — the walking skeleton is zero-cost every tick.
+    # The walking skeleton stays zero-cost every tick: no wake, so nothing is
+    # delivered and no LLM path is entered.
     delivery = FakeDelivery()
     lm = _build(delivery=delivery)
 
@@ -148,178 +138,30 @@ def test_run_tick_never_wakes_and_never_delivers() -> None:
     assert delivery.sent == []
 
 
-def test_run_tick_wires_neurons_through_bus_to_aggregator() -> None:
-    # Seam probe: a neuron's signal flows onto the bus and reaches the
-    # aggregator's decide(). 1.1 ships no neurons; this proves 1.2/1.3 only fill
-    # the seam rather than reshape the tick.
-    aggregator = _RecordingAggregator()
-    lm = _build(neurons=(_EmitOnceNeuron("sig-1"),), aggregator=aggregator)
-
-    run_tick(lm, logger=_RecordingLogger())
-
-    assert [s.origin_id for s in aggregator.seen] == ["sig-1"]
-
-
-def test_run_tick_accumulates_one_delta_into_pressure_each_tick() -> None:
-    # 1.2 engine validation: the stub neuron owns a fixed delta; run_tick sums
-    # the consumed signals' deltas into State.pressure. K ticks → K*delta, the
-    # number PERSISTS between ticks (loaded from the committed state, not
-    # recomputed from zero), bookkeeping still advances, a neuron_fired event is
-    # recorded each tick, and the wake gate stays asleep the whole time (0 LLM).
-    store = FakeStateStore()
-    clock = FakeClock(_T0)
-    logger = _RecordingLogger()
-    delta = 2.0
-    neuron = StubTimerNeuron(delta=delta, logger=logger)
-    lm = _build(state=store, clock=clock, neurons=(neuron,))
-
-    k = 3
-    for i in range(k):
-        decision = run_tick(lm, logger=logger)
-        assert decision.wake is False  # wake gate stays {"wakeAgent": false}
-        assert store.load().pressure == (i + 1) * delta  # grows + persists
-        clock.advance(timedelta(minutes=1))
-
-    final = store.load()
-    assert final.pressure == k * delta
-    assert final.tick_count == k
-    assert final.last_tick_at == (_T0 + timedelta(minutes=k - 1)).isoformat()
-
-    fired = [fields for event, fields in logger.calls if event == EVENT_NEURON_FIRED]
-    assert len(fired) == k  # the neuron fired once per tick
-    ticks = [fields for event, fields in logger.calls if event == EVENT_TICK]
-    assert all(t["wake"] is False for t in ticks)
-
-
-def test_run_tick_wakes_when_accumulated_pressure_crosses_threshold() -> None:
-    # 1.3 acceptance: below-threshold ticks accumulate silently until the crossing
-    # tick flips the wake gate. Drive the real run_tick harness with the real
-    # ThresholdAggregator + StubTimerNeuron; assert the gate progression and that
-    # the crossing line is a single JSON object that parses back into a WakePacket
-    # carrying reason + pressure + threshold.
-    store = FakeStateStore()
-    clock = FakeClock(_T0)
-    threshold = 3.0
-    lm = _build(
-        state=store,
-        clock=clock,
-        neurons=(StubTimerNeuron(delta=1.0),),
-        aggregator=ThresholdAggregator(threshold=threshold),
-    )
-
-    # Ticks 1 and 2: pressure 1.0, 2.0 — below threshold, gate stays asleep.
-    for _ in range(2):
-        decision = run_tick(lm, logger=_RecordingLogger())
-        assert decision.wake is False
-        assert json.loads(wake_gate_line(decision)) == {"wakeAgent": False}
-        clock.advance(timedelta(minutes=1))
-
-    # Tick 3: pressure reaches 3.0 == threshold → wake.
-    decision = run_tick(lm, logger=_RecordingLogger())
-    assert decision.wake is True
-    assert decision.packet is not None
-
-    line = wake_gate_line(decision)
-    gate = json.loads(line)  # a single, parseable JSON object
-    assert gate["wakeAgent"] is True
-
-    packet = WakePacket.from_dict(gate)  # parses back via the hardened schema
-    assert packet.reason
-    assert packet.pressure == 3.0  # the packet records the pressure that crossed
-    assert packet.threshold == threshold
-    assert store.load().pressure == 0.0  # drained on wake (roadmap 1.4)
-
-
-def test_run_tick_below_threshold_is_zero_llm_and_delivers_nothing() -> None:
-    # Below threshold → no wake, so nothing is delivered and no LLM path opens.
-    delivery = FakeDelivery()
-    lm = _build(
-        delivery=delivery,
-        neurons=(StubTimerNeuron(delta=1.0),),
-        aggregator=ThresholdAggregator(threshold=100.0),
-    )
+def test_run_tick_defers_and_writes_nothing_when_service_is_alive() -> None:
+    # Liveness watchdog (spec §6): while the in-process service's stamp is
+    # fresh, it owns state exclusively — the cron tick must not touch
+    # tick_count/last_tick_at (no two brains racing the same commit).
+    store = FakeStateStore(State(egress_service_alive_at=_T0.isoformat(), tick_count=5))
+    lm = _build(state=store, clock=FakeClock(_T0))
 
     decision = run_tick(lm, logger=_RecordingLogger())
 
     assert decision.wake is False
-    assert json.loads(wake_gate_line(decision)) == {"wakeAgent": False}
-    assert delivery.sent == []
+    assert store.load().tick_count == 5  # untouched while the service is alive
 
 
-def test_run_tick_decides_against_accumulated_pressure_not_transient_signal() -> None:
-    # The aggregator is handed the *accumulated* State.pressure (post-sum), not the
-    # bare per-tick delta — proving accumulate-happens-before-decide.
-    store = FakeStateStore(State(pressure=5.0))
-    agg = _RecordingAggregator()
-    lm = _build(state=store, neurons=(StubTimerNeuron(delta=2.0),), aggregator=agg)
+def test_run_tick_falls_back_to_bookkeeping_once_the_stamp_is_stale() -> None:
+    from lifemodel.tick import SERVICE_LIVENESS_MAX_AGE
 
-    run_tick(lm, logger=_RecordingLogger())
+    stale_stamp = (_T0 - SERVICE_LIVENESS_MAX_AGE - timedelta(seconds=1)).isoformat()
+    store = FakeStateStore(State(egress_service_alive_at=stale_stamp, tick_count=5))
+    lm = _build(state=store, clock=FakeClock(_T0))
 
-    # 5.0 carried over + 2.0 this tick = 7.0 seen by decide().
-    assert agg.pressures == [7.0]
+    decision = run_tick(lm, logger=_RecordingLogger())
 
-
-def test_run_tick_delegates_the_wake_call_entirely_to_the_aggregator() -> None:
-    # The orchestrator holds no threshold: whatever the aggregator returns is
-    # what run_tick returns. A stub that wakes at pressure 0 proves the tick
-    # applies no suppression; a stub that sleeps at huge pressure proves it adds
-    # no wake logic of its own.
-    waker = _ConstantAggregator(
-        WakeDecision.wake_with(WakePacket(reason="x", pressure_kind="k", pressure=0.0))
-    )
-    lm_wake = _build(neurons=(), aggregator=waker)
-    assert run_tick(lm_wake, logger=_RecordingLogger()).wake is True
-    assert waker.pressures == [0.0]  # woke at zero pressure — no tick-side gate
-
-    sleeper = _ConstantAggregator(WakeDecision.stay_asleep())
-    lm_sleep = _build(
-        state=FakeStateStore(State(pressure=1_000.0)),
-        neurons=(),
-        aggregator=sleeper,
-    )
-    assert run_tick(lm_sleep, logger=_RecordingLogger()).wake is False  # slept at huge pressure
-
-
-def test_run_tick_source_holds_no_threshold_literal() -> None:
-    # The threshold decision lives in the aggregator, never in the orchestrator:
-    # run_tick's source carries no copy of the threshold value.
-    src = inspect.getsource(run_tick)
-    assert str(DEFAULT_WAKE_THRESHOLD) not in src
-
-
-def test_pressure_persists_across_a_fresh_graph_over_the_same_store() -> None:
-    # Persistence proof: a *new* LifeModel (fresh bus/clock) over the same
-    # committed store keeps accumulating from the persisted pressure, not from
-    # zero — the number lives in State, not in the process.
-    store = FakeStateStore()
-    delta = 1.0
-    lm1 = _build(state=store, clock=FakeClock(_T0), neurons=(StubTimerNeuron(delta=delta),))
-    run_tick(lm1, logger=_RecordingLogger())
-    assert store.load().pressure == delta
-
-    lm2 = _build(
-        state=store,
-        clock=FakeClock(_T0 + timedelta(minutes=1)),
-        neurons=(StubTimerNeuron(delta=delta),),
-    )
-    run_tick(lm2, logger=_RecordingLogger())
-    assert store.load().pressure == 2 * delta  # continued, not reset
-
-
-def test_default_neuron_signal_is_distinct_each_tick_so_dedup_never_collapses() -> None:
-    # The stub neuron's origin_id is tied to tick_count, so a persistent dedup
-    # ledger never swallows a later tick's impulse — every tick contributes.
-    store = FakeStateStore()
-    clock = FakeClock(_T0)
-    bus = FakeSignalBus()
-    lm = _build(state=store, bus=bus, clock=clock, neurons=(StubTimerNeuron(delta=1.0),))
-
-    run_tick(lm, logger=_RecordingLogger())
-    clock.advance(timedelta(minutes=1))
-    run_tick(lm, logger=_RecordingLogger())
-
-    # Two ticks, two distinct origin ids logged on the shared bus → pressure 2.0.
-    assert store.load().pressure == 2.0
+    assert decision.wake is False
+    assert store.load().tick_count == 6  # stale stamp -> cron takes the fallback
 
 
 def test_wake_gate_line_stays_asleep_is_wakeagent_false() -> None:
@@ -328,8 +170,8 @@ def test_wake_gate_line_stays_asleep_is_wakeagent_false() -> None:
 
 
 def test_wake_gate_line_wake_carries_packet_and_true_flag() -> None:
-    # Forward seam (1.3): a waking decision emits the wake-packet fields plus the
-    # wakeAgent:true flag on the single stdout line.
+    # wake_gate_line itself stays a general renderer (unit-tested on its own),
+    # even though this entrypoint's run_tick never feeds it a waking decision.
     packet = WakePacket(reason="overdue", pressure_kind="connection", pressure=2.0)
     gate = json.loads(wake_gate_line(WakeDecision.wake_with(packet)))
     assert gate["wakeAgent"] is True
@@ -363,34 +205,6 @@ def test_main_prints_wake_gate_and_persists_across_ticks(
     tick_events = [r for r in records if r.get("event") == EVENT_TICK]
     assert [r["tick_count"] for r in tick_events] == [1, 2]
     assert all(r["wake"] is False for r in tick_events)
-
-
-def test_main_default_neuron_accumulates_pressure_and_stays_asleep(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # End-to-end via the real entrypoint: the DEFAULT graph now wires the stub
-    # timer neuron (both call sites get it), so State.pressure grows one delta
-    # per tick, a neuron_fired event lands in the sink, and the wake gate stays
-    # {"wakeAgent": false} — zero LLM.
-    monkeypatch.setattr(tick_mod, "_hermes_home", lambda: tmp_path)
-
-    assert main() == 0
-    assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
-    assert main() == 0
-    assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
-
-    sdir = tmp_path / "workspace" / "lifemodel"
-    state = json.loads((sdir / "state.json").read_text(encoding="utf-8"))
-    assert state["tick_count"] == 2
-    assert state["pressure"] == 2.0  # default delta 1.0, accumulated over 2 ticks
-
-    records = [
-        json.loads(line)
-        for line in (sdir / EVENTS_FILENAME).read_text(encoding="utf-8").splitlines()
-        if line
-    ]
-    fired = [r for r in records if r.get("event") == EVENT_NEURON_FIRED]
-    assert len(fired) == 2  # the wired-in neuron fired each tick
 
 
 def test_main_stdout_last_line_is_readable_by_the_scheduler_gate(
@@ -461,24 +275,19 @@ def test_main_fails_closed_when_the_tick_raises(
     assert not any(r.get("event") == EVENT_TICK for r in records)  # tick never completed
 
 
-def test_main_commit_failure_on_a_wake_tick_stays_silent_and_undrained(
+def test_main_commit_failure_stays_silent_and_state_unwritten(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # FINDING 1 realistic scenario: a would-be-wake tick whose commit() raises
-    # (e.g. state dir unwritable / disk full). Without the fail-closed guard the
-    # script would crash, Hermes would wake cognition, and it would deliver a
-    # crash message with pressure NOT drained — repeating every run. With the
-    # guard: {"wakeAgent": false}, exit 0, and the on-disk state is left UNDRAINED
-    # so a clean wake retries on a later healthy tick.
+    # A commit() failure (disk full / unwritable state dir) during the ordinary
+    # bookkeeping tick must still fail closed: {"wakeAgent": false}, exit 0, and
+    # the on-disk state is left exactly as seeded (the failing commit never
+    # wrote) — a clean tick retries later rather than wedging on a crash.
     monkeypatch.setattr(tick_mod, "_hermes_home", lambda: tmp_path)
     sdir = tmp_path / "workspace" / "lifemodel"
 
-    # Seed pressure at/above the default wake threshold so this tick WOULD wake.
     seed = JsonStateStore(sdir)
-    seed.commit(State(pressure=15.0))  # DEFAULT_WAKE_THRESHOLD is 10.0
+    seed.commit(State(tick_count=7))
 
-    # Now make every commit fail — the tick will decide to wake, drain in-memory,
-    # then blow up trying to persist.
     def _fail_commit(self: Any, state: State) -> None:
         raise OSError("simulated unwritable state dir")
 
@@ -487,11 +296,9 @@ def test_main_commit_failure_on_a_wake_tick_stays_silent_and_undrained(
     assert main() == 0
     assert _last_gate_line(capsys.readouterr().out) == {"wakeAgent": False}
 
-    # On-disk state is unchanged (the failing commit never wrote): pressure stays
-    # at the seeded value, so the wake is retried later rather than lost.
+    # On-disk state is unchanged (the failing commit never wrote).
     persisted = json.loads((sdir / "state.json").read_text(encoding="utf-8"))
-    assert persisted["pressure"] == 15.0  # undrained
-    assert persisted.get("cooldown_until") is None  # no cooldown opened
+    assert persisted["tick_count"] == 7
 
     records = _events_in(sdir)
     assert any(r.get("event") == EVENT_TICK_FAILED for r in records)

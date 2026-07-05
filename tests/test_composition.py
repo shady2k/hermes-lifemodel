@@ -18,8 +18,8 @@ from lifemodel.adapters.clock import SystemClock
 from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.composition import LifeModel, build_lifemodel
-from lifemodel.core.aggregator import ThresholdAggregator
-from lifemodel.core.neuron import Neuron, StubTimerNeuron
+from lifemodel.core.aggregator import SilentAggregator
+from lifemodel.core.neuron import Neuron
 from lifemodel.domain.signal import Signal
 from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
@@ -68,19 +68,24 @@ def test_builds_with_concrete_json_store_over_tmp_dir(tmp_path: Path) -> None:
     assert isinstance(lm.bus, FileSignalBus)
     assert isinstance(lm.clock, SystemClock)
     assert isinstance(lm.delivery, NoopDelivery)
-    assert isinstance(lm.aggregator, ThresholdAggregator)
-    # Phase 1.2 replaced the empty default neuron list with the stub timer neuron.
-    assert len(lm.neurons) == 1
-    assert isinstance(lm.neurons[0], StubTimerNeuron)
+    # Wire-desire-model plan (Task 4): the live path decides nothing here — the
+    # in-process service is the sole brain via core/decision — so the default
+    # aggregator is the guaranteed-quiet SilentAggregator and there are no
+    # default neurons.
+    assert isinstance(lm.aggregator, SilentAggregator)
+    assert lm.neurons == ()
     _assert_no_hermes()
 
 
-def test_explicit_empty_neurons_overrides_the_stub_default(tmp_path: Path) -> None:
-    # Passing neurons explicitly (even empty) opts out of the default — the seam
-    # tests that need a bare graph, and later real wiring, stay in control.
-    lm = build_lifemodel(base_dir=tmp_path, neurons=())
+def test_explicit_neurons_and_aggregator_override_the_defaults(tmp_path: Path) -> None:
+    # Passing neurons/aggregator explicitly (even empty/guaranteed-quiet) opts
+    # out of the default — the seam tests, and later real wiring, stay in
+    # control.
+    neuron = _CountingNeuron()
+    lm = build_lifemodel(base_dir=tmp_path, neurons=(neuron,), aggregator=SilentAggregator())
 
-    assert lm.neurons == ()
+    assert lm.neurons == (neuron,)
+    assert isinstance(lm.aggregator, SilentAggregator)
 
 
 def test_default_graph_is_exercisable_end_to_end(tmp_path: Path) -> None:
@@ -88,14 +93,14 @@ def test_default_graph_is_exercisable_end_to_end(tmp_path: Path) -> None:
     # and the pass-through aggregator stays quiet.
     lm = build_lifemodel(base_dir=tmp_path)
 
-    lm.state.commit(State(pressure=1.5))
-    assert lm.state.load().pressure == 1.5
+    lm.state.commit(State(u=1.5))
+    assert lm.state.load().u == 1.5
 
     lm.bus.publish(Signal(origin_id="m1", kind="incoming"))
     consumed: Sequence[Signal] = lm.bus.consume_unprocessed()
     assert [s.origin_id for s in consumed] == ["m1"]
 
-    # Zero accumulated pressure is below the default threshold → stays quiet.
+    # The default SilentAggregator never wakes, whatever it is asked to decide.
     assert lm.aggregator.decide(consumed, pressure=0.0).wake is False
     _assert_no_hermes()
 

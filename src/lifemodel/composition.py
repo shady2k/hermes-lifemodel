@@ -18,22 +18,27 @@ Two call sites this must serve (roadmap 0.4):
 For Phase 0.4 the defaults are the concrete :class:`SystemClock`,
 :class:`JsonStateStore`, and durable :class:`FileSignalBus`, with a
 :class:`NoopDelivery` stub for the ``DeliveryPort``. Note the Phase-1.4 *proactive*
-outbound does **not** go through this port: on a wake the tick prints
-``wakeAgent: true`` and Hermes' cron delivers the woken turn's message via the
-gateway (``deliver``, HLA §7/D4). The ``DeliveryPort`` stays the seam for a future
-*direct*-from-cognition delivery path, so ``NoopDelivery`` remains the default.
-Phase 1.3 replaced the pass-through aggregator with the
-real :class:`ThresholdAggregator`, which wakes once the accumulated pressure
-crosses its threshold (:class:`SilentAggregator` stays available for tests that
-want a guaranteed-quiet graph). Phase 1.2 landed the first neuron: the default
-neuron list
-is now a single :class:`StubTimerNeuron`, so every default graph accumulates
-pressure each tick (real behavioural neurons arrive in Phase 2+). The graph
-therefore constructs and is exercisable end-to-end now, and later tasks fill in
-implementations rather than reshape the wiring.
+outbound does **not** go through this port: the in-process egress service is the
+sole decision brain and launches proactive turns directly via its own
+``ProactiveEgressPort`` (see :mod:`lifemodel.egress_service`); the cron tick
+never wakes at all (roadmap Task 4, the drum-killer). The ``DeliveryPort`` stays
+the seam for a future *direct*-from-cognition delivery path, so ``NoopDelivery``
+remains the default.
 
-Passing ``neurons`` explicitly — including an empty ``()`` — opts out of that
-default, so real Hermes wiring and the seam tests stay in full control.
+**Wire-desire-model plan (Task 4): no decision aggregator/neuron in the live
+path.** The cron tick no longer runs a neuron loop or asks an aggregator to
+decide — the in-process service uses :mod:`lifemodel.core.decision` (which
+reconstructs the certified ``sim`` primitives from ``State`` directly, bypassing
+this ``Aggregator``/``Neuron`` seam entirely). So the live default aggregator is
+now :class:`SilentAggregator` (never wakes, whatever it is asked to decide —
+matching "cron never decides") and the live default neuron list is empty.
+:class:`ThresholdAggregator` and :class:`StubTimerNeuron` remain defined and are
+still exercised by their own unit tests, but neither is wired as a default here
+any more; a later cleanup task removes them if they end up fully orphaned.
+
+Passing ``neurons`` or ``aggregator`` explicitly — including an empty ``()`` —
+opts out of the default, so real Hermes wiring and the seam tests stay in full
+control.
 
 **This module imports no Hermes** — only Hermes-free adapters and the core — so
 the whole graph is constructible (and testable) with injected fakes off-host.
@@ -48,8 +53,8 @@ from pathlib import Path
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
-from .core.aggregator import Aggregator, ThresholdAggregator
-from .core.neuron import Neuron, StubTimerNeuron
+from .core.aggregator import Aggregator, SilentAggregator
+from .core.neuron import Neuron
 from .core.signal_bus import SignalBus
 from .logging import EventLogger
 from .ports.clock import ClockPort
@@ -94,18 +99,18 @@ def build_lifemodel(
     inject real Hermes adapters and tests can inject fakes — the wiring is the
     same, only the parts differ.
 
-    ``neurons`` defaults to a single :class:`StubTimerNeuron` (the Phase-1.2
-    autonomic layer). ``None`` means "take the default"; passing any sequence —
+    ``neurons`` defaults to an empty tuple and ``aggregator`` defaults to
+    :class:`SilentAggregator` (roadmap Task 4: the cron path decides nothing —
+    the in-process service is the sole brain via ``core/decision``, bypassing
+    this seam). ``None`` means "take the default"; passing an explicit value —
     including an empty ``()`` — overrides it, so callers keep full control.
     """
     resolved_state: StatePort = state or JsonStateStore(base_dir, logger=logger)
     resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_clock: ClockPort = clock or SystemClock()
     resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
-    resolved_aggregator: Aggregator = aggregator or ThresholdAggregator()
-    resolved_neurons: tuple[Neuron, ...] = (
-        (StubTimerNeuron(logger=logger),) if neurons is None else tuple(neurons)
-    )
+    resolved_aggregator: Aggregator = aggregator or SilentAggregator()
+    resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
     return LifeModel(
         state=resolved_state,

@@ -1,30 +1,33 @@
 """The heartbeat tick — the cron ``--script`` entrypoint (roadmap 1.1, HLA D1).
 
 A Hermes cron job fires ~every minute and runs this module as its pre-check
-``--script`` (via ``sys.executable`` inside Hermes' interpreter). The tick is the
-**autonomic pulse** of the being: it loads state, lets the neurons read it and
-emit signals, asks the aggregator whether to wake cognition, advances the
-heartbeat bookkeeping, and commits — all at **zero LLM cost** (HLA §1).
+``--script`` (via ``sys.executable`` inside Hermes' interpreter).
+
+**Phase-1 drum-killer (wire-desire-model plan, Task 4): the cron tick is a
+silent watchdog, never a second brain.** The in-process egress service
+(:func:`~lifemodel.egress_service.run_proactive_tick`, reusing
+:mod:`lifemodel.core.decision`) is the **sole** decision brain — it is the only
+code path that rises the drive, evaluates the wake gates, and launches a
+proactive turn. This cron tick **never** decides to wake: :func:`run_tick`
+always returns :meth:`~lifemodel.domain.wake.WakeDecision.stay_asleep`,
+whatever the persisted state. Its only remaining jobs are (1) a liveness
+watchdog — while the in-process service's stamp is fresh it owns state
+exclusively, so this tick writes nothing and gets out of the way — and (2),
+once that stamp goes stale/absent, plain heartbeat bookkeeping
+(``tick_count``/``last_tick_at``) so ``/lifemodel debug`` still has a "last
+tick" to show, at zero LLM cost and with no proactive fallback (Global
+Constraint: "cron never wakes proactively... both must never disagree, so cron
+simply never decides").
 
 **The wake-gate contract (verified against ``cron/scheduler.py``).** The
 scheduler runs this script *first* and parses its **last non-empty stdout line**
 as a wake gate (``_parse_wake_gate``): a JSON object ``{"wakeAgent": false}``
 skips the agent entirely — no LLM, silent, zero cost; anything else wakes it and
-injects the script's full stdout as context (HLA D4). So this module prints
-**exactly one** JSON line to stdout, derived from the aggregator's decision.
-
-As of Phase 1.3 the graph carries one autonomic neuron
-(:class:`~lifemodel.core.neuron.StubTimerNeuron`) accumulating pressure into
-state each tick, and the real
-:class:`~lifemodel.core.aggregator.ThresholdAggregator`: while the accumulated
-pressure stays below its threshold the decision is "stay asleep" → the gate is
-``{"wakeAgent": false}`` (silent, zero LLM), and the tick the pressure crosses
-the threshold the aggregator returns a waking decision → this same code emits the
-wake-packet with ``wakeAgent: true`` — no rewrite of the tick (HLA §11). Phase 1.4
-closes the loop: on a wake the tick **drains** the pressure, stamps the contact,
-and opens a **cooldown** that vetoes the next would-be wakes (single-fire, ≤ 1
-message per threshold cycle); the message itself is sent by Hermes' cron when it
-wakes the agent (delivery = gateway, HLA §7 / D4).
+injects the script's full stdout as context (HLA D4). Because :func:`run_tick`
+always stays asleep now, this module always prints ``{"wakeAgent": false}`` —
+:func:`wake_gate_line` keeps the general wake-packet rendering path (still
+exercised by its own unit tests / other wake producers), it is simply never fed
+a waking decision from this entrypoint.
 
 **stdout discipline.** Only the single wake-gate line is written to stdout;
 structured logs go to stderr (see :func:`~lifemodel.logging.configure`) and to
@@ -42,7 +45,6 @@ from __future__ import annotations
 import contextlib
 import json
 import sys
-from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -52,14 +54,6 @@ from .events import EVENT_TICK, EVENT_TICK_FAILED, EVENTS_FILENAME, EventSink
 from .logging import EventLogger, EventTee, configure, get_logger
 from .paths import state_dir
 from .state.model import State
-
-#: How long after a wake the being stays quiet before it may wake again (roadmap
-#: 1.4). A wall-clock duration compared against ``State.cooldown_until``: while it
-#: is active the tick stays asleep even above threshold, so at most one message
-#: fires per threshold cycle. Cooldown/quiet-hours are *ours*, not Hermes' (HLA
-#: §7). A sane default; a disk-backed, hot-reloadable value plugs in here later
-#: (same seam as the aggregator's threshold) without reshaping ``run_tick``.
-DEFAULT_WAKE_COOLDOWN = timedelta(minutes=30)
 
 #: How long after a liveness stamp the cron heartbeat still considers the
 #: in-process egress service "alive" and defers to it (lm-64s, spec §6). ~3× the
@@ -75,10 +69,12 @@ def service_is_alive(
     """True if the in-process egress service stamped liveness within *max_age*.
 
     The cron heartbeat calls this before ticking: a fresh stamp means the
-    in-process service owns the brain (it ticks pressure + decides reach-out
-    itself), so the cron defers to avoid two brains writing state at once. Stale
-    or absent stamps fall back to the cron path. Unparseable stamps are treated as
-    dead rather than raising — fail-over to cron, never a mid-cron crash.
+    in-process service owns state exclusively (it is the sole decision brain —
+    see :mod:`lifemodel.core.decision` / :mod:`lifemodel.egress_service`), so the
+    cron defers and writes nothing to avoid two brains racing the same commit.
+    Stale or absent stamps fall back to the cron's own (purely bookkeeping) path.
+    Unparseable stamps are treated as dead rather than raising — fail-over to
+    cron, never a mid-cron crash.
     """
     stamp = state.egress_service_alive_at
     if stamp is None:
@@ -122,100 +118,40 @@ def wake_gate_line(decision: WakeDecision) -> str:
     return json.dumps(gate, ensure_ascii=False)
 
 
-def run_tick(
-    lm: LifeModel, *, logger: EventLogger, cooldown: timedelta = DEFAULT_WAKE_COOLDOWN
-) -> WakeDecision:
-    """Run one heartbeat tick over the assembled graph and return the decision.
+def run_tick(lm: LifeModel, *, logger: EventLogger) -> WakeDecision:
+    """Run one cron heartbeat tick as a **silent watchdog** and never wake.
 
     Hermes-free and side-effecting only through the injected collaborators, so a
-    test drives it with fakes (``FakeClock`` / ``FakeStateStore`` / ...). The
-    orchestration keeps every layer's seam live while hardcoding none of their
-    logic (roadmap "interfaces from day one"):
+    test drives it with fakes (``FakeClock`` / ``FakeStateStore`` / ...).
 
-    1. **Autonomic layer** — each neuron reads state and emits signals onto the
-       bus. The first neuron (``StubTimerNeuron``) lands in 1.2.
-    2. **Accumulate** — sum the consumed signals' pressure *deltas* into
-       ``State.pressure`` (each neuron owns the delta it emitted as its
-       ``salience``; the tick only *sums* them — no threshold/wake logic lives
-       here). This happens *before* the decision so the aggregator weighs the
-       accumulated pressure, not just this tick's transient signals.
-    3. **Aggregation layer** — ask the aggregator for a wake decision against the
-       accumulated pressure. ``ThresholdAggregator`` wakes once it crosses the
-       threshold (1.3); the threshold call is entirely the aggregator's.
-    4. **Drain + cooldown + single-fire (roadmap 1.4)** — an active cooldown
-       *vetoes* a would-be wake (stay asleep even above threshold), so at most one
-       message fires per threshold cycle. When a wake is honoured we **drain**
-       ``State.pressure`` to zero, stamp ``last_contact_at``, and open a fresh
-       ``cooldown_until = now + cooldown``. The threshold call stays the
-       aggregator's; the cooldown is *ours* (HLA §7 "quiet-hours/cooldown —
-       наши"), enforced here as an orchestration guard rather than by widening
-       the pure-threshold aggregator. The emitted wake-packet is enriched with
-       the *prior* contact time (HLA §11) before it is overwritten.
-    5. **Heartbeat bookkeeping** — advance ``tick_count`` and stamp
-       ``last_tick_at`` from the injected clock, then commit atomically. This is
-       the single state writer of the tick (HLA §9); neurons never persist.
-    6. **Observability** — emit the structured ``tick`` event so ``/lifemodel
-       debug`` can answer "last tick" from the event sink (HLA §12).
+    Per the wire-desire-model plan (Task 4), the in-process egress service is
+    the sole decision brain (:mod:`lifemodel.core.decision` /
+    :mod:`lifemodel.egress_service`) — this tick decides nothing and **always**
+    returns :meth:`WakeDecision.stay_asleep`, whatever state it finds:
 
-    Delivery is *not* here: on a wake this tick prints ``wakeAgent: true`` and
-    Hermes' cron wakes the agent and delivers via the gateway (HLA §7 "decision —
-    ours, delivery — gateway"; D1/D4). Draining on the *wake decision* (not on a
-    delivery ack) is deliberate: the tick is the single state writer and cannot
-    observe the async gateway send, and draining here is exactly what guarantees
-    the next tick sees no pressure + an open cooldown → no second message.
+    1. **Liveness watchdog** — while the in-process service's liveness stamp is
+       fresh (:func:`service_is_alive`) it owns state exclusively, so this tick
+       writes nothing and returns immediately (avoids two brains racing the same
+       commit).
+    2. **Heartbeat bookkeeping (fallback only)** — once that stamp goes
+       stale/absent, advance ``tick_count`` and stamp ``last_tick_at`` from the
+       injected clock, then commit — the only reason this cron path still runs
+       at all is so ``/lifemodel debug`` keeps a "last tick" even if the
+       in-process service is down. No proactive fallback: the cron never
+       launches a reach-out on its own (Global Constraint — "both must never
+       disagree, so cron simply never decides").
+    3. **Observability** — emit the structured ``tick`` event either way.
     """
     state = lm.state.load()
     now = lm.clock.now()
 
     # Liveness watchdog (lm-64s, spec §6): while the in-process egress service is
-    # alive it owns the brain (it ticks pressure + decides reach-out itself), so
-    # the cron heartbeat defers here — before any accumulation — and stays a silent
-    # fallback. Pressure is left untouched; the in-proc service is the sole writer
-    # while alive. When the stamp goes stale/absent the cron takes over as the
-    # fallback brain and falls through to the normal tick below.
+    # alive it owns state exclusively, so the cron heartbeat defers here — before
+    # writing anything — and stays a silent fallback. When the stamp goes
+    # stale/absent the cron takes over the (bookkeeping-only) path below.
     if service_is_alive(state, now=now):
-        logger.info(EVENT_TICK, deferred="service_alive", pressure=state.pressure)
+        logger.info(EVENT_TICK, deferred="service_alive")
         return WakeDecision.stay_asleep()
-
-    for neuron in lm.neurons:
-        for signal in neuron.tick(state):
-            lm.bus.publish(signal)
-
-    signals = lm.bus.consume_unprocessed()
-
-    # Orchestration only: sum the deltas the neurons emitted (each carried as a
-    # signal's salience) into the persistent accumulator, *before* deciding — the
-    # aggregator weighs the accumulated ``State.pressure``, not just this tick's
-    # transient signals. Below-threshold pressure keeps growing tick over tick;
-    # whether it is enough to *wake* is the aggregator's call (1.3), never the
-    # tick's — no threshold literal lives here.
-    state.pressure += sum((signal.salience for signal in signals), 0.0)
-    proposed = lm.aggregator.decide(signals, pressure=state.pressure)
-
-    # Cooldown guard (roadmap 1.4): honour a wake only when no cooldown is active.
-    # While ``now < cooldown_until`` we stay asleep even above threshold — this is
-    # the "≤ 1 message per threshold cycle" + cooldown rail. Threading ``now`` +
-    # the stored cooldown here keeps the aggregator a pure thalamus (pressure vs
-    # threshold) and the time/cooldown policy in the orchestrator (HLA §7).
-    in_cooldown = state.cooldown_until is not None and now < datetime.fromisoformat(
-        state.cooldown_until
-    )
-
-    if proposed.wake and proposed.packet is not None and not in_cooldown:
-        # Enrich the packet with the PRIOR contact time (HLA §11: the wake-packet
-        # carries "last contact") before we overwrite ``last_contact_at`` below.
-        decision = WakeDecision.wake_with(
-            replace(proposed.packet, last_contact_at=state.last_contact_at)
-        )
-        # Drain on wake: reset the drive, stamp the contact, open the cooldown.
-        state.pressure = 0.0
-        state.last_contact_at = now.isoformat()
-        state.cooldown_until = (now + cooldown).isoformat()
-    else:
-        # Below threshold, or vetoed by an active cooldown — stay silent (zero
-        # LLM). Pressure is committed as-is so it keeps accumulating toward the
-        # next cycle; the cooldown (if any) stays untouched.
-        decision = WakeDecision.stay_asleep()
 
     state.tick_count += 1
     state.last_tick_at = now.isoformat()
@@ -225,13 +161,9 @@ def run_tick(
         EVENT_TICK,
         tick_count=state.tick_count,
         last_tick_at=state.last_tick_at,
-        pressure=state.pressure,
-        signals=len(signals),
-        wake=decision.wake,
-        in_cooldown=in_cooldown,
-        cooldown_until=state.cooldown_until,
+        wake=False,
     )
-    return decision
+    return WakeDecision.stay_asleep()
 
 
 def main() -> int:
