@@ -7,7 +7,7 @@ guarded wrapper :mod:`tests.test_heartbeat_integration` invokes it as a
 subprocess against an **isolated, throwaway ``HERMES_HOME``**; you can also run
 it by hand for evidence:
 
-    HERMES_HOME=/tmp/iso LIFEMODEL_SRC=$PWD/src \\
+    HERMES_HOME=/tmp/iso LIFEMODEL_SRC=$(dirname "$PWD") \\
         ~/.hermes/hermes-agent/venv/bin/python tests/hermes_heartbeat_integration.py
 
 What it proves against the real scheduler (never the default ``~/.hermes``):

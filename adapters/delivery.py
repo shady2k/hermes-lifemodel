@@ -13,7 +13,7 @@ Hermes.
 
 from __future__ import annotations
 
-from ..logging import EventLogger, get_logger
+from ..log import EventLogger, get_logger
 
 
 class NoopDelivery:

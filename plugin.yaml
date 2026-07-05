@@ -1,7 +1,8 @@
 # hermes-lifemodel plugin manifest.
 #
 # Discovered by Hermes' PluginManager under ~/.hermes/plugins/lifemodel/
-# (dev install: a symlink to this package's src/lifemodel/, so edits track).
+# (dev install: a symlink to this repo — a flat root-layout package, so edits
+# track — installed for real via `hermes plugins install/update`, a git clone).
 # Loading is opt-in via `plugins.enabled` in ~/.hermes/config.yaml.
 name: lifemodel
 version: 0.0.0

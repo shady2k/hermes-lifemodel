@@ -13,9 +13,9 @@ from typing import Any
 
 import pytest
 
-import lifemodel.logging as lm_logging
+import lifemodel.log as lm_logging
 from lifemodel.events import EVENTS_FILENAME, EventSink
-from lifemodel.logging import EventTee, _StdlibEventLogger, configure, get_logger
+from lifemodel.log import EventTee, _StdlibEventLogger, configure, get_logger
 
 
 class _RecordingLogger:

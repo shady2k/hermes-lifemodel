@@ -28,7 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .logging import EventLogger, get_logger
+from .log import EventLogger, get_logger
 
 #: Stable job name — the idempotency key. One heartbeat per profile (HLA D1).
 HEARTBEAT_JOB_NAME = "lifemodel-heartbeat"

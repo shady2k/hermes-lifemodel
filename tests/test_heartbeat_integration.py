@@ -28,7 +28,10 @@ from pathlib import Path
 import pytest
 
 _DRIVER = Path(__file__).resolve().parent / "hermes_heartbeat_integration.py"
-_SRC = Path(__file__).resolve().parent.parent / "src"
+# Flat root-layout: the repo dir IS the `lifemodel` package, so its *parent*
+# (not a `src/` dir — there isn't one anymore) must go on the driver's
+# sys.path for `import lifemodel` to resolve, mirroring the root conftest.py.
+_SRC = Path(__file__).resolve().parent.parent.parent
 
 
 def _candidate_pythons() -> list[Path]:

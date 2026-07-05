@@ -57,7 +57,7 @@ from .adapters.signal_bus import FileSignalBus
 from .core.aggregator import Aggregator, SilentAggregator
 from .core.neuron import Neuron
 from .core.signal_bus import SignalBus
-from .logging import EventLogger
+from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
 from .state.json_store import JsonStateStore

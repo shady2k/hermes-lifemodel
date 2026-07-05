@@ -30,7 +30,7 @@ exercised by its own unit tests / other wake producers), it is simply never fed
 a waking decision from this entrypoint.
 
 **stdout discipline.** Only the single wake-gate line is written to stdout;
-structured logs go to stderr (see :func:`~lifemodel.logging.configure`) and to
+structured logs go to stderr (see :func:`~lifemodel.log.configure`) and to
 the queryable :class:`~lifemodel.events.EventSink`, so nothing corrupts the gate
 the scheduler parses.
 
@@ -51,7 +51,7 @@ from pathlib import Path
 from .composition import LifeModel, build_lifemodel
 from .domain.wake import WakeDecision
 from .events import EVENT_TICK, EVENT_TICK_FAILED, EVENTS_FILENAME, EventSink
-from .logging import EventLogger, EventTee, configure, get_logger
+from .log import EventLogger, EventTee, configure, get_logger
 from .paths import state_dir
 from .state.model import State
 

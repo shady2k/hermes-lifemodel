@@ -52,7 +52,7 @@ def test_install_core_shim_adds_methods_best_effort() -> None:
 
 def test_loop_yields_to_cron_when_reachin_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     from lifemodel import egress_service
-    from lifemodel.logging import get_logger
+    from lifemodel.log import get_logger
 
     ticks: list[int] = []
     monkeypatch.setattr(egress_service, "run_proactive_tick", lambda *a, **k: ticks.append(1))

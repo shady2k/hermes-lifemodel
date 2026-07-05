@@ -41,7 +41,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..logging import EventLogger, get_logger
+from ..log import EventLogger, get_logger
 from .errors import StateCorruptError, StateSchemaError, StateSerializationError
 from .model import SCHEMA_VERSION, State
 

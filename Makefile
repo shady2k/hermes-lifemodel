@@ -10,7 +10,7 @@ help:  ## List the available commands
 check:  ## Run the full quality gate: format check, lint, types, tests
 	uv run ruff format --check .
 	uv run ruff check .
-	uv run mypy src
+	uv run mypy -p lifemodel
 	uv run pytest
 
 fmt:  ## Auto-format the code with ruff

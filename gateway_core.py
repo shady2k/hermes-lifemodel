@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .domain.egress import ReachOutcome
-from .logging import EventLogger, get_logger
+from .log import EventLogger, get_logger
 
 MakeEvent = Callable[[str, Any, int | None], Any]
 Schedule = Callable[[Any, Any], None]

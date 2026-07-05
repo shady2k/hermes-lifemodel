@@ -1,7 +1,3 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "hermes-lifemodel"
 version = "0.0.0"
@@ -10,13 +6,13 @@ requires-python = ">=3.11,<3.12"
 # Runtime deps are deliberately empty: the plugin is loaded inside Hermes' own
 # interpreter (from ~/.hermes/plugins/), not pip-installed into Hermes' venv, so
 # anything Hermes already provides is not vendored here. structlog in particular
-# is only an *optional* logging backend — logging.py falls back to a stdlib shim
+# is only an *optional* logging backend — log.py falls back to a stdlib shim
 # when it is absent — so it is a dev/test dep (below), not a runtime dependency.
 dependencies = []
 
-# src-layout: distribution `hermes-lifemodel`, import package `lifemodel`.
-[tool.hatch.build.targets.wheel]
-packages = ["src/lifemodel"]
+# Flat root-layout: this repo directory IS the `lifemodel` package (no
+# build/wheel step — Hermes' PluginManager loads the install directory's
+# __init__.py + plugin.yaml directly via `hermes plugins install/update`).
 
 # Dev toolchain (PEP 735). `uv sync` installs the `dev` group by default, so
 # `uv run ruff/mypy/pytest` work without an extra flag.
@@ -29,7 +25,7 @@ dev = [
     "mypy",
     "ruff",
     "pre-commit",
-    # Optional runtime backend, required by the tests so logging.py's structlog
+    # Optional runtime backend, required by the tests so log.py's structlog
     # path (and structlog.testing.capture_logs) is still exercised off-host.
     "structlog",
 ]
@@ -37,7 +33,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = [".", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -49,9 +45,34 @@ select = [
     "SIM", # flake8-simplify
 ]
 
+# Flat root-layout: the `lifemodel` package IS the repo directory, so ruff's
+# isort can't auto-detect it as first-party from `src` (it looks for a
+# `lifemodel` entry *inside* the src dirs, not the src dir's own name).
+# Declaring it explicitly keeps `import lifemodel` / `from lifemodel.x import`
+# grouped after third-party imports everywhere (tests included).
+[tool.ruff.lint.isort]
+known-first-party = ["lifemodel"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
+# Flat root-layout: the repo directory itself IS the `lifemodel` package. Its
+# own `__init__.py` (moved to the repo root) is enough for mypy to find the
+# package root by walking up from any file until it hits a directory WITHOUT
+# an `__init__.py` — that's the repo's parent, one level up. `mypy_path = ".."`
+# tells `-p lifemodel` where to look for a top-level package named `lifemodel`
+# (the repo dir itself doesn't contain a `lifemodel/` subdir, so without this
+# it can't be located by name).
+mypy_path = ".."
+# `--explicit-package-bases` requires `--namespace-packages` and is only
+# needed when a package root lacks `__init__.py`; ours doesn't, so it's left
+# off. `tests/` sits directly under the repo root (== the package dir) and has
+# no `__init__.py` of its own — with mypy's default namespace-packages
+# discovery on, `-p lifemodel`'s recursive walk would treat it as an implicit
+# `lifemodel.tests` subpackage and pull every test file into the strict gate.
+# Disabling namespace packages excludes it; our real subpackages all have
+# `__init__.py`, so they're unaffected.
+namespace_packages = false
 
 # The Hermes runtime is not a pip dependency — the plugin is loaded inside
 # Hermes' interpreter. Treat its packages as untyped so `mypy --strict` does

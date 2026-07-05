@@ -22,7 +22,7 @@ from typing import Any
 
 from ..domain.egress import ReachOutcome
 from ..gateway_core import inject_proactive_turn, reachin_available
-from ..logging import EventLogger, get_logger
+from ..log import EventLogger, get_logger
 
 RunnerAccessor = Callable[[], Any | None]
 InjectFn = Callable[..., ReachOutcome]

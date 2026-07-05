@@ -22,7 +22,10 @@ import pytest
 from _hermes_probe import find_hermes_python
 
 _DRIVER = Path(__file__).resolve().parent / "hermes_reachin_integration.py"
-_SRC = Path(__file__).resolve().parent.parent / "src"
+# Flat root-layout: the repo dir IS the `lifemodel` package, so its *parent*
+# (not a `src/` dir — there isn't one anymore) must go on the driver's
+# sys.path for `import lifemodel` to resolve, mirroring the root conftest.py.
+_SRC = Path(__file__).resolve().parent.parent.parent
 
 
 def test_reachin_builds_real_message_event(tmp_path: Path) -> None:

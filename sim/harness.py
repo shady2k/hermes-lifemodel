@@ -26,10 +26,10 @@ import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
-from lifemodel.sim.aggregation import Aggregator, DesireStatus, Verdict
-from lifemodel.sim.drive import Drive
-from lifemodel.sim.quality import Actor, Label, quality_of
-from lifemodel.sim.wake import GateParams, LaneState, evaluate_wake
+from .aggregation import Aggregator, DesireStatus, Verdict
+from .drive import Drive
+from .quality import Actor, Label, quality_of
+from .wake import GateParams, LaneState, evaluate_wake
 
 
 @dataclass(frozen=True)

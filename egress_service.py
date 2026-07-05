@@ -40,7 +40,7 @@ from .domain.egress import ReachOutcome
 from .domain.wake import WakePacket
 from .gateway_core import reachin_available
 from .impulse import compose_impulse
-from .logging import EventLogger
+from .log import EventLogger
 from .ports.proactive import ProactiveEgressPort
 
 

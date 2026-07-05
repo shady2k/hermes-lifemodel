@@ -1,7 +1,7 @@
 """Packaging guard — structlog is a dev/test dep, not a runtime dep (Finding 1).
 
 The plugin loads inside Hermes' own interpreter (from ``~/.hermes/plugins/``),
-not pip-installed into Hermes' venv, and :mod:`lifemodel.logging` treats
+not pip-installed into Hermes' venv, and :mod:`lifemodel.log` treats
 structlog as OPTIONAL with a stdlib fallback. Declaring it as a runtime
 dependency is therefore misleading. It belongs in the dev group, where the tests
 that exercise the structlog logging path still get it. Imports no Hermes.
@@ -28,7 +28,7 @@ def test_structlog_is_not_a_runtime_dependency() -> None:
     runtime = _str_list(project.get("dependencies", []))
     assert not any("structlog" in dep for dep in runtime), (
         "structlog must NOT be a runtime dep: the plugin runs inside Hermes' "
-        "interpreter and logging.py falls back to stdlib when it is absent"
+        "interpreter and log.py falls back to stdlib when it is absent"
     )
 
 

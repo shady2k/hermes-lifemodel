@@ -21,11 +21,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from lifemodel.sim.aggregation import Aggregator, DesireStatus, Verdict
-from lifemodel.sim.drive import Drive
-from lifemodel.sim.quality import Actor, Label, quality_of
-from lifemodel.sim.wake import GateParams, LaneState, evaluate_wake
-from lifemodel.state.model import State
+from ..sim.aggregation import Aggregator, DesireStatus, Verdict
+from ..sim.drive import Drive
+from ..sim.quality import Actor, Label, quality_of
+from ..sim.wake import GateParams, LaneState, evaluate_wake
+from ..state.model import State
 
 #: The BASE prior (``tests/sim/test_sim_scenarios.py::BASE``, spec §9), hardcoded
 #: for Phase 1 (disk hot-reload is Phase 2, bead follow-up).

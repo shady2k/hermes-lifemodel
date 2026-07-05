@@ -20,7 +20,7 @@ Design constraints:
   Hermes, no third-party dependency (the plugin runs in Hermes' interpreter).
 
 This is the event *store*; the tee that feeds it lives with the logger
-(:class:`lifemodel.logging.EventTee`), and the reader is the debug command
+(:class:`lifemodel.log.EventTee`), and the reader is the debug command
 (:mod:`lifemodel.debug`).
 """
 

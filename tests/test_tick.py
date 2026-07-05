@@ -232,7 +232,7 @@ def _last_gate_line(stdout: str) -> dict[str, Any]:
 def test_sink_reads_back_the_last_tick(tmp_path: Path) -> None:
     # The tick event lands in the queryable EventSink so /lifemodel debug can
     # answer "last tick" (HLA §12) — exercised via the real EventTee wiring.
-    from lifemodel.logging import EventTee, get_logger
+    from lifemodel.log import EventTee, get_logger
 
     sink = EventSink(tmp_path / EVENTS_FILENAME)
     logger = EventTee(get_logger("lifemodel.tick.test"), sink)

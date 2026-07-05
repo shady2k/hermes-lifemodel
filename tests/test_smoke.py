@@ -6,7 +6,7 @@ Proves the toolchain (pytest + coverage) runs green on the scaffold.
 from __future__ import annotations
 
 import lifemodel
-from lifemodel.logging import configure, get_logger
+from lifemodel.log import configure, get_logger
 
 
 def test_version_is_importable() -> None:

@@ -35,7 +35,7 @@ from pathlib import Path
 
 from ..core.signal_bus import SignalBus
 from ..domain.signal import Signal
-from ..logging import EventLogger, get_logger
+from ..log import EventLogger, get_logger
 
 _LOG_FILENAME = "signals.log"
 _CONSUMED_FILENAME = "signals.consumed"

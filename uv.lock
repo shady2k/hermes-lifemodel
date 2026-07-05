@@ -95,7 +95,7 @@ wheels = [
 [[package]]
 name = "hermes-lifemodel"
 version = "0.0.0"
-source = { editable = "." }
+source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [

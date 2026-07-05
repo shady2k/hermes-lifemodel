@@ -3,7 +3,7 @@
 This module is the **adapter** between Hermes and the plugin: it is the only
 place that touches the host ``ctx`` and the host ``get_hermes_home()`` API. All
 reusable logic lives in Hermes-free submodules (:mod:`lifemodel.paths`,
-:mod:`lifemodel.logging`), which stay importable and unit-testable in isolation.
+:mod:`lifemodel.log`), which stay importable and unit-testable in isolation.
 
 MVP skeleton (task 0.1): prove the plugin loads and is per-profile aware. It
 registers one introspection command and emits a ``plugin_registered`` event.
@@ -23,7 +23,7 @@ from .events import EVENTS_FILENAME, EventSink
 from .gateway_core import install_core_shim, register_gateway_service
 from .heartbeat import _resolve_home_origin, register_heartbeat
 from .hooks import make_inbound_observer, make_post_llm_observer
-from .logging import EventTee, get_logger
+from .log import EventTee, get_logger
 from .paths import state_dir
 
 __version__ = "0.0.0"
