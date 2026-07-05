@@ -7,7 +7,7 @@ from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.aggregation import ContactAggregation
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import UpdateState
-from lifemodel.core.taxonomy import contact_signal, in_flight_signal
+from lifemodel.core.taxonomy import contact_signal, exchange_signal, in_flight_signal
 from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
 
@@ -107,3 +107,42 @@ def test_aggregation_does_not_write_u_on_normal_tick(tmp_path) -> None:
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
     assert "u" not in changes  # neuron owns u; aggregation only writes it on FULFILL (Task 4)
+
+
+def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        desire_status="active",
+        decline_count=2,
+        declined_at="2026-07-06T03:50:00+00:00",
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"  # desire cleared
+    assert changes["decline_count"] == 0
+    assert changes["declined_at"] is None
+    assert changes["last_exchange_at"] == now.isoformat()
+
+
+def test_exchange_this_tick_suppresses_wake(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=3.0, desire_status="none", last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"  # fresh exchange → SILENCE_WINDOW
+
+
+def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=3.0, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    own = exchange_signal(
+        origin_id="e1", actor="proactive_internal", label="two_way", timestamp=None
+    )
+    changes = _changes(_agg().step(_ctx(state, now, [c, own], tmp_path=tmp_path)))
+    assert changes["last_exchange_at"] is None  # own nudge did not reset the clock
+    assert changes["desire_status"] == "active"  # desire not cleared by own nudge
