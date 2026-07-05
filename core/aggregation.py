@@ -16,11 +16,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..sim.aggregation import Aggregator, DesireStatus
+from ..sim.aggregation import Aggregator, DesireStatus, Verdict
+from ..sim.drive import Drive
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .component import TickContext
 from .intents import Intent, UpdateState
-from .taxonomy import KIND_EXCHANGE, contact_value, is_in_flight, read_exchange
+from .taxonomy import (
+    KIND_EXCHANGE,
+    KIND_VERDICT,
+    contact_value,
+    is_in_flight,
+    read_exchange,
+    read_verdict,
+)
 from .timeutil import minutes_between
 
 
@@ -52,6 +60,9 @@ class ContactAggregation:
         declined_at = state.declined_at
         decline_count = state.decline_count
         agg = Aggregator(status=DesireStatus(state.desire_status))
+        last_contact_at = state.last_contact_at
+        u_out: float | None = None
+        fulfilled = False
 
         # 1) real exchanges reset the policy clocks and clear the desire (before wake)
         for sig in ctx.signals:
@@ -63,9 +74,29 @@ class ContactAggregation:
                     decline_count = 0
                     agg.on_exchange()
 
+        # 2) a verdict resolves the woken desire (after exchange, before wake)
+        for sig in ctx.signals:
+            if sig.kind == KIND_VERDICT:
+                verdict = read_verdict(sig)
+                agg.apply_verdict(verdict)
+                if verdict is Verdict.FULFILL:
+                    drive = Drive(alpha=0.0, beta=self._beta, u_max=self._u_max, u=u_now)
+                    drive.satiate(q=1.0)
+                    u_now = drive.u
+                    u_out = drive.u
+                    fulfilled = True
+                    last_exchange_at = now.isoformat()
+                    last_contact_at = now.isoformat()
+                elif verdict is Verdict.REJECT:
+                    declined_at = now.isoformat()
+                    decline_count += 1
+
         # duration-over-threshold accumulates on the current (risen) u
         dt = minutes_between(state.last_tick_at, now)
-        duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
+        if fulfilled:
+            duration = 0.0
+        else:
+            duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
 
         # wake gates — every quantity as minutes relative to now (now = 0.0)
         exch_min = -minutes_between(last_exchange_at, now) if last_exchange_at is not None else None
@@ -80,14 +111,14 @@ class ContactAggregation:
         if outcome.is_urge:
             agg.on_urge()
 
-        return [
-            UpdateState(
-                {
-                    "desire_status": agg.status.value,
-                    "duration_over_theta": duration,
-                    "last_exchange_at": last_exchange_at,
-                    "declined_at": declined_at,
-                    "decline_count": decline_count,
-                }
-            )
-        ]
+        changes: dict[str, object] = {
+            "desire_status": agg.status.value,
+            "duration_over_theta": duration,
+            "last_exchange_at": last_exchange_at,
+            "declined_at": declined_at,
+            "decline_count": decline_count,
+            "last_contact_at": last_contact_at,
+        }
+        if u_out is not None:
+            changes["u"] = u_out
+        return [UpdateState(changes)]

@@ -7,7 +7,13 @@ from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.aggregation import ContactAggregation
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import UpdateState
-from lifemodel.core.taxonomy import contact_signal, exchange_signal, in_flight_signal
+from lifemodel.core.taxonomy import (
+    contact_signal,
+    exchange_signal,
+    in_flight_signal,
+    verdict_signal,
+)
+from lifemodel.sim.aggregation import Verdict
 from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
 
@@ -146,3 +152,76 @@ def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
     changes = _changes(_agg().step(_ctx(state, now, [c, own], tmp_path=tmp_path)))
     assert changes["last_exchange_at"] is None  # own nudge did not reset the clock
     assert changes["desire_status"] == "active"  # desire not cleared by own nudge
+
+
+def test_fulfill_satiates_u_and_stamps_contact(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=1.5,
+        desire_status="active",
+        duration_over_theta=99.0,
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"
+    assert changes["u"] == 0.5  # 1.5 - beta*1.0
+    assert changes["duration_over_theta"] == 0.0
+    assert changes["last_contact_at"] == now.isoformat()
+    assert changes["last_exchange_at"] == now.isoformat()
+
+
+def test_reject_records_growing_backoff(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=1.5,
+        desire_status="active",
+        decline_count=1,
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"
+    assert changes["decline_count"] == 2
+    assert changes["declined_at"] == now.isoformat()
+    assert "u" not in changes  # reject does not satiate
+
+
+def test_defer_holds_desire_and_keeps_pressure(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.DEFER, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "deferred"
+    assert "u" not in changes  # pressure not dropped
+
+
+def test_fulfill_resets_duration_even_when_u_stays_high(tmp_path) -> None:
+    # FULFILL resets duration_over_theta unconditionally (matching decision.py),
+    # NOT merely because the satiated u fell below theta. Here u=5.0 -> satiate
+    # to 4.0 (still >= theta) but duration must still reset to 0.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=5.0,
+        desire_status="active",
+        duration_over_theta=500.0,
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=5.0, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["u"] == 4.0
+    assert changes["duration_over_theta"] == 0.0  # reset regardless of u
+
+
+def test_reject_then_backoff_blocks_immediate_rewake(tmp_path) -> None:
+    # after a REJECT this tick, the fresh declined_at must veto a wake in the same tick
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=5.0, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=5.0, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"  # rejected + backoff vetoes re-wake
