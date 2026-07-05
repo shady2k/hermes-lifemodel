@@ -19,8 +19,13 @@ immediately: the desire returns to ``none`` and the pending id is cleared, with
 no reject recorded, so the next tick's urge is free to retry rather than being
 stranded mid-flight or wrongly penalized by the growing backoff.
 
-The supervised ``proactive_service_loop`` that drives this on a timer landed in
-task 7 (busy centralization) — see its own docstring below.
+The supervised ``proactive_service_loop`` that drives this on a timer owns the
+sole ``busy`` computation (task 7, HLA/spec RC2): it is the ONE place that
+decides whether a turn is in flight and threads that verdict down through
+``busy=`` into :func:`~lifemodel.core.decision.decide_reachout`'s
+no-wake-in-flight gate. The delivery adapter
+(:class:`~lifemodel.adapters.reachin.ReachInEgress`) no longer second-guesses
+it — see the loop's own docstring below.
 """
 
 from __future__ import annotations
@@ -116,11 +121,13 @@ async def proactive_service_loop(
     """Supervised in-process brain: tick every interval until shutdown.
 
     Waits for the gateway to finish starting (``_running`` True / adapters wired),
-    then loops: each *interval_seconds* it runs one :func:`run_proactive_tick`
-    (marking the session busy if the gateway has an active turn) and stamps
-    liveness. It self-guards on ``_running``/``_draining`` and exits cleanly on
-    shutdown; a tick error is logged and swallowed so one bad tick can't kill the
-    loop (spec §3.2 — runner-owned, isolated, cancellable).
+    then loops: each *interval_seconds* it computes ``busy`` ONCE from the
+    runner — the single accurate source for the no-wake-in-flight gate (task 7;
+    the delivery adapter no longer second-guesses it) — and runs one
+    :func:`run_proactive_tick` with it, then stamps liveness. It self-guards on
+    ``_running``/``_draining`` and exits cleanly on shutdown; a tick error is
+    logged and swallowed so one bad tick can't kill the loop (spec §3.2 —
+    runner-owned, isolated, cancellable).
     """
     import asyncio
 
@@ -152,12 +159,15 @@ async def proactive_service_loop(
             logger.info("proactive_yield_to_cron")
             await asyncio.sleep(interval_seconds)
             continue
-        # INTERIM: no busy-skip. runner._running_agents stays truthy while a session
-        # is merely OPEN (not actively mid-turn), so it wrongly reported "busy" on
-        # every tick and blocked delivery entirely. The reach-in primitive is robust
-        # to an active turn (Hermes merge/FIFO semantics), so we inject regardless.
-        # A precise per-session in-flight check belongs to the upstream primitive
-        # (spec §5/§8).
+        # The ONE busy computation (task 7, HLA/spec RC2): decide_reachout's
+        # no-wake-in-flight gate needs exactly one accurate signal, computed
+        # here and threaded down — the delivery adapter (ReachInEgress) no
+        # longer second-guesses it. `runner._running_agents` was tried and
+        # rejected: it stays truthy while a session is merely OPEN (not
+        # actively mid-turn), so it wrongly reported "busy" on every tick and
+        # blocked delivery entirely. Until the upstream primitive exposes a
+        # precise per-session in-flight signal (spec §5/§8), the accurate
+        # answer is "never veto on this basis" — hence always False.
         busy = False
         try:
             run_proactive_tick(build_lm(), egress, target, logger=logger, busy=busy)

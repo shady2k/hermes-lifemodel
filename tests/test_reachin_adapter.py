@@ -30,14 +30,20 @@ def test_unavailable_when_no_runner() -> None:
     assert egress.reach_out(_TARGET, "hi") is ReachOutcome.UNAVAILABLE
 
 
-def test_skips_when_session_busy() -> None:
+def test_reach_out_does_not_self_skip_on_running_agents() -> None:
+    # Busy ownership is the caller's gate now (the ``busy`` arg threaded into
+    # ``decide_reachout`` by the service loop) — the adapter must not
+    # second-guess it via the stale ``runner._running_agents`` heuristic, which
+    # stays truthy while a session is merely OPEN (not mid-turn).
     calls: list[Any] = []
     egress = ReachInEgress(
         runner_accessor=lambda: _Runner(busy=True),
         inject=lambda *a, **k: calls.append((a, k)) or ReachOutcome.DELIVERED,
     )
-    assert egress.reach_out(_TARGET, "hi") is ReachOutcome.SKIPPED_BUSY
-    assert calls == []  # inject NOT called while busy
+    out = egress.reach_out(_TARGET, "hi")
+    assert out is not ReachOutcome.SKIPPED_BUSY
+    assert out is ReachOutcome.DELIVERED
+    assert calls  # inject IS called even though _running_agents is truthy
 
 
 def test_delegates_to_inject_when_idle() -> None:
