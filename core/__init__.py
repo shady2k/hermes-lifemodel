@@ -12,6 +12,7 @@ adapter. It holds the ABC extension points the system grows by subclassing:
 from __future__ import annotations
 
 from .act_gate import ActGate
+from .aggregation import ContactAggregation
 from .aggregator import Aggregator, SilentAggregator
 from .component import Component, TickContext
 from .contact_neuron import ContactNeuron
@@ -50,6 +51,7 @@ __all__ = [
     "CheckpointState",
     "Component",
     "ComponentManifest",
+    "ContactAggregation",
     "ContactNeuron",
     "ComponentRegistry",
     "CoreLoop",
