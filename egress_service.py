@@ -43,6 +43,13 @@ from .impulse import compose_impulse
 from .log import EventLogger
 from .ports.proactive import ProactiveEgressPort
 
+#: The supervised proactive loop's tick cadence (spec §3.2/§6). The single
+#: source of truth for "~once a minute" — the liveness watchdog in
+#: :mod:`lifemodel.tick` sizes ``SERVICE_LIVENESS_MAX_AGE`` against this, and the
+#: debug dump (spec §3.3 drift-owner table) imports it so the displayed interval
+#: can never drift from the real cadence.
+PROACTIVE_LOOP_INTERVAL_SEC = 60.0
+
 
 def run_proactive_tick(
     lm: LifeModel,
@@ -116,7 +123,7 @@ async def proactive_service_loop(
     target: Mapping[str, str | None],
     runner_accessor: Callable[[], Any | None],
     logger: EventLogger,
-    interval_seconds: float = 60.0,
+    interval_seconds: float = PROACTIVE_LOOP_INTERVAL_SEC,
 ) -> None:
     """Supervised in-process brain: tick every interval until shutdown.
 

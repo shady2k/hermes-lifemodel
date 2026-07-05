@@ -1,12 +1,14 @@
-"""Tests for the debug dump — the owner's read-only inspection (HLA §12, NFR9).
+"""Tests for the structured debug dump — read-only introspection (lm-zmf, HLA §12/NFR9).
 
-Contract under test:
-* the dump reflects a known ``State`` and known ``events.jsonl``, and shows
-  ``n/a`` for event categories nothing has produced yet;
-* it is **read-only** (HLA §9): the state store is never committed to and the
-  signal-bus ledger is never mutated — proven with spies and byte-comparison;
-* an empty / missing dir produces a clean dump without error;
-* it never leaks state to the operator logs (NFR9): the debug path logs nothing.
+Contract under test (spec §4/§7):
+* every section is present with its expected labels (META, TEMPERAMENT, DRIVE,
+  DESIRE LIFECYCLE, TIMING, WAKE READINESS, AUTONOMOUS LOOP);
+* the WAKE READINESS branch is honest about runtime ``in_flight`` — ``n/a`` when
+  ``u < θ`` (cannot matter), ``UNKNOWN`` + a ⚠ caveat when ``u ≥ θ``;
+* the gate verdict and "would launch outreach" are shown separately (the dedup
+  case: gate=URGE but launch=no);
+* an unreadable store yields an ``<unreadable: ...>`` banner, the rest still renders;
+* it is **read-only** (HLA §9): the dump never writes a byte; it logs nothing.
 
 No Hermes is imported.
 """
@@ -14,28 +16,26 @@ No Hermes is imported.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from structlog.testing import capture_logs
 
+from lifemodel.core.introspect import PersonalityReadings, compute_readings
 from lifemodel.debug import render_debug_dump, render_dump_for_dir
 from lifemodel.domain.signal import Signal
 from lifemodel.events import EVENTS_FILENAME, EventSink
 from lifemodel.state.model import SCHEMA_VERSION, State
-from lifemodel.testing.fakes import FakeSignalBus, FakeStateStore
+from lifemodel.testing.fakes import FakeSignalBus
 
 
-class SpyStateStore(FakeStateStore):
-    """A state store that records every ``commit`` so a test can assert none."""
+def at(mins: float) -> datetime:
+    return datetime(2026, 7, 5, 0, 0, tzinfo=UTC) + timedelta(minutes=mins)
 
-    def __init__(self, initial: State | None = None) -> None:
-        super().__init__(initial)
-        self.commits: list[State] = []
 
-    def commit(self, state: State) -> None:
-        self.commits.append(state)
-        super().commit(state)
+def _readings(state: State, *, now: datetime) -> PersonalityReadings:
+    return compute_readings(state, now=now)
 
 
 def _events(tmp_path: Path, *records: dict[str, object]) -> EventSink:
@@ -52,63 +52,191 @@ def _line(dump: str, label: str) -> str:
     return matches[0]
 
 
-def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> None:
-    state = FakeStateStore(
-        State(
-            u=2.5,
-            energy=0.8,
-            last_tick_at="2026-07-03T12:00:00Z",
-        )
+def _rung(dump: str, name: str) -> str:
+    """The single wake-gate ladder rung line for *name* (indented under the ladder)."""
+    matches = [line for line in dump.splitlines() if line.startswith(f"    {name}")]
+    assert len(matches) == 1, f"expected one ladder rung {name!r}, got {matches}"
+    return matches[0]
+
+
+# --- section presence + values ---------------------------------------------------------------
+
+
+def test_all_sections_present_with_expected_labels(tmp_path: Path) -> None:
+    state = State(
+        u=2.5,
+        energy=0.8,
+        tick_count=668,
+        last_tick_at=at(0).isoformat(),
     )
     bus = FakeSignalBus()
     bus.publish(Signal(origin_id="msg-9", kind="incoming"))
-    # Only a tick event was produced; wake/act/dream must show n/a.
-    events = _events(tmp_path, {"event": "tick", "pressure": 2.5, "energy": 0.8})
 
-    dump = render_debug_dump(state=state, bus=bus, events=events)
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(10)), bus=bus, events=_events(tmp_path)
+    )
 
-    # --- state values present, each on its own line ---
+    # every section header
+    for header in (
+        "META",
+        "TEMPERAMENT",
+        "DRIVE",
+        "DESIRE LIFECYCLE",
+        "TIMING",
+        "WAKE READINESS",
+        "AUTONOMOUS LOOP",
+    ):
+        assert header in dump
+    # META values
     assert str(SCHEMA_VERSION) in _line(dump, "schema_version:")
-    assert "2.5" in _line(dump, "u:")
-    assert "0.8" in _line(dump, "energy:")
-    assert "2026-07-03T12:00:00Z" in _line(dump, "last_tick_at:")
-    assert "n/a" in _line(dump, "last_contact_at:")  # None → n/a
-    # dedup is not a State metric: the dump must not surface processed_signal_ids
-    assert "processed_signal_ids" not in dump
-    # --- bus summary ---
-    assert "1" in _line(dump, "unprocessed:")
+    assert "668" in _line(dump, "tick_count:")
+    # TEMPERAMENT imports the real constants (no restated formulas)
+    assert "wake threshold θ:" in dump
+    assert "silence window w:" in dump
+    assert "pending-verdict timeout:" in dump
+    # DRIVE surfaces the risen urge (persisted 2.5 + 10 min of silence → ~254% of θ)
+    assert "254% of θ" in _line(dump, "u:")
+    assert "duration_over_theta:" in dump
+    assert "tracked; not currently gating" in dump
+    assert "energy:" in dump and "placeholder" in dump
+    # DESIRE LIFECYCLE
+    assert "desire_status:" in dump
+    assert "pending:" in dump
+    assert "decline_count:" in dump
+    # TIMING
+    assert "last_exchange:" in dump
+    assert "last_contact:" in dump
+    assert "last_tick:" in dump
+    # WAKE READINESS shows verdict + launch distinctly
+    assert "gate verdict:" in dump
+    assert "would launch outreach:" in dump
+    assert "assuming in_flight=false" in dump
+    # AUTONOMOUS LOOP
+    assert "1" in _line(dump, "signal bus unprocessed:")
     assert "incoming(msg-9)" in _line(dump, "recent:")
-    # --- events: tick populated, the rest n/a ---
-    assert "pressure=2.5" in _line(dump, "last tick:")
-    assert "n/a" in _line(dump, "last wake_decision:")
-    assert "n/a" in _line(dump, "last act_gate:")
-    assert "n/a" in _line(dump, "last dream_run:")
-    # --- lock status is n/a in Phase 1 ---
-    assert "n/a" in _line(dump, "lock status:")
+    assert "lock status:" in dump
 
 
-# NOTE: an acceptance test used to live here exercising `run_tick` twice and
-# asserting the debug dump reflected accumulated `State.pressure`. `run_tick`
-# still drives the retired cron pressure/cooldown decision path (`state.pressure
-# += ...`); that path is deleted in Task 3/4 of the desire-model wiring plan
-# (docs/superpowers/plans/2026-07-05-wire-desire-model-into-plugin.md), which
-# also restores an equivalent debug-dump-via-real-ticks acceptance test against
-# the new lifecycle fields. Task 1 only removes the field from `State` — it does
-# not touch `tick.py`.
+def test_absent_events_render_na_in_loop_summary(tmp_path: Path) -> None:
+    state = State(last_tick_at=at(0).isoformat())
+    # Only a tick event; wake/act/dream must show n/a in the compact summary.
+    events = _events(tmp_path, {"event": "tick", "deferred": "service_alive"})
+
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(1)), bus=FakeSignalBus(), events=events
+    )
+
+    assert "deferred=service_alive" in _line(dump, "last tick outcome:")
+    summary = _line(dump, "events:")
+    assert "wake_decision n/a" in summary
+    assert "act_gate n/a" in summary
+    assert "dream_run n/a" in summary
 
 
-def test_dump_is_read_only_never_commits_state(tmp_path: Path) -> None:
-    state = SpyStateStore(State(u=1.0))
-    bus = FakeSignalBus()
+# --- the in_flight honesty branch (must-fix 1 & 2) --------------------------------------------
 
-    render_debug_dump(state=state, bus=bus, events=_events(tmp_path))
 
-    assert state.commits == []  # the debug path never writes state
+def test_below_threshold_shows_in_flight_na_and_no_warning(tmp_path: Path) -> None:
+    # u stays well under θ: in_flight cannot matter, so no runtime caveat.
+    state = State(last_tick_at=at(0).isoformat())  # u=0
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(10)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+    assert "n/a" in _rung(dump, "in_flight")
+    assert "⚠" not in dump
+
+
+def test_over_threshold_shows_in_flight_unknown_with_warning(tmp_path: Path) -> None:
+    # u over θ with no exchange/decline → gate=URGE; in_flight is runtime-only.
+    state = State(u=50.0, last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(10)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+    assert "UNKNOWN" in _rung(dump, "in_flight")
+    assert "⚠" in dump
+    assert "no_wake_in_flight" in dump  # the caveat names the real runtime verdict
+
+
+def test_gate_verdict_and_would_launch_shown_separately_for_dedup(tmp_path: Path) -> None:
+    # Gate clears (URGE) but a desire is already live → no launch (Aggregator dedup).
+    state = State(u=50.0, desire_status="active", last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(10)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+    assert "URGE" in _line(dump, "gate verdict:")
+    launch = _line(dump, "would launch outreach:")
+    assert launch.startswith("  would launch outreach: no")
+    assert "Aggregator dedup" in launch
+
+
+def test_clean_urge_launches_and_ladder_reached(tmp_path: Path) -> None:
+    state = State(last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(240)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+    assert _line(dump, "would launch outreach:").startswith("  would launch outreach: yes")
+    assert "reached" in _rung(dump, "urge")
+
+
+def test_drive_and_wake_agree_on_urge_pct_for_stale_last_tick(tmp_path: Path) -> None:
+    # Stale last_tick_at: persisted u=0 but risen u ≥ θ. DRIVE's headline urge and
+    # WAKE's "urge now (risen)" must show the same % of θ — no self-contradiction
+    # (must-fix 2 regression).
+    state = State(u=0.0, last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(300)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+
+    drive_pct = _pct_of_theta(_line(dump, "u:"))
+    wake_pct = _pct_of_theta(_line(dump, "urge now (risen):"))
+    assert drive_pct == wake_pct
+    assert drive_pct >= 100  # risen past θ despite persisted u=0
+
+
+def _pct_of_theta(line: str) -> float:
+    import re
+
+    match = re.search(r"\((\d+)% of θ", line)
+    assert match, f"no 'N% of θ' in line: {line!r}"
+    return float(match.group(1))
+
+
+def test_loop_section_shows_imported_proactive_interval(tmp_path: Path) -> None:
+    from lifemodel.egress_service import PROACTIVE_LOOP_INTERVAL_SEC
+
+    state = State(last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(1)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+    interval_line = _line(dump, "proactive loop interval:")
+    assert f"{PROACTIVE_LOOP_INTERVAL_SEC:g} s" in interval_line
+
+
+def test_stale_pending_recovery_surfaced(tmp_path: Path) -> None:
+    from lifemodel.core.decision import PENDING_TIMEOUT_MIN
+
+    state = State(
+        u=99.0,
+        desire_status="active",
+        pending_proactive_id="p1",
+        pending_proactive_since=at(0).isoformat(),
+        last_tick_at=at(0).isoformat(),
+    )
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(PENDING_TIMEOUT_MIN)),
+        bus=FakeSignalBus(),
+        events=_events(tmp_path),
+    )
+    stale = _line(dump, "stale-pending recovery:")
+    assert "fires" in stale and "REJECT" in stale
+
+
+# --- read-only + degradation + privacy -------------------------------------------------------
 
 
 def test_render_dump_for_dir_leaves_files_byte_identical(tmp_path: Path) -> None:
     # Seed a real state.json + a consumed ledger, then prove the dump mutates
-    # neither (read-only, HLA §9).
+    # neither (read-only, HLA §9) — including the live decision run on a copy.
     from lifemodel.adapters.signal_bus import FileSignalBus
     from lifemodel.state.json_store import JsonStateStore
 
@@ -124,17 +252,17 @@ def test_render_dump_for_dir_leaves_files_byte_identical(tmp_path: Path) -> None
     dump = render_dump_for_dir(tmp_path)
 
     after = {name: (tmp_path / name).read_bytes() for name in tracked}
-    assert after == before  # nothing on disk changed
-    assert "1" in _line(dump, "unprocessed:")  # s2 still pending after the peek
-    assert "3.0" in _line(dump, "u:")  # the committed state is reflected
+    assert after == before  # nothing on disk changed — the copy never reached disk
+    assert "1" in _line(dump, "signal bus unprocessed:")  # s2 still pending after the peek
+    assert "(300% of θ)" in _line(dump, "u:")  # the committed u=3.0 is reflected
 
 
 def test_render_dump_for_dir_routes_through_the_composition_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Finding 2: debug must build its object graph via the SINGLE composition
-    # root (build_lifemodel), not a divergent second wiring — so a later change
-    # to build_lifemodel's defaults is reflected by the debug dump automatically.
+    # debug must build its object graph via the SINGLE composition root
+    # (build_lifemodel), not a divergent second wiring — so a later change to
+    # build_lifemodel's defaults is reflected by the debug dump automatically.
     from lifemodel.composition import build_lifemodel as real_build
 
     seen: list[Path] = []
@@ -156,9 +284,9 @@ def test_dump_on_empty_dir_is_clean(tmp_path: Path) -> None:
 
     assert "unreadable" not in dump
     assert str(SCHEMA_VERSION) in _line(dump, "schema_version:")
-    assert "0.0" in _line(dump, "u:")  # documented default State
-    assert "0" in _line(dump, "unprocessed:")
-    assert "n/a" in _line(dump, "last tick:")
+    assert "(0% of θ)" in _line(dump, "u:")  # documented default State (u=0)
+    assert "0" in _line(dump, "signal bus unprocessed:")
+    assert "n/a" in _line(dump, "last tick outcome:")
     # Read-only: inspecting an empty dir must not create any files.
     assert not any(tmp_path.iterdir())
 
@@ -170,8 +298,11 @@ def test_dump_survives_a_corrupt_state_file(tmp_path: Path) -> None:
 
     # A debug tool must report the breakage, not crash on it.
     assert "unreadable" in dump
+    # The constant TEMPERAMENT block still renders (it needs no state).
+    assert "TEMPERAMENT" in dump
     # Other sections still render.
-    assert "0" in _line(dump, "unprocessed:")
+    assert "0" in _line(dump, "signal bus unprocessed:")
+    assert "n/a" in _line(dump, "lock status:")
 
 
 def test_debug_path_emits_nothing_to_operator_logs(tmp_path: Path) -> None:
