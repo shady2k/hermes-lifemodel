@@ -14,6 +14,7 @@ from __future__ import annotations
 from .act_gate import ActGate
 from .aggregator import Aggregator, SilentAggregator
 from .component import Component, TickContext
+from .coreloop import CoreLoop, TickReport
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
@@ -33,6 +34,7 @@ __all__ = [
     "Component",
     "ComponentManifest",
     "ComponentRegistry",
+    "CoreLoop",
     "DuplicateComponent",
     "EmitSignal",
     "Intent",
@@ -43,6 +45,7 @@ __all__ = [
     "SilentAggregator",
     "StateActor",
     "TickContext",
+    "TickReport",
     "UnknownComponent",
     "UnknownStateField",
     "UpdateState",
