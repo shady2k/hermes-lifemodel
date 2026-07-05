@@ -17,6 +17,7 @@ from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
 from .signal_bus import SignalBus
+from .state_actor import StateActor, UnknownStateField
 
 __all__ = [
     "ActGate",
@@ -29,5 +30,7 @@ __all__ = [
     "ProcessingLayer",
     "SignalBus",
     "SilentAggregator",
+    "StateActor",
+    "UnknownStateField",
     "UpdateState",
 ]
