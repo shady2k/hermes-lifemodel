@@ -37,6 +37,7 @@ from .core.introspect import (
     temperament,
 )
 from .domain.signal import Signal
+from .egress_service import PROACTIVE_LOOP_INTERVAL_SEC
 from .events import (
     EVENT_ACT_GATE,
     EVENT_DREAM_RUN,
@@ -182,11 +183,14 @@ def _temperament_section(temp: Temperament) -> list[str]:
 
 
 def _drive_section(r: PersonalityReadings) -> list[str]:
-    pct = r.u_persisted / temp_theta(r) * 100
+    # DRIVE reads the SAME risen urge as WAKE READINESS (must-fix 2): the section
+    # is titled "right now", so the headline is the post-decision urge (risen by
+    # elapsed silence since last_tick), never the stale persisted value.
+    pct = r.u_risen / temp_theta(r) * 100
     out = [
         "DRIVE  (the contact urge right now)",
-        f"  {'u:':21} {_num(r.u_persisted)}   ({pct:.0f}% of θ)"
-        "   ← strength of the pull to reach out",
+        f"  {'u:':21} {_num(r.u_risen)}   ({pct:.0f}% of θ)"
+        "   ← urge right now, risen as of last_tick",
         f"  {'duration_over_theta:':21} {r.duration_over_theta:.1f} min"
         "   ← time u has sat ≥ θ (tracked; not currently gating) [lm-zhz]",
         f"  {'energy:':21} {r.energy:.1f} (placeholder)"
@@ -285,6 +289,8 @@ def _loop_section(
     # in-process egress service liveness (alive-bool computed against the imported
     # SERVICE_LIVENESS_MAX_AGE — spec §3.3; the raw stamp + ago come from readings).
     out.append(f"  {'in-proc egress service:':27} {_egress_label(r)}")
+    # the loop cadence — imported from its owner so it can never drift (must-fix 4).
+    out.append(f"  {'proactive loop interval:':27} {PROACTIVE_LOOP_INTERVAL_SEC:g} s")
 
     # structured events (read-only)
     try:
@@ -320,12 +326,15 @@ def _drive_interpretation(r: PersonalityReadings) -> str:
 
 
 def _desire_interpretation(r: PersonalityReadings) -> str:
+    # The lifecycle reflects the post-decision snapshot, so a recovery that fired
+    # this eval already shows up as (none + a fresh decline): explain both halves.
     if r.stale_pending_recovery:
-        age = r.stale_pending_age_min
         return (
-            f"stale pending ({_fmt_ago(age)}) — the next tick recovers it as REJECT "
-            f"(≥ {r.temperament.pending_timeout_min:.0f} min)"
+            f"recovered a stale pending as REJECT ({_fmt_ago(r.stale_pending_age_min)}); "
+            f"in decline backoff ({_fmt_until(r.backoff_remaining_min)} left)"
         )
+    if r.desire_status == "active":
+        return "woken this eval; awaiting a verdict"
     if r.pending:
         return "a proactive turn is pending; awaiting its post-llm_call verdict"
     if r.backoff_remaining_min is not None:

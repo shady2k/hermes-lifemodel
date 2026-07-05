@@ -94,8 +94,8 @@ def test_all_sections_present_with_expected_labels(tmp_path: Path) -> None:
     assert "wake threshold θ:" in dump
     assert "silence window w:" in dump
     assert "pending-verdict timeout:" in dump
-    # DRIVE surfaces the persisted urge + the tracked-not-gating duration field
-    assert "2.5" in _line(dump, "u:")
+    # DRIVE surfaces the risen urge (persisted 2.5 + 10 min of silence → ~254% of θ)
+    assert "254% of θ" in _line(dump, "u:")
     assert "duration_over_theta:" in dump
     assert "tracked; not currently gating" in dump
     assert "energy:" in dump and "placeholder" in dump
@@ -176,6 +176,40 @@ def test_clean_urge_launches_and_ladder_reached(tmp_path: Path) -> None:
     )
     assert _line(dump, "would launch outreach:").startswith("  would launch outreach: yes")
     assert "reached" in _rung(dump, "urge")
+
+
+def test_drive_and_wake_agree_on_urge_pct_for_stale_last_tick(tmp_path: Path) -> None:
+    # Stale last_tick_at: persisted u=0 but risen u ≥ θ. DRIVE's headline urge and
+    # WAKE's "urge now (risen)" must show the same % of θ — no self-contradiction
+    # (must-fix 2 regression).
+    state = State(u=0.0, last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(300)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+
+    drive_pct = _pct_of_theta(_line(dump, "u:"))
+    wake_pct = _pct_of_theta(_line(dump, "urge now (risen):"))
+    assert drive_pct == wake_pct
+    assert drive_pct >= 100  # risen past θ despite persisted u=0
+
+
+def _pct_of_theta(line: str) -> float:
+    import re
+
+    match = re.search(r"\((\d+)% of θ", line)
+    assert match, f"no 'N% of θ' in line: {line!r}"
+    return float(match.group(1))
+
+
+def test_loop_section_shows_imported_proactive_interval(tmp_path: Path) -> None:
+    from lifemodel.egress_service import PROACTIVE_LOOP_INTERVAL_SEC
+
+    state = State(last_tick_at=at(0).isoformat())
+    dump = render_debug_dump(
+        readings=_readings(state, now=at(1)), bus=FakeSignalBus(), events=_events(tmp_path)
+    )
+    interval_line = _line(dump, "proactive loop interval:")
+    assert f"{PROACTIVE_LOOP_INTERVAL_SEC:g} s" in interval_line
 
 
 def test_stale_pending_recovery_surfaced(tmp_path: Path) -> None:

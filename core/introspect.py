@@ -99,15 +99,17 @@ class PersonalityReadings:
     # --- TEMPERAMENT (fixed nature) ---
     temperament: Temperament
 
-    # --- DRIVE (the contact urge now; persisted u + risen u) ---
-    u_persisted: float
+    # --- DRIVE (the contact urge right now — risen "as of now" from snapshot) ---
+    #: The risen urge ``u`` after the elapsed-since-``last_tick`` rise has been
+    #: applied by the decision run. DRIVE and WAKE READINESS read the SAME value
+    #: so the two sections can never contradict (must-fix 2).
     u_risen: float
     duration_over_theta: float
     energy: float
     #: Minutes of continued silence until ``u`` reaches θ; ``None`` once at/over.
     time_to_theta_min: float | None
 
-    # --- DESIRE LIFECYCLE (persisted) ---
+    # --- DESIRE LIFECYCLE (post-decision snapshot — consistent with the verdict) ---
     desire_status: str
     pending: bool
     decline_count: int
@@ -175,11 +177,18 @@ def compute_readings(
     temp = temperament()
 
     # Stale-pending detection runs against the PERSISTED state (before the copy),
-    # so the renderer can flag "the next tick would recover this as REJECT" even
-    # though the copy's own verdict already reflects the post-rejection backoff.
+    # so the renderer can flag "this eval recovered a stale pending as REJECT".
     stale_recovery, stale_age = _stale_pending(state, now=now)
 
-    # The honest verdict: the real decision, on a copy, as of now.
+    # The honest verdict: the real decision, on a copy, as of now. After this call
+    # `snapshot` holds the post-decision "as of now" state — the risen urge, the
+    # resolved desire lifecycle, any recovery-applied REJECT. INVARIANT: every
+    # "current state" reading (drive, desire lifecycle, wake readiness) is derived
+    # from `snapshot`, so the dump can never contradict itself (e.g. a recovery
+    # that the verdict reflects but the lifecycle section denied). Only the on-disk
+    # header (schema/tick_count) and the historical timestamps (last exchange /
+    # contact / tick, egress stamp — none of which the decision touches) come from
+    # the persisted `state`.
     snapshot = copy.deepcopy(state)
     decision: ReachoutDecision = decide_reachout(snapshot, now=now, busy=busy)
     u_risen = snapshot.u
@@ -189,16 +198,15 @@ def compute_readings(
         schema_version=state.schema_version,
         tick_count=state.tick_count,
         temperament=temp,
-        u_persisted=state.u,
         u_risen=u_risen,
-        duration_over_theta=state.duration_over_theta,
-        energy=state.energy,
+        duration_over_theta=snapshot.duration_over_theta,
+        energy=snapshot.energy,
         time_to_theta_min=None if risen_over_theta else (THETA - u_risen) / ALPHA,
-        desire_status=state.desire_status,
-        pending=state.pending_proactive_id is not None,
-        decline_count=state.decline_count,
-        declined_at=state.declined_at,
-        backoff_remaining_min=_backoff_remaining(state, now=now),
+        desire_status=snapshot.desire_status,
+        pending=snapshot.pending_proactive_id is not None,
+        decline_count=snapshot.decline_count,
+        declined_at=snapshot.declined_at,
+        backoff_remaining_min=_backoff_remaining(snapshot, now=now),
         stale_pending_recovery=stale_recovery,
         stale_pending_age_min=stale_age,
         last_exchange_at=state.last_exchange_at,
@@ -211,7 +219,7 @@ def compute_readings(
         would_launch=decision.wake,
         risen_over_theta=risen_over_theta,
         silence_window_remaining_min=_silence_window_remaining(
-            state, now=now, w=temp.base_params.w
+            snapshot, now=now, w=temp.base_params.w
         ),
         gate_ladder=_gate_ladder(
             decision=decision, snapshot=snapshot, snapshot_u=u_risen, now=now, temp=temp

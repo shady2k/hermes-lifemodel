@@ -129,10 +129,38 @@ def test_stale_pending_recovery_is_flagged_and_verdict_reflects_reject():
     # The recovered REJECT stamps a fresh decline → the verdict reflects the backoff.
     assert r.gate_verdict == WakeOutcome.DECLINE_BACKOFF.value
     assert r.would_launch is False
+
+    # SNAPSHOT CONSISTENCY (must-fix 1/3): the lifecycle readings are derived from
+    # the post-decision snapshot, so they reflect the recovery the verdict saw —
+    # not the persisted state, which still has the stale active+pending desire.
+    assert r.desire_status == "none"  # REJECT resolved the desire
+    assert r.pending is False  # …and cleared the pending bookkeeping
+    assert r.decline_count == 1  # the recovery's first decline
+    assert r.declined_at is not None
+    expected_r1 = backoff_interval(
+        decline_count=1, r0=BASE_PARAMS.r0, k=BASE_PARAMS.k, r_max=BASE_PARAMS.r_max
+    )
+    assert r.backoff_remaining_min == pytest.approx(expected_r1, abs=1e-9)
+
     # The original (persisted) state is untouched — recovery only ran on the copy.
     assert s.desire_status == "active"
     assert s.decline_count == 0
     assert s.pending_proactive_id == "p1"
+
+
+def test_stale_last_tick_rises_u_so_drive_and_wake_agree():
+    # A stale `last_tick_at` means the elapsed-since-last-tick rise is large: the
+    # persisted u is 0, but "right now" u has risen past θ. DRIVE (u now) and WAKE
+    # READINESS (urge now risen) must read the SAME post-decision urge — the bug
+    # they regress is DRIVE showing persisted 0% while WAKE says ≥θ (must-fix 2).
+    s = State(u=0.0, last_tick_at=at(0).isoformat())  # persisted u = 0
+    r = compute_readings(s, now=at(300), busy=False)  # 300 min of silence → u ≥ θ
+
+    assert r.u_risen >= THETA  # risen past θ, even though persisted u was 0
+    assert r.u_risen > 0.0
+    assert r.gate_verdict == WakeOutcome.URGE.value
+    # The persisted state is untouched (no rise leaked back).
+    assert s.u == 0.0
 
 
 def test_fresh_pending_is_not_flagged_as_stale():
