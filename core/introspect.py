@@ -87,9 +87,10 @@ class PersonalityReadings:
     """Everything the debug renderer needs, already computed (spec §3.1/§4).
 
     Frozen and pure: building it never touches disk. The temperament block is
-    constant; the drive / lifecycle / timing blocks echo persisted ``State``; the
-    wake-readiness block reflects the deep-copy decision run. See module docstring
-    for the no-drift and read-only invariants.
+    constant; the timing block echoes the persisted timestamps; the drive,
+    lifecycle, and wake-readiness blocks all reflect one consistent post-decision
+    snapshot (a single deep-copy ``decide_reachout`` run) so they never contradict
+    each other. See module docstring for the no-drift and read-only invariants.
     """
 
     # --- META ---
