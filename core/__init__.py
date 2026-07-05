@@ -14,6 +14,7 @@ from __future__ import annotations
 from .act_gate import ActGate
 from .aggregator import Aggregator, SilentAggregator
 from .component import Component, TickContext
+from .contact_neuron import ContactNeuron
 from .coreloop import CoreLoop, TickReport
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
@@ -34,6 +35,7 @@ from .taxonomy import (
     is_kind,
     read_exchange,
 )
+from .timeutil import minutes_between
 
 __all__ = [
     "ActGate",
@@ -41,6 +43,7 @@ __all__ = [
     "CheckpointState",
     "Component",
     "ComponentManifest",
+    "ContactNeuron",
     "ComponentRegistry",
     "CoreLoop",
     "DuplicateComponent",
@@ -62,5 +65,6 @@ __all__ = [
     "contact_signal",
     "exchange_signal",
     "is_kind",
+    "minutes_between",
     "read_exchange",
 ]
