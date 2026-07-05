@@ -36,6 +36,17 @@ THETA = 1.0
 
 BASE_PARAMS = GateParams(theta_u=THETA, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
 
+#: If the ``post_llm_call`` verdict for an outstanding proactive turn never
+#: arrives (missed hook, mis-correlation — the correlation caveat
+#: ``hooks.py``'s module docstring already documents), an ``active`` desire
+#: would otherwise sit forever with ``pending_proactive_id`` set. Because
+#: ``decide_reachout`` dedups every further urge against a live desire (the
+#: anti-drum guarantee), that would silence the being permanently. This is the
+#: timeout after which such a stale pending verdict is released *silently* (no
+#: reject — a lost verdict is not cognition's "nothing to say") so a fresh urge
+#: can wake again.
+PENDING_TIMEOUT_MIN = 30.0
+
 
 @dataclass(frozen=True)
 class ReachoutDecision:
@@ -46,10 +57,23 @@ class ReachoutDecision:
 
 
 def _minutes_between(a_iso: str | None, b: datetime) -> float:
-    """Minutes from ``a_iso`` to ``b`` (``0.0`` if ``a_iso`` is ``None``)."""
+    """Minutes from ``a_iso`` to ``b``.
+
+    Returns ``0.0`` — "no elapsed rise this tick" — for ``None``, an
+    unparseable string, or a timezone-*naive* value, rather than raising.
+    Defensive on purpose: ``state.last_tick_at`` (unlike the other timestamp
+    fields) is validated by ``State.from_dict`` only as an opaque string, never
+    as a parsed instant (see that field's docstring), so a malformed or
+    tz-naive value can legitimately reach here and must not crash the tick.
+    """
     if a_iso is None:
         return 0.0
-    a = datetime.fromisoformat(a_iso)
+    try:
+        a = datetime.fromisoformat(a_iso)
+    except ValueError:
+        return 0.0
+    if a.tzinfo is None or a.utcoffset() is None:
+        return 0.0
     return (b - a).total_seconds() / 60.0
 
 
@@ -60,7 +84,22 @@ def decide_reachout(state: State, *, now: datetime, busy: bool) -> ReachoutDecis
     ``last_tick_at``) and creates ONE ``active`` desire on a clean URGE — a second
     urge while one is already live (active or deferred) is deduped, never a
     second wake (the anti-drum guarantee).
+
+    STALE-PENDING RECOVERY (before anything else): an ``active`` desire whose
+    ``pending_proactive_since`` is older than :data:`PENDING_TIMEOUT_MIN` means
+    the ``post_llm_call`` verdict never arrived — release it silently (no
+    reject recorded) so the anti-drum dedup above does not silence the being
+    forever waiting on a verdict that is never coming.
     """
+    if (
+        state.desire_status == "active"
+        and state.pending_proactive_since is not None
+        and _minutes_between(state.pending_proactive_since, now) >= PENDING_TIMEOUT_MIN
+    ):
+        state.desire_status = "none"
+        state.pending_proactive_id = None
+        state.pending_proactive_since = None
+
     dt = _minutes_between(state.last_tick_at, now)
     drive = Drive(alpha=ALPHA, beta=BETA, u_max=U_MAX, u=state.u)
     if dt > 0:
@@ -102,6 +141,16 @@ def observe_exchange(state: State, *, actor: Actor, label: Label, now: datetime)
     An internal ``proactive_internal`` impulse is a no-op — it never satiates
     the drive and never touches the exchange clock (spec §6's load-bearing
     rule: the being must not satiate its own urge with its own nudge).
+
+    Also clears any outstanding ``pending_proactive_id``/``pending_proactive_since``
+    (blocker fix): a genuine exchange landing while a proactive turn is pending
+    resolves that desire *now* (via :func:`Aggregator.on_exchange` below) — if
+    the pending bookkeeping were left behind, the proactive turn's own delayed
+    ``post_llm_call`` verdict would later still correlate and apply a stale
+    verdict (a reject after real contact, or a double satiate) to a desire that
+    is no longer live. See also ``hooks.py``'s ``make_post_llm_observer`` guard,
+    which independently refuses to apply a verdict once ``desire_status`` is no
+    longer ``"active"``.
     """
     if actor == "proactive_internal":
         return
@@ -114,6 +163,8 @@ def observe_exchange(state: State, *, actor: Actor, label: Label, now: datetime)
     state.last_exchange_at = now.isoformat()
     state.declined_at = None
     state.decline_count = 0
+    state.pending_proactive_id = None
+    state.pending_proactive_since = None
 
     agg = Aggregator(status=DesireStatus(state.desire_status))
     agg.on_exchange()

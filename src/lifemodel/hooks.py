@@ -136,7 +136,13 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
     (``session_id``, ``task_id``, ``turn_id``, ``conversation_history``,
     ``model``, ``platform``, ``telemetry_schema_version``, ...) is accepted
     and ignored. A turn that does not correlate to the pending proactive
-    desire (see :func:`_is_pending_proactive_turn`) is a no-op.
+    desire (see :func:`_is_pending_proactive_turn`) is a no-op — as is a turn
+    that correlates on id/text but whose desire is no longer live
+    (``desire_status != "active"``): a genuine user exchange may have already
+    resolved it (``core.decision.observe_exchange`` clears the pending
+    bookkeeping, but this guard is a second, independent line of defense
+    against applying a stale verdict to a desire nothing pending should still
+    resolve).
     """
 
     def _observer(
@@ -147,6 +153,8 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
     ) -> None:
         state = lm.state.load()
         if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
+            return
+        if state.desire_status != "active":
             return
         verdict = Verdict.REJECT if _is_no_reply(assistant_response) else Verdict.FULFILL
         apply_verdict(state, verdict, now=lm.clock.now())

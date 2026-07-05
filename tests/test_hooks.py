@@ -174,6 +174,48 @@ def test_impulse_text_ignored_when_nothing_pending() -> None:
     assert s.decline_count == 0
 
 
+def test_post_llm_call_ignores_verdict_when_desire_already_resolved() -> None:
+    # BLOCKER 2b — defense in depth: even if pending_proactive_id is still on
+    # record (e.g. some other codepath resolved the desire without clearing
+    # it), the observer must not apply a verdict to a desire that is no
+    # longer live (desire_status != "active").
+    lm = make_lm_pending(pending_id="p1")
+    state = lm.state.load()
+    state.desire_status = "none"  # resolved by some other path; pending id left stale
+    lm.state.commit(state)
+
+    make_post_llm_observer(lm)(**_fake_payload(proactive=True, text="NO_REPLY"))
+
+    s = lm.state.load()
+    assert s.decline_count == 0
+    assert s.declined_at is None
+
+
+def test_user_exchange_then_stale_post_llm_call_applies_no_verdict_end_to_end() -> None:
+    # BLOCKER 2 end-to-end: a genuine user exchange lands while a proactive
+    # turn is pending (clearing desire_status AND pending_proactive_id, per
+    # observe_exchange's fix), then the delayed post_llm_call for the original
+    # proactive turn finally arrives. It must apply NO verdict — no reject, no
+    # extra satiate.
+    from lifemodel.core.decision import observe_exchange
+
+    lm = make_lm_pending(pending_id="p1")
+    state = lm.state.load()
+    u_before = state.u
+    observe_exchange(state, actor="user", label="two_way", now=_T0)
+    lm.state.commit(state)
+
+    make_post_llm_observer(lm)(**_fake_payload(proactive=True, text="NO_REPLY"))
+
+    s = lm.state.load()
+    assert s.pending_proactive_id is None
+    assert s.decline_count == 0
+    assert s.declined_at is None
+    # No extra satiate beyond what the user exchange itself already applied
+    # (quality_of(user, two_way) == 1.0), unchanged by the stale verdict.
+    assert s.u == u_before - 1.0
+
+
 # --- make_inbound_observer (Task 6) -------------------------------------------
 
 

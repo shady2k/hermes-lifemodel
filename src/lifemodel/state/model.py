@@ -154,8 +154,13 @@ class State:
             # against the clock's aware ``now`` — is corruption caught loud at
             # load, never a mid-tick crash. (With the fail-closed ``main`` such a
             # crash would wedge the being silent rather than fire; either way it
-            # must not reach the tick.) ``last_tick_at`` stays an opaque display
-            # string — it is never parsed or compared.
+            # must not reach the tick.) ``last_tick_at`` is validated here only
+            # as an opaque string, NOT as a parsed instant: unlike the fields
+            # above, ``core/decision.py``'s ``_minutes_between`` (the sole
+            # parser of this field) is deliberately defensive — a malformed or
+            # tz-naive value returns ``0.0`` (no elapsed rise this tick) rather
+            # than raising, so a bad ``last_tick_at`` degrades gracefully
+            # instead of being corruption caught at load.
             last_contact_at=_as_opt_iso(data.get("last_contact_at"), "last_contact_at"),
             egress_service_alive_at=_as_opt_iso(
                 data.get("egress_service_alive_at"), "egress_service_alive_at"
