@@ -6,7 +6,7 @@
 
 **rev.3 headline.** We could never *derive* a constant answer to "after a conversation, how many hours until it proactively writes again?" — because there is **no universal constant**. The right rhythm is individual and must be *learned per relationship*. This is not our failure; it is consistent with established findings (Niv et al.: optimal action latency is context-dependent, not fixed; Matthews & Tye: the social set-point is individual and plastic). Consequently the model splits cleanly:
 
-- **v1 (this task — mechanics built & certified; one calibration step remains):** the *fast drive* + the *desire lifecycle* + the *hard safety envelope* — a well-mannered being with a **fixed, conservative set-point** (a documented prior, explicitly **not** a calibrated truth). It never drums, never interrupts. The 54-test mechanics are green; the last v1 step is the shared-prior feasibility check (§9).
+- **v1 (this task — built & certified):** the *fast drive* + the *desire lifecycle* + the *hard safety envelope* — a well-mannered being with a **fixed, conservative set-point** (a documented prior, explicitly **not** a calibrated truth). It never drums, never interrupts. 54 tests green; one shared conservative prior (`BASE`) certified across all 8 scenarios with wake-latency bands (§9).
 - **v2 (separate epic, [lm-27h]/new):** *adaptation* — a bounded **learned set-point** and a separate **rhythm/availability estimator** that make the being learn *this* person, slowly, inside hard clamps. Designed here (§10) so it is not lost; **not implemented here**.
 
 ---
@@ -26,7 +26,7 @@ The live system today (HEAD `0881ebc`) ships the proactive-egress **delivery** l
 3. **Hard structural gates are separate from the drive.** "Don't interrupt", "don't wake in-flight", "don't re-wake right after a reject" are *policy*, not *dynamics*.
 4. **A desire has a lifecycle and is remembered.** Repeated crossings do not spawn duplicate wakes (dedup / `ack`); a *deferred* desire is held and re-presented, never forgotten, never drummed.
 5. **The safety envelope is fixed; only comfort is learned** (rev.3). Whatever v2 learns, a hard-coded envelope never moves: never-interrupt (`W`), no-wake-in-flight, dedup, growing reject-backoff, internal-impulse exclusion, a per-window send cap, and "threshold wakes cognition, never sends." Learning adjusts *latency/eagerness inside* the envelope — never *permission* to violate it. This is the "something basic" underneath adaptation.
-6. **Calibrate honestly, do not guess, do not overclaim.** v1 ships a *conservative prior* to be verified for feasibility across every scenario (not truth) — the mechanics are certified, the shared-prior check is the last v1 step (§9). Fitting the set-point to a real person is v2, and even there the simulation proves the *mechanism*, never "calibrated to humans" (§10).
+6. **Calibrate honestly, do not guess, do not overclaim.** v1 ships a *conservative prior* certified for feasibility across every scenario (not truth) — one shared `BASE` set passes every invariant **and** the wake-latency bands (§9). Fitting the set-point to a real person is v2, and even there the simulation proves the *mechanism*, never "calibrated to humans" (§10).
 7. **Minimal set first (YAGNI).** v1 is one continuous drive with a fixed set-point. The second (learned) variable is added in v2 *because the science and the "no universal constant" result point to it* — argued from the literature, not assumed, and not certified by v1 (which ships one variable).
 
 ## 3. Science grounding
@@ -143,7 +143,7 @@ For the simulation, `q` is read from the trace label. For the plugin (out of sco
 
 **Direction-conflict note (kept from rev.2):** withdrawal (`a`) *raises* the effective threshold; a deteriorating-bond intuition *lowers* it. They are opposite and must be modelled separately or as an explicit non-monotone effect, decided on real traces in v2 — never hidden under one variable.
 
-## 9. Simulation harness (v1 mechanics — built & certified)
+## 9. Simulation harness + conservative prior (v1 — built & certified)
 
 **Pure Python, no Hermes**, under `src/lifemodel/sim/` (inside the ruff/mypy-strict/pytest/coverage gate). Built: `drive.py`, `quality.py`, `wake.py`, `aggregation.py`, `harness.py`; **54 tests green**, ruff+mypy clean. Trace rows:
 
@@ -171,7 +171,7 @@ no_contact_when_scripted_unavailable        no fulfill while user_available=no
 
 **Scenarios (all 8 green):** (1) the 2026-07-04 failing log — no wake inside `W`, reject backoff grows 30→60, **no drum** *(the regression)*; (2) active back-and-forth → never wakes; (3) dormant-healthy bond → one wake then growing backoff, eventual re-wake; (4) question-then-disappear → no drum; (5) overnight/multi-day silence → `eventual_wake` within Y; (6) bad-moment defer + presence release; (7) gateway restart persists a deferred desire, no spurious wake; (8) user returns after a reject → backoff cleared + satiated.
 
-**v1 calibration = feasibility of a conservative prior, not a search for truth — and it is the one piece of v1 still to do.** The 54 tests certify the *mechanics*, but each scenario currently uses its own `α` (`0.5`, `0.25`, `0.01`, …); they do **not** yet prove one shared prior. Remaining v1 deliverable: confirm a single shared conservative set `{α, θ, β, W, r0, k}` satisfies **every** invariant on **every** scenario. Because most gates are `α`-independent once `u ≥ θ`, "widest margin" would otherwise collapse to the degenerate never-wake optimum (`θ→100`); to constrain it, add per-scenario **wake-latency bands** (a *should-wake-by* deadline and a *should-stay-silent-until* floor) as soft targets *alongside* the hard invariants. Report the chosen shared prior and its margins. The grid-search-for-the-one-true-constant is *retired* — there is no such constant (§8); this is only a feasibility + latency-band check documenting a safe starting envelope.
+**v1 calibration = feasibility of a conservative prior, not a search for truth — DONE.** All 8 scenarios run on **one shared conservative prior** (`test_sim_scenarios.py::BASE`): `α = 1/240` (urge after ~4 h of pure silence), `θ = 1`, `β = 1`, `W = 15` min, `r0 = 30`, `k = 2`, `r_max = 1440` — normalized units, minutes. Only the *situation* (initial pressure, horizon, trace, verdicts, deadlines) differs per scenario; the *coefficients* are identical (the being has one personality, not one per situation). Because most gates are `α`-independent once `u ≥ θ`, "passes the invariants" alone would admit the degenerate never-wake optimum; so each dormant/overnight scenario also asserts a **wake-latency band** (`assert_woke_by` — it *does* reach out in time) and each active/regression scenario a **silence band** (`assert_silent_until` — it *does* stay quiet). The grid-search-for-the-one-true-constant is *retired* — there is no such constant (§8); `BASE` is a documented safe starting envelope, explicitly **not** a fit to any real person (v2, bead `lm-ocx`, learns it). Coefficients are varied only in the *unit* tests whose purpose is to probe a dial's effect.
 
 ## 10. v2 adaptation design (deferred epic — designed here, NOT implemented)
 
@@ -202,7 +202,7 @@ The learning layer that makes the being learn *this* person. **Bounded, slow, an
 
 - **Rise form:** linear-with-clip (v1 default) vs saturating `α(1−u/100)` — swept; decide by which meets invariants at calmer constants.
 - **Reject-backoff shape:** growing is required; `k`, `R_max` from the v1 feasibility check.
-- **v1 conservative prior:** which shared `{α, θ, β, W, r0, k}` gives the widest invariant **+ latency-band** margin (§9) — the documented starting envelope for v2.
+- **v1 conservative prior:** documented as `BASE` (§9); the exact values (esp. `α`/`W`) are a starting envelope, revisited as v2 learning provides real evidence — not claimed optimal.
 - **v2 set-point clamps:** where exactly `s_min`/`s_max` sit; how `h(t)` combines with observed presence (OR vs weighted).
 - **v2 second-variable direction:** does `a(t)` (withdrawal, raises threshold) get added alongside `s`, and does any effect *lower* the threshold — resolved on real traces, never assumed.
 - **Global vs per-lane:** desire is per-lane; a global daily-cap (BRD FR6) is cheap multi-lane insurance — add only if a multi-lane scenario shows lanes co-firing.
