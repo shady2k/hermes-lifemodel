@@ -122,10 +122,14 @@ def _state_section(state: StateReader) -> list[str]:
         out.append(f"  <unreadable: {type(exc).__name__}: {exc}>")
         return out
     out.append(f"  {'schema_version:':21} {current.schema_version}")
-    out.append(f"  {'pressure:':21} {current.pressure}")
+    out.append(f"  {'u:':21} {current.u}")
+    out.append(f"  {'duration_over_theta:':21} {current.duration_over_theta}")
+    out.append(f"  {'desire_status:':21} {current.desire_status}")
     out.append(f"  {'energy:':21} {current.energy}")
     out.append(f"  {'last_tick_at:':21} {_opt(current.last_tick_at)}")
     out.append(f"  {'last_contact_at:':21} {_opt(current.last_contact_at)}")
+    out.append(f"  {'last_exchange_at:':21} {_opt(current.last_exchange_at)}")
+    out.append(f"  {'decline_count:':21} {current.decline_count}")
     return out
 
 

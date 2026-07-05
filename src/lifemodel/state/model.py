@@ -51,25 +51,48 @@ class State:
     #: the tick orchestrator; the simplest proof that state persists *between*
     #: ticks (a fresh store loads it, +1, commits). Never decreases.
     tick_count: int = 0
-    #: Accumulated drive to act. Persists between neuron ticks (roadmap 1.2/1.3):
-    #: ticks add to it, a threshold crossing drains it.
-    pressure: float = 0.0
     #: Coarse energy placeholder (HLA §4/§11). Recovered during sleep in later
     #: phases; carried now so the wake path has a slot to read.
     energy: float = 1.0
+    #: The contact-desire drive's continuous urge variable (certified sim
+    #: ``Drive.u``, spec §5). Rises with genuine silence, satiated by a positive
+    #: exchange, drained when a wake-eligible urge is consumed — see
+    #: ``lifemodel.core.decision`` (the live adapter) and ``lifemodel.sim.drive``
+    #: (the certified source of truth this reconstructs each tick).
+    u: float = 0.0
+    #: Elapsed minutes ``u`` has continuously sat at/over the wake threshold
+    #: ``θ`` (spec §5/§7). Reset to zero whenever ``u`` dips back under ``θ`` or
+    #: a desire resolves; feeds the wake-decision's duration gate.
+    duration_over_theta: float = 0.0
+    #: ISO-8601 UTC timestamp of the last genuine (non-internal) exchange with
+    #: the user (spec §4/§6). Satiates the drive and opens the active-silence
+    #: window; ``None`` before the first exchange.
+    last_exchange_at: str | None = None
+    #: Where the current contact-desire sits in its lifecycle (spec §4/§5/§7):
+    #: ``"none"`` (no live desire), ``"active"`` (woken, awaiting a verdict), or
+    #: ``"deferred"`` (held for a later release condition — unreachable live in
+    #: Phase 1, kept for parity with the certified ``DesireStatus`` enum).
+    desire_status: str = "none"
+    #: ISO-8601 UTC timestamp of the most recent REJECT verdict (spec §5/§7),
+    #: feeding the growing-backoff gate so a declined desire is not re-tried too
+    #: soon. ``None`` until the first reject.
+    declined_at: str | None = None
+    #: Consecutive REJECT count (spec §7's growing backoff — ``r0·k**n``),
+    #: reset to zero by any genuine exchange or a FULFILL verdict.
+    decline_count: int = 0
+    #: Correlation id of the in-flight proactive turn awaiting a verdict from
+    #: the final LLM output (``post_llm_call``), or ``None`` when no proactive
+    #: turn is outstanding.
+    pending_proactive_id: str | None = None
+    #: ISO-8601 UTC timestamp the pending proactive turn above was launched at,
+    #: or ``None`` when no proactive turn is outstanding.
+    pending_proactive_since: str | None = None
     #: ISO-8601 UTC timestamp of the last neuron tick, or ``None`` before the
     #: first tick.
     last_tick_at: str | None = None
     #: ISO-8601 UTC timestamp of the last outbound contact, for cooldown
     #: bookkeeping (roadmap 1.4). ``None`` until the being first reaches out.
     last_contact_at: str | None = None
-    #: ISO-8601 UTC timestamp the current wake-cooldown expires at (roadmap 1.4).
-    #: Stamped ``now + COOLDOWN`` when a wake drains the pressure; while
-    #: ``now < cooldown_until`` the tick stays asleep even above threshold, so at
-    #: most one message fires per threshold cycle. ``None`` until the first wake.
-    #: Additive field — the schema stays v1 because :meth:`from_dict` defaults it
-    #: when absent, so state files written before 1.4 load unchanged.
-    cooldown_until: str | None = None
     #: ISO-8601 UTC liveness stamp of the in-process proactive-egress service
     #: (lm-64s). While it is fresh (within ``SERVICE_LIVENESS_MAX_AGE``) the cron
     #: heartbeat defers to the in-process brain — it owns ticking while alive — and
@@ -90,29 +113,50 @@ class State:
         """Build a ``State`` from a parsed mapping, validating field types.
 
         Tolerant of *missing* keys (documented defaults fill in — so new fields
-        added in later phases load cleanly from files written by this build).
-        Strict on *present* keys of the wrong type: those signal corruption and
-        raise :class:`StateCorruptError`. The caller (the store) is responsible
-        for gating ``schema_version`` compatibility before calling this.
+        added in later phases load cleanly from files written by this build) and
+        of *unknown* keys (a legacy field from an older build, e.g. the retired
+        ``pressure``/``cooldown_until``, is silently dropped rather than raising
+        or resurrecting a dead attribute — this method only ever looks up known
+        field names by name, never splats ``**data``). Strict on *present*
+        *known* keys of the wrong type: those signal corruption and raise
+        :class:`StateCorruptError`. The caller (the store) is responsible for
+        gating ``schema_version`` compatibility before calling this.
         """
         return cls(
             schema_version=_as_int(data.get("schema_version", SCHEMA_VERSION), "schema_version"),
             tick_count=_as_int(data.get("tick_count", 0), "tick_count"),
-            pressure=_as_float(data.get("pressure", 0.0), "pressure"),
             energy=_as_float(data.get("energy", 1.0), "energy"),
+            u=_as_float(data.get("u", 0.0), "u"),
+            duration_over_theta=_as_float(
+                data.get("duration_over_theta", 0.0), "duration_over_theta"
+            ),
+            # last_exchange_at, declined_at, and pending_proactive_since are
+            # compared against the clock's aware ``now`` by ``core/decision.py``
+            # (the live adapter), so — like last_contact_at below — they are
+            # validated here as timezone-*aware* ISO-8601 instants: a malformed
+            # value, or a tz-*naive* one that would raise ``TypeError`` when
+            # compared, is corruption caught loud at load, never a mid-tick crash.
+            last_exchange_at=_as_opt_iso(data.get("last_exchange_at"), "last_exchange_at"),
+            desire_status=_as_str(data.get("desire_status", "none"), "desire_status"),
+            declined_at=_as_opt_iso(data.get("declined_at"), "declined_at"),
+            decline_count=_as_int(data.get("decline_count", 0), "decline_count"),
+            pending_proactive_id=_as_opt_str(
+                data.get("pending_proactive_id"), "pending_proactive_id"
+            ),
+            pending_proactive_since=_as_opt_iso(
+                data.get("pending_proactive_since"), "pending_proactive_since"
+            ),
             last_tick_at=_as_opt_str(data.get("last_tick_at"), "last_tick_at"),
-            # last_contact_at and cooldown_until are the timestamps the engine
-            # threads into datetime comparisons (the wake cooldown, see
-            # ``lifemodel.tick.run_tick``; the contact time flows into the
-            # wake-packet). They are validated here as timezone-*aware* ISO-8601
-            # instants: a malformed value — or a tz-*naive* one that would raise
-            # ``TypeError`` when compared against the clock's aware ``now`` — is
-            # corruption caught loud at load, never a mid-tick crash. (With the
-            # fail-closed ``main`` such a crash would wedge the being silent rather
-            # than fire; either way it must not reach the tick.) ``last_tick_at``
-            # stays an opaque display string — it is never parsed or compared.
+            # last_contact_at is a timestamp the engine threads into datetime
+            # comparisons (the wake-packet's cooldown context). It is validated
+            # here as a timezone-*aware* ISO-8601 instant: a malformed value — or
+            # a tz-*naive* one that would raise ``TypeError`` when compared
+            # against the clock's aware ``now`` — is corruption caught loud at
+            # load, never a mid-tick crash. (With the fail-closed ``main`` such a
+            # crash would wedge the being silent rather than fire; either way it
+            # must not reach the tick.) ``last_tick_at`` stays an opaque display
+            # string — it is never parsed or compared.
             last_contact_at=_as_opt_iso(data.get("last_contact_at"), "last_contact_at"),
-            cooldown_until=_as_opt_iso(data.get("cooldown_until"), "cooldown_until"),
             egress_service_alive_at=_as_opt_iso(
                 data.get("egress_service_alive_at"), "egress_service_alive_at"
             ),
@@ -143,6 +187,15 @@ def _as_opt_str(value: object, field_name: str) -> str | None:
     if value is None or isinstance(value, str):
         return value
     raise StateCorruptError(f"field {field_name!r} must be a string or null, got {_type(value)}")
+
+
+def _as_str(value: object, field_name: str) -> str:
+    # Unlike ``_as_opt_str``, ``None`` is not a valid value here: fields routed
+    # through this validator (e.g. ``desire_status``) always default to a
+    # concrete string, never ``null``.
+    if isinstance(value, str):
+        return value
+    raise StateCorruptError(f"field {field_name!r} must be a string, got {_type(value)}")
 
 
 def _as_opt_iso(value: object, field_name: str) -> str | None:

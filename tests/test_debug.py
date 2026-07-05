@@ -55,7 +55,7 @@ def _line(dump: str, label: str) -> str:
 def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> None:
     state = FakeStateStore(
         State(
-            pressure=2.5,
+            u=2.5,
             energy=0.8,
             last_tick_at="2026-07-03T12:00:00Z",
         )
@@ -69,7 +69,7 @@ def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> N
 
     # --- state values present, each on its own line ---
     assert str(SCHEMA_VERSION) in _line(dump, "schema_version:")
-    assert "2.5" in _line(dump, "pressure:")
+    assert "2.5" in _line(dump, "u:")
     assert "0.8" in _line(dump, "energy:")
     assert "2026-07-03T12:00:00Z" in _line(dump, "last_tick_at:")
     assert "n/a" in _line(dump, "last_contact_at:")  # None → n/a
@@ -87,34 +87,18 @@ def test_dump_shows_state_bus_and_events_with_na_for_absent(tmp_path: Path) -> N
     assert "n/a" in _line(dump, "lock status:")
 
 
-def test_dump_reflects_pressure_accumulated_by_real_ticks(tmp_path: Path) -> None:
-    # Acceptance (roadmap 1.2): after real ticks the debug dump shows the grown
-    # pressure (state section) and the last tick (events section) — read-only,
-    # and built through the same composition root the engine runs with.
-    from datetime import UTC, datetime, timedelta
-
-    from lifemodel.composition import build_lifemodel
-    from lifemodel.logging import EventTee, get_logger
-    from lifemodel.testing.fakes import FakeClock
-    from lifemodel.tick import run_tick
-
-    sink = EventSink(tmp_path / EVENTS_FILENAME)
-    logger = EventTee(get_logger("lifemodel.tick.test"), sink)
-    clock = FakeClock(datetime(2026, 7, 4, 12, 0, tzinfo=UTC))
-    lm = build_lifemodel(base_dir=tmp_path, clock=clock, logger=logger)
-
-    run_tick(lm, logger=logger)
-    clock.advance(timedelta(minutes=1))
-    run_tick(lm, logger=logger)
-
-    dump = render_dump_for_dir(tmp_path)
-
-    assert "2.0" in _line(dump, "pressure:")  # default delta 1.0 × 2 ticks
-    assert "tick_count=2" in _line(dump, "last tick:")  # last tick reflected
+# NOTE: an acceptance test used to live here exercising `run_tick` twice and
+# asserting the debug dump reflected accumulated `State.pressure`. `run_tick`
+# still drives the retired cron pressure/cooldown decision path (`state.pressure
+# += ...`); that path is deleted in Task 3/4 of the desire-model wiring plan
+# (docs/superpowers/plans/2026-07-05-wire-desire-model-into-plugin.md), which
+# also restores an equivalent debug-dump-via-real-ticks acceptance test against
+# the new lifecycle fields. Task 1 only removes the field from `State` — it does
+# not touch `tick.py`.
 
 
 def test_dump_is_read_only_never_commits_state(tmp_path: Path) -> None:
-    state = SpyStateStore(State(pressure=1.0))
+    state = SpyStateStore(State(u=1.0))
     bus = FakeSignalBus()
 
     render_debug_dump(state=state, bus=bus, events=_events(tmp_path))
@@ -128,7 +112,7 @@ def test_render_dump_for_dir_leaves_files_byte_identical(tmp_path: Path) -> None
     from lifemodel.adapters.signal_bus import FileSignalBus
     from lifemodel.state.json_store import JsonStateStore
 
-    JsonStateStore(tmp_path).commit(State(pressure=3.0, energy=0.5))
+    JsonStateStore(tmp_path).commit(State(u=3.0, energy=0.5))
     bus = FileSignalBus(tmp_path)
     bus.publish(Signal(origin_id="s1", kind="incoming"))
     bus.consume_unprocessed()  # writes signals.consumed
@@ -142,7 +126,7 @@ def test_render_dump_for_dir_leaves_files_byte_identical(tmp_path: Path) -> None
     after = {name: (tmp_path / name).read_bytes() for name in tracked}
     assert after == before  # nothing on disk changed
     assert "1" in _line(dump, "unprocessed:")  # s2 still pending after the peek
-    assert "3.0" in _line(dump, "pressure:")  # the committed state is reflected
+    assert "3.0" in _line(dump, "u:")  # the committed state is reflected
 
 
 def test_render_dump_for_dir_routes_through_the_composition_root(
@@ -172,7 +156,7 @@ def test_dump_on_empty_dir_is_clean(tmp_path: Path) -> None:
 
     assert "unreadable" not in dump
     assert str(SCHEMA_VERSION) in _line(dump, "schema_version:")
-    assert "0.0" in _line(dump, "pressure:")  # documented default State
+    assert "0.0" in _line(dump, "u:")  # documented default State
     assert "0" in _line(dump, "unprocessed:")
     assert "n/a" in _line(dump, "last tick:")
     # Read-only: inspecting an empty dir must not create any files.
@@ -195,7 +179,7 @@ def test_debug_path_emits_nothing_to_operator_logs(tmp_path: Path) -> None:
     # state so there is soul-ish content that must NOT reach the logs.
     from lifemodel.state.json_store import JsonStateStore
 
-    JsonStateStore(tmp_path).commit(State(pressure=9.9))
+    JsonStateStore(tmp_path).commit(State(u=9.9))
 
     with capture_logs() as logs:
         render_dump_for_dir(tmp_path)

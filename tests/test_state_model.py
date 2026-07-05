@@ -16,11 +16,9 @@ def test_defaults_are_documented_and_current_schema() -> None:
     state = State()
     assert state.schema_version == SCHEMA_VERSION == 1
     assert state.tick_count == 0
-    assert state.pressure == 0.0
     assert state.energy == 1.0
     assert state.last_tick_at is None
     assert state.last_contact_at is None
-    assert state.cooldown_until is None
 
 
 def test_no_processed_signal_ids_field() -> None:
@@ -39,54 +37,53 @@ def test_to_dict_puts_schema_version_first_as_a_header() -> None:
 def test_round_trip_through_dict_is_identity() -> None:
     state = State(
         tick_count=42,
-        pressure=3.5,
         energy=0.25,
         last_tick_at="2026-07-03T12:00:00Z",
         last_contact_at="2026-07-03T11:00:00Z",
-        cooldown_until="2026-07-03T11:30:00Z",
     )
     assert State.from_dict(state.to_dict()) == state
 
 
-def test_cooldown_until_is_additive_and_schema_stays_v1() -> None:
-    # cooldown_until (roadmap 1.4) is a new optional field; a file written before
-    # it existed (only the header + pre-1.4 fields) still loads under schema v1,
-    # defaulting cooldown_until to None — additive, no version bump.
+def test_declined_at_is_additive_and_schema_stays_v1() -> None:
+    # declined_at (the desire-lifecycle model's reject bookkeeping) is a new
+    # optional field; a file written before it existed (only the header + prior
+    # fields) still loads under schema v1, defaulting declined_at to None —
+    # additive, no version bump.
     legacy = {
         "schema_version": SCHEMA_VERSION,
         "tick_count": 7,
-        "pressure": 2.0,
         "energy": 1.0,
         "last_tick_at": "2026-07-03T12:00:00Z",
         "last_contact_at": None,
     }
     state = State.from_dict(legacy)
-    assert state.cooldown_until is None
+    assert state.declined_at is None
     assert state.tick_count == 7
 
 
-def test_cooldown_until_rejects_wrong_type() -> None:
+def test_declined_at_rejects_wrong_type() -> None:
     with pytest.raises(StateCorruptError):
-        State.from_dict({"schema_version": SCHEMA_VERSION, "cooldown_until": 123})
+        State.from_dict({"schema_version": SCHEMA_VERSION, "declined_at": 123})
 
 
-def test_cooldown_until_rejects_unparseable_iso() -> None:
-    # cooldown_until is the one timestamp the engine parses/branches on, so a
-    # malformed string is corruption caught loud at load — never a mid-tick crash.
+def test_declined_at_rejects_unparseable_iso() -> None:
+    # declined_at is one of the timestamps the engine parses/branches on, so a
+    # malformed string is corruption caught loud at load, never a mid-tick crash.
     with pytest.raises(StateCorruptError):
-        State.from_dict({"schema_version": SCHEMA_VERSION, "cooldown_until": "not-a-timestamp"})
+        State.from_dict({"schema_version": SCHEMA_VERSION, "declined_at": "not-a-timestamp"})
 
 
-def test_cooldown_until_accepts_valid_iso_forms() -> None:
+def test_declined_at_accepts_valid_iso_forms() -> None:
     # Both an explicit +00:00 offset and the 'Z' suffix parse (Python 3.11+).
     for ts in ("2026-07-04T12:00:00+00:00", "2026-07-04T12:00:00Z"):
         assert (
-            State.from_dict({"schema_version": SCHEMA_VERSION, "cooldown_until": ts}).cooldown_until
-            == ts
+            State.from_dict({"schema_version": SCHEMA_VERSION, "declined_at": ts}).declined_at == ts
         )
 
 
-@pytest.mark.parametrize("field", ["cooldown_until", "last_contact_at"])
+@pytest.mark.parametrize(
+    "field", ["last_contact_at", "last_exchange_at", "declined_at", "pending_proactive_since"]
+)
 def test_iso_fields_reject_timezone_naive_values(field: str) -> None:
     # FINDING 2: a tz-naive value parses fine via fromisoformat but the tick
     # compares it against the clock's aware UTC ``now`` → TypeError mid-tick. The
@@ -128,7 +125,7 @@ def test_from_dict_rejects_non_finite_floats(bad: float) -> None:
     # Non-finite floats are not valid JSON and poison downstream comparisons;
     # from_dict must reject them as corruption.
     with pytest.raises(StateCorruptError):
-        State.from_dict({"schema_version": SCHEMA_VERSION, "pressure": bad})
+        State.from_dict({"schema_version": SCHEMA_VERSION, "u": bad})
 
 
 def test_from_dict_rejects_non_integer_schema_version() -> None:
@@ -148,12 +145,56 @@ def test_state_roundtrips_egress_service_alive_at() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"schema_version": SCHEMA_VERSION, "pressure": "high"},
+        {"schema_version": SCHEMA_VERSION, "u": "high"},
         {"schema_version": SCHEMA_VERSION, "energy": None},
-        {"schema_version": SCHEMA_VERSION, "pressure": True},  # bool is not a number
+        {"schema_version": SCHEMA_VERSION, "u": True},  # bool is not a number
         {"schema_version": SCHEMA_VERSION, "last_tick_at": 123},
     ],
 )
 def test_from_dict_rejects_wrong_field_types(payload: dict[str, object]) -> None:
     with pytest.raises(StateCorruptError):
         State.from_dict(payload)
+
+
+def test_state_has_lifecycle_fields_with_defaults() -> None:
+    s = State()
+    assert s.u == 0.0
+    assert s.duration_over_theta == 0.0
+    assert s.last_exchange_at is None
+    assert s.desire_status == "none"
+    assert s.declined_at is None
+    assert s.decline_count == 0
+    assert s.pending_proactive_id is None
+    assert s.pending_proactive_since is None
+
+
+def test_state_roundtrips_lifecycle_fields() -> None:
+    s = State(
+        u=42.0,
+        duration_over_theta=7.0,
+        last_exchange_at="2026-07-05T10:00:00+00:00",
+        desire_status="active",
+        declined_at="2026-07-05T09:00:00+00:00",
+        decline_count=3,
+        pending_proactive_id="p-1",
+        pending_proactive_since="2026-07-05T10:01:00+00:00",
+    )
+    assert State.from_dict(s.to_dict()) == s
+
+
+def test_from_dict_ignores_unknown_legacy_keys() -> None:
+    # Old state.json carried pressure/cooldown_until; they must be dropped, not crash.
+    data = {
+        "schema_version": 1,
+        "pressure": 5.0,
+        "cooldown_until": "2026-01-01T00:00:00+00:00",
+        "u": 3.0,
+    }
+    s = State.from_dict(data)
+    assert s.u == 3.0
+    assert not hasattr(s, "pressure")
+
+
+def test_naive_lifecycle_timestamp_is_corruption() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": 1, "last_exchange_at": "2026-07-05T10:00:00"})  # no tz
