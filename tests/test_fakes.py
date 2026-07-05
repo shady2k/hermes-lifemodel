@@ -35,21 +35,21 @@ def test_fake_delivery_records_sends() -> None:
 def test_fake_state_store_defaults_and_round_trips() -> None:
     store = FakeStateStore()
     assert store.load() == State()
-    store.commit(State(pressure=2.0))
-    assert store.load().pressure == 2.0
+    store.commit(State(u=2.0))
+    assert store.load().u == 2.0
 
 
 def test_fake_state_store_isolates_from_caller_mutation() -> None:
     store = FakeStateStore()
-    state = State(pressure=1.0)
+    state = State(u=1.0)
     store.commit(state)
     # Mutating the caller's object must not reach into the store (copy-in).
-    state.pressure = 99.0
-    assert store.load().pressure == 1.0
+    state.u = 99.0
+    assert store.load().u == 1.0
     # ...and a loaded copy is likewise detached (copy-out).
     loaded = store.load()
-    loaded.pressure = 42.0
-    assert store.load().pressure == 1.0
+    loaded.u = 42.0
+    assert store.load().u == 1.0
 
 
 def test_fake_signal_bus_matches_dedup_contract() -> None:
