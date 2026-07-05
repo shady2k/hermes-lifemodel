@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
+from ..domain.signal import Signal
 from ..state.model import State
 from .intents import Intent
 from .signal_bus import SignalBus
@@ -25,6 +26,7 @@ class TickContext:
     state: State
     now: datetime
     bus: SignalBus
+    signals: tuple[Signal, ...] = ()
 
 
 @runtime_checkable

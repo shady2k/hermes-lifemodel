@@ -9,6 +9,7 @@ from lifemodel.core.coreloop import CoreLoop, TickReport
 from lifemodel.core.intents import EmitSignal, Intent, UpdateState
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
+from lifemodel.core.taxonomy import contact_signal
 from lifemodel.domain.signal import Signal
 from lifemodel.state.model import State
 
@@ -63,6 +64,31 @@ class Broken:
         raise RuntimeError("boom")
 
 
+# --- Phase B1 helpers ---
+
+
+class SeenRecorder:
+    """Records what signals it saw in ctx.signals."""
+
+    id = "seen"
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def step(self, ctx: TickContext) -> Sequence[Intent]:
+        self.seen = [s.origin_id for s in ctx.signals]
+        return []
+
+
+class ContactEmitter:
+    id = "emitter"
+
+    def step(self, ctx: TickContext) -> Sequence[Intent]:
+        return [
+            EmitSignal(contact_signal(origin_id="c-tick", value=1.0, delta=0.0, timestamp=None))
+        ]
+
+
 def _loop(
     registry: ComponentRegistry,
     store: RecordingStore,
@@ -92,14 +118,40 @@ def test_healthy_component_intents_reach_state_and_tick_bumps(tmp_path) -> None:
     assert report.ran == ("healthy",)
 
 
-def test_emit_signal_is_published_to_bus(tmp_path) -> None:
+def test_emit_signal_is_transient_not_durable(tmp_path) -> None:
+    # EmitSignal threads to later components in-tick; it is NOT written to the bus.
     reg = ComponentRegistry()
-    reg.register(Emitter(), ComponentManifest(id="emitter", type="neuron"))
+    reg.register(ContactEmitter(), ComponentManifest(id="emitter", type="neuron"))
     bus = FileSignalBus(tmp_path)
     loop = _loop(reg, RecordingStore(), bus)
     loop.tick()
-    published = bus.peek_unprocessed()
-    assert [s.origin_id for s in published] == ["emitter-1"]
+    assert bus.peek_unprocessed() == []  # transient — nothing persisted
+
+
+def test_later_component_sees_earlier_components_emitted_signal(tmp_path) -> None:
+    reg = ComponentRegistry()
+    seen = SeenRecorder()
+    reg.register(ContactEmitter(), ComponentManifest(id="emitter", type="neuron"))
+    reg.register(seen, ComponentManifest(id="seen", type="aggregation"))
+    loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path))
+    loop.tick()
+    assert "c-tick" in seen.seen  # aggregation saw the neuron's transient contact signal
+
+
+def test_durable_inbound_signal_is_consumed_once_and_threaded(tmp_path) -> None:
+    reg = ComponentRegistry()
+    seen = SeenRecorder()
+    reg.register(seen, ComponentManifest(id="seen", type="aggregation"))
+    bus = FileSignalBus(tmp_path)
+    bus.publish(
+        Signal(origin_id="ext-1", kind="exchange", payload={"actor": "user", "label": "two_way"})
+    )
+    loop = _loop(reg, RecordingStore(), bus)
+    loop.tick()
+    assert seen.seen == ["ext-1"]  # inbound external input threaded in
+    seen.seen = []
+    loop.tick()
+    assert seen.seen == []  # consumed once — not re-served next tick
 
 
 def test_failing_component_is_isolated_and_others_still_run(tmp_path) -> None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..domain.signal import Signal
 from ..log import EventLogger
 from ..ports.clock import ClockPort
 from .component import TickContext
@@ -58,7 +59,7 @@ class CoreLoop:
     def tick(self) -> TickReport:
         now = self._clock.now()
         state = self._state_actor.state
-        ctx = TickContext(state=state, now=now, bus=self._bus)
+        available: list[Signal] = list(self._bus.consume_unprocessed())
 
         intents: list[Intent] = []
         ran: list[str] = []
@@ -67,6 +68,7 @@ class CoreLoop:
         for component in self._registry.enabled():
             if component.id in self._broken:
                 continue
+            ctx = TickContext(state=state, now=now, bus=self._bus, signals=tuple(available))
             try:
                 produced = component.step(ctx)
             except Exception as exc:  # isolation: the heart never dies
@@ -76,7 +78,9 @@ class CoreLoop:
             self._failures[component.id] = 0
             for intent in produced:
                 if isinstance(intent, EmitSignal):
-                    self._bus.publish(intent.signal)
+                    available.append(
+                        intent.signal
+                    )  # transient — visible to later components this tick
                 else:
                     intents.append(intent)
             ran.append(component.id)
