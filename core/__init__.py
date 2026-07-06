@@ -21,6 +21,7 @@ from .intake import IntakeLimits, IntakeResult, apply_intake
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
+from .pressure import effective_pressure, inhibition_at
 from .registry import (
     ComponentManifest,
     ComponentRegistry,
@@ -82,6 +83,8 @@ __all__ = [
     "UnknownStateField",
     "UpdateState",
     "apply_intake",
+    "effective_pressure",
+    "inhibition_at",
     "contact_signal",
     "contact_value",
     "exchange_signal",

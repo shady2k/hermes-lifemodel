@@ -93,6 +93,10 @@ class State:
     #: ISO-8601 UTC timestamp of the last outbound contact, for cooldown
     #: bookkeeping (roadmap 1.4). ``None`` until the being first reaches out.
     last_contact_at: str | None = None
+    #: ISO-8601 UTC timestamp when the being's outreach was fulfilled (send
+    #: happened), starting the ActionPending inhibition window (spec §9.2).
+    #: ``None`` when no outreach is pending. A real exchange clears this.
+    action_pending_since: str | None = None
     #: ISO-8601 UTC liveness stamp of the in-process proactive-egress service
     #: (lm-64s). While it is fresh (within ``SERVICE_LIVENESS_MAX_AGE``) the cron
     #: heartbeat defers to the in-process brain — it owns ticking while alive — and
@@ -164,6 +168,9 @@ class State:
             last_contact_at=_as_opt_iso(data.get("last_contact_at"), "last_contact_at"),
             egress_service_alive_at=_as_opt_iso(
                 data.get("egress_service_alive_at"), "egress_service_alive_at"
+            ),
+            action_pending_since=_as_opt_iso(
+                data.get("action_pending_since"), "action_pending_since"
             ),
         )
 

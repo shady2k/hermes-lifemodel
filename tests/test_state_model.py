@@ -198,3 +198,13 @@ def test_from_dict_ignores_unknown_legacy_keys() -> None:
 def test_naive_lifecycle_timestamp_is_corruption() -> None:
     with pytest.raises(StateCorruptError):
         State.from_dict({"schema_version": 1, "last_exchange_at": "2026-07-05T10:00:00"})  # no tz
+
+
+def test_action_pending_since_roundtrips() -> None:
+    s = State(action_pending_since="2026-07-06T12:00:00+00:00")
+    assert State.from_dict(s.to_dict()).action_pending_since == "2026-07-06T12:00:00+00:00"
+
+
+def test_action_pending_since_defaults_none() -> None:
+    assert State().action_pending_since is None
+    assert State.from_dict({}).action_pending_since is None  # additive: missing key is fine
