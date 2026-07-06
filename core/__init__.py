@@ -18,6 +18,7 @@ from .circadian import circadian
 from .component import Component, TickContext
 from .contact_neuron import ContactNeuron
 from .coreloop import CoreLoop, TickReport
+from .energy import Reservation, can_afford, cost_real, reserve, settle
 from .intake import IntakeLimits, IntakeResult, apply_intake
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
@@ -55,8 +56,10 @@ __all__ = [
     "ActGate",
     "Aggregator",
     "CheckpointState",
+    "can_afford",
     "circadian",
     "Component",
+    "cost_real",
     "ComponentManifest",
     "ContactAggregation",
     "ContactNeuron",
@@ -75,6 +78,7 @@ __all__ = [
     "Lane",
     "Layer",
     "Neuron",
+    "Reservation",
     "ProcessingLayer",
     "SignalBus",
     "SilentAggregator",
@@ -97,5 +101,7 @@ __all__ = [
     "minutes_between",
     "read_exchange",
     "read_verdict",
+    "reserve",
+    "settle",
     "verdict_signal",
 ]
