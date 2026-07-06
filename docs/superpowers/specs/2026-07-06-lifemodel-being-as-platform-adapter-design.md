@@ -203,3 +203,18 @@ Verdict: **sound-with-changes.** The four open questions, resolved against sourc
   cron liveness machinery.
 - Port-only tick must not retain `reachin_available`/runner checks; all reach-in
   stays under `adapters/`.
+
+### Implementation-review nits (codex, verdict: ship-with-nits) — decisions
+
+- **Applied:** track/log the `_notify_fatal_error()` task (a failed notify would
+  otherwise silently strand the reconnect); call `_mark_disconnected()` on a clean
+  `disconnect()` so status is not left stale-"connected".
+- **Deliberate non-goal (YAGNI):** no watchdog for a "wedged-forever" synchronous
+  tick. The tick is disk-read + pure computation; a truly hung sync tick would
+  block the whole gateway event loop (loudly visible), not fail silently. The
+  realistic death mode is an exception, which `SupervisedLoop` already converts to
+  a fatal + reconnect. Revisit only if a hang is ever observed.
+- **Untested seam (accepted):** the adapter shell (`connect`/fatal/`disconnect`,
+  `register_platform`) is not off-host unit-tested (the test venv lacks `gateway`).
+  All logic is in tested Hermes-free units; the shell is verified at runtime and a
+  Hermes-venv integration probe is a possible later addition.

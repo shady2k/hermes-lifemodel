@@ -72,9 +72,19 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             return
         self._log.info("being_loop_died", error=repr(exc))
         self._set_fatal_error("brain_loop_exited", f"proactive loop died: {exc!r}", retryable=True)
-        # always on the gateway loop in practice; suppress if somehow off-loop
+        # always on the gateway loop in practice; suppress if somehow off-loop.
+        # Track the notify task so a failure to notify (which would strand the
+        # reconnect) is at least logged rather than a silent event-loop warning.
         with contextlib.suppress(RuntimeError):
-            asyncio.get_running_loop().create_task(self._notify_fatal_error())
+            task = asyncio.get_running_loop().create_task(self._notify_fatal_error())
+            task.add_done_callback(self._on_notify_done)
+
+    def _on_notify_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._log.info("being_notify_fatal_failed", error=repr(exc))
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._shutting_down = False
@@ -95,6 +105,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
             self._loop_task = None
+        self._mark_disconnected()  # keep status accurate on a clean stop
         self._log.info("being_disconnected")
 
     async def send(
