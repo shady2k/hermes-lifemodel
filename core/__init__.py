@@ -25,6 +25,7 @@ from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
 from .personality import Personality
 from .pressure import effective_pressure, inhibition_at
+from .projection import project_contact
 from .registry import (
     ComponentManifest,
     ComponentRegistry,
@@ -91,6 +92,7 @@ __all__ = [
     "UnknownStateField",
     "UpdateState",
     "apply_intake",
+    "project_contact",
     "effective_pressure",
     "inhibition_at",
     "contact_signal",
