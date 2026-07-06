@@ -21,6 +21,7 @@ from ..sim.drive import Drive
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .component import TickContext
 from .intents import Intent, UpdateState
+from .pressure import effective_pressure, inhibition_at
 from .taxonomy import (
     KIND_EXCHANGE,
     KIND_VERDICT,
@@ -42,6 +43,9 @@ class ContactAggregation:
         theta: float,
         beta: float,
         u_max: float,
+        i0: float = 1.0,
+        grace_min: float = 45.0,
+        halflife_min: float = 60.0,
         id: str = "contact-aggregation",
     ) -> None:
         self.id = id
@@ -49,6 +53,9 @@ class ContactAggregation:
         self._theta = theta
         self._beta = beta
         self._u_max = u_max
+        self._i0 = i0
+        self._grace_min = grace_min
+        self._halflife_min = halflife_min
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
@@ -98,6 +105,16 @@ class ContactAggregation:
         else:
             duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
 
+        # compute effective pressure: latent u gated by ActionPending inhibition
+        inhibition = inhibition_at(
+            state.action_pending_since,
+            now,
+            i0=self._i0,
+            grace_min=self._grace_min,
+            halflife_min=self._halflife_min,
+        )
+        effective = effective_pressure(u_now, inhibition)
+
         # wake gates — every quantity as minutes relative to now (now = 0.0)
         exch_min = -minutes_between(last_exchange_at, now) if last_exchange_at is not None else None
         decl_min = -minutes_between(declined_at, now) if declined_at is not None else None
@@ -107,7 +124,7 @@ class ContactAggregation:
             declined_at=decl_min,
             decline_count=decline_count,
         )
-        outcome = evaluate_wake(u=u_now, now=0.0, state=lane, params=self._params)
+        outcome = evaluate_wake(u=effective, now=0.0, state=lane, params=self._params)
         if outcome.is_urge:
             agg.on_urge()
 

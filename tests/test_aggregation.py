@@ -225,3 +225,52 @@ def test_reject_then_backoff_blocks_immediate_rewake(tmp_path) -> None:
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
     assert changes["desire_status"] == "none"  # rejected + backoff vetoes re-wake
+
+
+# --- Phase C1: effective pressure gates ---
+
+
+def test_action_pending_grace_suppresses_wake_despite_high_latent(tmp_path) -> None:
+    # latent u=3 (>= theta) but a send 10 min ago (within 45-min grace) -> effective ~0 -> no wake
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        desire_status="none",
+        action_pending_since="2026-07-06T03:50:00+00:00",  # 10 min ago
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"  # inhibited during grace
+
+
+def test_pressure_recovers_after_grace_and_decay(tmp_path) -> None:
+    # send ~3h ago: grace(45m)+ ~2 half-lives -> inhibition ~0.06 -> effective ~ u -> wake
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        desire_status="none",
+        action_pending_since="2026-07-06T01:00:00+00:00",  # 180 min ago
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "active"  # ignored long enough -> loneliness returns
+
+
+def test_duration_over_theta_uses_latent_not_effective(tmp_path) -> None:
+    # even fully inhibited (effective 0), latent u>=theta so duration keeps accruing
+    now = datetime(2026, 7, 6, 0, 5, tzinfo=UTC)  # dt=5
+    state = State(
+        u=2.0,
+        desire_status="none",
+        duration_over_theta=10.0,
+        action_pending_since="2026-07-06T00:04:00+00:00",  # in grace -> inhibition 1
+        last_tick_at="2026-07-06T00:00:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    assert (
+        abs(changes["duration_over_theta"] - 15.0) < 1e-9
+    )  # latent-based, accrues under inhibition
+    assert changes["desire_status"] == "none"  # but no wake (effective suppressed)
