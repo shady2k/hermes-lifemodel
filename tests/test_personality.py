@@ -59,6 +59,15 @@ def test_fatigue_never_negative(tmp_path) -> None:
     assert changes["fatigue"] == 0.0
 
 
+def test_negative_dt_does_not_run_physiology_backward(tmp_path) -> None:
+    # last_tick_at is in the FUTURE relative to now -> negative dt
+    state = State(energy=0.5, fatigue=0.5, last_tick_at="2026-07-06T12:10:00+00:00")
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)  # 10 min BEFORE last_tick
+    changes = _changes(_p().step(_ctx(state, now, tmp_path=tmp_path)))
+    assert changes["energy"] == 0.5  # not reduced
+    assert changes["fatigue"] == 0.5  # not increased
+
+
 def test_night_recovers_faster_than_day(tmp_path) -> None:
     # same dt, but at circadian trough (01:00 UTC) recovery is boosted vs peak (13:00 UTC)
     day = State(energy=0.5, last_tick_at="2026-07-06T13:00:00+00:00")

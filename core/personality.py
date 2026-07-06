@@ -41,7 +41,7 @@ class Personality:
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
-        dt = minutes_between(state.last_tick_at, ctx.now)
+        dt = max(0.0, minutes_between(state.last_tick_at, ctx.now))
         c = circadian(ctx.now, peak_hour_utc=self._peak_hour_utc)
 
         recovery = self._recovery_per_min * (1.0 + self._night_boost * (1.0 - c))

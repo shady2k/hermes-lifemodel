@@ -134,7 +134,7 @@ class ContactAggregation:
                 pending_since = None
 
         # duration on latent u
-        dt = minutes_between(state.last_tick_at, now)
+        dt = max(0.0, minutes_between(state.last_tick_at, now))
         duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
 
         # effective pressure for the wake gate (post-verdict inhibition)

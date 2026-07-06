@@ -326,6 +326,19 @@ def test_fulfill_records_a_send(tmp_path) -> None:
     assert len(log) == 2  # appended to the prior one
 
 
+def test_negative_dt_does_not_shrink_duration(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        desire_status="none",
+        duration_over_theta=30.0,
+        last_tick_at="2026-07-06T12:10:00+00:00",
+    )
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)  # before last_tick
+    c = contact_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    assert changes["duration_over_theta"] == 30.0  # unchanged (dt clamped to 0), not reduced
+
+
 def test_reject_does_not_record_a_send(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
