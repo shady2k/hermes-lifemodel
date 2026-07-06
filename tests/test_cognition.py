@@ -59,6 +59,13 @@ def test_insufficient_energy_holds_no_launch(tmp_path) -> None:
     assert _update(intents) is None  # energy untouched, desire stays active
 
 
+def test_launch_carries_the_reserved_energy(tmp_path) -> None:
+    state = State(desire_status="active", u=2.0, energy=1.0, fatigue=0.0)
+    launch = _launch(_cog().step(_ctx(state, tmp_path=tmp_path)))
+    # estimate = (0.02+0.03)*(1+2*0) = 0.05
+    assert abs(launch.reserved_energy - 0.05) < 1e-9
+
+
 def test_prompt_has_no_raw_numbers(tmp_path) -> None:
     import re
 

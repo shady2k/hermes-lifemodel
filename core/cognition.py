@@ -44,7 +44,9 @@ class Cognition:
         correlation_id = f"proactive-{ctx.now.isoformat()}"
         packet = build_wake_packet(value=state.u, theta=1.0, correlation_id=correlation_id)
         return [
-            LaunchProactive(prompt=packet.prompt, correlation_id=correlation_id),
+            LaunchProactive(
+                prompt=packet.prompt, correlation_id=correlation_id, reserved_energy=estimate
+            ),
             UpdateState(
                 {
                     "energy": energy_after,

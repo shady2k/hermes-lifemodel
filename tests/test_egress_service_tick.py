@@ -108,6 +108,44 @@ def test_failed_launch_rolls_back_pending(tmp_path) -> None:
     assert final.desire_status == "active"  # kept to retry (not rejected)
 
 
+def test_backstop_block_refunds_the_reservation(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    log = ["2026-07-06T11:00:00+00:00", "2026-07-06T10:00:00+00:00", "2026-07-06T09:00:00+00:00"]
+    state = State(
+        desire_status="active",
+        u=2.0,
+        energy=1.0,
+        proactive_send_log=log,
+        last_tick_at="2026-07-06T11:59:00+00:00",
+    )
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    # cognition deducted 0.05, then the block refunded it -> back to ~1.0 (minus any recovery)
+    assert lm.state.load().energy >= 0.99
+
+
+def test_failed_launch_refunds_the_reservation(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(
+        desire_status="active", u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"
+    )
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(
+        lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t")
+    )
+    assert lm.state.load().energy >= 0.99  # refunded — no turn ran
+
+
+def test_delivered_launch_keeps_the_cost(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(
+        desire_status="active", u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"
+    )
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    assert lm.state.load().energy < 1.0  # the turn ran -> energy spent, not refunded
+
+
 def test_liveness_is_stamped(tmp_path) -> None:
     now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
     state = State(desire_status="none", last_tick_at="2026-07-06T11:59:00+00:00")

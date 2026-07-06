@@ -56,3 +56,4 @@ class LaunchProactive(Intent):
 
     prompt: str
     correlation_id: str
+    reserved_energy: float = 0.0

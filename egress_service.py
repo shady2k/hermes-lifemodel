@@ -44,32 +44,41 @@ def run_proactive_tick(
     busy: bool = False,  # retained for the loop's call shape; in-flight is a signal now
 ) -> ReachOutcome:
     """One in-process proactive tick — run the layered pipeline, launch on a
-    surfaced desire, gated by the global backstop (spec §13/§14, model A)."""
+    surfaced desire, gated by the global backstop (spec §13/§14, model A).
+
+    Assumes a fresh ``LifeModel`` per call (the supervised loop builds one each
+    tick); the reconciliation commit is a host concern outside the state-actor,
+    safe under that invariant.
+    """
     assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
     report = lm.coreloop.tick()  # pipeline runs + state committed by the state-actor
     now = lm.clock.now()
 
     outcome = ReachOutcome.SKIPPED_BUSY
     rollback_status: str | None = None
+    refund_energy = 0.0
     if report.launches:
         state = lm.state.load()
         launch = report.launches[0]
         if not allow_send(state.proactive_send_log, now):
             rollback_status = "deferred"  # backstop: hold the desire, send nothing (spec §14)
+            refund_energy = launch.reserved_energy  # no turn ran -> refund the reservation
             logger.info("proactive_backstop_blocked")
         else:
             outcome = egress.reach_out(target, IMPULSE_LABEL_PREFIX + launch.prompt)
             if outcome is not ReachOutcome.DELIVERED:
                 rollback_status = "active"  # launch failed — keep active to retry
+                refund_energy = launch.reserved_energy  # no turn ran -> refund
                 logger.info("proactive_launch_failed", outcome=outcome.value)
 
-    # one reconciliation commit: liveness stamp + optional pending rollback
+    # one reconciliation commit: liveness stamp + optional pending rollback + reservation refund
     state = lm.state.load()
     state.egress_service_alive_at = now.isoformat()
     if rollback_status is not None:
         state.pending_proactive_id = None
         state.pending_proactive_since = None
         state.desire_status = rollback_status
+        state.energy += refund_energy
     lm.state.commit(state)
     logger.info("proactive_tick", launches=len(report.launches), outcome=outcome.value)
     return outcome
