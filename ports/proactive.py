@@ -2,10 +2,11 @@
 
 The hexagonal port for proactive delivery: a single method that injects an
 internal user turn on a known lane so the being composes and delivers a native
-reply. Concrete adapters live in :mod:`lifemodel.adapters` — the primary
-:class:`~lifemodel.adapters.reachin.ReachInEgress` (native reach-in) and the
-cron fallback. ``target`` is the home-origin dict ``{platform, chat_id,
-thread_id}`` (as produced by :func:`lifemodel.heartbeat._resolve_home_origin`).
+reply. The concrete adapter is
+:class:`~lifemodel.adapters.reachin.ReachInEgress` (native reach-in), driven by
+the supervised platform adapter. ``target`` is the home-origin dict
+``{platform, chat_id, thread_id}`` (from
+:func:`lifemodel.adapters.origin.resolve_home_origin`).
 """
 
 from __future__ import annotations

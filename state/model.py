@@ -47,9 +47,9 @@ class State:
     schema_version: int = SCHEMA_VERSION
 
     # --- the being's persisted state (Phase 1 minimal; extend, don't rewrite) ---
-    #: Monotonic count of heartbeat ticks (roadmap 1.1). Bumped once per tick by
-    #: the tick orchestrator; the simplest proof that state persists *between*
-    #: ticks (a fresh store loads it, +1, commits). Never decreases.
+    #: Monotonic count of brain-loop ticks. Bumped once per tick by ``coreloop.tick()``
+    #: (driven by the platform adapter's loop); the simplest proof that state persists
+    #: *between* ticks (a fresh store loads it, +1, commits). Never decreases.
     tick_count: int = 0
     #: Coarse energy placeholder (HLA §4/§11). Recovered during sleep in later
     #: phases; carried now so the wake path has a slot to read.
@@ -105,12 +105,6 @@ class State:
     #: ``SEND_LOG_KEEP`` (spec §14). The global backstop reads this to enforce
     #: the hard rate limit (≤3/day, ≥60 min apart). Defaults to empty (additive).
     proactive_send_log: list[str] = field(default_factory=list)
-    #: ISO-8601 UTC liveness stamp of the in-process proactive-egress service
-    #: (lm-64s). While it is fresh (within ``SERVICE_LIVENESS_MAX_AGE``) the cron
-    #: heartbeat defers to the in-process brain — it owns ticking while alive — and
-    #: takes over as the fallback brain when the stamp goes stale/absent (spec §6).
-    #: Additive: the schema stays v1 (``from_dict`` defaults it when absent).
-    egress_service_alive_at: str | None = None
     # NB: signal dedup does *not* live here. It is owned by the SignalBus
     # consumed-ledger (``signals.consumed``), which persists "already consumed"
     # independently of this State to avoid racing the tick's own commit — see
@@ -175,9 +169,6 @@ class State:
             # than raising, so a bad ``last_tick_at`` degrades gracefully
             # instead of being corruption caught at load.
             last_contact_at=_as_opt_iso(data.get("last_contact_at"), "last_contact_at"),
-            egress_service_alive_at=_as_opt_iso(
-                data.get("egress_service_alive_at"), "egress_service_alive_at"
-            ),
             action_pending_since=_as_opt_iso(
                 data.get("action_pending_since"), "action_pending_since"
             ),
