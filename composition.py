@@ -56,6 +56,7 @@ from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
 from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
+from .core.cognition import Cognition
 from .core.contact_neuron import ContactNeuron
 from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
@@ -83,6 +84,10 @@ ENERGY_RECOVERY_PER_MIN = 0.01
 NIGHT_RECOVERY_BOOST = 0.5
 FATIGUE_DECAY_PER_MIN = 0.002
 CIRCADIAN_PEAK_UTC_HOUR = 13.0  # peak alertness 16:00 MSK, trough 04:00 MSK
+
+COGNITION_FAST_COST = 0.02
+COGNITION_SEND_COST = 0.03
+COST_ALPHA = 2.0
 
 
 @dataclass(frozen=True)
@@ -172,6 +177,15 @@ def build_lifemodel(
         resolved_registry.register(
             aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
         )
+    try:
+        resolved_registry.manifest("cognition")
+    except UnknownComponent:
+        cognition = Cognition(
+            fast_cost=COGNITION_FAST_COST,
+            send_cost=COGNITION_SEND_COST,
+            alpha=COST_ALPHA,
+        )
+        resolved_registry.register(cognition, ComponentManifest(id=cognition.id, type="cognition"))
     resolved_state_actor = StateActor(resolved_state, logger=logger)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,

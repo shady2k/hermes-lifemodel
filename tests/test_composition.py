@@ -280,3 +280,15 @@ def test_pipeline_tick_recovers_energy_and_decays_fatigue(tmp_path: Path) -> Non
     final = store.load()
     assert final.energy > 0.5  # recovered during the idle tick
     assert final.fatigue < 0.5  # decayed
+
+
+# --- Phase D1: Cognition component wiring ---
+
+
+def test_cognition_registered_after_aggregation(tmp_path: Path) -> None:
+    from lifemodel.core.cognition import Cognition
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = [c.id for c in lm.registry.enabled()]
+    assert ids.index("contact-aggregation") < ids.index("cognition")
+    assert any(isinstance(c, Cognition) for c in lm.registry.enabled())

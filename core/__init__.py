@@ -15,12 +15,13 @@ from .act_gate import ActGate
 from .aggregation import ContactAggregation
 from .aggregator import Aggregator, SilentAggregator
 from .circadian import circadian
+from .cognition import Cognition
 from .component import Component, TickContext
 from .contact_neuron import ContactNeuron
 from .coreloop import CoreLoop, TickReport
 from .energy import Reservation, can_afford, cost_real, reserve, settle
 from .intake import IntakeLimits, IntakeResult, apply_intake
-from .intents import CheckpointState, EmitSignal, Intent, UpdateState
+from .intents import CheckpointState, EmitSignal, Intent, LaunchProactive, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
 from .output_lint import DEFAULT_MECHANICAL_PATTERNS, LintResult, lint_proactive
@@ -63,6 +64,7 @@ __all__ = [
     "can_afford",
     "circadian",
     "Component",
+    "Cognition",
     "DEFAULT_MECHANICAL_PATTERNS",
     "cost_real",
     "ComponentManifest",
@@ -76,6 +78,7 @@ __all__ = [
     "IntakeLimits",
     "IntakeResult",
     "Intent",
+    "LaunchProactive",
     "KIND_CONTACT",
     "lint_proactive",
     "LintResult",

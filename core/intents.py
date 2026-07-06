@@ -47,3 +47,12 @@ class EmitSignal(Intent):
 class CheckpointState(Intent):
     """Observability marker for a committed checkpoint. The state-actor emits
     it implicitly on mutation (spec §6); callers need not construct it."""
+
+
+@dataclass(frozen=True)
+class LaunchProactive(Intent):
+    """Launch a proactive turn (the being's native Hermes turn) with this
+    desire-framed prompt. Consumed by the egress in Phase E."""
+
+    prompt: str
+    correlation_id: str
