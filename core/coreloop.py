@@ -25,7 +25,7 @@ from ..log import EventLogger
 from ..ports.clock import ClockPort
 from .component import TickContext
 from .intake import IntakeLimits, apply_intake
-from .intents import EmitSignal, Intent, UpdateState
+from .intents import EmitSignal, Intent, LaunchProactive, UpdateState
 from .registry import ComponentRegistry
 from .signal_bus import SignalBus
 from .state_actor import StateActor
@@ -41,6 +41,7 @@ class TickReport:
     skipped_broken: tuple[str, ...]
     failed: tuple[str, ...]
     committed: bool
+    launches: tuple[LaunchProactive, ...] = ()
 
 
 class CoreLoop:
@@ -83,6 +84,7 @@ class CoreLoop:
         available: list[Signal] = list(intake.kept)
 
         intents: list[Intent] = []
+        launches: list[LaunchProactive] = []
         ran: list[str] = []
         failed: list[str] = []
 
@@ -102,6 +104,8 @@ class CoreLoop:
                     available.append(
                         intent.signal
                     )  # transient — visible to later components this tick
+                elif isinstance(intent, LaunchProactive):
+                    launches.append(intent)
                 else:
                     intents.append(intent)
             ran.append(component.id)
@@ -117,6 +121,7 @@ class CoreLoop:
             skipped_broken=tuple(sorted(self._broken)),
             failed=tuple(failed),
             committed=new_state is not state,
+            launches=tuple(launches),
         )
 
     def _record_failure(self, component_id: str, exc: Exception) -> None:

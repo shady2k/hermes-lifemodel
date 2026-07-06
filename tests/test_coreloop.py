@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext
 from lifemodel.core.coreloop import CoreLoop, TickReport
-from lifemodel.core.intents import EmitSignal, Intent, UpdateState
+from lifemodel.core.intents import EmitSignal, Intent, LaunchProactive, UpdateState
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
 from lifemodel.core.taxonomy import contact_signal
@@ -220,3 +220,25 @@ def test_coreloop_bounds_a_flood_and_survives(tmp_path) -> None:
 def test_coreloop_default_intake_limits_present(tmp_path) -> None:
     loop = _loop(ComponentRegistry(), RecordingStore(), FileSignalBus(tmp_path))
     loop.tick()  # smoke: default IntakeLimits, no flood, still ticks
+
+
+class Launcher:
+    id = "launcher"
+
+    def step(self, ctx) -> list:
+        return [LaunchProactive(prompt="hi", correlation_id="c-1")]
+
+
+def test_launch_proactive_is_surfaced_in_report(tmp_path) -> None:
+    reg = ComponentRegistry()
+    reg.register(Launcher(), ComponentManifest(id="launcher", type="cognition"))
+    loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path))
+    report = loop.tick()
+    assert len(report.launches) == 1
+    assert report.launches[0].correlation_id == "c-1"
+    assert report.launches[0].prompt == "hi"
+
+
+def test_no_launch_means_empty_tuple(tmp_path) -> None:
+    loop = _loop(ComponentRegistry(), RecordingStore(), FileSignalBus(tmp_path))
+    assert loop.tick().launches == ()
