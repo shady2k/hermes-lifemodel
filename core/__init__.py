@@ -23,6 +23,7 @@ from .coreloop import CoreLoop, TickReport
 from .energy import Reservation, can_afford, cost_real, reserve, settle
 from .intake import IntakeLimits, IntakeResult, apply_intake
 from .intents import CheckpointState, EmitSignal, Intent, LaunchProactive, UpdateState
+from .invalidation import is_verdict_stale
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
 from .output_lint import DEFAULT_MECHANICAL_PATTERNS, LintResult, lint_proactive
@@ -79,6 +80,7 @@ __all__ = [
     "EmitSignal",
     "IntakeLimits",
     "IntakeResult",
+    "is_verdict_stale",
     "Intent",
     "LaunchProactive",
     "KIND_CONTACT",
