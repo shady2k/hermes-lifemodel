@@ -59,6 +59,7 @@ from .core.aggregator import Aggregator, SilentAggregator
 from .core.contact_neuron import ContactNeuron
 from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
+from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
 from .core.state_actor import StateActor
@@ -76,6 +77,12 @@ CONTACT_PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
 CONTACT_I0 = 1.0
 CONTACT_GRACE_MIN = 45.0
 CONTACT_INHIBITION_HALFLIFE_MIN = 60.0
+
+E_MAX = 1.0
+ENERGY_RECOVERY_PER_MIN = 0.01
+NIGHT_RECOVERY_BOOST = 0.5
+FATIGUE_DECAY_PER_MIN = 0.002
+CIRCADIAN_PEAK_UTC_HOUR = 13.0  # peak alertness 16:00 MSK, trough 04:00 MSK
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,19 @@ def build_lifemodel(
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
     resolved_registry: ComponentRegistry = registry if registry is not None else ComponentRegistry()
+    try:
+        resolved_registry.manifest("personality")
+    except UnknownComponent:
+        personality = Personality(
+            e_max=E_MAX,
+            recovery_per_min=ENERGY_RECOVERY_PER_MIN,
+            night_boost=NIGHT_RECOVERY_BOOST,
+            fatigue_decay_per_min=FATIGUE_DECAY_PER_MIN,
+            peak_hour_utc=CIRCADIAN_PEAK_UTC_HOUR,
+        )
+        resolved_registry.register(
+            personality, ComponentManifest(id=personality.id, type="personality")
+        )
     try:
         resolved_registry.manifest("contact")
     except UnknownComponent:

@@ -129,7 +129,8 @@ def test_build_wires_registry_state_actor_and_coreloop(tmp_path: Path) -> None:
 def test_default_registry_contains_contact_neuron(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
     ids = tuple(c.id for c in lm.registry.enabled())
-    assert ids == ("contact", "contact-aggregation")
+    assert "contact" in ids
+    assert "contact-aggregation" in ids
 
 
 def test_coreloop_tick_bookkeeps_and_runs_contact(tmp_path: Path) -> None:
@@ -137,7 +138,8 @@ def test_coreloop_tick_bookkeeps_and_runs_contact(tmp_path: Path) -> None:
     # Tick still checkpoints the bookkeeping bump — proves the wired seam works.
     lm = build_lifemodel(base_dir=tmp_path)
     report = lm.coreloop.tick()
-    assert report.ran == ("contact", "contact-aggregation")
+    assert "contact" in report.ran
+    assert "contact-aggregation" in report.ran
     assert lm.state.load().tick_count == 1
 
 
@@ -253,3 +255,28 @@ def test_pipeline_send_suppresses_then_recovers(tmp_path: Path) -> None:
     )
     lm.coreloop.tick()
     assert store.load().desire_status == "none"  # grace suppresses the wake end-to-end
+
+
+# --- Phase C2: Personality component wiring ---
+
+
+def test_personality_is_registered(tmp_path: Path) -> None:
+    from lifemodel.core.personality import Personality
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    assert any(isinstance(c, Personality) for c in lm.registry.enabled())
+
+
+def test_pipeline_tick_recovers_energy_and_decays_fatigue(tmp_path: Path) -> None:
+    from lifemodel.state.json_store import JsonStateStore
+    from lifemodel.state.model import State
+
+    store = JsonStateStore(tmp_path)
+    store.commit(State(energy=0.5, fatigue=0.5, last_tick_at="2026-07-06T12:00:00+00:00"))
+    lm = build_lifemodel(
+        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 12, 30, tzinfo=UTC))
+    )
+    lm.coreloop.tick()
+    final = store.load()
+    assert final.energy > 0.5  # recovered during the idle tick
+    assert final.fatigue < 0.5  # decayed
