@@ -23,6 +23,7 @@ from .intake import IntakeLimits, IntakeResult, apply_intake
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
+from .output_lint import DEFAULT_MECHANICAL_PATTERNS, LintResult, lint_proactive
 from .personality import Personality
 from .pressure import effective_pressure, inhibition_at
 from .projection import project_contact
@@ -61,6 +62,7 @@ __all__ = [
     "can_afford",
     "circadian",
     "Component",
+    "DEFAULT_MECHANICAL_PATTERNS",
     "cost_real",
     "ComponentManifest",
     "ContactAggregation",
@@ -74,6 +76,8 @@ __all__ = [
     "IntakeResult",
     "Intent",
     "KIND_CONTACT",
+    "lint_proactive",
+    "LintResult",
     "KIND_EXCHANGE",
     "KIND_IN_FLIGHT",
     "KIND_VERDICT",
