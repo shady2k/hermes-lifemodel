@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -54,6 +54,10 @@ class State:
     #: Coarse energy placeholder (HLA §4/§11). Recovered during sleep in later
     #: phases; carried now so the wake path has a slot to read.
     energy: float = 1.0
+    #: Homeostatic sleep-pressure debt S (spec §8), in [0, 1]. Rises with
+    #: cognition spend (Phase D); decays toward 0 during rest. Additive:
+    #: ``from_dict`` defaults it when absent.
+    fatigue: float = 0.0
     #: The contact-desire drive's continuous urge variable (certified sim
     #: ``Drive.u``, spec §5). Rises with genuine silence, satiated by a positive
     #: exchange, drained when a wake-eligible urge is consumed — see
@@ -93,6 +97,14 @@ class State:
     #: ISO-8601 UTC timestamp of the last outbound contact, for cooldown
     #: bookkeeping (roadmap 1.4). ``None`` until the being first reaches out.
     last_contact_at: str | None = None
+    #: ISO-8601 UTC timestamp when the being's outreach was fulfilled (send
+    #: happened), starting the ActionPending inhibition window (spec §9.2).
+    #: ``None`` when no outreach is pending. A real exchange clears this.
+    action_pending_since: str | None = None
+    #: ISO-8601 UTC timestamps of recent real proactive sends, bounded by
+    #: ``SEND_LOG_KEEP`` (spec §14). The global backstop reads this to enforce
+    #: the hard rate limit (≤3/day, ≥60 min apart). Defaults to empty (additive).
+    proactive_send_log: list[str] = field(default_factory=list)
     #: ISO-8601 UTC liveness stamp of the in-process proactive-egress service
     #: (lm-64s). While it is fresh (within ``SERVICE_LIVENESS_MAX_AGE``) the cron
     #: heartbeat defers to the in-process brain — it owns ticking while alive — and
@@ -126,6 +138,7 @@ class State:
             schema_version=_as_int(data.get("schema_version", SCHEMA_VERSION), "schema_version"),
             tick_count=_as_int(data.get("tick_count", 0), "tick_count"),
             energy=_as_float(data.get("energy", 1.0), "energy"),
+            fatigue=_as_float(data.get("fatigue", 0.0), "fatigue"),
             u=_as_float(data.get("u", 0.0), "u"),
             duration_over_theta=_as_float(
                 data.get("duration_over_theta", 0.0), "duration_over_theta"
@@ -165,6 +178,10 @@ class State:
             egress_service_alive_at=_as_opt_iso(
                 data.get("egress_service_alive_at"), "egress_service_alive_at"
             ),
+            action_pending_since=_as_opt_iso(
+                data.get("action_pending_since"), "action_pending_since"
+            ),
+            proactive_send_log=_as_str_list(data, "proactive_send_log", []),
         )
 
 
@@ -201,6 +218,15 @@ def _as_str(value: object, field_name: str) -> str:
     if isinstance(value, str):
         return value
     raise StateCorruptError(f"field {field_name!r} must be a string, got {_type(value)}")
+
+
+def _as_str_list(data: Mapping[str, Any], key: str, default: list[str]) -> list[str]:
+    if key not in data:
+        return list(default)
+    value = data[key]
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise StateCorruptError(f"'{key}' must be a list[str]")
+    return list(value)
 
 
 def _as_opt_iso(value: object, field_name: str) -> str | None:

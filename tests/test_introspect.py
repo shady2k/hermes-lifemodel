@@ -1,267 +1,93 @@
-"""Tests for ``core/introspect`` — pure, Hermes-free personality readings (lm-zmf).
-
-Contract under test (spec §7):
-* ``compute_readings`` runs the REAL ``decide_reachout`` on a deep copy and
-  surfaces its honest verdict — one crafted ``State`` per gate outcome plus the
-  dedup and stale-pending-recovery cases;
-* derived quantities (time-to-θ, silence-window / decline-backoff remaining)
-  match hand-computed values built from the IMPORTED constants;
-* the input ``State`` is never mutated (the copy is the only thing that moves);
-* the temperament snapshot echoes the imported constants (no restated formulas).
-
-Offline: no Hermes, no network, no Anthropic env required. Stdlib only.
-"""
-
+# tests/test_introspect.py
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
-import pytest
-
-from lifemodel.core.decision import ALPHA, BASE_PARAMS, PENDING_TIMEOUT_MIN, THETA
-from lifemodel.core.introspect import PersonalityReadings, compute_readings, temperament
-from lifemodel.sim.wake import WakeOutcome, backoff_interval
+from lifemodel.core.introspect import DebugConfig, Readings, compute_readings
+from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
 
+CFG = DebugConfig(
+    params=GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0),
+    theta=1.0,
+    i0=1.0,
+    grace_min=45.0,
+    halflife_min=60.0,
+    peak_hour_utc=13.0,
+    max_per_day=3,
+    min_interval_min=60.0,
+    alpha=1.0 / 240.0,
+    u_max=100.0,
+)
+NOW = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
 
-def at(mins: float) -> datetime:
-    return datetime(2026, 7, 5, 0, 0, tzinfo=UTC) + timedelta(minutes=mins)
+
+def test_reads_physiology_and_drive() -> None:
+    state = State(u=2.0, energy=0.7, fatigue=0.3, last_tick_at="2026-07-06T03:59:00+00:00")
+    r = compute_readings(state, now=NOW, cfg=CFG)
+    assert isinstance(r, Readings)
+    assert r.energy == 0.7
+    assert r.fatigue == 0.3
+    assert 0.0 <= r.circadian <= 1.0
+    assert r.u > 2.0  # risen by 1 min * alpha from persisted value
+    assert r.inhibition == 0.0  # no ActionPending
+    assert r.effective > 0.0  # u*(1-0)
+    assert r.would_wake is True  # effective >= theta, no gates
 
 
-# --- temperament: imported constants, not restated -------------------------------------------
-
-
-def test_temperament_echoes_imported_constants():
-    temp = temperament()
-
-    assert temp.theta == THETA
-    assert temp.alpha == ALPHA
-    assert temp.base_params == BASE_PARAMS
-    assert temp.pending_timeout_min == PENDING_TIMEOUT_MIN
-    # The backoff schedule is the real R_n series from sim.wake, grown to the cap.
-    expected_first = backoff_interval(
-        decline_count=1, r0=BASE_PARAMS.r0, k=BASE_PARAMS.k, r_max=BASE_PARAMS.r_max
+def test_action_pending_suppresses_effective_and_wake() -> None:
+    state = State(
+        u=3.0,
+        action_pending_since="2026-07-06T03:50:00+00:00",
+        last_tick_at="2026-07-06T03:59:00+00:00",
     )
-    assert temp.backoff_schedule[0] == expected_first
-    # Monotonically growing until it hits the cap, then constant at the cap.
-    assert temp.backoff_schedule[-1] == BASE_PARAMS.r_max
-    assert all(b <= BASE_PARAMS.r_max + 1e-9 for b in temp.backoff_schedule)
+    r = compute_readings(state, now=NOW, cfg=CFG)  # 10 min ago -> in grace -> inhibition 1
+    assert r.inhibition == 1.0
+    assert r.action_pending_phase == "grace"
+    assert r.effective == 0.0
+    assert r.would_wake is False
+    assert r.wake_reason == "no_wake_below_threshold"  # effective 0 < theta
 
 
-# --- one crafted State per gate outcome -------------------------------------------------------
+def test_backstop_readings() -> None:
+    log = ["2026-07-06T03:30:00+00:00", "2026-07-06T02:00:00+00:00"]  # 2 today, last 30m ago
+    state = State(u=2.0, proactive_send_log=log, last_tick_at="2026-07-06T03:59:00+00:00")
+    r = compute_readings(state, now=NOW, cfg=CFG)
+    assert r.sends_today == 2
+    assert r.sends_cap == 3
+    assert r.send_allowed is False  # last send 30 min ago < 60 min interval
 
 
-def test_below_threshold_verdict_and_derived_time_to_theta():
-    s = State(last_tick_at=at(0).isoformat())  # u starts at 0
-    r = compute_readings(s, now=at(10), busy=False)
-
-    assert r.gate_verdict == WakeOutcome.BELOW_THRESHOLD.value
-    assert r.would_launch is False
-    assert not r.risen_over_theta
-    # u rose by 10 min of silence: 10 · α.
-    assert r.u_risen == pytest.approx(10 * ALPHA, abs=1e-9)
-    # (θ − u) / α minutes remain.
-    assert r.time_to_theta_min == pytest.approx((THETA - r.u_risen) / ALPHA, abs=1e-6)
-    # input untouched
-    assert s.u == 0.0
-    assert s.desire_status == "none"
-    assert s.last_tick_at == at(0).isoformat()
-
-
-def test_over_theta_inside_silence_window():
-    s = State(u=50.0, last_tick_at=at(0).isoformat(), last_exchange_at=at(0).isoformat())
-    r = compute_readings(s, now=at(10), busy=False)  # 10 < w=15
-
-    assert r.gate_verdict == WakeOutcome.SILENCE_WINDOW.value
-    assert r.would_launch is False
-    assert r.risen_over_theta
-    assert r.silence_window_remaining_min == pytest.approx(BASE_PARAMS.w - 10.0, abs=1e-9)
-
-
-def test_over_theta_inside_decline_backoff():
-    s = State(
-        u=50.0, last_tick_at=at(0).isoformat(), declined_at=at(0).isoformat(), decline_count=1
+def test_silence_window_and_backoff() -> None:
+    state = State(
+        u=2.0,
+        last_exchange_at="2026-07-06T03:55:00+00:00",  # 5 min ago, w=15 -> 10 left
+        declined_at="2026-07-06T03:40:00+00:00",
+        decline_count=1,  # 20 min ago, r0=30 -> 10 left
+        last_tick_at="2026-07-06T03:59:00+00:00",
     )
-    r = compute_readings(s, now=at(20), busy=False)  # 20 < r0=30
+    r = compute_readings(state, now=NOW, cfg=CFG)
+    assert abs((r.silence_window_remaining_min or 0) - 10.0) < 1e-6
+    assert abs((r.backoff_remaining_min or 0) - 10.0) < 1e-6
+    assert r.would_wake is False  # silence window blocks
 
-    assert r.gate_verdict == WakeOutcome.DECLINE_BACKOFF.value
-    assert r.would_launch is False
-    expected_R1 = backoff_interval(
-        decline_count=1, r0=BASE_PARAMS.r0, k=BASE_PARAMS.k, r_max=BASE_PARAMS.r_max
+
+def test_drive_is_risen_as_of_now_for_display() -> None:
+    # persisted u=0, but 240 min elapsed at alpha=1/240 -> should display ~1.0
+    cfg = DebugConfig(
+        params=GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0),
+        theta=1.0,
+        i0=1.0,
+        grace_min=45.0,
+        halflife_min=60.0,
+        peak_hour_utc=13.0,
+        max_per_day=3,
+        min_interval_min=60.0,
+        alpha=1.0 / 240.0,
+        u_max=100.0,
     )
-    assert r.backoff_remaining_min == pytest.approx(expected_R1 - 20.0, abs=1e-9)
-
-
-def test_clean_urge_launches_outreach():
-    s = State(last_tick_at=at(0).isoformat())
-    r = compute_readings(s, now=at(240), busy=False)  # 240 min → u crosses θ
-
-    assert r.gate_verdict == WakeOutcome.URGE.value
-    assert r.would_launch is True
-    assert r.risen_over_theta
-    # persisted lifecycle is still "none" — the wake is what the NEXT tick would do.
-    assert s.desire_status == "none"
-
-
-def test_dedup_gate_urge_but_would_not_launch():
-    # Gate clears (URGE) but a desire is already live → Aggregator dedup, no launch.
-    s = State(u=50.0, desire_status="active", last_tick_at=at(0).isoformat())
-    r = compute_readings(s, now=at(10), busy=False)
-
-    assert r.gate_verdict == WakeOutcome.URGE.value  # gate said URGE
-    assert r.would_launch is False  # …but outreach does not launch (dedup)
-    # input untouched
-    assert s.desire_status == "active"
-
-
-def test_stale_pending_recovery_is_flagged_and_verdict_reflects_reject():
-    s = State(
-        u=99.0,
-        desire_status="active",
-        pending_proactive_id="p1",
-        pending_proactive_since=at(0).isoformat(),
-        last_tick_at=at(0).isoformat(),
-    )
-    r = compute_readings(s, now=at(PENDING_TIMEOUT_MIN), busy=False)
-
-    assert r.stale_pending_recovery is True
-    assert r.stale_pending_age_min == pytest.approx(PENDING_TIMEOUT_MIN, abs=1e-9)
-    # The recovered REJECT stamps a fresh decline → the verdict reflects the backoff.
-    assert r.gate_verdict == WakeOutcome.DECLINE_BACKOFF.value
-    assert r.would_launch is False
-
-    # SNAPSHOT CONSISTENCY (must-fix 1/3): the lifecycle readings are derived from
-    # the post-decision snapshot, so they reflect the recovery the verdict saw —
-    # not the persisted state, which still has the stale active+pending desire.
-    assert r.desire_status == "none"  # REJECT resolved the desire
-    assert r.pending is False  # …and cleared the pending bookkeeping
-    assert r.decline_count == 1  # the recovery's first decline
-    assert r.declined_at is not None
-    expected_r1 = backoff_interval(
-        decline_count=1, r0=BASE_PARAMS.r0, k=BASE_PARAMS.k, r_max=BASE_PARAMS.r_max
-    )
-    assert r.backoff_remaining_min == pytest.approx(expected_r1, abs=1e-9)
-
-    # The original (persisted) state is untouched — recovery only ran on the copy.
-    assert s.desire_status == "active"
-    assert s.decline_count == 0
-    assert s.pending_proactive_id == "p1"
-
-
-def test_stale_last_tick_rises_u_so_drive_and_wake_agree():
-    # A stale `last_tick_at` means the elapsed-since-last-tick rise is large: the
-    # persisted u is 0, but "right now" u has risen past θ. DRIVE (u now) and WAKE
-    # READINESS (urge now risen) must read the SAME post-decision urge — the bug
-    # they regress is DRIVE showing persisted 0% while WAKE says ≥θ (must-fix 2).
-    s = State(u=0.0, last_tick_at=at(0).isoformat())  # persisted u = 0
-    r = compute_readings(s, now=at(300), busy=False)  # 300 min of silence → u ≥ θ
-
-    assert r.u_risen >= THETA  # risen past θ, even though persisted u was 0
-    assert r.u_risen > 0.0
-    assert r.gate_verdict == WakeOutcome.URGE.value
-    # The persisted state is untouched (no rise leaked back).
-    assert s.u == 0.0
-
-
-def test_fresh_pending_is_not_flagged_as_stale():
-    s = State(
-        u=99.0,
-        desire_status="active",
-        pending_proactive_id="p1",
-        pending_proactive_since=at(0).isoformat(),
-        last_tick_at=at(0).isoformat(),
-    )
-    r = compute_readings(s, now=at(PENDING_TIMEOUT_MIN - 1), busy=False)
-
-    assert r.stale_pending_recovery is False
-    assert r.stale_pending_age_min == pytest.approx(PENDING_TIMEOUT_MIN - 1, abs=1e-9)
-
-
-# --- the input State is never mutated ---------------------------------------------------------
-
-
-def test_compute_readings_never_mutates_input_state():
-    s = State(
-        u=42.0,
-        desire_status="active",
-        declined_at=at(0).isoformat(),
-        decline_count=2,
-        pending_proactive_id="p9",
-        pending_proactive_since=at(1).isoformat(),
-        last_tick_at=at(0).isoformat(),
-        last_exchange_at=at(2).isoformat(),
-        tick_count=17,
-    )
-    snapshot_fields = (
-        "u",
-        "duration_over_theta",
-        "desire_status",
-        "declined_at",
-        "decline_count",
-        "pending_proactive_id",
-        "pending_proactive_since",
-        "last_tick_at",
-        "last_exchange_at",
-        "tick_count",
-    )
-    before = {f: getattr(s, f) for f in snapshot_fields}
-
-    compute_readings(s, now=at(20), busy=False)
-
-    after = {f: getattr(s, f) for f in snapshot_fields}
-    assert after == before
-
-
-# --- gate ladder: statuses per branch ---------------------------------------------------------
-
-
-def _rung(r: PersonalityReadings, name: str) -> str:
-    match = [x for x in r.gate_ladder if x.name == name]
-    assert len(match) == 1, f"no single rung named {name!r}"
-    return match[0].status
-
-
-def test_gate_ladder_below_threshold_branch():
-    r = compute_readings(State(last_tick_at=at(0).isoformat()), now=at(10), busy=False)
-    assert _rung(r, "below_threshold") == "BLOCKS HERE"
-    assert _rung(r, "in_flight") == "n/a"  # u < θ → cannot matter
-    assert _rung(r, "urge") == "—"
-
-
-def test_gate_ladder_clean_urge_branch():
-    r = compute_readings(State(last_tick_at=at(0).isoformat()), now=at(240), busy=False)
-    assert _rung(r, "below_threshold") == "clear"
-    assert _rung(r, "in_flight") == "UNKNOWN"  # runtime-only
-    assert _rung(r, "silence_window") == "clear"
-    assert _rung(r, "decline_backoff") == "clear"
-    assert _rung(r, "urge") == "reached"
-
-
-def test_gate_ladder_decline_backoff_branch():
-    s = State(
-        u=50.0, last_tick_at=at(0).isoformat(), declined_at=at(0).isoformat(), decline_count=1
-    )
-    r = compute_readings(s, now=at(20), busy=False)
-    assert _rung(r, "decline_backoff") == "would-block"
-    assert _rung(r, "urge") == "—"  # blocked above
-
-
-def test_gate_ladder_stale_recovery_uses_snapshot_decline():
-    # The verdict (run on the copy) reflects the REJECT stale-recovery just applied,
-    # so the ladder must see that freshly-stamped decline — not the persisted state
-    # (which still has no decline). Regression: previously this rendered "R_0 ... ~0.0".
-    s = State(
-        u=99.0,
-        desire_status="active",
-        pending_proactive_id="p1",
-        pending_proactive_since=at(0).isoformat(),
-        last_tick_at=at(0).isoformat(),
-    )
-    r = compute_readings(s, now=at(PENDING_TIMEOUT_MIN), busy=False)
-
-    decline_rung = [x for x in r.gate_ladder if x.name == "decline_backoff"][0]
-    assert decline_rung.status == "would-block"
-    assert "R_1" in decline_rung.detail  # the recovery's first decline, not R_0
-    assert "R_0" not in decline_rung.detail
-    # A real backoff remains (the just-stamped decline's full R_1), not ~0 left.
-    assert not decline_rung.detail.startswith("~0.0 min")
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)  # 240 min later
+    r = compute_readings(state, now=now, cfg=cfg)
+    assert abs(r.u - 1.0) < 1e-6  # risen as of now
+    assert r.would_wake is True  # and the debug reflects the imminent wake

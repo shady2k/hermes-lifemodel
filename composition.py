@@ -54,14 +54,40 @@ from pathlib import Path
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
+from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
+from .core.cognition import Cognition
+from .core.contact_neuron import ContactNeuron
+from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
+from .core.personality import Personality
+from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
+from .core.state_actor import StateActor
 from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
+from .sim.wake import GateParams
 from .state.json_store import JsonStateStore
 from .state.port import StatePort
+
+CONTACT_ALPHA = 1.0 / 240.0
+CONTACT_BETA = 1.0
+CONTACT_U_MAX = 100.0
+CONTACT_PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
+CONTACT_I0 = 1.0
+CONTACT_GRACE_MIN = 45.0
+CONTACT_INHIBITION_HALFLIFE_MIN = 60.0
+
+E_MAX = 1.0
+ENERGY_RECOVERY_PER_MIN = 0.01
+NIGHT_RECOVERY_BOOST = 0.5
+FATIGUE_DECAY_PER_MIN = 0.002
+CIRCADIAN_PEAK_UTC_HOUR = 13.0  # peak alertness 16:00 MSK, trough 04:00 MSK
+
+COGNITION_FAST_COST = 0.02
+COGNITION_SEND_COST = 0.03
+COST_ALPHA = 2.0
 
 
 @dataclass(frozen=True)
@@ -79,6 +105,9 @@ class LifeModel:
     delivery: DeliveryPort
     aggregator: Aggregator
     neurons: tuple[Neuron, ...] = field(default_factory=tuple)
+    registry: ComponentRegistry = field(default_factory=ComponentRegistry)
+    state_actor: StateActor | None = None
+    coreloop: CoreLoop | None = None
 
 
 def build_lifemodel(
@@ -91,6 +120,7 @@ def build_lifemodel(
     aggregator: Aggregator | None = None,
     neurons: Sequence[Neuron] | None = None,
     logger: EventLogger | None = None,
+    registry: ComponentRegistry | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -113,6 +143,58 @@ def build_lifemodel(
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
+    resolved_registry: ComponentRegistry = registry if registry is not None else ComponentRegistry()
+    try:
+        resolved_registry.manifest("personality")
+    except UnknownComponent:
+        personality = Personality(
+            e_max=E_MAX,
+            recovery_per_min=ENERGY_RECOVERY_PER_MIN,
+            night_boost=NIGHT_RECOVERY_BOOST,
+            fatigue_decay_per_min=FATIGUE_DECAY_PER_MIN,
+            peak_hour_utc=CIRCADIAN_PEAK_UTC_HOUR,
+        )
+        resolved_registry.register(
+            personality, ComponentManifest(id=personality.id, type="personality")
+        )
+    try:
+        resolved_registry.manifest("contact")
+    except UnknownComponent:
+        contact = ContactNeuron(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
+        resolved_registry.register(contact, ComponentManifest(id=contact.id, type="neuron"))
+    try:
+        resolved_registry.manifest("contact-aggregation")
+    except UnknownComponent:
+        aggregation = ContactAggregation(
+            params=CONTACT_PARAMS,
+            theta=CONTACT_PARAMS.theta_u,
+            beta=CONTACT_BETA,
+            u_max=CONTACT_U_MAX,
+            i0=CONTACT_I0,
+            grace_min=CONTACT_GRACE_MIN,
+            halflife_min=CONTACT_INHIBITION_HALFLIFE_MIN,
+        )
+        resolved_registry.register(
+            aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
+        )
+    try:
+        resolved_registry.manifest("cognition")
+    except UnknownComponent:
+        cognition = Cognition(
+            fast_cost=COGNITION_FAST_COST,
+            send_cost=COGNITION_SEND_COST,
+            alpha=COST_ALPHA,
+        )
+        resolved_registry.register(cognition, ComponentManifest(id=cognition.id, type="cognition"))
+    resolved_state_actor = StateActor(resolved_state, logger=logger)
+    resolved_coreloop = CoreLoop(
+        registry=resolved_registry,
+        state_actor=resolved_state_actor,
+        bus=resolved_bus,
+        clock=resolved_clock,
+        logger=logger,
+    )
+
     return LifeModel(
         state=resolved_state,
         bus=resolved_bus,
@@ -120,4 +202,7 @@ def build_lifemodel(
         delivery=resolved_delivery,
         aggregator=resolved_aggregator,
         neurons=resolved_neurons,
+        registry=resolved_registry,
+        state_actor=resolved_state_actor,
+        coreloop=resolved_coreloop,
     )

@@ -1,131 +1,154 @@
-"""Tests for :func:`lifemodel.egress_service.run_proactive_tick` (spec §3.2/§5/§6).
+"""Tests for :func:`lifemodel.egress_service.run_proactive_tick` (spec §13/§14, model A).
 
-The old pressure/aggregator/cooldown decision path is gone — ``run_proactive_tick``
-now decides purely via :func:`lifemodel.core.decision.decide_reachout` (already
-pinned by ``tests/test_decision.py``) and only adds the delivery-launch behaviour
-this module owns: on a wake, record a pending proactive id and call
-``egress.reach_out``; roll the desire back (no reject) on anything short of
-``DELIVERED``. The verdict itself (fulfill/reject) is applied later by the
-``post_llm_call`` observer — never here.
-
-Local fakes/helpers (no shared ``conftest.py`` exists in this repo; every test
-module builds its own, matching the existing style — see e.g.
-``tests/test_tick.py``'s ``_build``):
-
-* ``make_lm(**state_kwargs)`` — a ``LifeModel`` wired from a fresh ``State``
-  seeded with *state_kwargs*, a ``FakeStateStore``/``FakeSignalBus`` and a
-  ``FakeClock`` pinned at ``_T0``. Neurons/aggregator are irrelevant to the new
-  decision path (it never reads ``lm.bus``/``lm.aggregator``/``lm.neurons``), so
-  they are wired with inert defaults.
-* ``make_lm_high_u()`` — a ``LifeModel`` whose urge is already mature (``u`` far
-  past ``THETA``) and past the active-silence window, with no reject on record —
-  i.e. one tick away from a wake.
-* ``fake_egress()`` / ``fake_egress_failing()`` — a ``ProactiveEgressPort`` fake
-  recording every ``reach_out`` call, returning ``DELIVERED`` / ``FAILED``
-  respectively.
-* ``NULL_LOGGER`` — a no-op ``EventLogger`` so tests don't depend on structlog
-  output.
+Phase E3: ``run_proactive_tick`` now drives ``coreloop.tick()`` (the layered pipeline),
+consumes surfaced ``LaunchProactive`` intents, applies the global backstop
+(``allow_send``), and reaches out with ``IMPULSE_LABEL_PREFIX + launch.prompt``.
+Blocked/failed launches roll pending back. Liveness always stamped.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any
+from datetime import UTC, datetime
 
-from lifemodel.composition import LifeModel, build_lifemodel
-from lifemodel.core.aggregator import SilentAggregator
+from lifemodel.composition import build_lifemodel
+from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.egress_service import run_proactive_tick
+from lifemodel.log import get_logger
 from lifemodel.state.model import State
-from lifemodel.testing.fakes import FakeClock, FakeSignalBus, FakeStateStore
 
-_T0 = datetime(2026, 7, 4, 18, 0, tzinfo=UTC)
-_TARGET = {"platform": "telegram", "chat_id": "1", "thread_id": None}
+TARGET = {"platform": "telegram", "chat_id": "1", "thread_id": None}
 
 
-class _NullLogger:
-    def info(self, event: str, **fields: Any) -> None:
-        pass
-
-
-NULL_LOGGER = _NullLogger()
-
-
-def make_lm(**state_kwargs: Any) -> LifeModel:
-    """A ``LifeModel`` over a fresh state seeded with *state_kwargs* (no kwargs =
-    the documented ``State()`` defaults — silence not yet matured)."""
-    return build_lifemodel(
-        base_dir=Path("/unused"),
-        state=FakeStateStore(State(**state_kwargs)),
-        bus=FakeSignalBus(),
-        clock=FakeClock(_T0),
-        aggregator=SilentAggregator(),
-        neurons=(),
-    )
-
-
-def make_lm_high_u() -> LifeModel:
-    """``u`` well past ``THETA``, past the active-silence window, no reject —
-    ``decide_reachout`` wakes on the very next call with ``busy=False``."""
-    return make_lm(u=50.0, last_exchange_at=(_T0 - timedelta(minutes=20)).isoformat())
-
-
-class _FakeEgress:
-    def __init__(self, outcome: ReachOutcome) -> None:
+class FakeEgress:
+    def __init__(self, outcome=ReachOutcome.DELIVERED) -> None:
         self.outcome = outcome
-        self.calls: list[tuple[dict[str, str | None], str]] = []
+        self.calls: list[tuple] = []
 
-    def reach_out(self, target: Mapping[str, str | None], impulse: str) -> ReachOutcome:
-        self.calls.append((dict(target), impulse))
+    def reach_out(self, target, impulse):
+        self.calls.append((target, impulse))
         return self.outcome
 
 
-def fake_egress() -> _FakeEgress:
-    return _FakeEgress(ReachOutcome.DELIVERED)
+class FixedClock:
+    def __init__(self, m):
+        self._m = m
+
+    def now(self):
+        return self._m
 
 
-def fake_egress_failing() -> _FakeEgress:
-    return _FakeEgress(ReachOutcome.FAILED)
+def _lm(tmp_path, state: State, now: datetime):
+    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(now))
+    lm.state.commit(state)
+    return lm
 
 
-def test_no_reach_out_below_threshold() -> None:
-    lm = make_lm()  # fresh state — urge has not matured
-    egress = fake_egress()
-    run_proactive_tick(lm, egress, _TARGET, logger=NULL_LOGGER, busy=False)
-    assert egress.calls == []  # urge not matured -> no reach-out
-    assert lm.state.load().egress_service_alive_at is not None  # liveness always stamped
-
-
-def test_wake_launches_turn_records_pending_and_does_not_apply_verdict() -> None:
-    lm = make_lm_high_u()  # u high, past W, no reject
-    egress = fake_egress()
-    run_proactive_tick(lm, egress, _TARGET, logger=NULL_LOGGER, busy=False)
+def test_active_desire_launches_native_turn(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(
+        desire_status="active",
+        u=2.0,
+        energy=1.0,
+        pending_proactive_id=None,
+        last_tick_at="2026-07-06T11:59:00+00:00",
+    )
+    lm = _lm(tmp_path, state, now)
+    egress = FakeEgress()
+    run_proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
     assert len(egress.calls) == 1
-    s = lm.state.load()
-    assert s.desire_status == "active"
-    assert s.pending_proactive_id is not None
-    assert s.decline_count == 0  # verdict NOT applied here
+    _, impulse = egress.calls[0]
+    assert impulse.startswith(IMPULSE_LABEL_PREFIX)  # correlation marker prepended
+    assert lm.state.load().pending_proactive_id is not None  # a turn is in flight
 
 
-def test_busy_gate_blocks_reach_out() -> None:
-    lm = make_lm_high_u()
-    egress = fake_egress()
-    run_proactive_tick(lm, egress, _TARGET, logger=NULL_LOGGER, busy=True)
+def test_no_active_desire_does_not_reach_out(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(desire_status="none", u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
+    lm = _lm(tmp_path, state, now)
+    egress = FakeEgress()
+    run_proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
     assert egress.calls == []
 
 
-def test_failed_launch_rolls_back_desire() -> None:
-    lm = make_lm_high_u()
-    egress = fake_egress_failing()
-    run_proactive_tick(lm, egress, _TARGET, logger=NULL_LOGGER, busy=False)
-    s = lm.state.load()
-    assert s.desire_status == "none" and s.pending_proactive_id is None  # rolled back, no reject
+def test_backstop_blocks_when_cap_reached(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    log = [
+        "2026-07-06T11:00:00+00:00",
+        "2026-07-06T10:00:00+00:00",
+        "2026-07-06T09:00:00+00:00",
+    ]  # 3 today
+    state = State(
+        desire_status="active",
+        u=2.0,
+        energy=1.0,
+        proactive_send_log=log,
+        last_tick_at="2026-07-06T11:59:00+00:00",
+    )
+    lm = _lm(tmp_path, state, now)
+    egress = FakeEgress()
+    run_proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    assert egress.calls == []  # backstop blocked the send
+    assert lm.state.load().desire_status == "deferred"  # held, not sent
 
 
-def test_liveness_stamped_even_on_failed_launch() -> None:
-    lm = make_lm_high_u()
-    egress = fake_egress_failing()
-    run_proactive_tick(lm, egress, _TARGET, logger=NULL_LOGGER, busy=False)
-    assert lm.state.load().egress_service_alive_at is not None
+def test_failed_launch_rolls_back_pending(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(
+        desire_status="active",
+        u=2.0,
+        energy=1.0,
+        last_tick_at="2026-07-06T11:59:00+00:00",
+    )
+    lm = _lm(tmp_path, state, now)
+    egress = FakeEgress(outcome=ReachOutcome.UNAVAILABLE)
+    run_proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    final = lm.state.load()
+    assert final.pending_proactive_id is None  # rolled back
+    assert final.desire_status == "active"  # kept to retry (not rejected)
+
+
+def test_backstop_block_refunds_the_reservation(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    log = ["2026-07-06T11:00:00+00:00", "2026-07-06T10:00:00+00:00", "2026-07-06T09:00:00+00:00"]
+    state = State(
+        desire_status="active",
+        u=2.0,
+        energy=1.0,
+        proactive_send_log=log,
+        last_tick_at="2026-07-06T11:59:00+00:00",
+    )
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    # cognition deducted 0.05, then the block refunded it -> back to ~1.0 (minus any recovery)
+    assert lm.state.load().energy >= 0.99
+
+
+def test_failed_launch_refunds_the_reservation(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(
+        desire_status="active", u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"
+    )
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(
+        lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t")
+    )
+    assert lm.state.load().energy >= 0.99  # refunded — no turn ran
+
+
+def test_delivered_launch_keeps_the_cost(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(
+        desire_status="active", u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"
+    )
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    assert lm.state.load().energy < 1.0  # the turn ran -> energy spent, not refunded
+
+
+def test_liveness_is_stamped(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+    state = State(desire_status="none", last_tick_at="2026-07-06T11:59:00+00:00")
+    lm = _lm(tmp_path, state, now)
+    run_proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    assert lm.state.load().egress_service_alive_at == now.isoformat()

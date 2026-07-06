@@ -102,9 +102,9 @@ _LOADER_SCRIPT = textwrap.dedent(
     assert callable(module.register), "register(ctx) must be callable"
 
     tick_mod = importlib.import_module("hermes_plugins.lifemodel.tick")
-    decision_mod = importlib.import_module("hermes_plugins.lifemodel.core.decision")
+    introspect_mod = importlib.import_module("hermes_plugins.lifemodel.core.introspect")
     assert tick_mod is not None
-    assert decision_mod is not None
+    assert introspect_mod is not None
 
     print("OK")
     """

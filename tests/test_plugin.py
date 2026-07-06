@@ -127,9 +127,8 @@ def test_register_lifemodel_debug_subcommand_returns_dump(
 
     # `/lifemodel debug` renders the read-only inspection dump (default state).
     dump = handler("debug")
-    assert "debug dump" in dump
-    assert "schema_version:" in dump
-    assert "lock status:" in dump
+    assert "read-only" in dump
+    assert "PHYSIOLOGY" in dump
     # `/lifemodel` (and any other arg) still prints the status line.
     assert "alive" in handler("")
     assert "alive" in handler("status")
