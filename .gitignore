@@ -16,3 +16,6 @@ htmlcov/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Superpowers workflow scratch (per-session SDD/task reports)
+.superpowers/
