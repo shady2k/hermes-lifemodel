@@ -17,6 +17,7 @@ from .aggregator import Aggregator, SilentAggregator
 from .component import Component, TickContext
 from .contact_neuron import ContactNeuron
 from .coreloop import CoreLoop, TickReport
+from .intake import IntakeLimits, IntakeResult, apply_intake
 from .intents import CheckpointState, EmitSignal, Intent, UpdateState
 from .layer import Layer, ProcessingLayer
 from .neuron import Neuron
@@ -61,6 +62,8 @@ __all__ = [
     "CoreLoop",
     "DuplicateComponent",
     "EmitSignal",
+    "IntakeLimits",
+    "IntakeResult",
     "Intent",
     "KIND_CONTACT",
     "KIND_EXCHANGE",
@@ -78,6 +81,7 @@ __all__ = [
     "UnknownComponent",
     "UnknownStateField",
     "UpdateState",
+    "apply_intake",
     "contact_signal",
     "contact_value",
     "exchange_signal",
