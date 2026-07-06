@@ -20,6 +20,7 @@ from collections.abc import Sequence
 
 from ..sim.aggregation import Aggregator, DesireStatus, Verdict
 from ..sim.wake import GateParams, LaneState, evaluate_wake
+from .backstop import record_send
 from .component import TickContext
 from .intents import Intent, UpdateState
 from .invalidation import is_verdict_stale
@@ -123,6 +124,7 @@ class ContactAggregation:
             if verdict is Verdict.FULFILL:
                 action_pending_since = now.isoformat()  # send -> inhibition starts
                 last_contact_at = now.isoformat()
+                send_log = record_send(send_log, now)  # backstop counter (spec §14)
                 pending_id = None
                 pending_since = None
             elif verdict is Verdict.REJECT:

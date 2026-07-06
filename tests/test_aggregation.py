@@ -313,3 +313,23 @@ def test_duration_over_theta_uses_latent_not_effective(tmp_path) -> None:
         abs(changes["duration_over_theta"] - 15.0) < 1e-9
     )  # latent-based, accrues under inhibition
     assert changes["desire_status"] == "none"  # but no wake (effective suppressed)
+
+
+def test_fulfill_records_a_send(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    log = changes["proactive_send_log"]
+    assert log[-1] == now.isoformat()  # this send recorded
+    assert len(log) == 2  # appended to the prior one
+
+
+def test_reject_does_not_record_a_send(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["proactive_send_log"] == ["2026-07-06T02:00:00+00:00"]  # unchanged
