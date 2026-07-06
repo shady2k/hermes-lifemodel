@@ -54,6 +54,7 @@ from .taxonomy import (
     lane_of,
     read_exchange,
     read_verdict,
+    read_verdict_correlation,
     verdict_signal,
 )
 from .timeutil import minutes_between
@@ -120,6 +121,7 @@ __all__ = [
     "minutes_between",
     "read_exchange",
     "read_verdict",
+    "read_verdict_correlation",
     "record_send",
     "reserve",
     "settle",

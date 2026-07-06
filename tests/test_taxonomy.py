@@ -107,3 +107,20 @@ def test_unknown_kind_defaults_to_sensor_never_control() -> None:
     from lifemodel.core.taxonomy import lane_of
 
     assert lane_of("something-new") == "sensor"  # unknown floods can't claim lossless control
+
+
+def test_verdict_signal_carries_correlation_id() -> None:
+    sig = verdict_signal(
+        origin_id="v9", verdict=Verdict.FULFILL, timestamp=None, correlation_id="proactive-X"
+    )
+    assert read_verdict(sig) is Verdict.FULFILL
+    from lifemodel.core.taxonomy import read_verdict_correlation
+
+    assert read_verdict_correlation(sig) == "proactive-X"
+
+
+def test_verdict_correlation_defaults_empty() -> None:
+    sig = verdict_signal(origin_id="v10", verdict=Verdict.REJECT, timestamp=None)
+    from lifemodel.core.taxonomy import read_verdict_correlation
+
+    assert read_verdict_correlation(sig) == ""

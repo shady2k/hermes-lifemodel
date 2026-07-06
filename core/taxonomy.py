@@ -80,12 +80,14 @@ def read_exchange(signal: Signal) -> tuple[Actor, Label]:
     return cast(Actor, actor), cast(Label, label)
 
 
-def verdict_signal(*, origin_id: str, verdict: Verdict, timestamp: str | None) -> Signal:
+def verdict_signal(
+    *, origin_id: str, verdict: Verdict, timestamp: str | None, correlation_id: str = ""
+) -> Signal:
     """Build a durable verdict-input signal (cognition's decision on a desire)."""
     return Signal(
         origin_id=origin_id,
         kind=KIND_VERDICT,
-        payload={"verdict": verdict.value},
+        payload={"verdict": verdict.value, "correlation_id": correlation_id},
         timestamp=timestamp,
     )
 
@@ -98,6 +100,14 @@ def read_verdict(signal: Signal) -> Verdict:
     if raw not in _VERDICTS:
         raise ValueError(f"invalid verdict payload: {signal.payload!r}")
     return _VERDICTS[raw]
+
+
+def read_verdict_correlation(signal: Signal) -> str:
+    """The correlation id a verdict resolves (``""`` if absent)."""
+    if signal.kind != KIND_VERDICT:
+        raise ValueError(f"not a verdict signal: kind={signal.kind!r}")
+    raw = signal.payload.get("correlation_id", "")
+    return raw if isinstance(raw, str) else ""
 
 
 def in_flight_signal(*, origin_id: str, value: bool, timestamp: str | None) -> Signal:
