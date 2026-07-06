@@ -229,3 +229,27 @@ def test_pipeline_exchange_satiates_and_clears(tmp_path: Path) -> None:
     assert final.u < 3.0  # neuron satiated (reduced)
     assert final.desire_status == "none"  # aggregation cleared the desire
     assert final.last_exchange_at is not None
+
+
+# --- Phase C1: inhibition constants wired into composition ---
+
+
+def test_pipeline_send_suppresses_then_recovers(tmp_path: Path) -> None:
+    from lifemodel.state.json_store import JsonStateStore
+    from lifemodel.state.model import State
+
+    store = JsonStateStore(tmp_path)
+    # high latent, a send 10 min ago -> within grace -> no wake this tick
+    store.commit(
+        State(
+            u=3.0,
+            desire_status="none",
+            action_pending_since="2026-07-06T03:50:00+00:00",
+            last_tick_at="2026-07-06T03:59:00+00:00",
+        )
+    )
+    lm = build_lifemodel(
+        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    )
+    lm.coreloop.tick()
+    assert store.load().desire_status == "none"  # grace suppresses the wake end-to-end

@@ -73,6 +73,9 @@ CONTACT_ALPHA = 1.0 / 240.0
 CONTACT_BETA = 1.0
 CONTACT_U_MAX = 100.0
 CONTACT_PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
+CONTACT_I0 = 1.0
+CONTACT_GRACE_MIN = 45.0
+CONTACT_INHIBITION_HALFLIFE_MIN = 60.0
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,9 @@ def build_lifemodel(
             theta=CONTACT_PARAMS.theta_u,
             beta=CONTACT_BETA,
             u_max=CONTACT_U_MAX,
+            i0=CONTACT_I0,
+            grace_min=CONTACT_GRACE_MIN,
+            halflife_min=CONTACT_INHIBITION_HALFLIFE_MIN,
         )
         resolved_registry.register(
             aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
