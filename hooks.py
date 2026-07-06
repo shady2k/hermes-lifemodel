@@ -1,86 +1,20 @@
-"""Verdict feedback via Hermes' ``post_llm_call`` hook (spec §5/§7, Task 5).
+"""Signal-publishing hooks — verdict + exchange (spec §7.1, Phase E3).
 
-A wake only *launches* a proactive turn (``egress_service.run_proactive_tick``)
-— cognition's actual answer only exists once the LLM's final output comes
-back. This module observes that output via the ``post_llm_call`` lifecycle
-hook and resolves the pending desire:
+Before Phase E3 these hooks mutated ``State`` directly (calling
+``core.decision.apply_verdict`` / ``observe_exchange``). Now they **publish
+signals** to ``lm.bus`` — producers only enqueue (spec §7.1). The aggregation
+layer inside ``coreloop.tick()`` consumes them on the next tick.
 
-* the model answers ``NO_REPLY`` / ``NO REPLY`` / ``[SILENT]`` / ``SILENT``
-  (case-insensitive, whitespace-collapsed) -> :data:`Verdict.REJECT` (growing
-  backoff — the anti-drum guarantee, no message sent);
-* any other text -> :data:`Verdict.FULFILL` (satiate, stamp contact).
+``make_post_llm_observer`` — on a correlated proactive turn (``pending_proactive_id``
+set AND ``user_message`` starts with ``IMPULSE_LABEL_PREFIX``) whose desire is
+still active, decides ``FULFILL`` (any text) vs ``REJECT`` (a silence marker),
+runs ``lint_proactive`` on a FULFILL and logs a mechanical leak (advisory), then
+publishes a ``verdict`` signal carrying the ``correlation_id``.
 
-SPIKE findings (read-only against ``~/.hermes/hermes-agent``, hermes-agent
-0.17.0 — recorded here since the payload shape lives outside this repo):
+``make_inbound_observer`` — on a genuine (non-internal, non-own-impulse) inbound
+message, publishes an ``exchange`` signal.
 
-* ``post_llm_call`` **is** in ``VALID_HOOKS`` (``hermes_cli/plugins.py``) and
-  fires exactly once per turn, right after ``transform_llm_output``, from
-  ``agent/turn_finalizer.py`` (~line 361)::
-
-      invoke_hook(
-          "post_llm_call",
-          session_id=agent.session_id, task_id=effective_task_id,
-          turn_id=turn_id, user_message=original_user_message,
-          assistant_response=final_response, conversation_history=list(messages),
-          model=agent.model, platform=getattr(agent, "platform", None) or "",
-      )
-
-  ``PluginManager.invoke_hook`` calls every registered callback as
-  ``cb(**kwargs)`` (a **kwargs call, not a single payload object** — plugins.py
-  ~line 1872) — so :func:`make_post_llm_observer` returns a handler with that
-  keyword shape, not a one-argument payload handler.
-* ``assistant_response`` is the raw final text (post any
-  ``transform_llm_output``, *pre* delivery-suppression) — so a literal
-  ``NO_REPLY`` is still observable here even though the gateway later hides it
-  from the chat surface. ``gateway/response_filters.py`` already defines the
-  exact same four canonical markers this module matches
-  (``LIVE_GATEWAY_SILENT_MARKERS``) and a streaming-safe partial-marker buffer
-  (``is_partial_silence_marker``) — so the Phase-2 worry "does NO_REPLY leak
-  visibly under streaming" looks pre-addressed upstream; still worth a live
-  confirmation, not re-derived here.
-* **Correlation caveat — needs field verification.** The real payload carries
-  no id we control that echoes ``state.pending_proactive_id``: Hermes does not
-  thread a plugin-supplied id through the turn/hook pipeline, and upstreaming
-  that is out of Phase-1 scope. The only signal available without a host
-  change is the one the design spec's own guard table already anticipated
-  (``docs/superpowers/specs/2026-07-04-lifemodel-proactive-egress-design.md``
-  §5 guard (c)): plugin hooks see the synthetic impulse text verbatim as
-  ``user_message``. So correlation here is two gates: (1) a proactive turn is
-  actually outstanding (``state.pending_proactive_id is not None``) **and**
-  (2) *this* turn's ``user_message`` is recognizably our own impulse (starts
-  with :data:`~lifemodel.impulse.IMPULSE_LABEL_PREFIX`). Because
-  ``core.decision.decide_reachout`` dedups to at most one live desire at a
-  time, gate (1) already narrows this to "the" pending turn, and gate (2)
-  filters out a genuine user turn that happens to land while one is pending.
-  This has **not** been exercised against a real running Hermes turn (no live
-  session in this environment) — treat it as the one field-verification item
-  before relying on this in production.
-
-Task 6 (inbound observation) SPIKE findings — read-only against the same host:
-
-* ``pre_gateway_dispatch`` **is** in ``VALID_HOOKS`` (``hermes_cli/plugins.py``
-  line 173) and is *preferred* over ``pre_llm_call`` per the plan: it fires
-  **once per incoming** ``MessageEvent``, inside ``GatewayRunner._handle_message``
-  (``gateway/run.py`` ~line 8650), via
-  ``invoke_hook("pre_gateway_dispatch", event=event, gateway=self,
-  session_store=self.session_store)`` — again a ``cb(**kwargs)`` call.
-* **Load-bearing:** the host itself gates this invocation on
-  ``if not is_internal:`` (``is_internal = bool(getattr(event, "internal",
-  False))``), *before* any hook fires — and our own proactive impulse is
-  injected via ``gateway_core.inject_proactive_turn`` -> ``_default_make_event``
-  as ``MessageEvent(..., internal=True)``, dispatched through the very same
-  ``adapter.handle_message`` -> ``_handle_message`` path (``adapter`` is wired
-  with ``set_message_handler(self._handle_message)`` at ``gateway/run.py``
-  ~line 6841). So the host *never* invokes ``pre_gateway_dispatch`` for our own
-  nudge at all — disjointness from the post_llm_call verdict path is a host
-  guarantee here, not something this module has to enforce alone. This module
-  still checks ``event.internal`` and the
-  :data:`~lifemodel.impulse.IMPULSE_LABEL_PREFIX` text defensively (belt and
-  suspenders — cheap, and robust if that host guarantee ever changes).
-* Return contract: ``None`` = normal dispatch, a dict with
-  ``{"action": "skip"|"rewrite"|"allow"}`` influences flow. This observer only
-  *observes* — it always returns ``None`` so it can never itself skip/rewrite a
-  genuine inbound message.
+Neither mutates ``State``.
 """
 
 from __future__ import annotations
@@ -89,15 +23,12 @@ from collections.abc import Callable
 from typing import Any
 
 from .composition import LifeModel
-from .core.decision import apply_verdict, observe_exchange
+from .core.output_lint import lint_proactive
+from .core.taxonomy import exchange_signal, verdict_signal
 from .impulse import IMPULSE_LABEL_PREFIX
 from .sim.aggregation import Verdict
 
-#: The exact silence markers Hermes' own gateway treats as intentional silence
-#: (``gateway/response_filters.py::LIVE_GATEWAY_SILENT_MARKERS``, hermes-agent
-#: 0.17.0). Kept as a local, stdlib-only constant — the plugin core stays
-#: importable without the host (Global Constraints) — rather than imported, so
-#: both sets must be kept in lockstep by hand if the host's ever changes.
+#: The exact silence markers Hermes' own gateway treats as intentional silence.
 _NO_REPLY_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})
 
 
@@ -127,72 +58,52 @@ def _is_pending_proactive_turn(pending_proactive_id: str | None, user_message: s
     return user_message.strip().startswith(IMPULSE_LABEL_PREFIX)
 
 
+def _log_lint(lm: LifeModel, reason: str) -> None:
+    """Advisory: record that a delivered proactive message tripped the output-lint
+    (mechanical timer / filler). Model A can't block the native send — this is
+    observability feeding future prompt tuning (spec §13)."""
+    try:
+        from .log import get_logger
+
+        get_logger("lifemodel.hooks").info("proactive_output_lint", reason=reason)
+    except Exception:  # noqa: BLE001 - advisory logging must never break a turn
+        pass
+
+
 def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
-    """Return a ``post_llm_call`` handler that resolves the pending desire.
+    """Return a ``post_llm_call`` handler that PUBLISHES a verdict signal (§7.1)."""
 
-    Accepts the real Hermes kwargs shape (``invoke_hook`` calls
-    ``cb(**kwargs)`` — see the SPIKE notes above), reading only
-    ``user_message`` and ``assistant_response``; every other kwarg
-    (``session_id``, ``task_id``, ``turn_id``, ``conversation_history``,
-    ``model``, ``platform``, ``telemetry_schema_version``, ...) is accepted
-    and ignored. A turn that does not correlate to the pending proactive
-    desire (see :func:`_is_pending_proactive_turn`) is a no-op — as is a turn
-    that correlates on id/text but whose desire is no longer live
-    (``desire_status != "active"``): a genuine user exchange may have already
-    resolved it (``core.decision.observe_exchange`` clears the pending
-    bookkeeping, but this guard is a second, independent line of defense
-    against applying a stale verdict to a desire nothing pending should still
-    resolve).
-    """
-
-    def _observer(
-        *,
-        user_message: str = "",
-        assistant_response: str = "",
-        **_ignored: Any,
-    ) -> None:
+    def _observer(*, user_message: str = "", assistant_response: str = "", **_ignored: Any) -> None:
         state = lm.state.load()
         if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
             return
         if state.desire_status != "active":
             return
         verdict = Verdict.REJECT if _is_no_reply(assistant_response) else Verdict.FULFILL
-        apply_verdict(state, verdict, now=lm.clock.now())
-        lm.state.commit(state)
+        if verdict is Verdict.FULFILL:
+            lint = lint_proactive(assistant_response)
+            if not lint.ok:
+                _log_lint(lm, lint.reason)
+        now = lm.clock.now()
+        lm.bus.publish(
+            verdict_signal(
+                origin_id=f"verdict-{state.pending_proactive_id}",
+                verdict=verdict,
+                timestamp=now.isoformat(),
+                correlation_id=state.pending_proactive_id or "",
+            )
+        )
 
     return _observer
 
 
 def _is_own_impulse(text: str) -> bool:
-    """True when *text* is our own composed proactive impulse (spec §6).
-
-    Belt-and-suspenders alongside ``event.internal`` (see the module
-    docstring's Task 6 SPIKE notes): the being must never treat its own nudge
-    as user contact.
-    """
+    """True when *text* is our own composed proactive impulse (spec §6)."""
     return text.strip().startswith(IMPULSE_LABEL_PREFIX)
 
 
 def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
-    """Return a ``pre_gateway_dispatch`` handler that observes genuine user contact.
-
-    On a genuine inbound user message: satiates the drive, stamps
-    ``last_exchange_at``, clears the reject record, and resolves any live
-    desire (:func:`~lifemodel.core.decision.observe_exchange` with
-    ``actor="user", label="two_way"``) — so silence resets on real contact
-    (RC1: the being now *hears* the user).
-
-    Accepts the real Hermes kwargs shape (``invoke_hook`` calls ``cb(**kwargs)``
-    with ``event``, ``gateway``, ``session_store`` — see the SPIKE notes above),
-    reading only ``event.text`` / ``event.internal``; every other kwarg is
-    accepted and ignored. Two turns are ignored, never touching state: an
-    internal/synthetic event (``event.internal``, or missing ``event``
-    entirely — defensive), and our own composed impulse text (the
-    :data:`~lifemodel.impulse.IMPULSE_LABEL_PREFIX` marker) — so the being
-    never satiates its own urge with its own nudge, and never double-counts
-    with the ``post_llm_call`` verdict path. Always returns ``None`` (normal
-    dispatch) — this observer never skips or rewrites the message.
-    """
+    """Return a ``pre_gateway_dispatch`` handler that PUBLISHES an exchange signal (§7.1)."""
 
     def _observer(*, event: Any = None, **_ignored: Any) -> None:
         if event is None or getattr(event, "internal", False):
@@ -200,8 +111,19 @@ def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
         text = getattr(event, "text", "") or ""
         if _is_own_impulse(text):
             return
-        state = lm.state.load()
-        observe_exchange(state, actor="user", label="two_way", now=lm.clock.now())
-        lm.state.commit(state)
+        now = lm.clock.now()
+        origin = (
+            getattr(event, "id", None)
+            or getattr(event, "message_id", None)
+            or f"exchange-{now.isoformat()}"
+        )
+        lm.bus.publish(
+            exchange_signal(
+                origin_id=str(origin),
+                actor="user",
+                label="two_way",
+                timestamp=now.isoformat(),
+            )
+        )
 
     return _observer
