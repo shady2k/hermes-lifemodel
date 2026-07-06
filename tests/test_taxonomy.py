@@ -81,3 +81,29 @@ def test_contact_value_reads_transient_signal_or_default() -> None:
     c = _contact_signal(origin_id="c-9", value=2.5, delta=0.1, timestamp=None)
     assert contact_value([c], default=0.0) == 2.5
     assert contact_value([], default=1.23) == 1.23
+
+
+def test_control_kinds_are_control_lane() -> None:
+    from lifemodel.core.taxonomy import (
+        CONTROL_KINDS,
+        KIND_EXCHANGE,
+        KIND_IN_FLIGHT,
+        KIND_VERDICT,
+        lane_of,
+    )
+
+    for k in (KIND_EXCHANGE, KIND_VERDICT, KIND_IN_FLIGHT):
+        assert k in CONTROL_KINDS
+        assert lane_of(k) == "control"
+
+
+def test_contact_is_sensor_lane() -> None:
+    from lifemodel.core.taxonomy import lane_of
+
+    assert lane_of(KIND_CONTACT) == "sensor"
+
+
+def test_unknown_kind_defaults_to_sensor_never_control() -> None:
+    from lifemodel.core.taxonomy import lane_of
+
+    assert lane_of("something-new") == "sensor"  # unknown floods can't claim lossless control

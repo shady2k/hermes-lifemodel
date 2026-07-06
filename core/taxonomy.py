@@ -12,7 +12,7 @@ Builders keep payloads JSON-native and uniform; readers validate on the way out.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import cast
+from typing import Literal, cast
 
 from ..domain.signal import Signal
 from ..sim.aggregation import Verdict
@@ -22,6 +22,22 @@ KIND_CONTACT = "contact"
 KIND_EXCHANGE = "exchange"
 KIND_VERDICT = "verdict"
 KIND_IN_FLIGHT = "in_flight"
+
+Lane = Literal["control", "sensor"]
+
+#: Load-bearing lifecycle events — never salience-shed (spec §5.1). Includes a
+#: forward-looking ``delivery_result`` kind (used by phases D/E) so the lane is
+#: stable before that signal exists.
+CONTROL_KINDS: frozenset[str] = frozenset(
+    {KIND_EXCHANGE, KIND_VERDICT, KIND_IN_FLIGHT, "delivery_result"}
+)
+
+
+def lane_of(kind: str) -> Lane:
+    """Backpressure lane for a signal kind. Unknown kinds are sensors (never
+    control) so an unknown flood cannot claim the lossless lane."""
+    return "control" if kind in CONTROL_KINDS else "sensor"
+
 
 _VERDICTS: dict[str, Verdict] = {v.value: v for v in Verdict}
 
