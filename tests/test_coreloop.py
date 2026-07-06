@@ -188,3 +188,35 @@ def test_tick_count_increments_each_tick(tmp_path) -> None:
     loop.tick()
     loop.tick()
     assert store.commits[-1].tick_count == 2
+
+
+def test_coreloop_bounds_a_flood_and_survives(tmp_path) -> None:
+    # publish a flood of exchange signals to the bus; one tick must complete,
+    # bounded, without raising, and the aggregation-facing ctx must be capped.
+    from lifemodel.core.intake import IntakeLimits
+
+    reg = ComponentRegistry()
+    seen = SeenRecorder()
+    reg.register(seen, ComponentManifest(id="seen", type="aggregation"))
+    bus = FileSignalBus(tmp_path)
+    for i in range(1000):
+        bus.publish(
+            Signal(
+                origin_id=f"e{i}", kind="exchange", payload={"actor": "user", "label": "two_way"}
+            )
+        )
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=bus,
+        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
+        intake_limits=IntakeLimits(max_control=256, max_sensor=64),
+    )
+    report = loop.tick()  # must not raise
+    assert report.committed
+    assert len(seen.seen) <= 256 + 64  # aggregation saw a bounded batch
+
+
+def test_coreloop_default_intake_limits_present(tmp_path) -> None:
+    loop = _loop(ComponentRegistry(), RecordingStore(), FileSignalBus(tmp_path))
+    loop.tick()  # smoke: default IntakeLimits, no flood, still ticks

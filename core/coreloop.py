@@ -24,10 +24,12 @@ from ..domain.signal import Signal
 from ..log import EventLogger
 from ..ports.clock import ClockPort
 from .component import TickContext
+from .intake import IntakeLimits, apply_intake
 from .intents import EmitSignal, Intent, UpdateState
 from .registry import ComponentRegistry
 from .signal_bus import SignalBus
 from .state_actor import StateActor
+from .taxonomy import lane_of
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class CoreLoop:
         clock: ClockPort,
         logger: EventLogger | None = None,
         breaker_threshold: int = 3,
+        intake_limits: IntakeLimits | None = None,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
@@ -58,13 +61,26 @@ class CoreLoop:
         self._clock = clock
         self._log = logger
         self._breaker_threshold = breaker_threshold
+        self._intake_limits = intake_limits or IntakeLimits()
         self._failures: dict[str, int] = {}
         self._broken: set[str] = set()
 
     def tick(self) -> TickReport:
         now = self._clock.now()
         state = self._state_actor.state
-        available: list[Signal] = list(self._bus.consume_unprocessed())
+        intake = apply_intake(
+            self._bus.consume_unprocessed(), limits=self._intake_limits, lane_of=lane_of
+        )
+        if self._log is not None and (
+            intake.shed_control or intake.shed_sensor or intake.coalesced_sensor
+        ):
+            self._log.info(
+                "signals_shed",
+                shed_control=intake.shed_control,
+                shed_sensor=intake.shed_sensor,
+                coalesced_sensor=intake.coalesced_sensor,
+            )
+        available: list[Signal] = list(intake.kept)
 
         intents: list[Intent] = []
         ran: list[str] = []
