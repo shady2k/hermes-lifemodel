@@ -93,9 +93,8 @@ def render_debug_dump(*, readings: Readings) -> str:
         "BACKSTOP (hard send limit)",
         f"  sends_today {r.sends_today}/{r.sends_cap}   send_allowed_now {r.send_allowed}",
         "",
-        "TIMING",
-        f"  tick {r.tick_count}"
-        f"   last_tick {_opt(r.last_tick_ago_min, ' min ago')}"
-        f"   service_alive {_opt(r.egress_service_ago_min, ' min ago')}",
+        "HEALTH (is the brain ticking)",
+        f"  brain {'alive' if r.brain_alive else 'STALE — loop may be down'}"
+        f"   last_tick {_opt(r.last_tick_ago_min, ' min ago')}   tick {r.tick_count}",
     ]
     return "\n".join(lines) + "\n"

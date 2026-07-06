@@ -20,6 +20,12 @@ from .circadian import circadian
 from .pressure import effective_pressure, inhibition_at
 from .timeutil import minutes_between
 
+#: Max age (minutes) of ``last_tick_at`` before the brain reads as STALE. The loop
+#: ticks ~every 60s (stamping ``last_tick_at`` via ``coreloop.tick()``), so a gap
+#: past this means the loop is probably down and the gateway should have
+#: reconnected the adapter. Two ticks of grace.
+BRAIN_STALE_MIN = 2.0
+
 
 @dataclass(frozen=True)
 class DebugConfig:
@@ -71,11 +77,10 @@ class Readings:
     sends_today: int
     sends_cap: int
     send_allowed: bool
-    # timing
+    # health / timing
     last_tick_at: str | None
     last_tick_ago_min: float | None
-    egress_service_alive_at: str | None
-    egress_service_ago_min: float | None
+    brain_alive: bool  # last tick fresh (<= BRAIN_STALE_MIN) => the loop is ticking
 
 
 def _ago(iso: str | None, now: datetime) -> float | None:
@@ -133,6 +138,7 @@ def _sends_today(send_log: list[str], now: datetime) -> int:
 
 
 def compute_readings(state: State, *, now: datetime, cfg: DebugConfig) -> Readings:
+    last_tick_ago = _ago(state.last_tick_at, now)
     dt = max(0.0, minutes_between(state.last_tick_at, now))
     u = min(cfg.u_max, state.u + dt * cfg.alpha)
     inhibition, phase, grace_left = _action_pending(state, now, cfg)
@@ -188,7 +194,6 @@ def compute_readings(state: State, *, now: datetime, cfg: DebugConfig) -> Readin
             min_interval_min=cfg.min_interval_min,
         ),
         last_tick_at=state.last_tick_at,
-        last_tick_ago_min=_ago(state.last_tick_at, now),
-        egress_service_alive_at=state.egress_service_alive_at,
-        egress_service_ago_min=_ago(state.egress_service_alive_at, now),
+        last_tick_ago_min=last_tick_ago,
+        brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,
     )
