@@ -116,6 +116,10 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # no-op. Fail clearly rather than pretend success.
         return SendResult(success=False, error="lifemodel is an internal drive, not a message sink")
 
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        # The being has no real chats; return a minimal synthetic descriptor.
+        return {"id": chat_id, "platform": PLATFORM_NAME, "type": "internal"}
+
 
 def register_being_platform(
     ctx: Any,
