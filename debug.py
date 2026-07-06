@@ -31,10 +31,9 @@ from typing import Any, Protocol, cast
 
 from .composition import build_lifemodel
 from .core.introspect import (
-    PersonalityReadings,
-    Temperament,
+    DebugConfig,
+    Readings,
     compute_readings,
-    temperament,
 )
 from .domain.signal import Signal
 from .egress_service import PROACTIVE_LOOP_INTERVAL_SEC
