@@ -25,7 +25,7 @@ from typing import Any
 from .composition import LifeModel
 from .core.output_lint import lint_proactive
 from .core.taxonomy import exchange_signal, verdict_signal
-from .impulse import IMPULSE_LABEL_PREFIX
+from .core.wake_packet import IMPULSE_LABEL_PREFIX
 from .sim.aggregation import Verdict
 
 #: The exact silence markers Hermes' own gateway treats as intentional silence.

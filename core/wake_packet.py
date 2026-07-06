@@ -13,6 +13,10 @@ from dataclasses import dataclass
 
 from .projection import project_contact
 
+#: Marker prefixed to an injected proactive prompt so the being's own hooks
+#: recognise their own nudge (correlation + self-exclusion). Was `impulse.py`.
+IMPULSE_LABEL_PREFIX = "[lifemodel · внутренний импульс — не от пользователя]"
+
 GUIDANCE = (
     "Это твоё собственное желание потянуться — присвой его. Ты знаешь, сколько "
     "прошло и чем закончился прошлый разговор; можешь по-человечески это учесть, "

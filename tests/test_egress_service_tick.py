@@ -11,9 +11,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from lifemodel.composition import build_lifemodel
+from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.egress_service import run_proactive_tick
-from lifemodel.impulse import IMPULSE_LABEL_PREFIX
 from lifemodel.log import get_logger
 from lifemodel.state.model import State
 

@@ -21,9 +21,9 @@ from typing import Any
 
 from .composition import LifeModel
 from .core.backstop import allow_send
+from .core.wake_packet import IMPULSE_LABEL_PREFIX
 from .domain.egress import ReachOutcome
 from .gateway_core import reachin_available
-from .impulse import IMPULSE_LABEL_PREFIX
 from .log import EventLogger
 from .ports.proactive import ProactiveEgressPort
 

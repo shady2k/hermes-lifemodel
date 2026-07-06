@@ -22,8 +22,8 @@ from lifemodel.core.taxonomy import (
     read_verdict,
     read_verdict_correlation,
 )
+from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
-from lifemodel.impulse import IMPULSE_LABEL_PREFIX
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.state.model import State
 

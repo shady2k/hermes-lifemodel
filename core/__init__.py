@@ -58,7 +58,7 @@ from .taxonomy import (
     verdict_signal,
 )
 from .timeutil import minutes_between
-from .wake_packet import GUIDANCE, ProactivePrompt, build_wake_packet
+from .wake_packet import GUIDANCE, IMPULSE_LABEL_PREFIX, ProactivePrompt, build_wake_packet
 
 __all__ = [
     "ActGate",
@@ -108,6 +108,7 @@ __all__ = [
     "project_contact",
     "build_wake_packet",
     "GUIDANCE",
+    "IMPULSE_LABEL_PREFIX",
     "ProactivePrompt",
     "effective_pressure",
     "inhibition_at",
