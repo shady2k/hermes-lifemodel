@@ -214,3 +214,15 @@ def test_fatigue_defaults_zero_and_roundtrips() -> None:
     assert State().fatigue == 0.0
     assert State.from_dict({}).fatigue == 0.0  # additive
     assert State.from_dict(State(fatigue=0.4).to_dict()).fatigue == 0.4
+
+
+def test_proactive_send_log_defaults_empty_and_roundtrips() -> None:
+    assert State().proactive_send_log == []
+    assert State.from_dict({}).proactive_send_log == []  # additive
+    s = State(proactive_send_log=["2026-07-06T20:00:00+00:00"])
+    assert State.from_dict(s.to_dict()).proactive_send_log == ["2026-07-06T20:00:00+00:00"]
+
+
+def test_proactive_send_log_rejects_non_list() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"proactive_send_log": "nope"})

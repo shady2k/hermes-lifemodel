@@ -14,6 +14,7 @@ from __future__ import annotations
 from .act_gate import ActGate
 from .aggregation import ContactAggregation
 from .aggregator import Aggregator, SilentAggregator
+from .backstop import allow_send, record_send
 from .circadian import circadian
 from .cognition import Cognition
 from .component import Component, TickContext
@@ -60,6 +61,7 @@ from .wake_packet import GUIDANCE, ProactivePrompt, build_wake_packet
 __all__ = [
     "ActGate",
     "Aggregator",
+    "allow_send",
     "CheckpointState",
     "can_afford",
     "circadian",
@@ -116,6 +118,7 @@ __all__ = [
     "minutes_between",
     "read_exchange",
     "read_verdict",
+    "record_send",
     "reserve",
     "settle",
     "verdict_signal",
