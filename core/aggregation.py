@@ -6,10 +6,12 @@ persisted state and drives the desire lifecycle. It reads the neuron's transient
 applies them in the order exchange → verdict → wake (threaded through locals,
 like ``core/decision.py``'s functions), and emits one ``UpdateState``.
 
-The neuron owns ``u`` on rise/exchange-satiation; this layer writes ``u`` only on
-a ``FULFILL`` verdict (the certified model's delivery satiation). This is the port
-of ``core/decision.py`` onto the layer boundary — the wake/lifecycle math is the
-reused ``sim`` code, never reimplemented here.
+The neuron owns ``u`` on rise and exchange-satiation; this layer never writes
+``u`` (send ≠ contact: FULFILL starts an ActionPending inhibition window but does
+not satiate the drive). Only a real exchange clears ActionPending (the neuron
+satiates ``u`` separately). This is the port of ``core/decision.py`` onto the
+layer boundary — the wake/lifecycle math is the reused ``sim`` code, never
+reimplemented here.
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ..sim.aggregation import Aggregator, DesireStatus, Verdict
-from ..sim.drive import Drive
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .component import TickContext
 from .intents import Intent, UpdateState
@@ -68,8 +69,7 @@ class ContactAggregation:
         decline_count = state.decline_count
         agg = Aggregator(status=DesireStatus(state.desire_status))
         last_contact_at = state.last_contact_at
-        u_out: float | None = None
-        fulfilled = False
+        action_pending_since = state.action_pending_since
 
         # 1) real exchanges reset the policy clocks and clear the desire (before wake)
         for sig in ctx.signals:
@@ -79,6 +79,7 @@ class ContactAggregation:
                     last_exchange_at = now.isoformat()
                     declined_at = None
                     decline_count = 0
+                    action_pending_since = None  # real contact resolves the pull
                     agg.on_exchange()
 
         # 2) a verdict resolves the woken desire (after exchange, before wake)
@@ -87,27 +88,19 @@ class ContactAggregation:
                 verdict = read_verdict(sig)
                 agg.apply_verdict(verdict)
                 if verdict is Verdict.FULFILL:
-                    drive = Drive(alpha=0.0, beta=self._beta, u_max=self._u_max, u=u_now)
-                    drive.satiate(q=1.0)
-                    u_now = drive.u
-                    u_out = drive.u
-                    fulfilled = True
-                    last_exchange_at = now.isoformat()
-                    last_contact_at = now.isoformat()
+                    action_pending_since = now.isoformat()  # send happened -> inhibition starts
+                    last_contact_at = now.isoformat()  # record our outreach (observability only)
                 elif verdict is Verdict.REJECT:
                     declined_at = now.isoformat()
                     decline_count += 1
 
-        # duration-over-threshold accumulates on the current (risen) u
+        # duration-over-threshold accumulates on latent u (not effective)
         dt = minutes_between(state.last_tick_at, now)
-        if fulfilled:
-            duration = 0.0
-        else:
-            duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
+        duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
 
         # compute effective pressure: latent u gated by ActionPending inhibition
         inhibition = inhibition_at(
-            state.action_pending_since,
+            action_pending_since,
             now,
             i0=self._i0,
             grace_min=self._grace_min,
@@ -135,7 +128,6 @@ class ContactAggregation:
             "declined_at": declined_at,
             "decline_count": decline_count,
             "last_contact_at": last_contact_at,
+            "action_pending_since": action_pending_since,
         }
-        if u_out is not None:
-            changes["u"] = u_out
         return [UpdateState(changes)]

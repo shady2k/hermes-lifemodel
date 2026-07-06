@@ -154,7 +154,8 @@ def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
     assert changes["desire_status"] == "active"  # desire not cleared by own nudge
 
 
-def test_fulfill_satiates_u_and_stamps_contact(tmp_path) -> None:
+def test_fulfill_starts_action_pending_and_does_not_satiate(tmp_path) -> None:
+    # send != contact: FULFILL sets action_pending_since, leaves u and duration alone
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=1.5,
@@ -165,11 +166,12 @@ def test_fulfill_satiates_u_and_stamps_contact(tmp_path) -> None:
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"
-    assert changes["u"] == 0.5  # 1.5 - beta*1.0
-    assert changes["duration_over_theta"] == 0.0
-    assert changes["last_contact_at"] == now.isoformat()
-    assert changes["last_exchange_at"] == now.isoformat()
+    assert changes["desire_status"] == "none"  # desire resolved
+    assert changes["action_pending_since"] == now.isoformat()  # ActionPending started
+    assert "u" not in changes  # NOT satiated — send is not contact
+    assert changes["last_exchange_at"] is None  # send does not count as an exchange
+    assert changes["last_contact_at"] == now.isoformat()  # our outreach is recorded (observability)
+    assert changes["duration_over_theta"] != 0.0  # latent duration NOT reset by a mere send
 
 
 def test_reject_records_growing_backoff(tmp_path) -> None:
@@ -199,22 +201,30 @@ def test_defer_holds_desire_and_keeps_pressure(tmp_path) -> None:
     assert "u" not in changes  # pressure not dropped
 
 
-def test_fulfill_resets_duration_even_when_u_stays_high(tmp_path) -> None:
-    # FULFILL resets duration_over_theta unconditionally (matching decision.py),
-    # NOT merely because the satiated u fell below theta. Here u=5.0 -> satiate
-    # to 4.0 (still >= theta) but duration must still reset to 0.
+def test_exchange_clears_action_pending(tmp_path) -> None:
+    # a real reply resolves the pull: clears ActionPending (neuron satiates u separately)
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
-        u=5.0,
+        u=1.0,
         desire_status="active",
-        duration_over_theta=500.0,
+        action_pending_since="2026-07-06T03:50:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
-    c = contact_signal(origin_id="c1", value=5.0, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None)
+    c = contact_signal(origin_id="c1", value=1.0, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
+    assert changes["action_pending_since"] is None  # contact resolved the pull
+    assert changes["desire_status"] == "none"
+
+
+def test_reject_does_not_set_action_pending(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["u"] == 4.0
-    assert changes["duration_over_theta"] == 0.0  # reset regardless of u
+    assert changes["action_pending_since"] is None  # REJECT never inhibits
+    assert changes["decline_count"] == 1  # existing backoff bookkeeping intact
 
 
 def test_reject_then_backoff_blocks_immediate_rewake(tmp_path) -> None:
