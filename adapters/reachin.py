@@ -1,18 +1,14 @@
 """Primary proactive-egress adapter: native reach-in turn (spec §3.1/§6).
 
-:class:`ReachInEgress` is the in-process brain's delivery side: it resolves the
-live :class:`GatewayRunner` and delegates to
-:func:`~lifemodel.gateway_core.inject_proactive_turn`. Fail-closed: every path
+:class:`ReachInEgress` is the being's delivery side, driven by the supervised
+platform adapter's tick: it resolves the live :class:`GatewayRunner` and delegates
+to :func:`~lifemodel.gateway_core.inject_proactive_turn`. Fail-closed: every path
 returns a :class:`~lifemodel.domain.egress.ReachOutcome`, never raises.
 
-**Busy ownership is centralized in the wake gate, not here** (task 7, HLA/spec
-RC2): the caller (``proactive_service_loop``) computes ``busy`` once from the
-accurate runner state and threads it into ``decide_reachout(..., busy=...)`` —
-the no-wake-in-flight gate. This adapter used to *also* second-guess busy via
+This adapter does not second-guess "busy": it used to gate on
 ``runner._running_agents``, but that attribute stays truthy while a session is
 merely OPEN (not actively mid-turn), so it silently dropped every reach-out.
-Removed outright — one accurate ``busy`` source, decided once, upstream of
-delivery.
+Removed outright — delivery is decided once, upstream, by the wake gate.
 """
 
 from __future__ import annotations

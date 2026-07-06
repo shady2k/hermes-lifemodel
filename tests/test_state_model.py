@@ -134,14 +134,6 @@ def test_from_dict_rejects_non_integer_schema_version() -> None:
         State.from_dict({"schema_version": "one"})
 
 
-def test_state_roundtrips_egress_service_alive_at() -> None:
-    from lifemodel.state.model import State
-
-    st = State(egress_service_alive_at="2026-07-04T18:00:00+00:00")
-    assert State.from_dict(st.to_dict()).egress_service_alive_at == "2026-07-04T18:00:00+00:00"
-    assert State().egress_service_alive_at is None
-
-
 @pytest.mark.parametrize(
     "payload",
     [

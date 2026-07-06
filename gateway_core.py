@@ -1,9 +1,14 @@
-"""Interim monkey-patch of two upstream-shaped Hermes core primitives (spec §3).
+"""Native reach-in delivery — inject a proactive turn on a known lane (spec §3).
 
-These functions have the exact signatures we intend to upstream as GatewayRunner
-methods (with a PluginContext facade). For now the plugin calls them directly with
-an explicitly-resolved runner + injected seams (so they unit-test without Hermes).
-Everything is fail-closed: nothing here may raise into the gateway.
+:func:`inject_proactive_turn` is the being's delivery primitive: it resolves the
+live ``GatewayRunner`` and its adapters and injects an ``internal=True`` user turn
+on the target lane, so the being composes and delivers a native reply there. It
+reaches into runner internals (the same ones ``tools/send_message_tool`` uses) —
+kept behind this one boundary function so the rest of the plugin never touches
+them. Everything is fail-closed: nothing here may raise into the gateway.
+
+The being's autonomic loop is hosted as a supervised platform adapter
+(:mod:`lifemodel.adapters.being_platform`); this module is only its delivery side.
 """
 
 from __future__ import annotations
@@ -118,98 +123,3 @@ def inject_proactive_turn(
     except Exception as exc:  # noqa: BLE001 - fail-closed, never crash the gateway
         log.info("reachin_failed", error=f"{type(exc).__name__}: {exc}")
         return ReachOutcome.FAILED
-
-
-def _spawn_on_loop(loop: Any, coro: Any) -> Any:
-    """Schedule *coro* on *loop* whether we're on it or calling from another thread.
-
-    If the calling code is itself running on *loop*, ``create_task`` is the cheap
-    in-loop path; otherwise (the common plugin-registration case, which runs off the
-    gateway loop) ``run_coroutine_threadsafe`` hands it to the gateway thread. Both
-    return a cancellable object the runner can track.
-    """
-    import asyncio
-
-    try:
-        running = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
-    if running is not None and running is loop:
-        return loop.create_task(coro)
-    return asyncio.run_coroutine_threadsafe(coro, loop)
-
-
-def register_gateway_service(
-    runner: Any,
-    key: str,
-    coro_factory: Callable[[], Any],
-    *,
-    logger: EventLogger | None = None,
-) -> bool:
-    """Spawn a gateway-owned supervised task. Fail-closed.
-
-    The runner owns the lifecycle: the task is tracked in ``runner._background_tasks``
-    so the gateway cancels it on shutdown, and runs on ``runner._gateway_loop``. Any
-    spawn failure is logged and degrades to ``False`` rather than raising into the
-    gateway (spec §3.2 — a plugin bug must never crash the host).
-    """
-    log = logger or get_logger("lifemodel.service")
-    loop = getattr(runner, "_gateway_loop", None)
-    if loop is None:
-        # At register()/discovery time the gateway startup is synchronous — no
-        # running loop yet, and runner._gateway_loop may be unset. Fall back to
-        # the currently running loop (works when this is called in-loop, e.g. from
-        # an on_session_start hook after startup completes).
-        try:
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-    if loop is None:
-        log.info("gateway_service_unavailable", key=key, reason="no_loop")
-        return False
-    try:
-        task = _spawn_on_loop(loop, coro_factory())
-        bucket = getattr(runner, "_background_tasks", None)
-        if isinstance(bucket, set):
-            bucket.add(task)
-            done = getattr(task, "add_done_callback", None)
-            if callable(done):
-                done(bucket.discard)
-        log.info("gateway_service_started", key=key)
-        return True
-    except Exception as exc:  # noqa: BLE001 - fail-closed
-        log.info("gateway_service_failed", key=key, error=f"{type(exc).__name__}: {exc}")
-        return False
-
-
-def install_core_shim(ctx: Any, *, logger: EventLogger | None = None) -> None:
-    """Best-effort: expose the two primitives as PluginContext methods (reusable).
-
-    Monkey-patches ``inject_proactive_turn`` / ``register_gateway_service`` onto
-    ``type(ctx)`` so any plugin can call ``ctx.inject_proactive_turn(...)`` with the
-    runner resolved via :func:`~lifemodel.adapters.reachin.default_runner_accessor`.
-    Purely decorative — never blocks plugin load (spec §7, best-effort shim).
-    """
-    log = logger or get_logger("lifemodel.shim")
-    try:
-        from .adapters.reachin import default_runner_accessor
-
-        cls = type(ctx)
-
-        def _ctx_inject(
-            self: Any, target: Mapping[str, str | None], prompt: str, **kw: Any
-        ) -> ReachOutcome:
-            return inject_proactive_turn(default_runner_accessor(), target, prompt, **kw)
-
-        def _ctx_register(self: Any, key: str, coro_factory: Callable[[], Any], **kw: Any) -> bool:
-            return register_gateway_service(default_runner_accessor(), key, coro_factory, **kw)
-
-        if not hasattr(cls, "inject_proactive_turn"):
-            cls.inject_proactive_turn = _ctx_inject
-        if not hasattr(cls, "register_gateway_service"):
-            cls.register_gateway_service = _ctx_register
-        log.info("core_shim_installed", cls=cls.__name__)
-    except Exception as exc:  # noqa: BLE001 - decorative; never block load
-        log.info("core_shim_skipped", error=f"{type(exc).__name__}: {exc}")

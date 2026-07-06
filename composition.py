@@ -17,13 +17,12 @@ Two call sites this must serve (roadmap 0.4):
 
 For Phase 0.4 the defaults are the concrete :class:`SystemClock`,
 :class:`JsonStateStore`, and durable :class:`FileSignalBus`, with a
-:class:`NoopDelivery` stub for the ``DeliveryPort``. Note the Phase-1.4 *proactive*
-outbound does **not** go through this port: the in-process egress service is the
-sole decision brain and launches proactive turns directly via its own
-``ProactiveEgressPort`` (see :mod:`lifemodel.egress_service`); the cron tick
-never wakes at all (roadmap Task 4, the drum-killer). The ``DeliveryPort`` stays
-the seam for a future *direct*-from-cognition delivery path, so ``NoopDelivery``
-remains the default.
+:class:`NoopDelivery` stub for the ``DeliveryPort``. Note the *proactive* outbound
+does **not** go through this port: the supervised platform adapter's tick
+(:mod:`lifemodel.adapters.being_platform` → :func:`lifemodel.core.proactive.proactive_tick`)
+launches proactive turns directly via its own ``ProactiveEgressPort``. The
+``DeliveryPort`` stays the seam for a future *direct*-from-cognition delivery path,
+so ``NoopDelivery`` remains the default.
 
 **Wire-desire-model plan (Task 4): no decision aggregator/neuron in the live
 path.** The cron tick no longer runs a neuron loop or asks an aggregator to

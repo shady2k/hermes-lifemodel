@@ -15,13 +15,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .adapters.reachin import ReachInEgress, default_runner_accessor
+from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
 from .debug import render_dump_for_dir
-from .egress_service import proactive_service_loop
 from .events import EVENTS_FILENAME, EventSink
-from .gateway_core import install_core_shim, register_gateway_service
-from .heartbeat import _resolve_home_origin, register_heartbeat
 from .hooks import make_inbound_observer, make_post_llm_observer
 from .log import EventTee, get_logger
 from .paths import state_dir
@@ -89,16 +86,6 @@ def register(ctx: Any) -> None:
         state_dir=str(sdir),
     )
 
-    # --- Proactive egress wiring (lm-64s, spec §6/§7) ------------------------
-    # Expose the two core primitives on the PluginContext (best-effort shim) so
-    # any plugin can reach them, then choose the brain: when native reach-in is
-    # available AND a home origin is configured, start the in-process supervised
-    # service loop (the primary brain). The cron heartbeat is ALWAYS registered
-    # below: it defers (liveness stamp) while the service is alive and is the
-    # fallback brain when it is not. Everything here is best-effort — a failure
-    # in either path must never break plugin load.
-    install_core_shim(ctx, logger=logger)
-
     # --- Verdict feedback wiring (Task 5, spec §5/§7) -------------------------
     # Resolves the pending proactive desire from the FINAL LLM output
     # (NO_REPLY -> reject + growing backoff, real text -> fulfill) via the
@@ -133,64 +120,17 @@ def register(ctx: Any) -> None:
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
         logger.info("inbound_observer_registration_skipped", error=f"{type(exc).__name__}: {exc}")
 
-    # NOTE: do NOT gate on reachin_available() here — at register()/discovery time
-    # the runner's adapters are not wired yet (they land later in gateway startup),
-    # so reachin_available() is falsely False. Start the service whenever a home
-    # origin exists; the loop waits for _running (adapters ready by then) and yields
-    # to the cron fallback per-tick if reach-in ever proves unavailable at runtime.
-    origin = _resolve_home_origin()
-    started = False
-    if origin is not None:
-        try:
-            egress = ReachInEgress(runner_accessor=default_runner_accessor, logger=logger)
-
-            def _factory() -> Any:
-                return proactive_service_loop(
-                    build_lm=lambda: build_lifemodel(base_dir=sdir, logger=logger),
-                    egress=egress,
-                    target=origin,
-                    runner_accessor=default_runner_accessor,
-                    logger=logger,
-                )
-
-            started = register_gateway_service(
-                default_runner_accessor(), "lifemodel-egress", _factory, logger=logger
-            )
-            if not started:
-                # register() runs during SYNCHRONOUS gateway startup — no event loop
-                # yet, so the service can't be scheduled here. Defer: arm it once, in
-                # the loop, on the first session start (register_gateway_service then
-                # falls back to the running loop). Idempotent — starts at most once.
-                armed = {"done": False}
-
-                def _arm_service(*_a: Any, **_k: Any) -> None:
-                    if armed["done"]:
-                        return
-                    if register_gateway_service(
-                        default_runner_accessor(), "lifemodel-egress", _factory, logger=logger
-                    ):
-                        armed["done"] = True
-                        logger.info("egress_service_armed_deferred")
-
-                try:
-                    ctx.register_hook("on_session_start", _arm_service)
-                    logger.info("egress_service_deferred", trigger="on_session_start")
-                except Exception as exc:  # noqa: BLE001 - best-effort
-                    logger.info("egress_service_defer_failed", error=f"{type(exc).__name__}: {exc}")
-        except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-            logger.info("egress_service_wiring_skipped", error=f"{type(exc).__name__}: {exc}")
-
-    # Register the ~1-minute heartbeat cron (roadmap 1.1, HLA D1). Best-effort:
-    # a host without the cron API (or any registration hiccup) must not break
-    # plugin load, and the registration is idempotent so repeated loads never
-    # duplicate the job. ``src`` = the plugin package's parent, added to the
-    # launcher shim's ``sys.path`` so Hermes' interpreter can import us. Always
-    # registered: it defers (liveness stamp) while the in-process service is
-    # alive, and is the fallback brain otherwise (spec §6).
-    src_dir = Path(__file__).resolve().parent.parent
+    # --- Proactive brain wiring (the being as a gateway platform) -------------
+    # The autonomic brain is hosted as a gateway-supervised platform adapter: its
+    # connect() runs the tick loop, and the gateway's reconnect watcher restarts
+    # it on failure (no self-spawned task, no cron fallback, no loop-timing luck).
+    # The import is lazy + best-effort: the adapter subclasses ``BasePlatformAdapter``
+    # (a top-level ``gateway`` import), so importing it off-host would fail — a
+    # failure here must only skip the registration, never break plugin load.
     try:
-        register_heartbeat(home, src_dir, logger=logger)
-    except Exception as exc:  # noqa: BLE001 - registration is best-effort (see above)
-        logger.info("heartbeat_registration_skipped", error=f"{type(exc).__name__}: {exc}")
+        from .adapters.being_platform import register_being_platform
 
-    logger.info("egress_wiring", service_started=started, has_origin=origin is not None)
+        register_being_platform(ctx, base_dir=sdir, target=resolve_home_origin(), logger=logger)
+        logger.info("being_platform_registered")
+    except Exception as exc:  # noqa: BLE001 - best-effort; never break load
+        logger.info("being_platform_registration_skipped", error=f"{type(exc).__name__}: {exc}")

@@ -148,7 +148,6 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
 
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
-    monkeypatch.setattr(lifemodel, "register_heartbeat", lambda *a, **k: None)
 
     ctx = _FakeCtx()
     lifemodel.register(ctx)  # must not raise even without a real Hermes host
@@ -181,7 +180,6 @@ def test_register_wires_pre_gateway_dispatch_hook(
 
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
-    monkeypatch.setattr(lifemodel, "register_heartbeat", lambda *a, **k: None)
 
     ctx = _FakeCtx()
     lifemodel.register(ctx)  # must not raise even without a real Hermes host
