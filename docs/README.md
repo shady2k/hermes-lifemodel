@@ -9,8 +9,8 @@
 |---|---|---|---|
 | [business-requirements.md](business-requirements.md) | Продукт | Зачем и что: видение, проблема, пользователи, цели/не-цели, требования (FR1–29, NFR1–10), принципы, критерии успеха | 🟢 целевое видение (ревью Codex ×2) |
 | [hla.md](hla.md) | Архитектура | Как: биопринцип + слои (mermaid), Hermes-mapping, D1–D6, контракты, §13 стек/логи/принципы кода (DI, гексагон, ABC) | 🟢 v0.4 (Codex ×3 + tech) |
-| [roadmap.md](roadmap.md) | Поставка | Фазы 0–8 (engine-first), MVP = Фаза 1 walking skeleton | 🟢 v0.3 (ревью Codex) |
-| [glossary.md](glossary.md) | Справка | Термины: genesis, becoming, нейрон, драйв, open-loops, thought-pressure… | ⚪ не начат |
+| [roadmap.md](roadmap.md) | Поставка | Фазы 0–8 (engine-first) | 🟢 v0.4 |
+| [glossary.md](glossary.md) | Справка | Термины: genesis, becoming, нейрон, драйв, open-loops, thought-pressure… | 🟡 черновик |
 
 Порядок работы: **BRD → HLA → roadmap** (каждый следующий растёт из предыдущего). Планы и задачи (`writing-plans`) — уже после, отдельно.
 
