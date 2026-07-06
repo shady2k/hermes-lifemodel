@@ -14,6 +14,7 @@ from __future__ import annotations
 from .act_gate import ActGate
 from .aggregation import ContactAggregation
 from .aggregator import Aggregator, SilentAggregator
+from .circadian import circadian
 from .component import Component, TickContext
 from .contact_neuron import ContactNeuron
 from .coreloop import CoreLoop, TickReport
@@ -54,6 +55,7 @@ __all__ = [
     "ActGate",
     "Aggregator",
     "CheckpointState",
+    "circadian",
     "Component",
     "ComponentManifest",
     "ContactAggregation",

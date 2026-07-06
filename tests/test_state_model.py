@@ -208,3 +208,9 @@ def test_action_pending_since_roundtrips() -> None:
 def test_action_pending_since_defaults_none() -> None:
     assert State().action_pending_since is None
     assert State.from_dict({}).action_pending_since is None  # additive: missing key is fine
+
+
+def test_fatigue_defaults_zero_and_roundtrips() -> None:
+    assert State().fatigue == 0.0
+    assert State.from_dict({}).fatigue == 0.0  # additive
+    assert State.from_dict(State(fatigue=0.4).to_dict()).fatigue == 0.4

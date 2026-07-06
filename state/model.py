@@ -54,6 +54,10 @@ class State:
     #: Coarse energy placeholder (HLA §4/§11). Recovered during sleep in later
     #: phases; carried now so the wake path has a slot to read.
     energy: float = 1.0
+    #: Homeostatic sleep-pressure debt S (spec §8), in [0, 1]. Rises with
+    #: cognition spend (Phase D); decays toward 0 during rest. Additive:
+    #: ``from_dict`` defaults it when absent.
+    fatigue: float = 0.0
     #: The contact-desire drive's continuous urge variable (certified sim
     #: ``Drive.u``, spec §5). Rises with genuine silence, satiated by a positive
     #: exchange, drained when a wake-eligible urge is consumed — see
@@ -130,6 +134,7 @@ class State:
             schema_version=_as_int(data.get("schema_version", SCHEMA_VERSION), "schema_version"),
             tick_count=_as_int(data.get("tick_count", 0), "tick_count"),
             energy=_as_float(data.get("energy", 1.0), "energy"),
+            fatigue=_as_float(data.get("fatigue", 0.0), "fatigue"),
             u=_as_float(data.get("u", 0.0), "u"),
             duration_over_theta=_as_float(
                 data.get("duration_over_theta", 0.0), "duration_over_theta"
