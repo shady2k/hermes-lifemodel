@@ -22,6 +22,7 @@ from ..sim.aggregation import Aggregator, DesireStatus, Verdict
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .component import TickContext
 from .intents import Intent, UpdateState
+from .invalidation import is_verdict_stale
 from .pressure import effective_pressure, inhibition_at
 from .taxonomy import (
     KIND_EXCHANGE,
@@ -30,6 +31,7 @@ from .taxonomy import (
     is_in_flight,
     read_exchange,
     read_verdict,
+    read_verdict_correlation,
 )
 from .timeutil import minutes_between
 
@@ -47,6 +49,7 @@ class ContactAggregation:
         i0: float = 1.0,
         grace_min: float = 45.0,
         halflife_min: float = 60.0,
+        verdict_deadline_min: float = 30.0,
         id: str = "contact-aggregation",
     ) -> None:
         self.id = id
@@ -57,6 +60,7 @@ class ContactAggregation:
         self._i0 = i0
         self._grace_min = grace_min
         self._halflife_min = halflife_min
+        self._verdict_deadline_min = verdict_deadline_min
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
@@ -70,8 +74,23 @@ class ContactAggregation:
         agg = Aggregator(status=DesireStatus(state.desire_status))
         last_contact_at = state.last_contact_at
         action_pending_since = state.action_pending_since
+        pending_id = state.pending_proactive_id
+        pending_since = state.pending_proactive_since
+        send_log = state.proactive_send_log
 
-        # 1) real exchanges reset the policy clocks and clear the desire (before wake)
+        # effective pressure at verdict time (from persisted inhibition) — staleness input
+        effective_now = effective_pressure(
+            u_now,
+            inhibition_at(
+                state.action_pending_since,
+                now,
+                i0=self._i0,
+                grace_min=self._grace_min,
+                halflife_min=self._halflife_min,
+            ),
+        )
+
+        # 1) real exchanges reset clocks, clear the desire and ActionPending (before verdict/wake)
         for sig in ctx.signals:
             if sig.kind == KIND_EXCHANGE:
                 actor, _label = read_exchange(sig)
@@ -79,36 +98,55 @@ class ContactAggregation:
                     last_exchange_at = now.isoformat()
                     declined_at = None
                     decline_count = 0
-                    action_pending_since = None  # real contact resolves the pull
+                    action_pending_since = None
                     agg.on_exchange()
 
-        # 2) a verdict resolves the woken desire (after exchange, before wake)
+        # 2) a verdict resolves the woken desire — dropped if stale (async invalidation §7.3)
         for sig in ctx.signals:
-            if sig.kind == KIND_VERDICT:
-                verdict = read_verdict(sig)
-                agg.apply_verdict(verdict)
-                if verdict is Verdict.FULFILL:
-                    action_pending_since = now.isoformat()  # send happened -> inhibition starts
-                    last_contact_at = now.isoformat()  # record our outreach (observability only)
-                elif verdict is Verdict.REJECT:
-                    declined_at = now.isoformat()
-                    decline_count += 1
+            if sig.kind != KIND_VERDICT:
+                continue
+            stale, _reason = is_verdict_stale(
+                desire_status=agg.status.value,
+                pending_id=pending_id,
+                verdict_correlation_id=read_verdict_correlation(sig),
+                last_exchange_at=last_exchange_at,
+                pending_since=pending_since,
+                effective=effective_now,
+                threshold=self._theta,
+                now=now,
+                deadline_min=self._verdict_deadline_min,
+            )
+            if stale:
+                continue
+            verdict = read_verdict(sig)
+            agg.apply_verdict(verdict)
+            if verdict is Verdict.FULFILL:
+                action_pending_since = now.isoformat()  # send -> inhibition starts
+                last_contact_at = now.isoformat()
+                pending_id = None
+                pending_since = None
+            elif verdict is Verdict.REJECT:
+                declined_at = now.isoformat()
+                decline_count += 1
+                pending_id = None
+                pending_since = None
 
-        # duration-over-threshold accumulates on latent u (not effective)
+        # duration on latent u
         dt = minutes_between(state.last_tick_at, now)
         duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
 
-        # compute effective pressure: latent u gated by ActionPending inhibition
-        inhibition = inhibition_at(
-            action_pending_since,
-            now,
-            i0=self._i0,
-            grace_min=self._grace_min,
-            halflife_min=self._halflife_min,
+        # effective pressure for the wake gate (post-verdict inhibition)
+        effective = effective_pressure(
+            u_now,
+            inhibition_at(
+                action_pending_since,
+                now,
+                i0=self._i0,
+                grace_min=self._grace_min,
+                halflife_min=self._halflife_min,
+            ),
         )
-        effective = effective_pressure(u_now, inhibition)
 
-        # wake gates — every quantity as minutes relative to now (now = 0.0)
         exch_min = -minutes_between(last_exchange_at, now) if last_exchange_at is not None else None
         decl_min = -minutes_between(declined_at, now) if declined_at is not None else None
         lane = LaneState(
@@ -129,5 +167,8 @@ class ContactAggregation:
             "decline_count": decline_count,
             "last_contact_at": last_contact_at,
             "action_pending_since": action_pending_since,
+            "pending_proactive_id": pending_id,
+            "pending_proactive_since": pending_since,
+            "proactive_send_log": send_log,
         }
         return [UpdateState(changes)]

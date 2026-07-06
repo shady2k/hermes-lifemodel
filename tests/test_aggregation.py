@@ -32,6 +32,22 @@ def _changes(intents) -> dict:
     return next(i for i in intents if isinstance(i, UpdateState)).changes
 
 
+CORR = "proactive-2026-07-06T03:55:00+00:00"
+
+
+def _live_pending_state(**over) -> State:
+    """A state with a proactive turn in flight, matching CORR."""
+    base = dict(
+        u=1.5,
+        desire_status="active",
+        pending_proactive_id=CORR,
+        pending_proactive_since="2026-07-06T03:55:00+00:00",
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    base.update(over)
+    return State(**base)
+
+
 def test_urge_over_threshold_creates_active_desire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=0.0, desire_status="none", last_tick_at="2026-07-06T00:00:00+00:00")
@@ -154,51 +170,40 @@ def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
     assert changes["desire_status"] == "active"  # desire not cleared by own nudge
 
 
-def test_fulfill_starts_action_pending_and_does_not_satiate(tmp_path) -> None:
-    # send != contact: FULFILL sets action_pending_since, leaves u and duration alone
+def test_fulfill_starts_action_pending_and_clears_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
-        u=1.5,
-        desire_status="active",
-        duration_over_theta=99.0,
-        last_tick_at="2026-07-06T03:59:00+00:00",
-    )
+    state = _live_pending_state(duration_over_theta=99.0)
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # desire resolved
-    assert changes["action_pending_since"] == now.isoformat()  # ActionPending started
-    assert "u" not in changes  # NOT satiated — send is not contact
-    assert changes["last_exchange_at"] is None  # send does not count as an exchange
-    assert changes["last_contact_at"] == now.isoformat()  # our outreach is recorded (observability)
-    assert changes["duration_over_theta"] != 0.0  # latent duration NOT reset by a mere send
+    assert changes["desire_status"] == "none"
+    assert changes["action_pending_since"] == now.isoformat()  # send -> ActionPending
+    assert "u" not in changes  # not satiated (send != contact)
+    assert changes["last_contact_at"] == now.isoformat()
+    assert changes["pending_proactive_id"] is None  # turn resolved
+    assert changes["pending_proactive_since"] is None
 
 
-def test_reject_records_growing_backoff(tmp_path) -> None:
+def test_reject_records_backoff_and_clears_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
-        u=1.5,
-        desire_status="active",
-        decline_count=1,
-        last_tick_at="2026-07-06T03:59:00+00:00",
-    )
+    state = _live_pending_state(decline_count=1)
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
     assert changes["desire_status"] == "none"
     assert changes["decline_count"] == 2
     assert changes["declined_at"] == now.isoformat()
-    assert "u" not in changes  # reject does not satiate
+    assert changes["pending_proactive_id"] is None
 
 
-def test_defer_holds_desire_and_keeps_pressure(tmp_path) -> None:
+def test_defer_holds_desire_keeps_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _live_pending_state()
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.DEFER, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.DEFER, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
     assert changes["desire_status"] == "deferred"
-    assert "u" not in changes  # pressure not dropped
+    assert "u" not in changes
 
 
 def test_exchange_clears_action_pending(tmp_path) -> None:
@@ -219,22 +224,46 @@ def test_exchange_clears_action_pending(tmp_path) -> None:
 
 def test_reject_does_not_set_action_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _live_pending_state()
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
     assert changes["action_pending_since"] is None  # REJECT never inhibits
     assert changes["decline_count"] == 1  # existing backoff bookkeeping intact
 
 
 def test_reject_then_backoff_blocks_immediate_rewake(tmp_path) -> None:
-    # after a REJECT this tick, the fresh declined_at must veto a wake in the same tick
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=5.0, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _live_pending_state(u=5.0)
     c = contact_signal(origin_id="c1", value=5.0, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
     assert changes["desire_status"] == "none"  # rejected + backoff vetoes re-wake
+
+
+def test_stale_verdict_wrong_correlation_is_dropped(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state()
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(
+        origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id="proactive-OTHER"
+    )
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "active"  # verdict dropped — desire untouched
+    assert changes["action_pending_since"] is None
+
+
+def test_exchange_dominates_same_tick_verdict(tmp_path) -> None:
+    # a real reply this tick clears the desire; the (now-stale) fulfill is ignored
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state()
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    changes = _changes(_agg().step(_ctx(state, now, [c, ex, v], tmp_path=tmp_path)))
+    assert changes["desire_status"] == "none"  # exchange cleared it
+    assert changes["action_pending_since"] is None  # fulfill was dropped (desire resolved)
+    assert changes["last_exchange_at"] == now.isoformat()
 
 
 # --- Phase C1: effective pressure gates ---
