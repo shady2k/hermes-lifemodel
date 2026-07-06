@@ -16,6 +16,8 @@ CFG = DebugConfig(
     peak_hour_utc=13.0,
     max_per_day=3,
     min_interval_min=60.0,
+    alpha=1.0 / 240.0,
+    u_max=100.0,
 )
 NOW = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
 
@@ -27,9 +29,9 @@ def test_reads_physiology_and_drive() -> None:
     assert r.energy == 0.7
     assert r.fatigue == 0.3
     assert 0.0 <= r.circadian <= 1.0
-    assert r.u == 2.0
+    assert r.u > 2.0  # risen by 1 min * alpha from persisted value
     assert r.inhibition == 0.0  # no ActionPending
-    assert abs(r.effective - 2.0) < 1e-9  # u*(1-0)
+    assert r.effective > 0.0  # u*(1-0)
     assert r.would_wake is True  # effective >= theta, no gates
 
 
@@ -68,3 +70,24 @@ def test_silence_window_and_backoff() -> None:
     assert abs((r.silence_window_remaining_min or 0) - 10.0) < 1e-6
     assert abs((r.backoff_remaining_min or 0) - 10.0) < 1e-6
     assert r.would_wake is False  # silence window blocks
+
+
+def test_drive_is_risen_as_of_now_for_display() -> None:
+    # persisted u=0, but 240 min elapsed at alpha=1/240 -> should display ~1.0
+    cfg = DebugConfig(
+        params=GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0),
+        theta=1.0,
+        i0=1.0,
+        grace_min=45.0,
+        halflife_min=60.0,
+        peak_hour_utc=13.0,
+        max_per_day=3,
+        min_interval_min=60.0,
+        alpha=1.0 / 240.0,
+        u_max=100.0,
+    )
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)  # 240 min later
+    r = compute_readings(state, now=now, cfg=cfg)
+    assert abs(r.u - 1.0) < 1e-6  # risen as of now
+    assert r.would_wake is True  # and the debug reflects the imminent wake

@@ -28,6 +28,8 @@ def _cfg() -> DebugConfig:
         peak_hour_utc=composition.CIRCADIAN_PEAK_UTC_HOUR,
         max_per_day=3,
         min_interval_min=60.0,
+        alpha=composition.CONTACT_ALPHA,
+        u_max=composition.CONTACT_U_MAX,
     )
 
 

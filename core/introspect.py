@@ -33,6 +33,8 @@ class DebugConfig:
     peak_hour_utc: float
     max_per_day: int
     min_interval_min: float
+    alpha: float
+    u_max: float
 
 
 @dataclass(frozen=True)
@@ -131,7 +133,8 @@ def _sends_today(send_log: list[str], now: datetime) -> int:
 
 
 def compute_readings(state: State, *, now: datetime, cfg: DebugConfig) -> Readings:
-    u = state.u
+    dt = max(0.0, minutes_between(state.last_tick_at, now))
+    u = min(cfg.u_max, state.u + dt * cfg.alpha)
     inhibition, phase, grace_left = _action_pending(state, now, cfg)
     effective = effective_pressure(u, inhibition)
 
