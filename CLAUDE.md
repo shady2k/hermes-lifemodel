@@ -60,17 +60,36 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+The plugin runs **inside Hermes's own venv** (`~/.hermes/hermes-agent/venv`), which lacks our dev deps — runtime code must use **only Python stdlib + what Hermes provides** (treat any extra dep as optional, with a stdlib fallback). Dev tooling runs under `uv` in this repo.
 
 ```bash
-# Example:
-# npm install
-# npm test
+make check   # full gate: ruff format --check, ruff check, mypy -p lifemodel, pytest
+make test    # pytest only
+make fmt     # auto-format
 ```
+
+## Deploy (to the live being)
+
+The plugin is installed from git at `~/.hermes/plugins/lifemodel` (a clone of `origin/main`). `hermes plugins update` pulls from **git**, not the working tree — so you must **commit + push first**. Command/adapter changes only take effect after a gateway restart (they register at plugin `register()`).
+
+```bash
+make deploy   # refuses on a dirty tree, then: git push → hermes plugins update lifemodel → hermes gateway restart → status
+```
+
+Equivalent by hand:
+
+```bash
+git push origin main
+hermes plugins update lifemodel
+hermes gateway restart
+hermes gateway status
+```
+
+⚠️ `make deploy` targets the **owner's live being** (`~/.hermes`). For integration tests use an **isolated `HERMES_HOME`**, never the live being.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+Docs live under `docs/` — product [`business-requirements.md`](docs/business-requirements.md), architecture [`hla.md`](docs/hla.md), delivery [`roadmap.md`](docs/roadmap.md) (phases = bd epics). Hexagonal layout: `core/` (Hermes-free layered engine: AUTONOMIC → AGGREGATION → COGNITION), `domain/`, `ports/`, `adapters/` (the only Hermes boundary; `being_platform.py` hosts the being as a supervised platform adapter), `state/`.
 
 ## Conventions & Patterns
 

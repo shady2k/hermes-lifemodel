@@ -1,7 +1,7 @@
 # hermes-lifemodel — dev commands. Everything runs under uv.
 .DEFAULT_GOAL := help
 
-.PHONY: help check fmt test
+.PHONY: help check fmt test deploy
 
 help:  ## List the available commands
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -18,3 +18,10 @@ fmt:  ## Auto-format the code with ruff
 
 test:  ## Run the test suite
 	uv run pytest
+
+deploy:  ## Deploy to the live being: push, pull into ~/.hermes, restart gateway
+	@git diff --quiet && git diff --cached --quiet || { echo "!! commit your changes first — 'hermes plugins update' pulls from git, not the working tree"; exit 1; }
+	git push origin main
+	hermes plugins update lifemodel
+	hermes gateway restart
+	hermes gateway status
