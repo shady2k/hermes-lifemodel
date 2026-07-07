@@ -124,6 +124,39 @@ def test_inbound_ignores_internal_and_own_impulse(tmp_path: Path) -> None:
     assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE] == []
 
 
+def test_inbound_ignores_own_lifemodel_force_wake_command(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path)
+    event = SimpleNamespace(text="/lifemodel force-wake", internal=False, id="m-1")
+    make_inbound_observer(lm)(event=event)
+    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE] == []
+
+
+def test_inbound_ignores_own_lifemodel_debug_command(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path)
+    event = SimpleNamespace(text="/lifemodel debug", internal=False, id="m-2")
+    make_inbound_observer(lm)(event=event)
+    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE] == []
+
+
+def test_inbound_still_publishes_exchange_for_normal_chat_message(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path)
+    event = SimpleNamespace(text="привет", internal=False, id="m-3")
+    make_inbound_observer(lm)(event=event)
+    exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
+    assert len(exchanges) == 1
+
+
+def test_inbound_still_publishes_exchange_for_other_slash_commands(tmp_path: Path) -> None:
+    # Only /lifemodel is the being's own control plane — other slash commands
+    # (e.g. /new, /model) still represent genuine user presence and must
+    # continue to count as contact.
+    lm = build_lifemodel(base_dir=tmp_path)
+    event = SimpleNamespace(text="/new", internal=False, id="m-4")
+    make_inbound_observer(lm)(event=event)
+    exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
+    assert len(exchanges) == 1
+
+
 # --- register(ctx) wiring smoke test ------------------------------------------
 
 

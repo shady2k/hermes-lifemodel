@@ -102,6 +102,19 @@ def _is_own_impulse(text: str) -> bool:
     return text.strip().startswith(IMPULSE_LABEL_PREFIX)
 
 
+def _is_own_command(text: str) -> bool:
+    """True when *text* is the being's own ``/lifemodel`` control-plane command.
+
+    ``pre_gateway_dispatch`` fires before the command router forks, so a
+    ``/lifemodel force-wake`` (or even a read-only ``/lifemodel debug``) sent
+    over the being's own channel would otherwise look like a genuine inbound
+    exchange. Scoped to ``/lifemodel`` only: other slash commands (e.g.
+    ``/new``, ``/model``) still mean the user is present and must keep
+    counting as contact.
+    """
+    return text.strip().startswith("/lifemodel")
+
+
 def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
     """Return a ``pre_gateway_dispatch`` handler that PUBLISHES an exchange signal (§7.1)."""
 
@@ -109,7 +122,7 @@ def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
         if event is None or getattr(event, "internal", False):
             return
         text = getattr(event, "text", "") or ""
-        if _is_own_impulse(text):
+        if _is_own_impulse(text) or _is_own_command(text):
             return
         now = lm.clock.now()
         origin = (
