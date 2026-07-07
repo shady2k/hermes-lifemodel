@@ -1,6 +1,11 @@
 # tests/test_debug.py
 from __future__ import annotations
 
+import sys
+import types
+from datetime import timedelta, timezone
+
+from lifemodel import debug as debug_mod
 from lifemodel.debug import render_dump_for_dir
 from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
@@ -14,6 +19,78 @@ def test_dump_renders_the_sections(tmp_path) -> None:
     for section in ("PHYSIOLOGY", "DRIVE", "DESIRE", "GATES", "BACKSTOP", "HEALTH"):
         assert section in out
     assert "effective" in out.lower()
+
+
+def test_dump_puts_one_metric_per_line(tmp_path) -> None:
+    # Owner complaint #1: several metrics used to be crammed onto one line.
+    # Every metric now gets its own aligned "label: value" line.
+    JsonStateStore(tmp_path).commit(
+        State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
+    )
+    out = render_dump_for_dir(tmp_path)
+    lines = out.splitlines()
+
+    energy_line = next(line for line in lines if "energy(E)" in line)
+    assert "fatigue(S)" not in energy_line
+    assert "circadian(C)" not in energy_line
+
+    fatigue_line = next(line for line in lines if line.strip().startswith("fatigue(S):"))
+    assert "circadian" not in fatigue_line
+    assert "energy" not in fatigue_line
+
+    drive_u_line = next(line for line in lines if line.strip().startswith("latent u:"))
+    assert "inhibition" not in drive_u_line
+
+    gates_wake_line = next(line for line in lines if line.strip().startswith("would_wake:"))
+    assert "reason" not in gates_wake_line
+
+    backstop_line = next(line for line in lines if line.strip().startswith("sends_today:"))
+    assert "send_allowed" not in backstop_line
+
+
+def test_dump_timestamps_render_in_the_hermes_local_timezone(monkeypatch, tmp_path) -> None:
+    # Owner complaint #2: UTC confuses the owner (+03:00). Force a fixed
+    # non-UTC offset via the single conversion helper and confirm every
+    # rendered timestamp uses it — trimmed to whole seconds, not raw UTC.
+    monkeypatch.setattr(debug_mod, "_resolve_tz", lambda: timezone(timedelta(hours=3)))
+    JsonStateStore(tmp_path).commit(
+        State(
+            last_contact_at="2026-07-07T07:40:42.297762+00:00",
+            last_tick_at="2026-07-06T00:00:00+00:00",
+        )
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "2026-07-07 10:40:42 +03:00" in out
+    assert "+00:00" not in out  # no raw-UTC timestamp leaks through
+    assert "297762" not in out  # microseconds trimmed
+    assert "T10:40:42" not in out  # not the raw ISO 'T' separator
+
+
+def test_resolve_tz_returns_none_offhost_when_hermes_time_is_unavailable() -> None:
+    # No hermes_time on sys.path in the dev/test venv -> degrade to None, which
+    # callers feed straight into datetime.astimezone(None) (system-local),
+    # never raising over an absent Hermes dependency.
+    assert "hermes_time" not in sys.modules
+    assert debug_mod._resolve_tz() is None
+
+
+def test_resolve_tz_prefers_the_hermes_configured_zone_when_available(monkeypatch) -> None:
+    tz = timezone(timedelta(hours=3))
+    fake = types.ModuleType("hermes_time")
+    fake.get_timezone = lambda: tz  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_time", fake)
+    assert debug_mod._resolve_tz() is tz
+
+
+def test_resolve_tz_degrades_to_none_on_any_hermes_failure(monkeypatch) -> None:
+    fake = types.ModuleType("hermes_time")
+
+    def _boom() -> object:
+        raise RuntimeError("config.yaml unreadable")
+
+    fake.get_timezone = _boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_time", fake)
+    assert debug_mod._resolve_tz() is None
 
 
 def test_health_shows_brain_liveness_and_drops_service_alive(tmp_path) -> None:

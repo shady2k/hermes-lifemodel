@@ -82,6 +82,7 @@ module = [
     "hermes.*",
     "hermes_cli.*",
     "hermes_constants",
+    "hermes_time",
     "cron.*",
     "agent.*",
     "tools.*",
