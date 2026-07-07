@@ -102,25 +102,30 @@ def render_dump_for_dir(base_dir: Path) -> str:
     try:
         state = lm.state.load()
     except StateError as exc:
-        return f"🫀 lifemodel debug (read-only)\n\n<unreadable: {exc}>\n"
+        return f"🫀 **lifemodel debug** (read-only)\n\n<unreadable: {exc}>\n"
     return render_debug_dump(readings=compute_readings(state, now=now, cfg=_cfg()))
 
 
 def _metrics(pairs: list[tuple[str, str]]) -> list[str]:
     """Render one section's ``(label, value)`` pairs as plain lines.
 
-    One datum per line, ``label: value`` with a single space after the colon
-    — no column-alignment padding. Telegram renders in a proportional font,
-    where space-padded columns go ragged; this matches Hermes' own
-    ``/status`` command, which reads cleanly precisely because it never tries
-    to line up a colon column.
+    One datum per line, ``**label:** value`` with a single space after the
+    bold colon — no column-alignment padding. Telegram renders in a
+    proportional font, where space-padded columns go ragged; this matches
+    Hermes' own ``/status`` command, which reads cleanly precisely because it
+    never tries to line up a colon column. The bold wrapping (standard
+    markdown ``**...**``, colon included inside the markers) matches
+    ``/status`` byte-for-byte — see e.g. ``locales/en.yaml``'s
+    ``"**Session ID:** \`{session_id}\`"`` and ``"**Agent Running:** {state}"``
+    — which the Telegram adapter converts to MarkdownV2 and auto-escapes
+    around.
     """
-    return [f"{label}: {value}" for label, value in pairs]
+    return [f"**{label}:** {value}" for label, value in pairs]
 
 
 def render_debug_dump(*, readings: Readings) -> str:
     r = readings
-    lines: list[str] = ["🫀 lifemodel debug (read-only)", ""]
+    lines: list[str] = ["🫀 **lifemodel debug** (read-only)", ""]
 
     phase = r.action_pending_phase
     if r.action_pending_remaining_min:
@@ -130,7 +135,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     if r.pending and r.pending_since:
         pending += f" (since {_local(r.pending_since)})"
 
-    lines.append("PHYSIOLOGY")
+    lines.append("**PHYSIOLOGY**")
     lines += _metrics(
         [
             ("energy(E)", _pct(r.energy)),
@@ -141,13 +146,13 @@ def render_debug_dump(*, readings: Readings) -> str:
     )
     lines.append("")
 
-    lines.append("DRIVE (contact)")
+    lines.append("**DRIVE (contact)**")
     lines += _metrics(
         [
             ("latent u", _n(r.u)),
             ("inhibition", _n(r.inhibition)),
             ("phase", phase),
-            ("effective", f"{_n(r.effective)} (= u * (1 - inhibition))"),
+            ("effective", f"{_n(r.effective)} (= u × (1 - inhibition))"),
             ("theta", _n(r.theta)),
             ("pct_to_wake", _pct(r.pct_to_wake)),
             (
@@ -158,7 +163,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     )
     lines.append("")
 
-    lines.append("DESIRE")
+    lines.append("**DESIRE**")
     lines += _metrics(
         [
             ("status", r.desire_status),
@@ -169,7 +174,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     )
     lines.append("")
 
-    lines.append("GATES (why wake / no wake)")
+    lines.append("**GATES (why wake / no wake)**")
     lines += _metrics(
         [
             ("would_wake", str(r.would_wake)),
@@ -181,7 +186,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     )
     lines.append("")
 
-    lines.append("BACKSTOP (hard send limit)")
+    lines.append("**BACKSTOP (hard send limit)**")
     lines += _metrics(
         [
             ("sends_today", f"{r.sends_today}/{r.sends_cap}"),
@@ -190,7 +195,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     )
     lines.append("")
 
-    lines.append("HEALTH (is the brain ticking)")
+    lines.append("**HEALTH (is the brain ticking)**")
     lines += _metrics(
         [
             ("brain", "alive" if r.brain_alive else "STALE — loop may be down"),

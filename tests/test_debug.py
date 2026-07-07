@@ -34,25 +34,25 @@ def test_dump_puts_one_metric_per_line(tmp_path) -> None:
     assert "fatigue(S)" not in energy_line
     assert "circadian(C)" not in energy_line
 
-    fatigue_line = next(line for line in lines if line.strip().startswith("fatigue(S):"))
+    fatigue_line = next(line for line in lines if line.strip().startswith("**fatigue(S):**"))
     assert "circadian" not in fatigue_line
     assert "energy" not in fatigue_line
 
-    drive_u_line = next(line for line in lines if line.strip().startswith("latent u:"))
+    drive_u_line = next(line for line in lines if line.strip().startswith("**latent u:**"))
     assert "inhibition" not in drive_u_line
 
-    gates_wake_line = next(line for line in lines if line.strip().startswith("would_wake:"))
+    gates_wake_line = next(line for line in lines if line.strip().startswith("**would_wake:**"))
     assert "reason" not in gates_wake_line
 
-    backstop_line = next(line for line in lines if line.strip().startswith("sends_today:"))
+    backstop_line = next(line for line in lines if line.strip().startswith("**sends_today:**"))
     assert "send_allowed" not in backstop_line
 
 
 def test_dump_has_no_column_alignment_padding(tmp_path) -> None:
     # Owner complaint #3: right-padding labels to line up a colon column goes
     # ragged in Telegram's proportional font. Match Hermes' native /status
-    # style instead: plain "label: value", a single space after the colon,
-    # no leading indent, no padding run lining anything up.
+    # style instead: plain "**label:** value", a single space after the bold
+    # colon, no leading indent, no padding run lining anything up.
     JsonStateStore(tmp_path).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
@@ -60,9 +60,9 @@ def test_dump_has_no_column_alignment_padding(tmp_path) -> None:
     lines = out.splitlines()
 
     energy_line = next(line for line in lines if "energy(E)" in line)
-    fatigue_line = next(line for line in lines if line.strip().startswith("fatigue(S):"))
-    assert energy_line == "energy(E): 60%"
-    assert fatigue_line == "fatigue(S): 0.2"
+    fatigue_line = next(line for line in lines if line.strip().startswith("**fatigue(S):**"))
+    assert energy_line == "**energy(E):** 60%"
+    assert fatigue_line == "**fatigue(S):** 0.2"
 
     for line in lines:
         if ":" not in line:
@@ -95,9 +95,39 @@ def test_dump_title_matches_hermes_status_style(tmp_path) -> None:
     # font (see the owner-cited /status sample in the bead).
     JsonStateStore(tmp_path).commit(State(last_tick_at="2026-07-06T00:00:00+00:00"))
     out = render_dump_for_dir(tmp_path)
-    assert out.startswith("🫀 lifemodel debug (read-only)")
+    assert out.startswith("🫀 **lifemodel debug** (read-only)")
     assert "```" not in out
     assert "=" * 10 not in out  # no leftover "====" divider rule
+
+
+def test_dump_labels_and_title_are_bold_like_hermes_status(tmp_path) -> None:
+    # Owner ask (lm-fib.4 follow-up): match /status's bold-label convention
+    # byte-for-byte — standard-markdown **bold**, which the Telegram adapter
+    # converts to MarkdownV2 (see locales/en.yaml's "**Session ID:** `{...}`"
+    # and "**Agent Running:** {state}"). Title, section headers, and every
+    # metric label (colon included) are bold; values stay plain.
+    JsonStateStore(tmp_path).commit(
+        State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "**lifemodel debug**" in out
+    assert "**energy(E):**" in out
+    assert "**PHYSIOLOGY**" in out
+    assert "**DRIVE (contact)**" in out
+
+
+def test_dump_effective_hint_has_no_lone_asterisk(tmp_path) -> None:
+    # A bare "*" in a value (the old "(= u * (1 - inhibition))" hint) can be
+    # mistaken for a markdown bold/italic marker by the markdown->MarkdownV2
+    # conversion. It must be replaced with an unambiguous multiplication
+    # glyph so no stray "*" survives outside the bold-label markers.
+    JsonStateStore(tmp_path).commit(
+        State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "u * (" not in out
+    stripped = out.replace("**", "")
+    assert "*" not in stripped
 
 
 def test_resolve_tz_returns_none_offhost_when_hermes_time_is_unavailable() -> None:
@@ -141,3 +171,5 @@ def test_dump_survives_a_corrupt_store(tmp_path) -> None:
     (tmp_path / "state.json").write_text("{ not json", encoding="utf-8")
     out = render_dump_for_dir(tmp_path)
     assert "unreadable" in out.lower()  # graceful banner, no crash
+    # Same bold title treatment as the healthy-store path, for consistency.
+    assert out.startswith("🫀 **lifemodel debug** (read-only)")
