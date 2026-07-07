@@ -51,6 +51,12 @@ RESERVED_KEYS = frozenset(
 #: The singleton ``kind="desire"`` contact-frame id.
 CONTACT_DESIRE_ID = "contact:owner"
 
+#: The singleton ``kind="intention"`` contact-frame id — the committed decision
+#: to reach out (the Bratman act-gate owner). Same bare id as the desire; the
+#: store keys by ``(kind, id)`` so the ``intention`` and ``desire`` singletons
+#: are distinct rows sharing the contact frame.
+CONTACT_INTENTION_ID = "contact:owner"
+
 
 def derive_id(*parts: str) -> str:
     """Compose a deterministic id from *parts* (``":".join`` — reproducible)."""

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.cognition import Cognition
 from lifemodel.core.component import TickContext
-from lifemodel.core.intents import LaunchProactive, UpdateState
+from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
 from lifemodel.state.model import State
 from lifemodel.testing import contact_desire_objects
 
@@ -13,6 +13,14 @@ NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 
 # a live active-desire snapshot (what the old ``desire_status="active"`` meant)
 ACTIVE = contact_desire_objects("active")
+
+
+def _intention_put(intents):
+    """The PutRecord birthing the contact intention this tick, if any."""
+    return next(
+        (i for i in intents if isinstance(i, PutRecord) and i.op.draft.kind == "intention"),
+        None,
+    )
 
 
 def _cog() -> Cognition:
@@ -88,3 +96,66 @@ def test_prompt_has_no_raw_numbers(tmp_path) -> None:
     state = State(u=3.2, energy=1.0)
     launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
     assert not re.search(r"\d", launch.prompt)
+
+
+# --- lm-27n.4: 0-LLM crystallization of the Bratman decision record ---
+
+
+def test_launch_crystallizes_an_active_intention(tmp_path) -> None:
+    # A launch now ALSO births the singleton intention, directly ``active`` so it
+    # is visible in the next tick's snapshot and owns the gate.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    desire = contact_desire_objects("active", salience=2.5, source_drive=2.0)
+    intents = _cog().step(_ctx(state, objects=desire, tmp_path=tmp_path))
+    put = _intention_put(intents)
+    assert put is not None
+    draft = put.op.draft
+    assert draft.kind == "intention"
+    assert draft.id == "contact:owner"
+    assert draft.state == "active"  # born committed, not pending
+    # Rubicon fields recorded for auditability (0-LLM, deterministic).
+    payload = draft.payload
+    assert payload["commitment_strength"] == 2.5  # = the desire's effective pressure
+    assert payload["goal"]
+    assert payload["plan"]
+    assert payload["implementation_trigger"]
+    assert payload["reconsideration_triggers"]  # recorded, not yet acted on
+    assert payload["rationale"]
+
+
+def test_crystallize_and_launch_fire_together(tmp_path) -> None:
+    # Behavior-neutral parity: the intention is created EXACTLY when a launch
+    # happens — same tick, same gate. Never one without the other.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path))
+    assert _launch(intents) is not None
+    assert _intention_put(intents) is not None
+
+
+def test_no_active_desire_crystallizes_nothing(tmp_path) -> None:
+    # Parity: no live desire -> no launch AND no intention (old none gate).
+    intents = _cog().step(_ctx(State(u=2.0), tmp_path=tmp_path))
+    assert _intention_put(intents) is None
+
+
+def test_pending_turn_crystallizes_nothing(tmp_path) -> None:
+    # Parity: a turn in flight -> no launch AND no intention (no double-crystallize).
+    state = State(u=2.0, pending_proactive_id="proactive-earlier")
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path))
+    assert _intention_put(intents) is None
+
+
+def test_insufficient_energy_crystallizes_nothing(tmp_path) -> None:
+    # Parity: unaffordable -> hold; no launch AND no intention (emergent shutoff).
+    state = State(u=2.0, energy=0.05, fatigue=1.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path))
+    assert _intention_put(intents) is None
+
+
+def test_deferred_desire_crystallizes_nothing(tmp_path) -> None:
+    # Parity: only an ACTIVE desire launches; a deferred one crystallizes nothing.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(
+        _ctx(state, objects=contact_desire_objects("deferred"), tmp_path=tmp_path)
+    )
+    assert _intention_put(intents) is None

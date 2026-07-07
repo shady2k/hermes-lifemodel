@@ -14,6 +14,7 @@ from typing import cast
 
 from . import composition
 from .core.desire_view import read_live_contact_desire
+from .core.intention_view import read_live_contact_intention
 from .core.introspect import DebugConfig, Readings, compute_readings
 from .ports.memory import MemoryPort
 from .state.errors import StateError
@@ -105,10 +106,19 @@ def render_dump_for_dir(base_dir: Path) -> str:
         state = lm.state.load()
     except StateError as exc:
         return f"🫀 **lifemodel debug** (read-only)\n\n<unreadable: {exc}>\n"
-    desire = read_live_contact_desire(lm.state) if isinstance(lm.state, MemoryPort) else None
+    memory = lm.state if isinstance(lm.state, MemoryPort) else None
+    desire = read_live_contact_desire(memory) if memory is not None else None
     desire_state = desire.state if desire is not None else "none"
+    intention = read_live_contact_intention(memory) if memory is not None else None
+    intention_state = intention.state if intention is not None else "none"
     return render_debug_dump(
-        readings=compute_readings(state, now=now, cfg=_cfg(), desire_state=desire_state)
+        readings=compute_readings(
+            state,
+            now=now,
+            cfg=_cfg(),
+            desire_state=desire_state,
+            intention_state=intention_state,
+        )
     )
 
 
@@ -173,6 +183,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     lines += _metrics(
         [
             ("status", r.desire_status),
+            ("intention", r.intention_status),
             ("pending_turn", pending),
             ("last_contact", _local(r.last_contact_at)),
             ("last_exchange", _local(r.last_exchange_at)),

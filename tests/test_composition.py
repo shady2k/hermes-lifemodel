@@ -322,3 +322,54 @@ def test_cognition_registered_after_aggregation(tmp_path: Path) -> None:
     ids = [c.id for c in lm.registry.enabled()]
     assert ids.index("contact-aggregation") < ids.index("cognition")
     assert any(isinstance(c, Cognition) for c in lm.registry.enabled())
+
+
+# --- lm-27n.4: the Intention decision record, end-to-end through the store ---
+
+
+def test_pipeline_crystallizes_intention_on_launch(tmp_path: Path) -> None:
+    # A high-u tick that launches also births the singleton intention active, in
+    # the SAME commit as pending being set (behavior-neutral on send timing).
+    from lifemodel.core.intention_view import read_live_contact_intention
+
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit(State(u=3.0, energy=1.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    _seed_active_desire(store)  # a live active desire cognition can launch on
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
+    lm.coreloop.tick()
+    final = store.load()
+    intention = read_live_contact_intention(store)
+    assert intention is not None and intention.state == "active"  # decision recorded
+    assert final.pending_proactive_id is not None  # ...in the same commit as pending
+
+
+def test_pipeline_exchange_resolves_desire_and_intention_atomically(tmp_path: Path) -> None:
+    # A real exchange terminalizes BOTH the desire and the intention in one tick,
+    # through the one atomic store committer — never a split-brain (HLA §4.1).
+    from lifemodel.core.intention_view import read_live_contact_intention
+
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    # a turn already in flight (pending set) gates cognition off, so this tick only
+    # RESOLVES the launched pair — it does not re-launch/re-crystallize.
+    store.commit(
+        State(
+            u=3.0,
+            pending_proactive_id="proactive-inflight",
+            last_tick_at="2026-07-06T03:59:00+00:00",
+        )
+    )
+    _seed_active_desire(store)
+    # seed a live intention too (the launched decision record)
+    from lifemodel.core.intention_view import build_contact_intention, encode_contact_intention
+    from lifemodel.domain.objects import IntentionState
+
+    store.put(encode_contact_intention(build_contact_intention(state=IntentionState.ACTIVE)))
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
+    lm.bus.publish(exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None))
+    lm.coreloop.tick()
+    assert read_live_contact_desire(store) is None  # desire terminalized
+    assert read_live_contact_intention(store) is None  # intention terminalized in lockstep
+    assert store.get("desire", "contact:owner").state == "satisfied"
+    assert store.get("intention", "contact:owner").state == "completed"

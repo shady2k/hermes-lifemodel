@@ -6,17 +6,29 @@ desire-framed wake-packet, and the being's own Hermes turn is the act-gate
 (message = FULFILL, ``[SILENT]`` = REJECT — fed back by the ``post_llm`` hook in
 Phase E). It launches only for a live, un-acted desire, and only if the proactive
 turn's energy is affordable — otherwise it holds (emergent shutoff, spec §8).
+
+lm-27n.4 inserts a typed :class:`~lifemodel.domain.objects.Intention` (the
+Bratman/Rubicon decision record) as the gate-owner between the active desire and
+the launch. Crystallization is **0-LLM** and **behavior-neutral on send timing**:
+the launch gate is unchanged (live active desire + no turn in flight + affordable),
+and *whenever* it fires cognition also emits ``PutRecord(intention active)`` — an
+upsert on the singleton ``contact:owner`` intention, born directly ``active`` so
+it is visible in the next tick's snapshot. The Rubicon fields are computed
+deterministically and recorded for auditability; they do NOT change *when* the
+being sends (that stays this gate + aggregation's upstream gates).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..domain.objects import DesireState
+from ..domain.memory import PutOp
+from ..domain.objects import DesireState, IntentionState
 from .component import TickContext
 from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
-from .intents import Intent, LaunchProactive, UpdateState
+from .intention_view import build_contact_intention, encode_contact_intention
+from .intents import Intent, LaunchProactive, PutRecord, UpdateState
 from .wake_packet import build_wake_packet
 
 
@@ -50,7 +62,19 @@ class Cognition:
 
         correlation_id = f"proactive-{ctx.now.isoformat()}"
         packet = build_wake_packet(value=state.u, theta=1.0, correlation_id=correlation_id)
+        # 0-LLM crystallization: record the committed decision (Bratman act-gate).
+        # ``commitment_strength`` is the effective pressure the desire crystallized
+        # on (its salience). Born directly ``active`` so it gates + is snapshot-visible
+        # next tick. An upsert on the singleton — on a delivery-fail retry this simply
+        # re-stamps the still-active intention, so the send timing is unchanged.
+        intention = build_contact_intention(
+            state=IntentionState.ACTIVE,
+            commitment_strength=desire.salience,
+            salience=desire.salience,
+            source_drive=desire.source_drive,
+        )
         return [
+            PutRecord(op=PutOp(draft=encode_contact_intention(intention))),
             LaunchProactive(
                 prompt=packet.prompt, correlation_id=correlation_id, reserved_energy=estimate
             ),

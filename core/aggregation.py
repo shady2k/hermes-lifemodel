@@ -33,12 +33,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ..domain.memory import PutOp, TransitionOp
-from ..domain.objects import DesireState
+from ..domain.objects import DesireState, IntentionState
 from ..sim.aggregation import Verdict
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .backstop import record_send
 from .component import TickContext
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
+from .intention_view import live_contact_intention
 from .intents import Intent, PutRecord, TransitionRecord, UpdateState
 from .invalidation import is_verdict_stale
 from .pressure import effective_pressure, inhibition_at
@@ -55,6 +56,18 @@ from .timeutil import minutes_between
 
 #: The logical "no live desire" sentinel — the old ``desire_status == "none"``.
 _NONE = "none"
+
+#: The atomic lifecycle interlock (lm-27n.4): when a desire resolution transitions
+#: the desire, the live intention (the decision record) is transitioned in lockstep
+#: — in the SAME tick commit — so the pair can never split-brain. Maps the desire's
+#: resolution target to the intention's. FULFILL/exchange → ``completed``; REJECT →
+#: ``dropped``; DEFER → ``deferred`` (each legal from both ``active`` and, for the
+#: terminal targets, ``deferred``).
+_INTENTION_TARGET: dict[str, str] = {
+    DesireState.SATISFIED.value: IntentionState.COMPLETED.value,
+    DesireState.DROPPED.value: IntentionState.DROPPED.value,
+    DesireState.DEFERRED.value: IntentionState.DEFERRED.value,
+}
 
 
 class ContactAggregation:
@@ -92,6 +105,12 @@ class ContactAggregation:
         # its logical state threaded through the reducer — the old ``agg.status``.
         live = live_contact_desire(ctx.objects)
         desire_state = live.state if live is not None else _NONE
+
+        # The live intention (the decision record cognition crystallized) from the
+        # same snapshot — resolved atomically with the desire below. ``None`` when
+        # the desire resolved before it ever crystallized (e.g. an inbound exchange
+        # terminalizes a never-launched desire): only the desire transitions then.
+        live_intention = live_contact_intention(ctx.objects)
 
         # working copies of the residual policy fields (threaded like decision.py)
         last_exchange_at = state.last_exchange_at
@@ -237,4 +256,25 @@ class ContactAggregation:
                     )
                 )
             )
+            # Atomic interlock: transition the live intention in the SAME commit as
+            # its desire — never one without the other (split-brain guard). Only
+            # when an intention exists AND the edge is a real change (skip a
+            # deferred→deferred no-op, which the machine would reject and roll the
+            # whole tick — and the desire resolution — back).
+            intention_target = _INTENTION_TARGET.get(str(transition_to))
+            if (
+                live_intention is not None
+                and intention_target is not None
+                and live_intention.state != intention_target
+            ):
+                intents.append(
+                    TransitionRecord(
+                        op=TransitionOp(
+                            kind="intention",
+                            id=live_intention.id,
+                            from_state=live_intention.state,
+                            to_state=intention_target,
+                        )
+                    )
+                )
         return intents

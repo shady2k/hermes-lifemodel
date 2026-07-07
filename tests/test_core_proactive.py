@@ -18,6 +18,7 @@ from lifemodel.core.desire_view import (
     encode_contact_desire,
     read_live_contact_desire,
 )
+from lifemodel.core.intention_view import read_live_contact_intention
 from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
@@ -109,6 +110,44 @@ def test_delivered_launch_keeps_the_cost(tmp_path) -> None:
     lm = _lm(tmp_path, _active(), NOW)
     proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
     assert lm.state.load().energy < 1.0  # the turn ran -> energy spent, not refunded
+
+
+# --- lm-27n.4: the intention (decision record) rides the same rollback ---
+
+
+def test_delivered_launch_leaves_intention_active_in_flight(tmp_path) -> None:
+    # A delivered launch crystallized the decision record; it stays ``active`` (the
+    # verdict resolves it next tick), mirroring the desire.
+    lm = _lm(tmp_path, _active(), NOW)
+    proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    intention = read_live_contact_intention(lm.state)
+    assert intention is not None and intention.state == "active"
+
+
+def test_backstop_block_defers_intention_with_desire(tmp_path) -> None:
+    # A backstop block holds BOTH the desire AND the intention active -> deferred,
+    # atomically with the pending-clear + energy refund.
+    lm = _lm(tmp_path, _active(proactive_send_log=CAP_LOG), NOW)
+    egress = FakeEgress()
+    proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    final = lm.state.load()
+    assert egress.calls == []  # backstop blocked the send
+    assert read_live_contact_desire(lm.state).state == "deferred"
+    assert read_live_contact_intention(lm.state).state == "deferred"  # held in lockstep
+    assert final.pending_proactive_id is None  # pending cleared
+    assert final.energy >= 0.99  # reservation refunded
+
+
+def test_failed_delivery_keeps_intention_active_to_retry(tmp_path) -> None:
+    # A delivery failure keeps BOTH rows active to retry; only pending clears + the
+    # reservation refunds — no transition, no split-brain.
+    lm = _lm(tmp_path, _active(), NOW)
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t"))
+    final = lm.state.load()
+    assert read_live_contact_desire(lm.state).state == "active"
+    assert read_live_contact_intention(lm.state).state == "active"  # kept to retry
+    assert final.pending_proactive_id is None
+    assert final.energy >= 0.99
 
 
 def test_does_not_stamp_egress_service_alive_at(tmp_path) -> None:

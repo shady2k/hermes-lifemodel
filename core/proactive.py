@@ -31,12 +31,13 @@ from collections.abc import Mapping
 from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
 from ..domain.memory import TransitionOp
-from ..domain.objects import CONTACT_DESIRE_ID, DesireState
+from ..domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID, DesireState, IntentionState
 from ..log import EventLogger
 from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
 from .backstop import allow_send
 from .desire_view import read_live_contact_desire
+from .intention_view import read_live_contact_intention
 from .intents import Intent, TransitionRecord, UpdateState
 from .state_actor import StateActor
 from .wake_packet import IMPULSE_LABEL_PREFIX
@@ -81,13 +82,16 @@ def proactive_tick(
 
 def _rollback(lm: LifeModel, actor: StateActor, reserved_energy: float, *, defer: bool) -> None:
     """Atomically undo a launch that did not deliver — clear pending + refund
-    energy, and (on a backstop block) hold the desire ``active → deferred``.
+    energy, and (on a backstop block) hold BOTH the desire AND the intention
+    ``active → deferred`` in lockstep.
 
-    One atomic ``commit_tick`` via the state-actor, so State and the desire row
-    never split. The ``active → deferred`` edge is only emitted when the desire is
-    still ``active`` — a same-tick exchange may have terminalized it, in which case
-    holding is moot and would be an illegal transition out of a terminal state, so
-    it is skipped (the pending-clear + refund still apply)."""
+    One atomic ``commit_tick`` via the state-actor, so State, the desire row and
+    the intention row never split. Each ``active → deferred`` edge is only emitted
+    when that row is still ``active`` — a same-tick exchange may have terminalized
+    it, in which case holding is moot and would be an illegal transition out of a
+    terminal state, so it is skipped (the pending-clear + refund still apply). A
+    delivery-fail (``defer=False``) keeps both rows ``active`` to retry — no
+    transition, just the pending-clear + refund."""
     state = actor.state
     intents: list[Intent] = [
         UpdateState(
@@ -109,6 +113,19 @@ def _rollback(lm: LifeModel, actor: StateActor, reserved_energy: float, *, defer
                         id=CONTACT_DESIRE_ID,
                         from_state=DesireState.ACTIVE,
                         to_state=DesireState.DEFERRED,
+                    )
+                ),
+            )
+        intention = read_live_contact_intention(lm.state)
+        if intention is not None and intention.state == IntentionState.ACTIVE:
+            intents.insert(
+                0,
+                TransitionRecord(
+                    op=TransitionOp(
+                        kind="intention",
+                        id=CONTACT_INTENTION_ID,
+                        from_state=IntentionState.ACTIVE,
+                        to_state=IntentionState.DEFERRED,
                     )
                 ),
             )

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from .base import (
     CONTACT_DESIRE_ID,
+    CONTACT_INTENTION_ID,
     BaseObject,
     derive_id,
     qualified_id,
@@ -42,6 +43,7 @@ from .thought import Thought, ThoughtState
 
 __all__ = [
     "CONTACT_DESIRE_ID",
+    "CONTACT_INTENTION_ID",
     "BaseObject",
     "Desire",
     "DesireSpring",

@@ -29,7 +29,11 @@ from lifemodel.core.taxonomy import (
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
-from lifemodel.testing import contact_desire_objects
+from lifemodel.testing import (
+    contact_desire_objects,
+    contact_desire_record,
+    contact_intention_record,
+)
 
 PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
 
@@ -400,3 +404,98 @@ def test_reject_does_not_record_a_send(tmp_path) -> None:
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["proactive_send_log"] == ["2026-07-06T02:00:00+00:00"]  # unchanged
+
+
+# --- lm-27n.4: atomic Desire<->Intention lifecycle interlock ---
+#
+# On resolution, aggregation transitions BOTH the desire AND the live intention
+# (the decision record) in the SAME tick commit — never one without the other
+# (split-brain guard). Both TransitionRecords ride out in one intent batch.
+
+
+def _kind_transition(intents, kind: str) -> tuple[str, str] | None:
+    """The (from_state, to_state) of the tick's transition for *kind*, if any."""
+    for i in intents:
+        if isinstance(i, TransitionRecord) and i.op.kind == kind:
+            return (i.op.from_state, i.op.to_state)
+    return None
+
+
+def _live_pair(desire_state: str = "active", intention_state: str = "active"):
+    """A snapshot holding BOTH a live desire and a live intention (the state a
+    launched, un-resolved contact frame is in)."""
+    return (
+        contact_desire_record(desire_state),
+        contact_intention_record(intention_state),
+    )
+
+
+def test_fulfill_completes_intention_and_satisfies_desire_atomically(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state()
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    intents = _agg().step(_ctx(state, now, [c, v], objects=_live_pair(), tmp_path=tmp_path))
+    # both transitions in ONE batch — the pair resolves together
+    assert _kind_transition(intents, "desire") == ("active", "satisfied")
+    assert _kind_transition(intents, "intention") == ("active", "completed")
+
+
+def test_reject_drops_both_intention_and_desire_atomically(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state()
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    intents = _agg().step(_ctx(state, now, [c, v], objects=_live_pair(), tmp_path=tmp_path))
+    assert _kind_transition(intents, "desire") == ("active", "dropped")
+    assert _kind_transition(intents, "intention") == ("active", "dropped")
+
+
+def test_exchange_completes_intention_and_satisfies_desire(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    intents = _agg().step(_ctx(state, now, [c, ex], objects=_live_pair(), tmp_path=tmp_path))
+    assert _kind_transition(intents, "desire") == ("active", "satisfied")
+    assert _kind_transition(intents, "intention") == ("active", "completed")
+
+
+def test_exchange_dominates_verdict_for_both_desire_and_intention(tmp_path) -> None:
+    # A real reply this tick clears the pair; the same-tick fulfill is ignored —
+    # exchange dominates for the intention exactly as it does for the desire.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state()
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    intents = _agg().step(_ctx(state, now, [c, ex, v], objects=_live_pair(), tmp_path=tmp_path))
+    assert _kind_transition(intents, "desire") == ("active", "satisfied")
+    assert _kind_transition(intents, "intention") == ("active", "completed")
+
+
+def test_exchange_completes_a_deferred_intention(tmp_path) -> None:
+    # After a backstop block the pair is held deferred; a real exchange terminalizes
+    # BOTH — the intention transitions from its actual ``deferred`` state.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    intents = _agg().step(
+        _ctx(state, now, [c, ex], objects=_live_pair("deferred", "deferred"), tmp_path=tmp_path)
+    )
+    assert _kind_transition(intents, "desire") == ("deferred", "satisfied")
+    assert _kind_transition(intents, "intention") == ("deferred", "completed")
+
+
+def test_desire_resolves_without_a_never_crystallized_intention(tmp_path) -> None:
+    # A desire can resolve before it ever crystallized (exchange terminalizes a
+    # never-launched desire). No intention row exists -> only the desire transitions;
+    # this is NOT split-brain (there is nothing to split).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
+    assert _kind_transition(intents, "desire") == ("active", "satisfied")
+    assert _kind_transition(intents, "intention") is None  # nothing to transition

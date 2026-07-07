@@ -63,6 +63,7 @@ class Readings:
     duration_over_theta: float
     # desire lifecycle
     desire_status: str
+    intention_status: str  # the live decision record: active/deferred/none
     pending: bool
     pending_since: str | None
     last_contact_at: str | None
@@ -138,11 +139,18 @@ def _sends_today(send_log: list[str], now: datetime) -> int:
 
 
 def compute_readings(
-    state: State, *, now: datetime, cfg: DebugConfig, desire_state: str = "none"
+    state: State,
+    *,
+    now: datetime,
+    cfg: DebugConfig,
+    desire_state: str = "none",
+    intention_state: str = "none",
 ) -> Readings:
     """Compute the debug readings. ``desire_state`` is the live contact-desire's
     lifecycle state (``active``/``deferred``/``none``), read by the caller from
-    the typed ``kind='desire'`` row (lm-27n.3 — no longer a ``State`` flag)."""
+    the typed ``kind='desire'`` row (lm-27n.3 — no longer a ``State`` flag);
+    ``intention_state`` is the live contact-intention's (the Bratman decision
+    record, lm-27n.4) — the "why did I send" audit line."""
     last_tick_ago = _ago(state.last_tick_at, now)
     dt = max(0.0, minutes_between(state.last_tick_at, now))
     u = min(cfg.u_max, state.u + dt * cfg.alpha)
@@ -181,6 +189,7 @@ def compute_readings(
         pct_to_wake=(effective / cfg.theta) if cfg.theta else 0.0,
         duration_over_theta=state.duration_over_theta,
         desire_status=desire_state,
+        intention_status=intention_state,
         pending=state.pending_proactive_id is not None,
         pending_since=state.pending_proactive_since,
         last_contact_at=state.last_contact_at,

@@ -16,6 +16,7 @@ from .fakes import (
     FakeSignalBus,
     FakeStateStore,
 )
+from .intentions import contact_intention_objects, contact_intention_record
 
 __all__ = [
     "FakeClock",
@@ -26,4 +27,6 @@ __all__ = [
     "FakeStateStore",
     "contact_desire_objects",
     "contact_desire_record",
+    "contact_intention_objects",
+    "contact_intention_record",
 ]
