@@ -10,8 +10,10 @@ from lifemodel.core.intents import EmitSignal, Intent, LaunchProactive, UpdateSt
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
 from lifemodel.core.taxonomy import contact_signal
+from lifemodel.domain.memory import MemoryDraft, MemoryMutation, PressureIndex
 from lifemodel.domain.signal import Signal
 from lifemodel.state.model import State
+from lifemodel.testing import FakeMemoryStore
 
 
 class FixedClock:
@@ -38,6 +40,12 @@ class RecordingStore:
         self._state = State()
         self.commits.append(self._state)
         return self._state
+
+    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+        # State-only in the live loop (no component emits a mutation yet); a
+        # state change routes through the same commit-recording path.
+        if state is not None:
+            self.commit(state)
 
 
 class Healthy:
@@ -247,3 +255,138 @@ def test_launch_proactive_is_surfaced_in_report(tmp_path) -> None:
 def test_no_launch_means_empty_tuple(tmp_path) -> None:
     loop = _loop(ComponentRegistry(), RecordingStore(), FileSignalBus(tmp_path))
     assert loop.tick().launches == ()
+
+
+# --- lm-27n.2: start-of-tick snapshots on TickContext ---
+
+
+class SnapshotRecorder:
+    def __init__(self, id: str) -> None:
+        self.id = id
+        self.pressure: PressureIndex | None = None
+        self.objects: tuple = ()  # type: ignore[type-arg]
+
+    def step(self, ctx: TickContext) -> Sequence[Intent]:
+        self.pressure = ctx.pressure
+        self.objects = ctx.objects
+        return []
+
+
+class CountingMemory:
+    """Wraps a FakeMemoryStore, counting find() calls to prove read-once."""
+
+    def __init__(self, inner: FakeMemoryStore) -> None:
+        self._inner = inner
+        self.find_calls = 0
+
+    def find(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        self.find_calls += 1
+        return self._inner.find(*args, **kwargs)  # type: ignore[arg-type]
+
+
+def _seeded_memory() -> FakeMemoryStore:
+    mem = FakeMemoryStore(clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)))
+    mem.put(
+        MemoryDraft(kind="desire", id="d1", state="active", payload={}, source="t", salience=0.7)
+    )
+    mem.put(MemoryDraft(kind="desire", id="d2", state="archived", payload={}, source="t"))
+    return mem
+
+
+def test_tick_context_snapshot_populated_once_and_shared(tmp_path) -> None:
+    mem = _seeded_memory()
+    reg = ComponentRegistry()
+    a, b = SnapshotRecorder("a"), SnapshotRecorder("b")
+    reg.register(a, ComponentManifest(id="a", type="neuron"))
+    reg.register(b, ComponentManifest(id="b", type="aggregation"))
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
+        pressure_sensor=mem,
+        memory=mem,
+    )
+    loop.tick()
+
+    assert a.pressure is not None and a.pressure.active_desire_count == 1
+    assert a.objects == b.objects  # same snapshot handed to every component
+    assert a.objects is b.objects  # read ONCE, shared by reference
+    assert tuple(o.id for o in a.objects) == ("d1",)  # only the active record
+
+
+def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
+    counting = CountingMemory(_seeded_memory())
+    reg = ComponentRegistry()
+    for cid in ("a", "b", "c"):
+        reg.register(SnapshotRecorder(cid), ComponentManifest(id=cid, type="neuron"))
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
+        memory=counting,  # type: ignore[arg-type]
+    )
+    loop.tick()
+    assert counting.find_calls == 1  # once per tick, not once per component
+
+
+def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
+    # A tick with snapshot ports commits exactly the same bookkeeping bump as one
+    # without — no component consumes the snapshot yet (behavior-neutral).
+    reg_with = ComponentRegistry()
+    reg_with.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    store_with = RecordingStore()
+    mem = _seeded_memory()
+    CoreLoop(
+        registry=reg_with,
+        state_actor=StateActor(store_with),
+        bus=FileSignalBus(tmp_path / "with"),
+        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
+        pressure_sensor=mem,
+        memory=mem,
+    ).tick()
+
+    reg_without = ComponentRegistry()
+    reg_without.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    store_without = RecordingStore()
+    _loop(reg_without, store_without, FileSignalBus(tmp_path / "without")).tick()
+
+    assert store_with.commits[-1] == store_without.commits[-1]
+
+
+def test_tick_context_snapshot_defaults_empty_without_ports(tmp_path) -> None:
+    reg = ComponentRegistry()
+    rec = SnapshotRecorder("only")
+    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    _loop(reg, RecordingStore(), FileSignalBus(tmp_path)).tick()
+    assert rec.pressure == PressureIndex()
+    assert rec.objects == ()
+
+
+class RaisingMemory:
+    """A memory port whose find() always raises — to prove the read is fail-soft."""
+
+    def find(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        raise RuntimeError("transient DB error")
+
+
+def test_objects_snapshot_read_is_fail_soft(tmp_path) -> None:
+    # No component consumes the objects snapshot yet (.3), so a transient DB error
+    # on that read must NOT fail the tick before component isolation — behavior-
+    # neutral: the tick proceeds, degrading to an empty snapshot.
+    reg = ComponentRegistry()
+    rec = SnapshotRecorder("only")
+    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    store = RecordingStore()
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(store),
+        bus=FileSignalBus(tmp_path),
+        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
+        memory=RaisingMemory(),  # type: ignore[arg-type]
+    )
+    report = loop.tick()
+    assert report.ran == ("only",)  # the component still ran
+    assert report.committed  # the tick still committed its bookkeeping
+    assert rec.objects == ()  # degraded to an empty snapshot, no crash

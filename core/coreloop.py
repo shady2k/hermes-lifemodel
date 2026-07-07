@@ -20,16 +20,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
 from ..log import EventLogger
 from ..ports.clock import ClockPort
+from ..ports.memory import MemoryPort
+from ..ports.pressure import PressureSensorPort
 from .component import TickContext
 from .intake import IntakeLimits, apply_intake
-from .intents import EmitSignal, Intent, LaunchProactive, UpdateState
+from .intents import (
+    EmitSignal,
+    Intent,
+    LaunchProactive,
+    PutRecord,
+    TransitionRecord,
+    UpdateState,
+)
 from .registry import ComponentRegistry
 from .signal_bus import SignalBus
 from .state_actor import StateActor
 from .taxonomy import lane_of
+
+#: How many ``state="active"`` records the start-of-tick snapshot pulls. A
+#: per-tick active-scan is fine at current scale (lm-fib.6.5 tracks scaling);
+#: the cap keeps it bounded. Unused until aggregation reads the snapshot (.3).
+OBJECTS_SNAPSHOT_LIMIT = 256
 
 
 @dataclass(frozen=True)
@@ -55,6 +70,8 @@ class CoreLoop:
         logger: EventLogger | None = None,
         breaker_threshold: int = 3,
         intake_limits: IntakeLimits | None = None,
+        pressure_sensor: PressureSensorPort | None = None,
+        memory: MemoryPort | None = None,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
@@ -63,12 +80,33 @@ class CoreLoop:
         self._log = logger
         self._breaker_threshold = breaker_threshold
         self._intake_limits = intake_limits or IntakeLimits()
+        self._pressure_sensor = pressure_sensor
+        self._memory = memory
         self._failures: dict[str, int] = {}
         self._broken: set[str] = set()
 
     def tick(self) -> TickReport:
         now = self._clock.now()
         state = self._state_actor.state
+        # Start-of-tick snapshot: read once, before any component runs, so every
+        # component this tick sees one consistent view (HLA §4.1). Pure reads —
+        # they never change tick output; no component consumes them yet (.3).
+        pressure = (
+            self._pressure_sensor.read_pressure_index(now)
+            if self._pressure_sensor is not None
+            else PressureIndex()
+        )
+        # Fail-soft, like the pressure read: no component consumes this yet (.3),
+        # so a transient DB error must NOT fail the tick before component isolation
+        # kicks in — that would be a behavior-neutrality regression. Degrade to an
+        # empty snapshot and keep ticking ("the heart never dies").
+        objects: tuple[MemoryRecord, ...] = ()
+        if self._memory is not None:
+            try:
+                objects = tuple(self._memory.find(state="active", limit=OBJECTS_SNAPSHOT_LIMIT))
+            except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
+                if self._log is not None:
+                    self._log.info("objects_snapshot_failed", error=repr(exc))
         intake = apply_intake(
             self._bus.consume_unprocessed(), limits=self._intake_limits, lane_of=lane_of
         )
@@ -91,7 +129,14 @@ class CoreLoop:
         for component in self._registry.enabled():
             if component.id in self._broken:
                 continue
-            ctx = TickContext(state=state, now=now, bus=self._bus, signals=tuple(available))
+            ctx = TickContext(
+                state=state,
+                now=now,
+                bus=self._bus,
+                signals=tuple(available),
+                pressure=pressure,
+                objects=objects,
+            )
             try:
                 produced = component.step(ctx)
             except Exception as exc:  # isolation: the heart never dies
@@ -113,6 +158,11 @@ class CoreLoop:
         intents.append(
             UpdateState({"tick_count": state.tick_count + 1, "last_tick_at": now.isoformat()})
         )
+        # A memory mutation commits durable state even when the State row itself is
+        # unchanged, so ``committed`` must reflect it too (today the tick always
+        # bumps ``tick_count`` so the State always changes, but this keeps the
+        # report honest once mutation-only paths are live — lm-27n.3).
+        had_mutation = any(isinstance(i, PutRecord | TransitionRecord) for i in intents)
         new_state = self._state_actor.apply(intents)
 
         return TickReport(
@@ -120,7 +170,7 @@ class CoreLoop:
             ran=tuple(ran),
             skipped_broken=tuple(sorted(self._broken)),
             failed=tuple(failed),
-            committed=new_state is not state,
+            committed=new_state is not state or had_mutation,
             launches=tuple(launches),
         )
 

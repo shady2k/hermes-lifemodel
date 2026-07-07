@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 
-from lifemodel.core.intents import EmitSignal, UpdateState
+from lifemodel.core.intents import EmitSignal, PutRecord, TransitionRecord, UpdateState
 from lifemodel.core.state_actor import StateActor, UnknownStateField
+from lifemodel.domain.memory import MemoryDraft, MemoryMutation, PutOp, TransitionOp
 from lifemodel.domain.signal import Signal
 from lifemodel.state.model import State
 
 
 class RecordingStore:
-    """Minimal StatePort double that counts commits."""
+    """Minimal StatePort + TickCommitPort double that records commits/mutations."""
 
     def __init__(self, initial: State | None = None) -> None:
         self._state = initial if initial is not None else State()
         self.commits: list[State] = []
+        self.tick_calls: list[tuple[State | None, list[MemoryMutation]]] = []
 
     def load(self) -> State:
         return self._state
@@ -26,6 +30,11 @@ class RecordingStore:
         self._state = State()
         self.commits.append(self._state)
         return self._state
+
+    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+        self.tick_calls.append((state, list(mutations)))
+        if state is not None:
+            self.commit(state)
 
 
 def test_apply_merges_updates_and_commits_once() -> None:
@@ -74,3 +83,102 @@ def test_injected_state_overrides_store_load() -> None:
     store = RecordingStore(State(u=0.1))
     actor = StateActor(store, state=State(u=0.4))
     assert actor.state.u == 0.4
+
+
+# --- lm-27n.2: the atomic State+memory committer ---
+
+
+def _put(id: str) -> PutRecord:
+    return PutRecord(
+        PutOp(MemoryDraft(kind="desire", id=id, state="active", payload={}, source="t"))
+    )
+
+
+def _transition(id: str) -> TransitionRecord:
+    return TransitionRecord(
+        TransitionOp(kind="desire", id=id, from_state="active", to_state="archived")
+    )
+
+
+def test_apply_collects_state_and_mutations_into_one_commit_tick() -> None:
+    store = RecordingStore()
+    actor = StateActor(store)
+    actor.apply([_put("a"), UpdateState({"u": 0.5}), _transition("a")])
+
+    assert len(store.tick_calls) == 1  # exactly one atomic commit
+    committed_state, mutations = store.tick_calls[0]
+    assert committed_state is not None and committed_state.u == 0.5
+    # Mutations preserved in emission order (put before transition).
+    assert isinstance(mutations[0], PutOp)
+    assert isinstance(mutations[1], TransitionOp)
+
+
+def test_apply_mutation_only_commits_with_none_state() -> None:
+    # A tick with mutations but no state patch still commits (something changed),
+    # passing state=None so the state row/revision is untouched.
+    store = RecordingStore()
+    actor = StateActor(store)
+    actor.apply([_put("solo")])
+
+    assert len(store.tick_calls) == 1
+    committed_state, mutations = store.tick_calls[0]
+    assert committed_state is None
+    assert len(mutations) == 1
+    assert store.commits == []  # state row never rewritten
+
+
+def test_apply_no_state_and_no_mutations_does_not_commit() -> None:
+    store = RecordingStore()
+    actor = StateActor(store)
+    actor.apply([EmitSignal(Signal(origin_id="n", kind="contact"))])
+    assert store.tick_calls == []
+
+
+def test_unknown_field_raises_before_commit_even_with_mutations() -> None:
+    store = RecordingStore()
+    actor = StateActor(store)
+    with pytest.raises(UnknownStateField):
+        actor.apply([_put("a"), UpdateState({"not_a_field": 1})])
+    assert store.tick_calls == []  # all-or-nothing: nothing committed
+
+
+def test_apply_state_only_passes_empty_mutations() -> None:
+    # Behavior-neutral: a state-only tick commits new_state with an empty batch.
+    store = RecordingStore()
+    actor = StateActor(store)
+    result = actor.apply([UpdateState({"u": 0.5})])
+
+    assert result.u == 0.5
+    committed_state, mutations = store.tick_calls[0]
+    assert committed_state is not None and committed_state.u == 0.5
+    assert mutations == []
+
+
+def test_state_actor_requires_a_committer_or_committing_store() -> None:
+    class StateOnly:
+        def load(self) -> State:
+            return State()
+
+        def commit(self, state: State) -> None: ...
+
+        def reset(self) -> State:
+            return State()
+
+    with pytest.raises(TypeError):
+        StateActor(StateOnly())  # type: ignore[arg-type]
+
+
+def test_state_actor_accepts_a_separate_committer() -> None:
+    class StateOnly:
+        def load(self) -> State:
+            return State(u=0.2)
+
+        def commit(self, state: State) -> None: ...
+
+        def reset(self) -> State:
+            return State()
+
+    committer = RecordingStore()
+    actor = StateActor(StateOnly(), committer=committer)  # type: ignore[arg-type]
+    actor.apply([UpdateState({"u": 0.9})])
+    assert committer.tick_calls[0][0] is not None

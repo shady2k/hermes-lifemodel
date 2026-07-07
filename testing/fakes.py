@@ -23,15 +23,20 @@ database. Purely additive — nothing in the live tick uses them yet.
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from datetime import datetime, timedelta
+from typing import assert_never
 
 from ..core.signal_bus import SignalBus
 from ..domain.memory import (
     MemoryDraft,
+    MemoryMutation,
     MemoryPatch,
     MemoryRecord,
     PressureIndex,
+    PutOp,
     StaleTransition,
+    TransitionOp,
     coalesce_patch,
     describe_stale_transition,
     ensure_json_serializable,
@@ -85,16 +90,27 @@ class FakeDelivery:
 
 
 class FakeStateStore:
-    """An in-memory :class:`~lifemodel.state.port.StatePort`.
+    """An in-memory :class:`~lifemodel.state.port.StatePort` (+ ``TickCommitPort``).
 
     Holds one ``State`` in memory (the documented default until first commit).
     Deep-copies on the way in and out so a caller mutating its own ``State`` can
     never reach through and change what the store holds — matching the isolation
     a real serializing store gives.
+
+    :meth:`commit_tick` mirrors the real
+    :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`'s atomic
+    State+memory committer. State-only ticks need no memory backing; to also
+    apply memory mutations, inject a :class:`FakeMemoryStore` (``memory=``) — the
+    two then move **all-or-nothing** together (a stale transition mid-batch rolls
+    back the state *and* every earlier put in the same batch), so fake and real
+    agree on split-brain-freedom (HLA §4.1).
     """
 
-    def __init__(self, initial: State | None = None) -> None:
+    def __init__(
+        self, initial: State | None = None, *, memory: FakeMemoryStore | None = None
+    ) -> None:
         self._state = copy.deepcopy(initial) if initial is not None else State()
+        self._memory = memory
 
     def load(self) -> State:
         return copy.deepcopy(self._state)
@@ -107,6 +123,47 @@ class FakeStateStore:
         successful :meth:`load`, matching :class:`~lifemodel.state.port.StatePort`."""
         self._state = State()
         return copy.deepcopy(self._state)
+
+    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+        """Atomically apply *state* (if not ``None``) then each mutation in order.
+
+        Snapshot-then-restore gives true all-or-nothing: any exception (a stale
+        transition, a serialization guard) restores both the ``State`` and the
+        memory rows to their pre-batch values and re-raises — matching the real
+        store's single transaction, including intra-batch ``put``-then-
+        ``transition`` of the same record.
+        """
+        if mutations and self._memory is None:
+            raise TypeError(
+                "FakeStateStore.commit_tick got memory mutations but no memory store; "
+                "construct it with FakeStateStore(memory=FakeMemoryStore(...))"
+            )
+        state_snapshot = copy.deepcopy(self._state)
+        rows_snapshot = copy.deepcopy(self._memory._rows) if self._memory is not None else None
+        try:
+            if state is not None:
+                self.commit(state)
+            for mutation in mutations:
+                match mutation:
+                    case PutOp():
+                        assert self._memory is not None  # guarded above
+                        self._memory.put(mutation.draft)
+                    case TransitionOp():
+                        assert self._memory is not None  # guarded above
+                        self._memory.transition(
+                            mutation.kind,
+                            mutation.id,
+                            mutation.from_state,
+                            mutation.to_state,
+                            mutation.patch,
+                        )
+                    case _:  # pragma: no cover - exhaustive over the closed union
+                        assert_never(mutation)
+        except BaseException:
+            self._state = state_snapshot
+            if self._memory is not None and rows_snapshot is not None:
+                self._memory._rows = rows_snapshot
+            raise
 
 
 class FakeSignalBus(SignalBus):
@@ -192,7 +249,7 @@ class FakeMemoryStore:
             created_at=created_at,
             updated_at=now,
             revision=revision,
-            schema_version=1,
+            schema_version=draft.schema_version,
         )
         return draft.id
 

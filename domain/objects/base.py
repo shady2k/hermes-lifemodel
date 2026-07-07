@@ -132,8 +132,10 @@ def pack_envelope(obj: BaseObject, semantic: JsonObject) -> MemoryDraft:
     """Pack *obj*'s envelope + *semantic* fields into a :class:`MemoryDraft`.
 
     Columnar fields map to draft columns; the envelope fields with no column
-    map to reserved payload keys. ``schema_version`` has no draft column (the
-    store stamps it); :meth:`~KindRegistry.decode` checks it off the record.
+    map to reserved payload keys. ``schema_version`` rides on the draft (from
+    the kind's ``SCHEMA_VERSION`` class metadata) so the store stamps the row
+    with the *kind's* version, not a hardcoded ``1``; :meth:`~KindRegistry.decode`
+    checks it off the record.
     """
     payload: JsonObject = dict(semantic)
     payload[RESERVED_SENSITIVITY] = str(obj.sensitivity)
@@ -154,6 +156,7 @@ def pack_envelope(obj: BaseObject, semantic: JsonObject) -> MemoryDraft:
         salience=obj.salience,
         confidence=obj.confidence,
         expires_at=obj.expires_at,
+        schema_version=obj.SCHEMA_VERSION,
     )
 
 

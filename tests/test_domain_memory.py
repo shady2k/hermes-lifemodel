@@ -9,14 +9,20 @@ contract suite.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from lifemodel.domain.memory import (
+    MemoryDraft,
+    MemoryMutation,
+    MemoryPatch,
     MemoryRecord,
     MemorySerializationError,
     PressureIndex,
+    PutOp,
+    TransitionOp,
     coalesce_patch,
     describe_stale_transition,
     ensure_json_serializable,
@@ -162,3 +168,45 @@ class TestSummarizePressureIndex:
         idx = summarize_pressure_index([expired, alive], now)
         assert idx.active_desire_count == 1
         assert idx.max_desire_salience == 0.0
+
+
+# --- lm-27n.2: schema_version on the draft + the mutation value types ---
+
+
+class TestMemoryDraftSchemaVersion:
+    def test_defaults_to_one(self) -> None:
+        draft = MemoryDraft(kind="desire", id="d", state="active", payload={}, source="t")
+        assert draft.schema_version == 1
+
+    def test_carries_an_explicit_version(self) -> None:
+        draft = MemoryDraft(
+            kind="desire", id="d", state="active", payload={}, source="t", schema_version=2
+        )
+        assert draft.schema_version == 2
+
+
+class TestMutationValueTypes:
+    def test_put_op_wraps_a_draft(self) -> None:
+        draft = MemoryDraft(kind="desire", id="d", state="active", payload={}, source="t")
+        op = PutOp(draft)
+        assert op.draft is draft
+        assert isinstance(op, MemoryMutation)  # runtime union membership
+
+    def test_transition_op_defaults_patch_to_none(self) -> None:
+        op = TransitionOp(kind="desire", id="d", from_state="active", to_state="archived")
+        assert op.patch is None
+        assert isinstance(op, MemoryMutation)
+
+    def test_transition_op_carries_a_patch(self) -> None:
+        patch = MemoryPatch(salience=0.5)
+        op = TransitionOp(
+            kind="desire", id="d", from_state="active", to_state="archived", patch=patch
+        )
+        assert op.patch is patch
+
+    def test_ops_are_frozen_and_equal_by_value(self) -> None:
+        a = TransitionOp(kind="desire", id="d", from_state="active", to_state="archived")
+        b = TransitionOp(kind="desire", id="d", from_state="active", to_state="archived")
+        assert a == b
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            a.kind = "fact"  # type: ignore[misc]

@@ -66,6 +66,32 @@ def test_builds_full_graph_from_injected_fakes_without_hermes(tmp_path: Path) ->
     _assert_no_hermes()
 
 
+def test_injected_fake_state_store_graph_can_tick(tmp_path: Path) -> None:
+    # lm-27n.2: an injected StatePort-only fake leaves the memory/pressure slots
+    # unwired (CoreLoop reads empty snapshots) and the StateActor falls back to
+    # the fake's own commit_tick — a full tick must still run and persist.
+    fake_state = FakeStateStore()
+    lm = build_lifemodel(
+        base_dir=tmp_path / "unused",
+        state=fake_state,
+        bus=FakeSignalBus(),
+        clock=FakeClock(datetime(2026, 7, 3, tzinfo=UTC)),
+        delivery=FakeDelivery(),
+    )
+    assert lm.coreloop is not None
+    lm.coreloop.tick()  # must not raise
+    assert lm.state.load().tick_count == 1
+
+
+def test_default_graph_wires_the_store_as_the_atomic_committer(tmp_path: Path) -> None:
+    # The one SQLite store backs state + memory + pressure + the tick committer,
+    # so a tick's commit spans vitals and entities in one transaction (HLA §4.1).
+    lm = build_lifemodel(base_dir=tmp_path)
+    assert isinstance(lm.state, SQLiteRuntimeStore)
+    lm.coreloop.tick()  # ticks through commit_tick over that same store
+    assert lm.state.load().tick_count == 1
+
+
 def test_builds_with_concrete_sqlite_store_over_tmp_dir(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
 

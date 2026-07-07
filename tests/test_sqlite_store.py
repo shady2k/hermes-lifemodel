@@ -18,7 +18,15 @@ import pytest
 from structlog.testing import capture_logs
 
 import lifemodel.state.sqlite_store as sqlite_store_module
-from lifemodel.domain.memory import MemoryDraft, PressureIndex
+from lifemodel.domain.memory import (
+    MemoryDraft,
+    MemoryPatch,
+    MemorySerializationError,
+    PressureIndex,
+    PutOp,
+    StaleTransition,
+    TransitionOp,
+)
 from lifemodel.state.errors import StateCorruptError, StateSchemaError, StateSerializationError
 from lifemodel.state.model import SCHEMA_VERSION, State
 from lifemodel.state.port import StatePort
@@ -587,3 +595,164 @@ def test_read_pressure_index_does_not_fail_soft_schema_errors(tmp_path: Path) ->
 
     with pytest.raises(sqlite3.OperationalError):
         store.read_pressure_index(clock.now())
+
+
+# ---- commit_tick: the atomic State+memory committer (lm-27n.2) ---------------
+
+
+def _runtime_state_revision(base_dir: Path) -> int:
+    with closing(sqlite3.connect(str(_db_path(base_dir)))) as conn:
+        row = conn.execute("SELECT revision FROM runtime_state WHERE id = 1").fetchone()
+    assert row is not None
+    revision = row[0]
+    assert isinstance(revision, int)
+    return revision
+
+
+def test_commit_tick_applies_state_and_mutations_in_one_transaction(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.put(_draft(id="d1", state="active", payload={"note": "seed"}))
+
+    store.commit_tick(
+        State(u=1.5),
+        [
+            PutOp(_draft(id="d2", state="active", payload={"note": "new"})),
+            TransitionOp(kind="desire", id="d1", from_state="active", to_state="archived"),
+        ],
+    )
+
+    # A FRESH store instance proves everything is durably committed together.
+    fresh = SQLiteRuntimeStore(tmp_path, clock=clock)
+    assert fresh.load().u == 1.5
+    d1 = fresh.get("desire", "d1")
+    d2 = fresh.get("desire", "d2")
+    assert d1 is not None and d1.state == "archived"
+    assert d2 is not None and d2.payload == {"note": "new"}
+
+
+def test_commit_tick_stale_transition_rolls_back_everything(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit(State(u=1.0))
+    revision_before = _runtime_state_revision(tmp_path)
+
+    # A batch: a state change, a fresh put, then a transition whose from_state is
+    # wrong. The stale transition must roll back the state row AND the earlier put.
+    with pytest.raises(StaleTransition):
+        store.commit_tick(
+            State(u=9.0),
+            [
+                PutOp(_draft(id="ghost", state="active", payload={"note": "should vanish"})),
+                TransitionOp(kind="desire", id="ghost", from_state="archived", to_state="active"),
+            ],
+        )
+
+    fresh = SQLiteRuntimeStore(tmp_path, clock=clock)
+    assert fresh.load().u == 1.0  # state row unchanged
+    assert _runtime_state_revision(tmp_path) == revision_before  # no revision bump
+    assert fresh.get("desire", "ghost") is None  # the earlier put was rolled back
+
+
+def test_commit_tick_applies_mutations_in_list_order(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+
+    # put a NEW record then transition THAT SAME record in one batch — the
+    # transition depends on the put having already landed (same transaction).
+    store.commit_tick(
+        None,
+        [
+            PutOp(_draft(id="loop", state="active", payload={"note": "born"})),
+            TransitionOp(kind="desire", id="loop", from_state="active", to_state="archived"),
+        ],
+    )
+
+    record = store.get("desire", "loop")
+    assert record is not None
+    assert record.state == "archived"
+
+
+def test_commit_tick_state_only_matches_old_commit(tmp_path: Path) -> None:
+    # Behavior-neutral: a state-only commit_tick is byte-identical to commit —
+    # same row, same revision bump, same state_commit log.
+    clock = FakeClock(BASE_TIME)
+    store_a = SQLiteRuntimeStore(tmp_path / "a", clock=clock)
+    store_b = SQLiteRuntimeStore(tmp_path / "b", clock=clock)
+
+    store_a.commit(State(u=1.0))
+    store_a.commit(State(u=2.0))
+    with capture_logs() as logs_b:
+        store_b.commit_tick(State(u=1.0), [])
+        store_b.commit_tick(State(u=2.0), [])
+
+    assert store_a.load() == store_b.load()
+    assert _runtime_state_revision(tmp_path / "a") == _runtime_state_revision(tmp_path / "b") == 1
+    assert [e for e in logs_b if e.get("event") == "state_commit"]  # same log emitted
+
+
+def test_commit_tick_mutation_only_does_not_log_state_commit(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    with capture_logs() as logs:
+        store.commit_tick(None, [PutOp(_draft(id="m", state="active"))])
+    assert [e for e in logs if e.get("event") == "state_commit"] == []
+
+
+def test_commit_tick_rejects_nan_state_before_writing_mutations(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    with pytest.raises(StateSerializationError):
+        store.commit_tick(State(u=float("nan")), [PutOp(_draft(id="never", state="active"))])
+    # The guard ran before connecting, so the put never landed.
+    assert store.get("desire", "never") is None
+
+
+def test_commit_tick_rejects_bad_transition_patch_expires_at_before_writing(
+    tmp_path: Path,
+) -> None:
+    # A transition patch's expires_at is validated in the pre-connection guard
+    # pass, so a naive (tz-less) value fails BEFORE any write — the sibling put in
+    # the same batch never lands, and the target row is untouched.
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.put(_draft(id="d1", state="active"))
+    with pytest.raises(MemorySerializationError):
+        store.commit_tick(
+            None,
+            [
+                PutOp(_draft(id="never", state="active")),
+                TransitionOp(
+                    kind="desire",
+                    id="d1",
+                    from_state="active",
+                    to_state="archived",
+                    patch=MemoryPatch(expires_at="2026-07-06T12:00:00"),  # naive: no tzinfo
+                ),
+            ],
+        )
+    assert store.get("desire", "never") is None  # sibling put rolled back / never ran
+    d1 = store.get("desire", "d1")
+    assert d1 is not None and d1.state == "active"  # target untouched
+
+
+def test_commit_tick_stamps_schema_version_from_draft(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit_tick(None, [PutOp(_draft(id="v2", state="active", schema_version=2))])
+    record = store.get("desire", "v2")
+    assert record is not None
+    assert record.schema_version == 2
+
+
+def test_put_persists_schema_version_from_draft(tmp_path: Path) -> None:
+    # The lm-27n.1 landmine fix: the store writes draft.schema_version, not a
+    # hardcoded 1. Default stays 1; a v2 draft round-trips as 2.
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.put(_draft(id="default"))
+    store.put(_draft(id="two", schema_version=2))
+    default = store.get("desire", "default")
+    two = store.get("desire", "two")
+    assert default is not None and default.schema_version == 1
+    assert two is not None and two.schema_version == 2

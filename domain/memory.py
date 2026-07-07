@@ -91,6 +91,12 @@ class MemoryDraft:
     #: expires". The store derives the epoch-millisecond column from this; see
     #: :func:`parse_expires_at_epoch_ms`.
     expires_at: str | None = None
+    #: The typed-kind payload schema version the store must stamp on the row.
+    #: Defaults to ``1`` (every kind is v1 today); :meth:`KindRegistry.encode`
+    #: threads each kind's ``SCHEMA_VERSION`` through here so a future v2 kind
+    #: persists correctly instead of the store hardcoding ``1`` (the lm-27n.1
+    #: landmine). Read back on the :class:`MemoryRecord` as ``schema_version``.
+    schema_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,35 @@ class MemoryPatch:
     confidence: float | None = None
     expires_at: str | None = None
     source: str | None = None
+
+
+@dataclass(frozen=True)
+class PutOp:
+    """A queued ``MemoryPort.put`` — the value form of a put, carried by an
+    intent so a component can *request* a write the tick's atomic committer
+    applies (HLA §4.1). Domain-level (not a core intent) so the store can apply
+    a batch without importing the core; see :data:`MemoryMutation`."""
+
+    draft: MemoryDraft
+
+
+@dataclass(frozen=True)
+class TransitionOp:
+    """A queued ``MemoryPort.transition`` — the value form of a guarded state
+    change. Applied by the tick committer in list order; a stale ``from_state``
+    aborts (and rolls back) the whole batch (HLA §4.1). Domain-level so the
+    store stays core-free; see :data:`MemoryMutation`."""
+
+    kind: str
+    id: str
+    from_state: str
+    to_state: str
+    patch: MemoryPatch | None = None
+
+
+#: One memory write the end-of-tick committer can apply — a closed union so the
+#: committer can ``match`` it exhaustively (``typing.assert_never`` on the else).
+MemoryMutation: TypeAlias = PutOp | TransitionOp
 
 
 @dataclass(frozen=True)

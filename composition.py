@@ -68,6 +68,9 @@ from .core.state_actor import StateActor
 from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
+from .ports.memory import MemoryPort
+from .ports.pressure import PressureSensorPort
+from .ports.tick_commit import TickCommitPort
 from .sim.wake import GateParams
 from .state.port import StatePort
 from .state.sqlite_store import SQLiteRuntimeStore
@@ -141,6 +144,22 @@ def build_lifemodel(
     resolved_state: StatePort = state or SQLiteRuntimeStore(
         base_dir, clock=resolved_clock, logger=logger
     )
+    # The one live adapter (SQLiteRuntimeStore) implements StatePort + MemoryPort
+    # + PressureSensorPort + TickCommitPort, so a tick's commit spans vitals and
+    # entities in one transaction (HLA §4.1). Default the memory/pressure/commit
+    # slots to that same instance when it satisfies the port; an injected fake
+    # StatePort that does not (e.g. FakeStateStore) leaves them unwired — the
+    # CoreLoop then reads empty snapshots and the StateActor uses the store's own
+    # commit_tick (the fakes implement it).
+    resolved_memory: MemoryPort | None = (
+        resolved_state if isinstance(resolved_state, MemoryPort) else None
+    )
+    resolved_pressure: PressureSensorPort | None = (
+        resolved_state if isinstance(resolved_state, PressureSensorPort) else None
+    )
+    resolved_committer: TickCommitPort | None = (
+        resolved_state if isinstance(resolved_state, TickCommitPort) else None
+    )
     resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
@@ -189,13 +208,15 @@ def build_lifemodel(
             alpha=COST_ALPHA,
         )
         resolved_registry.register(cognition, ComponentManifest(id=cognition.id, type="cognition"))
-    resolved_state_actor = StateActor(resolved_state, logger=logger)
+    resolved_state_actor = StateActor(resolved_state, committer=resolved_committer, logger=logger)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,
         state_actor=resolved_state_actor,
         bus=resolved_bus,
         clock=resolved_clock,
         logger=logger,
+        pressure_sensor=resolved_pressure,
+        memory=resolved_memory,
     )
 
     return LifeModel(

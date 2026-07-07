@@ -4,7 +4,15 @@ import dataclasses
 
 import pytest
 
-from lifemodel.core.intents import CheckpointState, EmitSignal, Intent, UpdateState
+from lifemodel.core.intents import (
+    CheckpointState,
+    EmitSignal,
+    Intent,
+    PutRecord,
+    TransitionRecord,
+    UpdateState,
+)
+from lifemodel.domain.memory import MemoryDraft, PutOp, TransitionOp
 from lifemodel.domain.signal import Signal
 
 
@@ -36,3 +44,24 @@ def test_checkpoint_state_is_a_marker_intent() -> None:
 def test_intents_are_equal_by_value() -> None:
     assert UpdateState({"u": 1.0}) == UpdateState({"u": 1.0})
     assert UpdateState({"u": 1.0}) != UpdateState({"u": 2.0})
+
+
+def test_put_record_carries_a_put_op() -> None:
+    op = PutOp(MemoryDraft(kind="desire", id="d", state="active", payload={}, source="t"))
+    intent = PutRecord(op)
+    assert isinstance(intent, Intent)
+    assert intent.op is op
+
+
+def test_transition_record_carries_a_transition_op() -> None:
+    op = TransitionOp(kind="desire", id="d", from_state="active", to_state="archived")
+    intent = TransitionRecord(op)
+    assert isinstance(intent, Intent)
+    assert intent.op is op
+
+
+def test_mutation_intents_are_frozen() -> None:
+    op = TransitionOp(kind="desire", id="d", from_state="active", to_state="archived")
+    intent = TransitionRecord(op)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        intent.op = op  # type: ignore[misc]

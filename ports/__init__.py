@@ -25,6 +25,7 @@ from .delivery import DeliveryPort
 from .memory import MemoryPort
 from .pressure import PressureSensorPort
 from .proactive import ProactiveEgressPort
+from .tick_commit import TickCommitPort
 
 __all__ = [
     "ClockPort",
@@ -33,4 +34,5 @@ __all__ = [
     "PressureSensorPort",
     "ProactiveEgressPort",
     "StatePort",
+    "TickCommitPort",
 ]

@@ -71,19 +71,22 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing, suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, assert_never
 
 from ..domain.memory import (
     JsonObject,
     MemoryDraft,
+    MemoryMutation,
     MemoryPatch,
     MemoryRecord,
     PressureIndex,
+    PutOp,
     StaleTransition,
+    TransitionOp,
     coalesce_patch,
     describe_stale_transition,
     ensure_json_serializable,
@@ -274,54 +277,70 @@ class SQLiteRuntimeStore:
     # ---- MemoryPort ---------------------------------------------------------
 
     def put(self, draft: MemoryDraft) -> str:
+        # Fail-before-write guard, then one self-contained transaction (unchanged
+        # single-op contract): the SQL body lives in :meth:`_put_on` so the same
+        # write can also run inside :meth:`commit_tick`'s multi-op transaction.
         ensure_json_serializable(draft.payload)
+        parse_expires_at_epoch_ms(draft.expires_at)  # validate expires_at before writing
+        now = self._clock.now()
+        stamp_iso_utc(now)  # validate the clock (tz-aware) before touching the DB
+        with closing(self._connect()) as conn, conn:
+            self._put_on(conn, draft, now)
+        return draft.id
+
+    def _put_on(self, conn: sqlite3.Connection, draft: MemoryDraft, now: datetime) -> None:
+        """Apply *draft*'s UPSERT on *conn* using the single passed *now*.
+
+        No connection management, no clock read — the caller owns both (so one
+        tick has one timestamp and one transaction). Fail-before-write JSON/clock
+        guards run in the caller; the serialization here is guaranteed to succeed.
+
+        One atomic UPSERT — NOT a SELECT-then-INSERT/UPDATE. Two writers over the
+        same file (the 60s tick + a separate-process command) could both read "no
+        row" and both INSERT (a PRIMARY KEY IntegrityError), or read the same
+        revision and each write revision+1 (an undercount). ON CONFLICT collapses
+        that to last-writer-wins with an atomic bump. ``created_at``/
+        ``created_at_epoch`` appear ONLY in the INSERT VALUES, never in DO UPDATE
+        SET, so an update preserves the original creation stamp (the pre-existing
+        contract); ``revision`` bumps off the row's own stored value, so concurrent
+        updates cannot undercount it. ``schema_version`` is stamped from the draft
+        (the kind's version), not a hardcoded literal (lm-27n.2).
+        """
         payload_json = json.dumps(draft.payload, allow_nan=False)
         expires_at_epoch = parse_expires_at_epoch_ms(draft.expires_at)
-        now = self._clock.now()
-        now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
+        now_iso = stamp_iso_utc(now)
         now_epoch = epoch_ms(now)
-
-        # One atomic UPSERT — NOT a SELECT-then-INSERT/UPDATE. Two writers over
-        # the same file (the 60s tick + a separate-process command) could both
-        # read "no row" and both INSERT (a PRIMARY KEY IntegrityError), or read
-        # the same revision and each write revision+1 (an undercount). ON
-        # CONFLICT collapses that to last-writer-wins with an atomic bump.
-        # ``created_at``/``created_at_epoch`` appear ONLY in the INSERT VALUES,
-        # never in DO UPDATE SET, so an update preserves the original creation
-        # stamp (the pre-existing contract); ``revision`` bumps off the row's
-        # own stored value, so concurrent updates cannot undercount it.
-        with closing(self._connect()) as conn, conn:
-            conn.execute(
-                "INSERT INTO memory_records ("
-                "kind, id, state, recipient_id, payload_json, salience, confidence, "
-                "expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
-                "updated_at, updated_at_epoch, revision, schema_version) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1) "
-                "ON CONFLICT(kind, id) DO UPDATE SET "
-                "state=excluded.state, recipient_id=excluded.recipient_id, "
-                "payload_json=excluded.payload_json, salience=excluded.salience, "
-                "confidence=excluded.confidence, expires_at=excluded.expires_at, "
-                "expires_at_epoch=excluded.expires_at_epoch, source=excluded.source, "
-                "updated_at=excluded.updated_at, updated_at_epoch=excluded.updated_at_epoch, "
-                "revision=memory_records.revision + 1",
-                (
-                    draft.kind,
-                    draft.id,
-                    draft.state,
-                    draft.recipient_id,
-                    payload_json,
-                    draft.salience,
-                    draft.confidence,
-                    draft.expires_at,
-                    expires_at_epoch,
-                    draft.source,
-                    now_iso,
-                    now_epoch,
-                    now_iso,
-                    now_epoch,
-                ),
-            )
-        return draft.id
+        conn.execute(
+            "INSERT INTO memory_records ("
+            "kind, id, state, recipient_id, payload_json, salience, confidence, "
+            "expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
+            "updated_at, updated_at_epoch, revision, schema_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?) "
+            "ON CONFLICT(kind, id) DO UPDATE SET "
+            "state=excluded.state, recipient_id=excluded.recipient_id, "
+            "payload_json=excluded.payload_json, salience=excluded.salience, "
+            "confidence=excluded.confidence, expires_at=excluded.expires_at, "
+            "expires_at_epoch=excluded.expires_at_epoch, source=excluded.source, "
+            "updated_at=excluded.updated_at, updated_at_epoch=excluded.updated_at_epoch, "
+            "revision=memory_records.revision + 1",
+            (
+                draft.kind,
+                draft.id,
+                draft.state,
+                draft.recipient_id,
+                payload_json,
+                draft.salience,
+                draft.confidence,
+                draft.expires_at,
+                expires_at_epoch,
+                draft.source,
+                now_iso,
+                now_epoch,
+                now_iso,
+                now_epoch,
+                draft.schema_version,
+            ),
+        )
 
     def get(self, kind: str, id: str) -> MemoryRecord | None:
         with closing(self._connect()) as conn:
@@ -370,65 +389,89 @@ class SQLiteRuntimeStore:
         to_state: str,
         patch: MemoryPatch | None = None,
     ) -> MemoryRecord:
-        patch = patch if patch is not None else MemoryPatch()
-        if patch.payload_merge is not None:
+        # Fail-before-write guard, then one self-contained transaction (unchanged
+        # single-op contract): the guarded SELECT+UPDATE lives in
+        # :meth:`_transition_on` so the same change can also run inside
+        # :meth:`commit_tick`'s multi-op transaction.
+        if patch is not None and patch.payload_merge is not None:
             ensure_json_serializable(patch.payload_merge)
-
+        now = self._clock.now()
+        stamp_iso_utc(now)  # validate the clock (tz-aware) before touching the DB
         with closing(self._connect()) as conn, conn:
-            row = conn.execute(
-                "SELECT payload_json, salience, confidence, expires_at, source "
-                "FROM memory_records WHERE kind = ? AND id = ? AND state = ?",
-                (kind, id, from_state),
-            ).fetchone()
-            if row is None:
-                actual = conn.execute(
-                    "SELECT state FROM memory_records WHERE kind = ? AND id = ?", (kind, id)
-                ).fetchone()
-                actual_state = actual[0] if actual is not None else None
-                raise StaleTransition(describe_stale_transition(kind, id, from_state, actual_state))
-
-            payload_json, salience, confidence, expires_at, source = row
-            payload: JsonObject = merge_payload(json.loads(payload_json), patch.payload_merge)
-            new_expires_at = coalesce_patch(patch.expires_at, expires_at)
-            new_expires_epoch = parse_expires_at_epoch_ms(new_expires_at)
-            now = self._clock.now()
-            now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
-
-            cursor = conn.execute(
-                "UPDATE memory_records SET state = ?, payload_json = ?, salience = ?, "
-                "confidence = ?, expires_at = ?, expires_at_epoch = ?, source = ?, "
-                "updated_at = ?, updated_at_epoch = ?, revision = revision + 1 "
-                "WHERE kind = ? AND id = ? AND state = ?",
-                (
-                    to_state,
-                    json.dumps(payload, allow_nan=False),
-                    coalesce_patch(patch.salience, salience),
-                    coalesce_patch(patch.confidence, confidence),
-                    new_expires_at,
-                    new_expires_epoch,
-                    coalesce_patch(patch.source, source),
-                    now_iso,
-                    epoch_ms(now),
-                    kind,
-                    id,
-                    from_state,
-                ),
-            )
-            # Defensive: the guarded UPDATE ran in the same transaction as the
-            # SELECT above, so it should always match exactly the one row. Once a
-            # later bead adds a second writer, this is what keeps the guarded-
-            # transition contract honest — a lost race raises StaleTransition and
-            # the surrounding ``with conn:`` rolls the (no-op) UPDATE back.
-            if cursor.rowcount != 1:
-                raise StaleTransition(
-                    f"guarded transition for kind={kind!r} id={id!r} from_state={from_state!r} "
-                    f"matched {cursor.rowcount} rows (expected 1)"
-                )
+            self._transition_on(conn, kind, id, from_state, to_state, patch, now)
 
         record = self.get(kind, id)
         if record is None:  # pragma: no cover - defensive: we just wrote this row
             raise StaleTransition(f"record kind={kind!r} id={id!r} vanished during transition")
         return record
+
+    def _transition_on(
+        self,
+        conn: sqlite3.Connection,
+        kind: str,
+        id: str,
+        from_state: str,
+        to_state: str,
+        patch: MemoryPatch | None,
+        now: datetime,
+    ) -> None:
+        """Apply the guarded state change on *conn* using the passed *now*.
+
+        No connection management, no clock read, and it does NOT re-``get`` the
+        row — the caller owns the transaction and any post-commit read. Raises
+        :class:`~lifemodel.domain.memory.StaleTransition` (from a ``from_state``
+        mismatch or a ``rowcount != 1``) so a stale transition mid-batch aborts —
+        and rolls back — :meth:`commit_tick`'s whole transaction (all-or-nothing).
+        """
+        patch = patch if patch is not None else MemoryPatch()
+        row = conn.execute(
+            "SELECT payload_json, salience, confidence, expires_at, source "
+            "FROM memory_records WHERE kind = ? AND id = ? AND state = ?",
+            (kind, id, from_state),
+        ).fetchone()
+        if row is None:
+            actual = conn.execute(
+                "SELECT state FROM memory_records WHERE kind = ? AND id = ?", (kind, id)
+            ).fetchone()
+            actual_state = actual[0] if actual is not None else None
+            raise StaleTransition(describe_stale_transition(kind, id, from_state, actual_state))
+
+        payload_json, salience, confidence, expires_at, source = row
+        payload: JsonObject = merge_payload(json.loads(payload_json), patch.payload_merge)
+        new_expires_at = coalesce_patch(patch.expires_at, expires_at)
+        new_expires_epoch = parse_expires_at_epoch_ms(new_expires_at)
+        now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
+
+        cursor = conn.execute(
+            "UPDATE memory_records SET state = ?, payload_json = ?, salience = ?, "
+            "confidence = ?, expires_at = ?, expires_at_epoch = ?, source = ?, "
+            "updated_at = ?, updated_at_epoch = ?, revision = revision + 1 "
+            "WHERE kind = ? AND id = ? AND state = ?",
+            (
+                to_state,
+                json.dumps(payload, allow_nan=False),
+                coalesce_patch(patch.salience, salience),
+                coalesce_patch(patch.confidence, confidence),
+                new_expires_at,
+                new_expires_epoch,
+                coalesce_patch(patch.source, source),
+                now_iso,
+                epoch_ms(now),
+                kind,
+                id,
+                from_state,
+            ),
+        )
+        # Defensive: the guarded UPDATE ran in the same transaction as the SELECT
+        # above, so it should always match exactly the one row. Once a later bead
+        # adds a second writer, this is what keeps the guarded-transition contract
+        # honest — a lost race raises StaleTransition and the surrounding
+        # transaction rolls the (no-op) UPDATE back.
+        if cursor.rowcount != 1:
+            raise StaleTransition(
+                f"guarded transition for kind={kind!r} id={id!r} from_state={from_state!r} "
+                f"matched {cursor.rowcount} rows (expected 1)"
+            )
 
     # ---- StatePort (lm-fib.6.2) -------------------------------------------
 
@@ -497,31 +540,128 @@ class SQLiteRuntimeStore:
         rename), or read the same revision and each write revision+1 (an
         undercount). ON CONFLICT collapses that to atomic last-writer-wins with
         the bump computed off the row's own stored value.
+
+        The UPSERT body lives in :meth:`_commit_state_on` so an identical write
+        can also run inside :meth:`commit_tick`'s multi-op transaction — a
+        state-only ``commit_tick(state, [])`` is byte-identical to this path.
         """
+        self._ensure_state_serializable(state)  # fail-closed before the DB is touched
+        now = self._clock.now()
+        with closing(self._connect()) as conn, conn:
+            self._commit_state_on(conn, state, now)
+        self._log.info("state_commit", schema_version=state.schema_version)
+
+    def _ensure_state_serializable(self, state: State) -> None:
+        """Fail-closed guard (mirrors ``JsonStateStore.commit``): reject a
+        ``State`` that is not valid JSON (NaN/Infinity float) *before* any
+        connection is opened, raising :class:`StateSerializationError`."""
         try:
-            payload = json.dumps(state.to_dict(), allow_nan=False)
+            json.dumps(state.to_dict(), allow_nan=False)
         except ValueError as exc:
-            # Out-of-range float (NaN/Infinity): refuse to persist poison,
-            # before the row is ever touched.
             raise StateSerializationError(
                 f"refusing to persist a State that is not valid JSON: {exc}"
             ) from exc
 
-        now = self._clock.now()
+    def _commit_state_on(self, conn: sqlite3.Connection, state: State, now: datetime) -> None:
+        """Apply the ``runtime_state`` UPSERT on *conn* using the passed *now*.
+
+        No connection management, no clock read. The JSON guard runs in the
+        caller (:meth:`_ensure_state_serializable`); the serialization here is
+        guaranteed to succeed. Whole-row last-writer-wins with a ``revision`` bump
+        computed off the row's own stored value — the exact pre-existing semantic.
+        """
+        payload = json.dumps(state.to_dict(), allow_nan=False)
         now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
         now_epoch = epoch_ms(now)
-        with closing(self._connect()) as conn, conn:
-            conn.execute(
-                "INSERT INTO runtime_state "
-                "(id, state_json, updated_at, updated_at_epoch, revision) "
-                "VALUES (1, ?, ?, ?, 0) "
-                "ON CONFLICT(id) DO UPDATE SET "
-                "state_json=excluded.state_json, updated_at=excluded.updated_at, "
-                "updated_at_epoch=excluded.updated_at_epoch, "
-                "revision=runtime_state.revision + 1",
-                (payload, now_iso, now_epoch),
-            )
-        self._log.info("state_commit", schema_version=state.schema_version)
+        conn.execute(
+            "INSERT INTO runtime_state "
+            "(id, state_json, updated_at, updated_at_epoch, revision) "
+            "VALUES (1, ?, ?, ?, 0) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "state_json=excluded.state_json, updated_at=excluded.updated_at, "
+            "updated_at_epoch=excluded.updated_at_epoch, "
+            "revision=runtime_state.revision + 1",
+            (payload, now_iso, now_epoch),
+        )
+
+    # ---- TickCommitPort (lm-27n.2) ----------------------------------------
+
+    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+        """Atomically persist a tick's *state* change + memory *mutations* (§4.1).
+
+        ONE connection, ONE ``now``, ONE transaction spanning ``runtime_state``
+        (vitals) and ``memory_records`` (entities) — so the being can never be
+        left split-brained (state advanced while memory dropped, or vice versa).
+        The state UPSERT (if *state* is not ``None``) is applied first, then each
+        mutation in list order. **All-or-nothing**: any stale transition, or a
+        serialization error, rolls back *everything* and propagates.
+
+        A state-only ``commit_tick(state, [])`` is byte-identical to
+        :meth:`commit` (same UPSERT, same revision bump, same ``state_commit``
+        log) — this task only installs the machinery; no live emitter produces a
+        mutation yet.
+
+        **Explicit transaction control (NOT the implicit ``with conn:``).** Under
+        Python 3.11's ``sqlite3``, an implicit transaction opens only before DML,
+        never before a ``SELECT`` — and :meth:`_transition_on` leads with a
+        ``SELECT``, so under ``with conn:`` its read would not share the batch's
+        start snapshot. So this drives the transaction itself: autocommit off, an
+        early ``BEGIN IMMEDIATE`` write-lock before the first helper, an explicit
+        commit, and a rollback on *any* exception. All fail-before-write JSON/clock
+        guards run HERE, before connecting, so a bad draft/patch never leaves a
+        half-open transaction to roll back.
+        """
+        # Snapshot the batch once: *mutations* is a Sequence (possibly a mutable /
+        # single-pass view), and we iterate it twice (validate, then apply) — a
+        # tuple guarantees both passes see the identical batch.
+        batch = tuple(mutations)
+        now = self._clock.now()
+        stamp_iso_utc(now)  # validate the clock (tz-aware) before connecting
+        if state is not None:
+            self._ensure_state_serializable(state)
+        for mutation in batch:
+            match mutation:
+                case PutOp():
+                    ensure_json_serializable(mutation.draft.payload)
+                    parse_expires_at_epoch_ms(mutation.draft.expires_at)
+                case TransitionOp():
+                    if mutation.patch is not None:
+                        if mutation.patch.payload_merge is not None:
+                            ensure_json_serializable(mutation.patch.payload_merge)
+                        parse_expires_at_epoch_ms(mutation.patch.expires_at)
+                case _:  # pragma: no cover - exhaustive over the closed union
+                    assert_never(mutation)
+
+        conn = self._connect()
+        conn.isolation_level = None  # autocommit mode: we drive the transaction ourselves
+        try:
+            conn.execute("BEGIN IMMEDIATE")  # real write txn before the first helper; early lock
+            if state is not None:
+                self._commit_state_on(conn, state, now)
+            for mutation in batch:
+                match mutation:
+                    case PutOp():
+                        self._put_on(conn, mutation.draft, now)
+                    case TransitionOp():
+                        self._transition_on(
+                            conn,
+                            mutation.kind,
+                            mutation.id,
+                            mutation.from_state,
+                            mutation.to_state,
+                            mutation.patch,
+                            now,
+                        )
+                    case _:  # pragma: no cover - exhaustive over the closed union
+                        assert_never(mutation)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if state is not None:
+            self._log.info("state_commit", schema_version=state.schema_version)
 
     def reset(self) -> State:
         """Factory-wipe the ``runtime_state`` row to a fresh ``State()``.

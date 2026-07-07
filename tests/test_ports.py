@@ -14,7 +14,14 @@ from lifemodel.adapters.clock import SystemClock
 from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.signal_bus import SignalBus
-from lifemodel.ports import ClockPort, DeliveryPort, MemoryPort, PressureSensorPort, StatePort
+from lifemodel.ports import (
+    ClockPort,
+    DeliveryPort,
+    MemoryPort,
+    PressureSensorPort,
+    StatePort,
+    TickCommitPort,
+)
 from lifemodel.ports.clock import ClockPort as ClockPortDirect
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import (
@@ -67,6 +74,14 @@ def test_pressure_sensor_port_is_satisfied_by_sqlite_store_and_fakes(tmp_path: o
     assert isinstance(store, PressureSensorPort)
     assert isinstance(fake_store, PressureSensorPort)
     assert isinstance(FakePressureSensor(fake_store), PressureSensorPort)
+
+
+def test_tick_commit_port_is_satisfied_by_sqlite_store_and_fake(tmp_path: object) -> None:
+    # One real adapter implements every port, so a tick's commit spans vitals +
+    # entities in one transaction; the state fake honours the same contract.
+    clock = FakeClock(datetime.now(UTC))
+    assert isinstance(SQLiteRuntimeStore(tmp_path, clock=clock), TickCommitPort)  # type: ignore[arg-type]
+    assert isinstance(FakeStateStore(), TickCommitPort)
 
 
 def test_clock_adapter_returns_aware_utc() -> None:

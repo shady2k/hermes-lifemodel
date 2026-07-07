@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..domain.memory import PutOp, TransitionOp
 from ..domain.signal import Signal
 
 
@@ -57,3 +58,24 @@ class LaunchProactive(Intent):
     prompt: str
     correlation_id: str
     reserved_energy: float = 0.0
+
+
+@dataclass(frozen=True)
+class PutRecord(Intent):
+    """Request a memory ``put``. The :class:`~lifemodel.core.state_actor.StateActor`
+    collects these (in emission order) and hands them to the tick's atomic
+    committer alongside the merged state patch — never a direct store write. No
+    live component emits one yet (lm-27n.2 installs the machinery; .3 wires
+    emitters)."""
+
+    op: PutOp
+
+
+@dataclass(frozen=True)
+class TransitionRecord(Intent):
+    """Request a guarded memory ``transition``. Collected by the
+    :class:`~lifemodel.core.state_actor.StateActor` into the tick's one atomic
+    commit; a stale ``from_state`` rolls back the whole tick (state included).
+    No live component emits one yet (lm-27n.2)."""
+
+    op: TransitionOp
