@@ -43,6 +43,8 @@ from .intention_view import live_contact_intention
 from .intents import Intent, PutRecord, TransitionRecord, UpdateState
 from .invalidation import is_verdict_stale
 from .pressure import effective_pressure, inhibition_at
+from .receptivity import appraise_receptivity
+from .relationship_view import DEFAULT_RELATIONSHIP, live_owner_relationship
 from .taxonomy import (
     KIND_EXCHANGE,
     KIND_VERDICT,
@@ -211,6 +213,18 @@ class ContactAggregation:
             ),
         )
 
+        # Receptivity appraisal (lm-27n.5): the NEW owner-appropriateness gate,
+        # DISJOINT from the wake gates below (it never re-derives silence / backoff /
+        # inhibition / in-flight — those stay in ``evaluate_wake`` + the effective
+        # pressure math above). A hard veto (explicit boundary — quiet hours,
+        # cadence min, no-contact) SUPPRESSES the birth; soft norms scale the
+        # effective pressure so a borderline urge that would have woken is held.
+        # With no relationship row (or the permissive DEFAULT) this returns
+        # allowed=True / multiplier=1.0 → behaviour-identical to .4.
+        relationship = live_owner_relationship(ctx.objects) or DEFAULT_RELATIONSHIP
+        appraisal = appraise_receptivity(relationship, state, now)
+        gated_effective = effective * appraisal.pressure_multiplier
+
         exch_min = -minutes_between(last_exchange_at, now) if last_exchange_at is not None else None
         decl_min = -minutes_between(declined_at, now) if declined_at is not None else None
         lane = LaneState(
@@ -219,12 +233,18 @@ class ContactAggregation:
             declined_at=decl_min,
             decline_count=decline_count,
         )
-        outcome = evaluate_wake(u=effective, now=0.0, state=lane, params=self._params)
-        # A wake-eligible urge births a desire only when none is live and nothing
-        # resolved one this tick (dedup / anti-drum). After any resolution the
-        # residual gates already veto a same-tick re-wake, so this is behaviour-
-        # identical to the old ``on_urge`` on a ``NONE`` status.
-        if outcome.is_urge and desire_state == _NONE and transition_to is None:
+        outcome = evaluate_wake(u=gated_effective, now=0.0, state=lane, params=self._params)
+        # A wake-eligible urge births a desire only when none is live, nothing
+        # resolved one this tick (dedup / anti-drum), AND the appraisal admits it
+        # (no explicit-boundary hard veto). After any resolution the residual gates
+        # already veto a same-tick re-wake, so with the permissive default this is
+        # behaviour-identical to the old ``on_urge`` on a ``NONE`` status.
+        if (
+            outcome.is_urge
+            and desire_state == _NONE
+            and transition_to is None
+            and appraisal.allowed
+        ):
             create_desire = True
 
         changes: dict[str, object] = {
@@ -241,8 +261,10 @@ class ContactAggregation:
         intents: list[Intent] = [UpdateState(changes)]
 
         if create_desire:
+            # Salience is the gated effective pressure — the pressure that actually
+            # cleared the wake bar (with the permissive default, == ``effective``).
             desire = build_contact_desire(
-                state=DesireState.ACTIVE, salience=effective, source_drive=u_now
+                state=DesireState.ACTIVE, salience=gated_effective, source_drive=u_now
             )
             intents.append(PutRecord(op=PutOp(draft=encode_contact_desire(desire))))
         elif transition_to is not None and live is not None:

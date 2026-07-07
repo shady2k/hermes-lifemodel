@@ -6,8 +6,13 @@ from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.cognition import Cognition
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
+from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE
 from lifemodel.state.model import State
-from lifemodel.testing import contact_desire_objects
+from lifemodel.testing import (
+    contact_desire_objects,
+    contact_desire_record,
+    owner_relationship_record,
+)
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 
@@ -159,3 +164,47 @@ def test_deferred_desire_crystallizes_nothing(tmp_path) -> None:
         _ctx(state, objects=contact_desire_objects("deferred"), tmp_path=tmp_path)
     )
     assert _intention_put(intents) is None
+
+
+# --- lm-27n.5: receptivity re-check before launch ---
+
+
+def test_default_relationship_launches_identically(tmp_path) -> None:
+    # Parity: a permissive relationship in the snapshot launches EXACTLY as the
+    # no-relationship path.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    objects = (contact_desire_record("active"), owner_relationship_record())
+    intents = _cog().step(_ctx(state, objects=objects, tmp_path=tmp_path))
+    assert _launch(intents) is not None
+    assert _intention_put(intents) is not None
+
+
+def test_explicit_quiet_hours_holds_the_launch(tmp_path) -> None:
+    # NOW is hour 12 UTC; an explicit bad-hours=(12,) that started AFTER the desire
+    # was born -> cognition re-checks and HOLDS (no launch, no intention). The
+    # live desire persists for a later admissible tick.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    rel = owner_relationship_record(bad_hours=(12,), confidence=EXPLICIT_CONFIDENCE)
+    objects = (contact_desire_record("active"), rel)
+    intents = _cog().step(_ctx(state, objects=objects, tmp_path=tmp_path))
+    assert _launch(intents) is None  # held
+    assert _intention_put(intents) is None
+    assert list(intents) == []  # nothing committed -> the desire survives
+
+
+def test_launch_records_appraisal_constraints_on_the_intention(tmp_path) -> None:
+    # An allowed launch with style/topic norms records them on the intention (audit).
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    rel = owner_relationship_record(
+        acceptable_styles=("playful", "concise"),
+        topic_sensitivity=("work",),
+        confidence=EXPLICIT_CONFIDENCE,
+    )
+    objects = (contact_desire_record("active"), rel)
+    intents = _cog().step(_ctx(state, objects=objects, tmp_path=tmp_path))
+    assert _launch(intents) is not None  # styles/topics are constraints, not vetoes
+    put = _intention_put(intents)
+    assert put is not None
+    constraints = put.op.draft.payload["constraints"]
+    assert any(c == "style: playful|concise" for c in constraints)
+    assert any(c == "avoid topic: work" for c in constraints)

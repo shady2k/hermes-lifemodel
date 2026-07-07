@@ -145,6 +145,7 @@ def build_contact_intention(
     salience: float = 0.0,
     source_drive: float | None = None,
     source: str = "contact-cognition",
+    extra_constraints: tuple[str, ...] = (),
 ) -> Intention:
     """Construct the singleton contact :class:`Intention` in *state*.
 
@@ -154,6 +155,11 @@ def build_contact_intention(
     and ``source_drive`` records the latent drive ``u``. Every Rubicon field is a
     fixed description (a decision record, not a gate) — the launch timing is decided
     entirely by cognition's affordability gate + aggregation's upstream gates.
+
+    ``extra_constraints`` appends the receptivity appraisal's composing constraints
+    (lm-27n.5 — allowed styles, topic sensitivities) for auditability; empty by
+    default, so an unpopulated relationship leaves the intention byte-identical to
+    .4 (behaviour-neutral).
     """
     return Intention(
         id=CONTACT_INTENTION_ID,
@@ -164,7 +170,7 @@ def build_contact_intention(
         commitment_strength=commitment_strength,
         plan=_PLAN,
         implementation_trigger=_IMPLEMENTATION_TRIGGER,
-        constraints=_CONSTRAINTS,
+        constraints=_CONSTRAINTS + extra_constraints,
         admissibility_filter=_ADMISSIBILITY_FILTER,
         reconsideration_triggers=_RECONSIDERATION_TRIGGERS,
         expiry=None,

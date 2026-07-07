@@ -190,3 +190,22 @@ def test_dump_survives_a_corrupt_store(tmp_path) -> None:
     assert "unreadable" in out.lower()  # graceful banner, no crash
     # Same bold title treatment as the healthy-store path, for consistency.
     assert out.startswith("🫀 **lifemodel debug** (read-only)")
+
+
+def test_dump_renders_the_receptivity_section(tmp_path) -> None:
+    from lifemodel.core.relationship_view import (
+        EXPLICIT_CONFIDENCE,
+        build_owner_relationship,
+        encode_owner_relationship,
+    )
+
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    store.commit(State(u=2.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    store.put(
+        encode_owner_relationship(
+            build_owner_relationship(bad_hours=(1,), confidence=EXPLICIT_CONFIDENCE)
+        )
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "RECEPTIVITY" in out
+    assert "allowed" in out.lower()

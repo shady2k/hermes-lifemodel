@@ -20,6 +20,7 @@ from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.aggregation import ContactAggregation
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import Intent, PutRecord, TransitionRecord, UpdateState
+from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE
 from lifemodel.core.taxonomy import (
     contact_signal,
     exchange_signal,
@@ -33,6 +34,7 @@ from lifemodel.testing import (
     contact_desire_objects,
     contact_desire_record,
     contact_intention_record,
+    owner_relationship_record,
 )
 
 PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
@@ -499,3 +501,71 @@ def test_desire_resolves_without_a_never_crystallized_intention(tmp_path) -> Non
     intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
     assert _kind_transition(intents, "desire") == ("active", "satisfied")
     assert _kind_transition(intents, "intention") is None  # nothing to transition
+
+
+# --- lm-27n.5: receptivity appraisal gate (owner appropriateness) ---
+#
+# The NEW relationship gate sits beside the wake gates. Behavior-neutral by
+# default (a default/absent relationship births exactly as before); an EXPLICIT
+# boundary hard-vetoes the birth; a soft norm raises the effective wake bar.
+
+
+def test_default_relationship_births_desire_identically(tmp_path) -> None:
+    # Parity: a permissive (default-confidence) relationship in the snapshot must
+    # birth the desire EXACTLY as the no-relationship path (test_urge_over_threshold).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    rel = owner_relationship_record()  # default: permissive, low confidence
+    intents = _agg().step(_ctx(state, now, [c], objects=(rel,), tmp_path=tmp_path))
+    assert _created_active(intents)  # identical to the no-relationship urge
+
+
+def test_explicit_quiet_hours_suppresses_the_birth(tmp_path) -> None:
+    # now hour is 04 UTC; an explicit bad-hours=(4,) hard-vetoes -> no desire born.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    rel = owner_relationship_record(bad_hours=(4,), confidence=EXPLICIT_CONFIDENCE)
+    intents = _agg().step(_ctx(state, now, [c], objects=(rel,), tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # hard veto -> suppressed
+
+
+def test_explicit_blanket_privacy_suppresses_the_birth(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    rel = owner_relationship_record(
+        privacy_boundaries=("no_proactive_contact",), confidence=EXPLICIT_CONFIDENCE
+    )
+    intents = _agg().step(_ctx(state, now, [c], objects=(rel,), tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
+
+
+def test_explicit_cadence_min_suppresses_the_birth(tmp_path) -> None:
+    # min 2h spacing, last proactive send 30 min ago -> inside gap -> hard veto.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=0.0,
+        last_tick_at="2026-07-06T00:00:00+00:00",
+        proactive_send_log=["2026-07-06T03:30:00+00:00"],
+    )
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    rel = owner_relationship_record(cadence="2h", confidence=EXPLICIT_CONFIDENCE)
+    intents = _agg().step(_ctx(state, now, [c], objects=(rel,), tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
+
+
+def test_soft_downweight_raises_the_effective_wake_bar(tmp_path) -> None:
+    # A borderline urge (effective 1.2, just over theta 1.0) that would wake with
+    # no relationship is SUPPRESSED once a soft norm (known load) scales it below
+    # theta — the soft-norm "higher bar", never a hard veto.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.2, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.2, delta=0.0, timestamp=None)
+    # sanity: no relationship -> the borderline urge wakes
+    assert _created_active(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    # with a known-load soft down-weight -> effective 0.9 < theta -> no wake
+    rel = owner_relationship_record(known_load="busy at work")
+    intents = _agg().step(_ctx(state, now, [c], objects=(rel,), tmp_path=tmp_path))
+    assert _desire_intent(intents) is None

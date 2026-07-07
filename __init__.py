@@ -28,6 +28,7 @@ from .state_commands import (
     reset_for_dir,
     satiate_for_dir,
     set_field_for_dir,
+    set_relationship_prefs_for_dir,
 )
 
 __version__ = "0.0.0"
@@ -63,6 +64,11 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
     ),
     "reset": _Subcommand("Factory wipe: write a fresh State(), as if newly born.", mutating=True),
     "set": _Subcommand("set <field> <value> — write one whitelisted state field.", mutating=True),
+    "relationship": _Subcommand(
+        "relationship <key>=<value> ... — set owner norms (bad-hours, cadence, "
+        "privacy, topics, styles, ...) that gate proactive contact.",
+        mutating=True,
+    ),
 }
 
 
@@ -150,6 +156,8 @@ def register(ctx: Any) -> None:
             return reset_for_dir(sdir, logger=logger)
         if sub == "set":
             return set_field_for_dir(sdir, rest, logger=logger)
+        if sub == "relationship":
+            return set_relationship_prefs_for_dir(sdir, rest, logger=logger)
         status = _status_line(profile, sdir)
         if sub == "":
             # Bare invocation: keep the status line, then surface the full

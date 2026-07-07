@@ -91,3 +91,26 @@ def test_drive_is_risen_as_of_now_for_display() -> None:
     r = compute_readings(state, now=now, cfg=cfg)
     assert abs(r.u - 1.0) < 1e-6  # risen as of now
     assert r.would_wake is True  # and the debug reflects the imminent wake
+
+
+# --- receptivity readings (lm-27n.5) ----------------------------------------
+
+
+def test_receptivity_defaults_are_behavior_neutral() -> None:
+    # No relationship passed -> permissive default -> allowed / multiplier 1.0.
+    state = State(u=2.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    r = compute_readings(state, now=NOW, cfg=CFG)
+    assert r.receptivity_allowed is True
+    assert r.receptivity_multiplier == 1.0
+    assert r.receptivity_hard_reasons == ()
+
+
+def test_receptivity_surfaces_an_explicit_hard_veto() -> None:
+    from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE, build_owner_relationship
+
+    # NOW is hour 04 UTC; explicit bad-hours=(4,) -> hard veto surfaced for the audit.
+    rel = build_owner_relationship(bad_hours=(4,), confidence=EXPLICIT_CONFIDENCE)
+    state = State(u=2.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    r = compute_readings(state, now=NOW, cfg=CFG, relationship=rel)
+    assert r.receptivity_allowed is False
+    assert r.receptivity_hard_reasons  # non-empty: the "why silent" audit

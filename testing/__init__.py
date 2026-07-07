@@ -17,6 +17,7 @@ from .fakes import (
     FakeStateStore,
 )
 from .intentions import contact_intention_objects, contact_intention_record
+from .relationships import owner_relationship_objects, owner_relationship_record
 
 __all__ = [
     "FakeClock",
@@ -29,4 +30,6 @@ __all__ = [
     "contact_desire_record",
     "contact_intention_objects",
     "contact_intention_record",
+    "owner_relationship_objects",
+    "owner_relationship_record",
 ]

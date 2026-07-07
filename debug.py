@@ -16,6 +16,7 @@ from . import composition
 from .core.desire_view import read_live_contact_desire
 from .core.intention_view import read_live_contact_intention
 from .core.introspect import DebugConfig, Readings, compute_readings
+from .core.relationship_view import read_owner_relationship
 from .ports.memory import MemoryPort
 from .state.errors import StateError
 
@@ -48,6 +49,14 @@ def _n(x: float) -> str:
 
 def _opt(x: float | None, unit: str = "") -> str:
     return "n/a" if x is None else f"{x:.1f}{unit}"
+
+
+def _reasons(reasons: tuple[str, ...]) -> str:
+    """Render a receptivity reason/constraint tuple as one scannable line.
+
+    Empty → ``"none"``; otherwise the reasons joined by ``"; "`` (single space,
+    so the no-column-padding house style holds — see ``tests/test_debug.py``)."""
+    return "none" if not reasons else "; ".join(reasons)
 
 
 def _resolve_tz() -> tzinfo | None:
@@ -111,6 +120,7 @@ def render_dump_for_dir(base_dir: Path) -> str:
     desire_state = desire.state if desire is not None else "none"
     intention = read_live_contact_intention(memory) if memory is not None else None
     intention_state = intention.state if intention is not None else "none"
+    relationship = read_owner_relationship(memory) if memory is not None else None
     return render_debug_dump(
         readings=compute_readings(
             state,
@@ -118,6 +128,7 @@ def render_dump_for_dir(base_dir: Path) -> str:
             cfg=_cfg(),
             desire_state=desire_state,
             intention_state=intention_state,
+            relationship=relationship,
         )
     )
 
@@ -208,6 +219,19 @@ def render_debug_dump(*, readings: Readings) -> str:
         [
             ("sends_today", f"{r.sends_today}/{r.sends_cap}"),
             ("send_allowed", str(r.send_allowed)),
+        ]
+    )
+    lines.append("")
+
+    lines.append("**RECEPTIVITY (owner appropriateness)**")
+    lines += _metrics(
+        [
+            ("allowed", str(r.receptivity_allowed)),
+            ("multiplier", _n(r.receptivity_multiplier)),
+            ("confidence", _n(r.receptivity_confidence)),
+            ("hard_veto", _reasons(r.receptivity_hard_reasons)),
+            ("soft_downweight", _reasons(r.receptivity_soft_reasons)),
+            ("constraints", _reasons(r.receptivity_constraints)),
         ]
     )
     lines.append("")

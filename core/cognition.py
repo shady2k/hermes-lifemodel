@@ -29,6 +29,8 @@ from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
 from .intention_view import build_contact_intention, encode_contact_intention
 from .intents import Intent, LaunchProactive, PutRecord, UpdateState
+from .receptivity import appraise_receptivity
+from .relationship_view import DEFAULT_RELATIONSHIP, live_owner_relationship
 from .wake_packet import build_wake_packet
 
 
@@ -54,6 +56,17 @@ class Cognition:
         ):
             return []
 
+        # Receptivity re-check (lm-27n.5): the relationship/state may have changed
+        # since the desire was born (e.g. quiet hours just started). Re-appraise
+        # with the SAME pure fn aggregation used — if an explicit boundary now
+        # hard-vetoes, HOLD (return []): do not launch this tick; the live desire
+        # persists for a later, admissible tick. With the permissive default this
+        # is always ``allowed`` → behaviour-identical to .4.
+        relationship = live_owner_relationship(ctx.objects) or DEFAULT_RELATIONSHIP
+        appraisal = appraise_receptivity(relationship, state, ctx.now)
+        if not appraisal.allowed:
+            return []
+
         estimate = cost_real(self._fast_cost + self._send_cost, state.fatigue, alpha=self._alpha)
         reserved = reserve(state.energy, estimate)
         if reserved is None:
@@ -72,6 +85,7 @@ class Cognition:
             commitment_strength=desire.salience,
             salience=desire.salience,
             source_drive=desire.source_drive,
+            extra_constraints=appraisal.constraints,
         )
         return [
             PutRecord(op=PutOp(draft=encode_contact_intention(intention))),

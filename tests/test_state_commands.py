@@ -40,6 +40,8 @@ from lifemodel.core.desire_view import (
     read_live_contact_desire,
 )
 from lifemodel.core.pressure import effective_pressure, inhibition_at
+from lifemodel.core.receptivity import appraise_receptivity
+from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE, read_owner_relationship
 from lifemodel.core.timeutil import minutes_between
 from lifemodel.domain.objects import DesireState
 from lifemodel.log import get_logger
@@ -58,6 +60,8 @@ from lifemodel.state_commands import (
     satiate_for_dir,
     set_field,
     set_field_for_dir,
+    set_relationship_prefs,
+    set_relationship_prefs_for_dir,
 )
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -457,3 +461,78 @@ def test_force_wake_wakes_on_the_next_real_tick(tmp_path) -> None:
 
     desire = read_live_contact_desire(_store(tmp_path))  # aggregation birthed the desire
     assert desire is not None and desire.state == "active"  # the wake happened
+
+
+# --- set_relationship_prefs (lm-27n.5) --------------------------------------
+
+
+def test_set_relationship_prefs_parses_and_marks_explicit() -> None:
+    rel, message = set_relationship_prefs("bad-hours=2,3,4 cadence=2h styles=playful,concise")
+    assert rel is not None
+    assert rel.bad_hours == (2, 3, 4)
+    assert rel.cadence == "2h"
+    assert rel.acceptable_styles == ("playful", "concise")
+    assert rel.confidence == EXPLICIT_CONFIDENCE  # explicit -> boundaries hard-veto
+    assert "(mutating)" in message
+
+
+def test_set_relationship_prefs_multiword_value() -> None:
+    rel, _ = set_relationship_prefs("load=busy at work cadence=daily")
+    assert rel is not None
+    assert rel.known_load == "busy at work"
+    assert rel.cadence == "daily"
+
+
+def test_set_relationship_prefs_rejects_unknown_key() -> None:
+    rel, message = set_relationship_prefs("bogus=1")
+    assert rel is None
+    assert "unknown relationship key" in message
+
+
+def test_set_relationship_prefs_rejects_bad_hours() -> None:
+    rel, message = set_relationship_prefs("bad-hours=25")
+    assert rel is None
+    assert "0-23" in message
+
+
+def test_set_relationship_prefs_empty_shows_usage() -> None:
+    rel, message = set_relationship_prefs("")
+    assert rel is None
+    assert "usage:" in message
+
+
+def test_set_relationship_prefs_for_dir_round_trips_and_gates(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.commit(State(u=5.0))
+    message = set_relationship_prefs_for_dir(tmp_path, "bad-hours=2,3", logger=get_logger("t"))
+    assert "(mutating)" in message
+    # the row is readable through the SAME store the adapter loop uses
+    rel = read_owner_relationship(_store(tmp_path))
+    assert rel is not None
+    assert rel.bad_hours == (2, 3)
+    assert rel.confidence == EXPLICIT_CONFIDENCE
+    # and a later appraisal reads it and hard-vetoes during a bad hour
+    bad_hour = datetime(2026, 7, 6, 2, 0, tzinfo=UTC)
+    assert appraise_receptivity(rel, State(), bad_hour).allowed is False
+
+
+def test_set_relationship_prefs_for_dir_patches_not_replaces(tmp_path) -> None:
+    # A second, unrelated update must PATCH — not clear a previously-set boundary.
+    store = _store(tmp_path)
+    store.commit(State(u=5.0))
+    set_relationship_prefs_for_dir(tmp_path, "bad-hours=2,3", logger=get_logger("t"))
+    set_relationship_prefs_for_dir(tmp_path, "cadence=2h", logger=get_logger("t"))
+    rel = read_owner_relationship(_store(tmp_path))
+    assert rel is not None
+    assert rel.bad_hours == (2, 3)  # the earlier boundary SURVIVES the cadence update
+    assert rel.cadence == "2h"  # and the new key is applied
+    assert rel.confidence == EXPLICIT_CONFIDENCE
+
+
+def test_set_relationship_prefs_for_dir_leaves_vitals_untouched(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.commit(State(u=5.0, decline_count=3))
+    set_relationship_prefs_for_dir(tmp_path, "cadence=2h", logger=get_logger("t"))
+    persisted = _store(tmp_path).load()
+    assert persisted.u == 5.0  # relationship set does not touch the being's vitals
+    assert persisted.decline_count == 3

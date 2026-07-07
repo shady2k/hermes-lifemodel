@@ -13,11 +13,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from ..domain.objects import Relationship
 from ..sim.wake import GateParams, LaneState, backoff_interval, evaluate_wake
 from ..state.model import State
 from .backstop import allow_send
 from .circadian import circadian
 from .pressure import effective_pressure, inhibition_at
+from .receptivity import appraise_receptivity
+from .relationship_view import DEFAULT_RELATIONSHIP
 from .timeutil import minutes_between
 
 #: Max age (minutes) of ``last_tick_at`` before the brain reads as STALE. The loop
@@ -78,6 +81,13 @@ class Readings:
     sends_today: int
     sends_cap: int
     send_allowed: bool
+    # receptivity (owner appropriateness — lm-27n.5)
+    receptivity_allowed: bool
+    receptivity_multiplier: float
+    receptivity_confidence: float
+    receptivity_hard_reasons: tuple[str, ...]
+    receptivity_soft_reasons: tuple[str, ...]
+    receptivity_constraints: tuple[str, ...]
     # health / timing
     last_tick_at: str | None
     last_tick_ago_min: float | None
@@ -145,12 +155,18 @@ def compute_readings(
     cfg: DebugConfig,
     desire_state: str = "none",
     intention_state: str = "none",
+    relationship: Relationship | None = None,
 ) -> Readings:
     """Compute the debug readings. ``desire_state`` is the live contact-desire's
     lifecycle state (``active``/``deferred``/``none``), read by the caller from
     the typed ``kind='desire'`` row (lm-27n.3 — no longer a ``State`` flag);
     ``intention_state`` is the live contact-intention's (the Bratman decision
-    record, lm-27n.4) — the "why did I send" audit line."""
+    record, lm-27n.4) — the "why did I send" audit line. ``relationship`` is the
+    live owner relationship (lm-27n.5); ``None`` falls back to the permissive
+    :data:`~lifemodel.core.relationship_view.DEFAULT_RELATIONSHIP`, so the
+    receptivity readings surface ``allowed=True / multiplier=1.0`` — the "why
+    silent" audit is behaviour-neutral until the owner sets prefs."""
+    appraisal = appraise_receptivity(relationship or DEFAULT_RELATIONSHIP, state, now)
     last_tick_ago = _ago(state.last_tick_at, now)
     dt = max(0.0, minutes_between(state.last_tick_at, now))
     u = min(cfg.u_max, state.u + dt * cfg.alpha)
@@ -207,6 +223,12 @@ def compute_readings(
             max_per_day=cfg.max_per_day,
             min_interval_min=cfg.min_interval_min,
         ),
+        receptivity_allowed=appraisal.allowed,
+        receptivity_multiplier=appraisal.pressure_multiplier,
+        receptivity_confidence=appraisal.confidence,
+        receptivity_hard_reasons=appraisal.hard_reasons,
+        receptivity_soft_reasons=appraisal.soft_reasons,
+        receptivity_constraints=appraisal.constraints,
         last_tick_at=state.last_tick_at,
         last_tick_ago_min=last_tick_ago,
         brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,
