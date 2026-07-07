@@ -1,4 +1,17 @@
 # tests/test_aggregation.py
+#
+# The contact-desire behaviour contract, migrated to the typed desire row
+# (lm-27n.3). The lifecycle is no longer a ``State.desire_status`` flag: it lives
+# in the ``kind='desire'`` singleton ``contact:owner``, read from the start-of-tick
+# ``ctx.objects`` snapshot and mutated by ONE PutRecord (birth) / TransitionRecord
+# (advance) the layer emits. Every assertion below preserves the ORIGINAL behaviour
+# the flag pinned; only the representation changed (flag -> row):
+#   * old ``desire_status == "active"`` on an urge  -> a PutRecord births active;
+#   * old ``desire_status == "none"`` (suppressed)  -> NO desire intent;
+#   * old ``desire_status`` unchanged on a dedup     -> NO desire intent;
+#   * old ``-> none`` on FULFILL/REJECT/exchange     -> a TransitionRecord to a
+#     terminal state (satisfied/dropped/satisfied);
+#   * old ``-> deferred`` on DEFER                    -> TransitionRecord to deferred.
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -6,7 +19,7 @@ from datetime import UTC, datetime
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.aggregation import ContactAggregation
 from lifemodel.core.component import TickContext
-from lifemodel.core.intents import UpdateState
+from lifemodel.core.intents import Intent, PutRecord, TransitionRecord, UpdateState
 from lifemodel.core.taxonomy import (
     contact_signal,
     exchange_signal,
@@ -16,30 +29,58 @@ from lifemodel.core.taxonomy import (
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
+from lifemodel.testing import contact_desire_objects
 
 PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
+
+# a live active-desire snapshot (what the old ``desire_status="active"`` meant)
+ACTIVE = contact_desire_objects("active")
+# a held deferred-desire snapshot (what the old ``desire_status="deferred"`` meant —
+# reachable via a backstop-blocked proactive launch)
+DEFERRED = contact_desire_objects("deferred")
 
 
 def _agg() -> ContactAggregation:
     return ContactAggregation(params=PARAMS, theta=1.0, beta=1.0, u_max=100.0)
 
 
-def _ctx(state: State, now: datetime, signals=(), *, tmp_path) -> TickContext:
-    return TickContext(state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals))
+def _ctx(state: State, now: datetime, signals=(), *, objects=(), tmp_path) -> TickContext:
+    return TickContext(
+        state=state,
+        now=now,
+        bus=FileSignalBus(tmp_path),
+        signals=tuple(signals),
+        objects=tuple(objects),
+    )
 
 
 def _changes(intents) -> dict:
     return next(i for i in intents if isinstance(i, UpdateState)).changes
 
 
+def _desire_intent(intents) -> Intent | None:
+    return next((i for i in intents if isinstance(i, PutRecord | TransitionRecord)), None)
+
+
+def _created_active(intents) -> bool:
+    """A fresh desire was born active this tick (old flag none -> active)."""
+    di = _desire_intent(intents)
+    return isinstance(di, PutRecord) and di.op.draft.state == "active"
+
+
+def _transition(intents) -> tuple[str, str] | None:
+    """The (from_state, to_state) of the tick's lone desire transition, if any."""
+    di = _desire_intent(intents)
+    return (di.op.from_state, di.op.to_state) if isinstance(di, TransitionRecord) else None
+
+
 CORR = "proactive-2026-07-06T03:55:00+00:00"
 
 
 def _live_pending_state(**over) -> State:
-    """A state with a proactive turn in flight, matching CORR."""
+    """State with a proactive turn in flight, matching CORR (pair with ACTIVE)."""
     base = dict(
         u=1.5,
-        desire_status="active",
         pending_proactive_id=CORR,
         pending_proactive_since="2026-07-06T03:55:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -50,82 +91,98 @@ def _live_pending_state(**over) -> State:
 
 def test_urge_over_threshold_creates_active_desire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, desire_status="none", last_tick_at="2026-07-06T00:00:00+00:00")
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "active"
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _created_active(intents)  # no live desire -> births one active
 
 
 def test_below_threshold_stays_none(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, desire_status="none", last_tick_at="2026-07-06T00:00:00+00:00")
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_signal(origin_id="c1", value=0.5, delta=0.0, timestamp=None)  # < theta
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # no wake -> no desire
 
 
 def test_second_urge_is_deduped_no_refire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "active"  # still one desire — dedup
+    intents = _agg().step(_ctx(state, now, [c], objects=ACTIVE, tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # a desire is already live -> dedup, no new row
+
+
+def test_deferred_desire_is_held_not_recreated(tmp_path) -> None:
+    # A DEFERRED desire (old ``desire_status="deferred"``, e.g. after a backstop
+    # block) is still LIVE: a fresh high-pressure urge must be deduped and the
+    # desire held — NOT a new active row created over the held one. This regresses
+    # the snapshot-visibility bug where deferred rows were filtered out.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    intents = _agg().step(_ctx(state, now, [c], objects=DEFERRED, tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # held: no new PutRecord, no transition
+
+
+def test_deferred_desire_cleared_by_exchange(tmp_path) -> None:
+    # A real exchange terminalizes a held deferred desire, exactly like an active
+    # one (old ``on_exchange`` cleared active OR deferred to none).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    intents = _agg().step(_ctx(state, now, [c, ex], objects=DEFERRED, tmp_path=tmp_path))
+    assert _transition(intents) == ("deferred", "satisfied")
 
 
 def test_silence_window_suppresses_wake(tmp_path) -> None:
-    # exchange 5 min ago (< w=15) → SILENCE_WINDOW, no wake even with high u
+    # exchange 5 min ago (< w=15) -> SILENCE_WINDOW, no wake even with high u
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=3.0,
-        desire_status="none",
         last_exchange_at="2026-07-06T03:55:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
 
 
 def test_in_flight_suppresses_wake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, desire_status="none", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     busy = in_flight_signal(origin_id="f1", value=True, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c, busy], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"
+    intents = _agg().step(_ctx(state, now, [c, busy], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
 
 
 def test_decline_backoff_suppresses_then_allows(tmp_path) -> None:
-    # declined 10 min ago, decline_count=1 → backoff r0=30 min active → no wake
+    # declined 10 min ago, decline_count=1 -> backoff r0=30 min active -> no wake
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=3.0,
-        desire_status="none",
         decline_count=1,
         declined_at="2026-07-06T03:50:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # inside backoff
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # inside backoff
 
 
 def test_duration_over_theta_accumulates(tmp_path) -> None:
     now = datetime(2026, 7, 6, 0, 5, tzinfo=UTC)  # dt=5 min
-    state = State(
-        u=2.0,
-        desire_status="active",
-        duration_over_theta=10.0,
-        last_tick_at="2026-07-06T00:00:00+00:00",
-    )
+    state = State(u=2.0, duration_over_theta=10.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)  # >= theta
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    changes = _changes(_agg().step(_ctx(state, now, [c], objects=ACTIVE, tmp_path=tmp_path)))
     assert abs(changes["duration_over_theta"] - 15.0) < 1e-9
 
 
 def test_aggregation_does_not_write_u_on_normal_tick(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, desire_status="none", last_tick_at="2026-07-06T00:00:00+00:00")
+    state = State(u=1.5, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
     assert "u" not in changes  # neuron owns u; aggregation only writes it on FULFILL (Task 4)
@@ -135,15 +192,15 @@ def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=3.0,
-        desire_status="active",
         decline_count=2,
         declined_at="2026-07-06T03:50:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # desire cleared
+    intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
+    changes = _changes(intents)
+    assert _transition(intents) == ("active", "satisfied")  # exchange terminalizes the desire
     assert changes["decline_count"] == 0
     assert changes["declined_at"] is None
     assert changes["last_exchange_at"] == now.isoformat()
@@ -151,23 +208,24 @@ def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
 
 def test_exchange_this_tick_suppresses_wake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, desire_status="none", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # fresh exchange → SILENCE_WINDOW
+    intents = _agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # fresh exchange -> SILENCE_WINDOW, no wake
 
 
 def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00")
+    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     own = exchange_signal(
         origin_id="e1", actor="proactive_internal", label="two_way", timestamp=None
     )
-    changes = _changes(_agg().step(_ctx(state, now, [c, own], tmp_path=tmp_path)))
+    intents = _agg().step(_ctx(state, now, [c, own], objects=ACTIVE, tmp_path=tmp_path))
+    changes = _changes(intents)
     assert changes["last_exchange_at"] is None  # own nudge did not reset the clock
-    assert changes["desire_status"] == "active"  # desire not cleared by own nudge
+    assert _desire_intent(intents) is None  # desire not cleared by own nudge (dedup)
 
 
 def test_fulfill_starts_action_pending_and_clears_pending(tmp_path) -> None:
@@ -175,8 +233,9 @@ def test_fulfill_starts_action_pending_and_clears_pending(tmp_path) -> None:
     state = _live_pending_state(duration_over_theta=99.0)
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"
+    intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
+    changes = _changes(intents)
+    assert _transition(intents) == ("active", "satisfied")
     assert changes["action_pending_since"] == now.isoformat()  # send -> ActionPending
     assert "u" not in changes  # not satiated (send != contact)
     assert changes["last_contact_at"] == now.isoformat()
@@ -189,8 +248,9 @@ def test_reject_records_backoff_and_clears_pending(tmp_path) -> None:
     state = _live_pending_state(decline_count=1)
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"
+    intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
+    changes = _changes(intents)
+    assert _transition(intents) == ("active", "dropped")
     assert changes["decline_count"] == 2
     assert changes["declined_at"] == now.isoformat()
     assert changes["pending_proactive_id"] is None
@@ -201,9 +261,9 @@ def test_defer_holds_desire_keeps_pending(tmp_path) -> None:
     state = _live_pending_state()
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.DEFER, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "deferred"
-    assert "u" not in changes
+    intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
+    assert _transition(intents) == ("active", "deferred")
+    assert "u" not in _changes(intents)
 
 
 def test_exchange_clears_action_pending(tmp_path) -> None:
@@ -211,15 +271,14 @@ def test_exchange_clears_action_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=1.0,
-        desire_status="active",
         action_pending_since="2026-07-06T03:50:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=1.0, delta=0.0, timestamp=None)
     ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
-    assert changes["action_pending_since"] is None  # contact resolved the pull
-    assert changes["desire_status"] == "none"
+    intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
+    assert _changes(intents)["action_pending_since"] is None  # contact resolved the pull
+    assert _transition(intents) == ("active", "satisfied")
 
 
 def test_reject_does_not_set_action_pending(tmp_path) -> None:
@@ -227,7 +286,7 @@ def test_reject_does_not_set_action_pending(tmp_path) -> None:
     state = _live_pending_state()
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["action_pending_since"] is None  # REJECT never inhibits
     assert changes["decline_count"] == 1  # existing backoff bookkeeping intact
 
@@ -237,8 +296,9 @@ def test_reject_then_backoff_blocks_immediate_rewake(tmp_path) -> None:
     state = _live_pending_state(u=5.0)
     c = contact_signal(origin_id="c1", value=5.0, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # rejected + backoff vetoes re-wake
+    intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
+    assert _transition(intents) == ("active", "dropped")  # rejected...
+    assert not _created_active(intents)  # ...and backoff vetoes a same-tick re-wake
 
 
 def test_stale_verdict_wrong_correlation_is_dropped(tmp_path) -> None:
@@ -248,9 +308,9 @@ def test_stale_verdict_wrong_correlation_is_dropped(tmp_path) -> None:
     v = verdict_signal(
         origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id="proactive-OTHER"
     )
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "active"  # verdict dropped — desire untouched
-    assert changes["action_pending_since"] is None
+    intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # verdict dropped -> desire untouched (dedup)
+    assert _changes(intents)["action_pending_since"] is None
 
 
 def test_exchange_dominates_same_tick_verdict(tmp_path) -> None:
@@ -260,8 +320,9 @@ def test_exchange_dominates_same_tick_verdict(tmp_path) -> None:
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, ex, v], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # exchange cleared it
+    intents = _agg().step(_ctx(state, now, [c, ex, v], objects=ACTIVE, tmp_path=tmp_path))
+    changes = _changes(intents)
+    assert _transition(intents) == ("active", "satisfied")  # exchange terminalized it
     assert changes["action_pending_since"] is None  # fulfill was dropped (desire resolved)
     assert changes["last_exchange_at"] == now.isoformat()
 
@@ -274,13 +335,12 @@ def test_action_pending_grace_suppresses_wake_despite_high_latent(tmp_path) -> N
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=3.0,
-        desire_status="none",
         action_pending_since="2026-07-06T03:50:00+00:00",  # 10 min ago
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "none"  # inhibited during grace
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # inhibited during grace
 
 
 def test_pressure_recovers_after_grace_and_decay(tmp_path) -> None:
@@ -288,13 +348,12 @@ def test_pressure_recovers_after_grace_and_decay(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(
         u=3.0,
-        desire_status="none",
         action_pending_since="2026-07-06T01:00:00+00:00",  # 180 min ago
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert changes["desire_status"] == "active"  # ignored long enough -> loneliness returns
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _created_active(intents)  # ignored long enough -> loneliness returns
 
 
 def test_duration_over_theta_uses_latent_not_effective(tmp_path) -> None:
@@ -302,17 +361,17 @@ def test_duration_over_theta_uses_latent_not_effective(tmp_path) -> None:
     now = datetime(2026, 7, 6, 0, 5, tzinfo=UTC)  # dt=5
     state = State(
         u=2.0,
-        desire_status="none",
         duration_over_theta=10.0,
         action_pending_since="2026-07-06T00:04:00+00:00",  # in grace -> inhibition 1
         last_tick_at="2026-07-06T00:00:00+00:00",
     )
     c = contact_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    changes = _changes(intents)
     assert (
         abs(changes["duration_over_theta"] - 15.0) < 1e-9
     )  # latent-based, accrues under inhibition
-    assert changes["desire_status"] == "none"  # but no wake (effective suppressed)
+    assert _desire_intent(intents) is None  # but no wake (effective suppressed)
 
 
 def test_fulfill_records_a_send(tmp_path) -> None:
@@ -320,22 +379,17 @@ def test_fulfill_records_a_send(tmp_path) -> None:
     state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     log = changes["proactive_send_log"]
     assert log[-1] == now.isoformat()  # this send recorded
     assert len(log) == 2  # appended to the prior one
 
 
 def test_negative_dt_does_not_shrink_duration(tmp_path) -> None:
-    state = State(
-        u=2.0,
-        desire_status="none",
-        duration_over_theta=30.0,
-        last_tick_at="2026-07-06T12:10:00+00:00",
-    )
+    state = State(u=2.0, duration_over_theta=30.0, last_tick_at="2026-07-06T12:10:00+00:00")
     now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)  # before last_tick
     c = contact_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)
-    changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    changes = _changes(_agg().step(_ctx(state, now, [c], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["duration_over_theta"] == 30.0  # unchanged (dt clamped to 0), not reduced
 
 
@@ -344,5 +398,5 @@ def test_reject_does_not_record_a_send(tmp_path) -> None:
     state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
     c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
-    changes = _changes(_agg().step(_ctx(state, now, [c, v], tmp_path=tmp_path)))
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["proactive_send_log"] == ["2026-07-06T02:00:00+00:00"]  # unchanged

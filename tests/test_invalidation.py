@@ -10,7 +10,7 @@ PENDING = "proactive-2026-07-06T11:55:00+00:00"
 
 def _call(**over: object) -> tuple[bool, str]:
     kw = dict(
-        desire_status="active",
+        desire_state="active",
         pending_id=PENDING,
         verdict_correlation_id=PENDING,
         last_exchange_at=None,
@@ -30,7 +30,7 @@ def test_fresh_verdict_is_applied() -> None:
 
 
 def test_resolved_desire_is_stale() -> None:
-    assert _call(desire_status="none")[0] is True
+    assert _call(desire_state="none")[0] is True
 
 
 def test_correlation_mismatch_is_stale() -> None:

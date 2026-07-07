@@ -137,7 +137,12 @@ def _sends_today(send_log: list[str], now: datetime) -> int:
     return count
 
 
-def compute_readings(state: State, *, now: datetime, cfg: DebugConfig) -> Readings:
+def compute_readings(
+    state: State, *, now: datetime, cfg: DebugConfig, desire_state: str = "none"
+) -> Readings:
+    """Compute the debug readings. ``desire_state`` is the live contact-desire's
+    lifecycle state (``active``/``deferred``/``none``), read by the caller from
+    the typed ``kind='desire'`` row (lm-27n.3 — no longer a ``State`` flag)."""
     last_tick_ago = _ago(state.last_tick_at, now)
     dt = max(0.0, minutes_between(state.last_tick_at, now))
     u = min(cfg.u_max, state.u + dt * cfg.alpha)
@@ -175,7 +180,7 @@ def compute_readings(state: State, *, now: datetime, cfg: DebugConfig) -> Readin
         theta=cfg.theta,
         pct_to_wake=(effective / cfg.theta) if cfg.theta else 0.0,
         duration_over_theta=state.duration_over_theta,
-        desire_status=state.desire_status,
+        desire_status=desire_state,
         pending=state.pending_proactive_id is not None,
         pending_since=state.pending_proactive_since,
         last_contact_at=state.last_contact_at,

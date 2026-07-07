@@ -315,6 +315,28 @@ def test_tick_context_snapshot_populated_once_and_shared(tmp_path) -> None:
     assert tuple(o.id for o in a.objects) == ("d1",)  # only the active record
 
 
+def test_snapshot_includes_deferred_not_only_active(tmp_path) -> None:
+    # A deferred desire is LIVE (held), so it must appear in the snapshot — else
+    # dedup would miss it. Seed an active + a deferred + a terminal row; the
+    # snapshot has the first two, never the terminal one.
+    mem = FakeMemoryStore(clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)))
+    mem.put(MemoryDraft(kind="desire", id="a", state="active", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="desire", id="d", state="deferred", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="desire", id="x", state="satisfied", payload={}, source="t"))
+    rec = SnapshotRecorder("only")
+    reg = ComponentRegistry()
+    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
+        memory=mem,
+    ).tick()
+    ids = {o.id for o in rec.objects}
+    assert ids == {"a", "d"}  # active + deferred, never the terminal 'satisfied'
+
+
 def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
     counting = CountingMemory(_seeded_memory())
     reg = ComponentRegistry()
@@ -328,7 +350,10 @@ def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
         memory=counting,  # type: ignore[arg-type]
     )
     loop.tick()
-    assert counting.find_calls == 1  # once per tick, not once per component
+    # The live snapshot is built ONCE per tick — two bounded finds (active +
+    # deferred = the non-terminal states), NOT once per component (which, with 3
+    # components, would be 6).
+    assert counting.find_calls == 2
 
 
 def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:

@@ -7,6 +7,7 @@ FakeMemoryStore, FakePressureSensor, FakeSignalBus, FakeStateStore``. See
 
 from __future__ import annotations
 
+from .desires import contact_desire_objects, contact_desire_record
 from .fakes import (
     FakeClock,
     FakeDelivery,
@@ -23,4 +24,6 @@ __all__ = [
     "FakePressureSensor",
     "FakeSignalBus",
     "FakeStateStore",
+    "contact_desire_objects",
+    "contact_desire_record",
 ]

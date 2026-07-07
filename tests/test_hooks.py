@@ -16,6 +16,11 @@ import pytest
 
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.composition import build_lifemodel
+from lifemodel.core.desire_view import (
+    build_contact_desire,
+    encode_contact_desire,
+    read_live_contact_desire,
+)
 from lifemodel.core.taxonomy import (
     KIND_EXCHANGE,
     KIND_VERDICT,
@@ -23,7 +28,9 @@ from lifemodel.core.taxonomy import (
     read_verdict_correlation,
 )
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
+from lifemodel.domain.objects import DesireState
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
+from lifemodel.ports.memory import MemoryPort
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
@@ -31,15 +38,20 @@ from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 _T0 = datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
 
 
+def _seed_active_desire(store: MemoryPort) -> None:
+    """Persist a live active contact-desire row (the old desire_status="active")."""
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
+
+
 def _lm_with_pending(tmp_path: Path, corr: str = "p-1") -> Any:
     lm = build_lifemodel(base_dir=tmp_path)
     lm.state.commit(
         State(
-            desire_status="active",
             pending_proactive_id=corr,
             pending_proactive_since="2026-07-06T00:00:00+00:00",
         )
     )
+    _seed_active_desire(lm.state)
     return lm
 
 
@@ -100,7 +112,8 @@ def test_post_llm_ignores_uncorrelated_turn(tmp_path: Path) -> None:
 
 def test_post_llm_ignores_when_desire_not_active(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
-    lm.state.commit(State(desire_status="none", pending_proactive_id="p-1"))
+    # pending turn but NO live desire row (the old desire_status="none")
+    lm.state.commit(State(pending_proactive_id="p-1"))
     make_post_llm_observer(lm)(user_message=f"{IMPULSE_LABEL_PREFIX} x", assistant_response="hi")
     assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT] == []
 
@@ -192,19 +205,18 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     # The registered callback publishes a verdict signal (not state mutation).
     sdir = tmp_path / "workspace" / "lifemodel"
     store = SQLiteRuntimeStore(sdir, clock=SystemClock())
-    pending_state = State(
-        desire_status="active", pending_proactive_id="p1", last_tick_at=_T0.isoformat()
-    )
+    pending_state = State(pending_proactive_id="p1", last_tick_at=_T0.isoformat())
     store.commit(pending_state)
+    _seed_active_desire(store)  # a live desire so the verdict gate passes
 
     matches[0](
         user_message=f"{IMPULSE_LABEL_PREFIX} impulse text",
         assistant_response="NO_REPLY",
     )
 
-    # State is NOT mutated — the hook only publishes a signal.
-    persisted = store.load()
-    assert persisted.desire_status == "active"  # unchanged — signal published, not applied
+    # Neither State nor the desire row is mutated — the hook only publishes a signal.
+    desire = read_live_contact_desire(store)
+    assert desire is not None and desire.state == "active"  # unchanged — published, not applied
 
 
 def test_register_wires_pre_gateway_dispatch_hook(

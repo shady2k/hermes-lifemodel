@@ -96,14 +96,19 @@ class CoreLoop:
             if self._pressure_sensor is not None
             else PressureIndex()
         )
-        # Fail-soft, like the pressure read: no component consumes this yet (.3),
-        # so a transient DB error must NOT fail the tick before component isolation
-        # kicks in — that would be a behavior-neutrality regression. Degrade to an
-        # empty snapshot and keep ticking ("the heart never dies").
+        # The live (non-terminal) objects snapshot: active AND deferred. A deferred
+        # desire is still LIVE — held, not gone (e.g. a backstop-blocked contact
+        # desire) — so it must be visible, else next tick's dedup would miss it and
+        # a high-pressure urge would re-create an active row over the held one.
+        # Terminal rows (satisfied/dropped/expired/archived) are absence, excluded.
+        # Fail-soft like the pressure read: a transient DB error degrades to an
+        # empty snapshot rather than failing the tick before component isolation.
         objects: tuple[MemoryRecord, ...] = ()
         if self._memory is not None:
             try:
-                objects = tuple(self._memory.find(state="active", limit=OBJECTS_SNAPSHOT_LIMIT))
+                objects = tuple(
+                    self._memory.find(state="active", limit=OBJECTS_SNAPSHOT_LIMIT)
+                ) + tuple(self._memory.find(state="deferred", limit=OBJECTS_SNAPSHOT_LIMIT))
             except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
                 if self._log is not None:
                     self._log.info("objects_snapshot_failed", error=repr(exc))

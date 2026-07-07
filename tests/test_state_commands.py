@@ -34,8 +34,14 @@ from lifemodel.composition import (
     build_lifemodel,
 )
 from lifemodel.core.backstop import allow_send
+from lifemodel.core.desire_view import (
+    build_contact_desire,
+    encode_contact_desire,
+    read_live_contact_desire,
+)
 from lifemodel.core.pressure import effective_pressure, inhibition_at
 from lifemodel.core.timeutil import minutes_between
+from lifemodel.domain.objects import DesireState
 from lifemodel.log import get_logger
 from lifemodel.sim.wake import LaneState, evaluate_wake
 from lifemodel.state.errors import StateCorruptError
@@ -67,7 +73,6 @@ def _blocked_state() -> State:
     ActionPending inhibition, and a backstop send-log at the daily cap."""
     return State(
         u=0.2,
-        desire_status="active",
         pending_proactive_id="corr-1",
         pending_proactive_since=_ago(2),
         last_exchange_at=_ago(2),  # well inside w=15min
@@ -109,11 +114,11 @@ def test_nudge_rejects_non_numeric_argument() -> None:
 
 
 def test_nudge_only_touches_u() -> None:
-    before = State(u=1.0, energy=0.42, desire_status="active")
+    before = State(u=1.0, energy=0.42, decline_count=3)
     after, _ = nudge(before, NOW, "1")
     assert after is not None
     assert after.energy == before.energy
-    assert after.desire_status == before.desire_status
+    assert after.decline_count == before.decline_count
 
 
 # --- force_wake ----------------------------------------------------------
@@ -133,10 +138,11 @@ def test_force_wake_backdates_last_exchange_past_the_silence_window() -> None:
     assert elapsed >= CONTACT_PARAMS.w
 
 
-def test_force_wake_clears_pending_and_desire_status() -> None:
+def test_force_wake_clears_pending() -> None:
+    # the desire-row clearing is done by force_wake_for_dir; the pure State
+    # function just clears the pending-turn bookkeeping so cognition may re-launch.
     after, _ = force_wake(_blocked_state(), NOW)
     assert after is not None
-    assert after.desire_status == "none"
     assert after.pending_proactive_id is None
     assert after.pending_proactive_since is None
 
@@ -227,16 +233,16 @@ def test_satiate_zeroes_u_and_stamps_contact_and_exchange() -> None:
     assert "(mutating)" in message
 
 
-def test_satiate_clears_desire_and_pending_and_action_pending() -> None:
+def test_satiate_clears_pending_and_action_pending() -> None:
+    # the desire-row terminalization is done by satiate_for_dir; the pure State
+    # function clears the pending-turn + ActionPending bookkeeping.
     before = State(
-        desire_status="active",
         pending_proactive_id="corr-1",
         pending_proactive_since=_ago(1),
         action_pending_since=_ago(1),
     )
     after, _ = satiate(before, NOW)
     assert after is not None
-    assert after.desire_status == "none"
     assert after.pending_proactive_id is None
     assert after.pending_proactive_since is None
     assert after.action_pending_since is None
@@ -251,7 +257,6 @@ def test_reset_produces_a_fresh_state() -> None:
         energy=0.1,
         fatigue=0.9,
         u=5.0,
-        desire_status="active",
         decline_count=3,
         proactive_send_log=[_ago(10), _ago(20)],
         last_tick_at=_ago(1),
@@ -312,17 +317,11 @@ def test_set_field_rejects_non_integer_decline_count() -> None:
     assert "expects an integer" in message
 
 
-def test_set_field_writes_valid_desire_status() -> None:
-    after, _ = set_field(State(), NOW, "desire_status deferred")
-    assert after is not None
-    assert after.desire_status == "deferred"
-
-
-def test_set_field_rejects_invalid_desire_status() -> None:
-    after, message = set_field(State(), NOW, "desire_status activ")
+def test_set_field_rejects_removed_desire_status_field() -> None:
+    # desire_status is no longer a State field / settable (lm-27n.3 — it is a row now)
+    after, message = set_field(State(), NOW, "desire_status active")
     assert after is None
-    assert "desire_status" in message
-    assert "activ" in message
+    assert "not writable" in message
 
 
 def test_set_field_resolves_now_literal_for_timestamps() -> None:
@@ -368,20 +367,25 @@ def test_nudge_for_dir_persists_through_the_real_store(tmp_path) -> None:
 
 
 def test_force_wake_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    _store(tmp_path).commit(_blocked_state())
+    store = _store(tmp_path)
+    store.commit(_blocked_state())
+    # a stuck live desire is terminalized so the next tick births a fresh one
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0)))
     message = force_wake_for_dir(tmp_path, logger=get_logger("t"))
     assert "gates satisfied" in message
     persisted = _store(tmp_path).load()
-    assert persisted.desire_status == "none"
+    assert read_live_contact_desire(_store(tmp_path)) is None  # stuck desire dropped
     assert persisted.u > CONTACT_PARAMS.theta_u
 
 
 def test_satiate_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    _store(tmp_path).commit(State(u=5.0, desire_status="active"))
+    store = _store(tmp_path)
+    store.commit(State(u=5.0))
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0)))
     satiate_for_dir(tmp_path, logger=get_logger("t"))
     persisted = _store(tmp_path).load()
     assert persisted.u == 0.0
-    assert persisted.desire_status == "none"
+    assert read_live_contact_desire(_store(tmp_path)) is None  # desire terminalized (satisfied)
     assert persisted.last_exchange_at is not None
 
 
@@ -451,4 +455,5 @@ def test_force_wake_wakes_on_the_next_real_tick(tmp_path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)  # fresh graph, real wall clock, next "tick"
     lm.coreloop.tick()
 
-    assert lm.state.load().desire_status == "active"  # the wake happened
+    desire = read_live_contact_desire(_store(tmp_path))  # aggregation birthed the desire
+    assert desire is not None and desire.state == "active"  # the wake happened

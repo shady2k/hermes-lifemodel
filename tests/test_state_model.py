@@ -153,7 +153,6 @@ def test_state_has_lifecycle_fields_with_defaults() -> None:
     assert s.u == 0.0
     assert s.duration_over_theta == 0.0
     assert s.last_exchange_at is None
-    assert s.desire_status == "none"
     assert s.declined_at is None
     assert s.decline_count == 0
     assert s.pending_proactive_id is None
@@ -165,7 +164,6 @@ def test_state_roundtrips_lifecycle_fields() -> None:
         u=42.0,
         duration_over_theta=7.0,
         last_exchange_at="2026-07-05T10:00:00+00:00",
-        desire_status="active",
         declined_at="2026-07-05T09:00:00+00:00",
         decline_count=3,
         pending_proactive_id="p-1",

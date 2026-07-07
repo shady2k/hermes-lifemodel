@@ -190,7 +190,6 @@ def test_commit_then_load_round_trips_full_fidelity(tmp_path: Path) -> None:
         fatigue=0.3,
         duration_over_theta=4.0,
         last_exchange_at="2026-07-03T12:00:00+00:00",
-        desire_status="active",
         declined_at="2026-07-02T00:00:00+00:00",
         decline_count=2,
         pending_proactive_id="corr-1",
@@ -273,7 +272,7 @@ def test_load_rejects_non_finite_tokens(tmp_path: Path, token: str) -> None:
 
 def test_reset_overwrites_and_returns_a_fresh_state(tmp_path: Path) -> None:
     store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
-    store.commit(State(tick_count=7, u=3.0, desire_status="active"))
+    store.commit(State(tick_count=7, u=3.0))
 
     fresh = store.reset()
 

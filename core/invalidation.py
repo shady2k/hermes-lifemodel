@@ -26,7 +26,7 @@ def _parse(ts: str | None) -> datetime | None:
 
 def is_verdict_stale(
     *,
-    desire_status: str,
+    desire_state: str,
     pending_id: str | None,
     verdict_correlation_id: str,
     last_exchange_at: str | None,
@@ -36,8 +36,12 @@ def is_verdict_stale(
     now: datetime,
     deadline_min: float = 30.0,
 ) -> tuple[bool, str]:
-    """Return ``(stale, reason)`` for a returning proactive verdict."""
-    if desire_status != "active":
+    """Return ``(stale, reason)`` for a returning proactive verdict.
+
+    ``desire_state`` is the live desire's lifecycle state (``active``/``deferred``/
+    ``none``) read from the typed row — a verdict is only ever fresh for an
+    ``active`` desire; any other state means it was already resolved."""
+    if desire_state != "active":
         return True, "desire_resolved"
     if verdict_correlation_id != pending_id:
         return True, "stale_desire_id"

@@ -13,9 +13,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from lifemodel.composition import build_lifemodel
+from lifemodel.core.desire_view import (
+    build_contact_desire,
+    encode_contact_desire,
+    read_live_contact_desire,
+)
 from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
+from lifemodel.domain.objects import DesireState
 from lifemodel.log import get_logger
 from lifemodel.state.model import State
 
@@ -40,14 +46,17 @@ class FixedClock:
         return self._m
 
 
-def _lm(tmp_path, state: State, now: datetime):
+def _lm(tmp_path, state: State, now: datetime, *, desire: DesireState | None = DesireState.ACTIVE):
     lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(now))
     lm.state.commit(state)
+    if desire is not None:
+        # the contact desire is a typed row now (lm-27n.3), not a State flag
+        lm.state.put(encode_contact_desire(build_contact_desire(state=desire, salience=state.u)))
     return lm
 
 
 def _active(**over) -> State:
-    base = dict(desire_status="active", u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00")
+    base = dict(u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00")
     base.update(over)
     return State(**base)
 
@@ -68,8 +77,8 @@ def test_active_desire_launches_native_turn(tmp_path) -> None:
 
 
 def test_no_active_desire_does_not_reach_out(tmp_path) -> None:
-    idle = State(desire_status="none", u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
-    lm = _lm(tmp_path, idle, NOW)
+    idle = State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
+    lm = _lm(tmp_path, idle, NOW, desire=None)  # no live desire row
     egress = FakeEgress()
     proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
     assert egress.calls == []
@@ -80,8 +89,9 @@ def test_backstop_block_defers_and_refunds(tmp_path) -> None:
     egress = FakeEgress()
     proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
     final = lm.state.load()
+    desire = read_live_contact_desire(lm.state)
     assert egress.calls == []  # backstop blocked the send
-    assert final.desire_status == "deferred"  # held, not sent
+    assert desire is not None and desire.state == "deferred"  # held, not sent
     assert final.energy >= 0.99  # reservation refunded
 
 
@@ -89,8 +99,9 @@ def test_failed_delivery_rolls_pending_active_and_refunds(tmp_path) -> None:
     lm = _lm(tmp_path, _active(), NOW)
     proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t"))
     final = lm.state.load()
+    desire = read_live_contact_desire(lm.state)
     assert final.pending_proactive_id is None  # rolled back
-    assert final.desire_status == "active"  # kept to retry
+    assert desire is not None and desire.state == "active"  # kept to retry
     assert final.energy >= 0.99  # refunded — no turn ran
 
 
@@ -101,7 +112,7 @@ def test_delivered_launch_keeps_the_cost(tmp_path) -> None:
 
 
 def test_does_not_stamp_egress_service_alive_at(tmp_path) -> None:
-    lm = _lm(tmp_path, State(desire_status="none", last_tick_at="2026-07-06T11:59:00+00:00"), NOW)
+    lm = _lm(tmp_path, State(last_tick_at="2026-07-06T11:59:00+00:00"), NOW, desire=None)
     proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
     # liveness is NOT a separate stamp anymore; last_tick_at (dt clock) carries it
     assert getattr(lm.state.load(), "egress_service_alive_at", None) is None

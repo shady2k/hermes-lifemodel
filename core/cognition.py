@@ -12,7 +12,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ..domain.objects import DesireState
 from .component import TickContext
+from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
 from .intents import Intent, LaunchProactive, UpdateState
 from .wake_packet import build_wake_packet
@@ -32,7 +34,12 @@ class Cognition:
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
-        if state.desire_status != "active" or state.pending_proactive_id is not None:
+        desire = live_contact_desire(ctx.objects)
+        if (
+            desire is None
+            or desire.state != DesireState.ACTIVE
+            or state.pending_proactive_id is not None
+        ):
             return []
 
         estimate = cost_real(self._fast_cost + self._send_cost, state.fatigue, alpha=self._alpha)

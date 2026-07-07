@@ -23,9 +23,12 @@ from collections.abc import Callable
 from typing import Any
 
 from .composition import LifeModel
+from .core.desire_view import read_live_contact_desire
 from .core.output_lint import lint_proactive
 from .core.taxonomy import exchange_signal, verdict_signal
 from .core.wake_packet import IMPULSE_LABEL_PREFIX
+from .domain.objects import DesireState
+from .ports.memory import MemoryPort
 from .sim.aggregation import Verdict
 
 #: The exact silence markers Hermes' own gateway treats as intentional silence.
@@ -77,7 +80,9 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
         state = lm.state.load()
         if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
             return
-        if state.desire_status != "active":
+        memory = lm.state if isinstance(lm.state, MemoryPort) else None
+        desire = read_live_contact_desire(memory) if memory is not None else None
+        if desire is None or desire.state != DesireState.ACTIVE:
             return
         verdict = Verdict.REJECT if _is_no_reply(assistant_response) else Verdict.FULFILL
         if verdict is Verdict.FULFILL:

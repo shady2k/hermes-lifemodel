@@ -37,6 +37,7 @@ command deliberately does not touch, bypass, or run synchronously.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
@@ -45,10 +46,20 @@ from typing import Any
 
 from . import composition
 from .core.backstop import allow_send
+from .core.desire_view import DESIRE_KIND
+from .domain.memory import MemoryMutation, StaleTransition, TransitionOp
+from .domain.objects import CONTACT_DESIRE_ID, DesireState
 from .log import EventLogger
-from .sim.aggregation import DesireStatus
+from .ports.memory import MemoryPort
+from .ports.tick_commit import TickCommitPort
 from .state.errors import StateCorruptError, StateError
 from .state.model import State
+
+#: The terminal desire states — a live desire in any other state can still be
+#: terminalized; one already here is left alone.
+_TERMINAL_DESIRE_STATES: frozenset[str] = frozenset(
+    {DesireState.SATISFIED.value, DesireState.DROPPED.value, DesireState.EXPIRED.value}
+)
 
 #: Margin above theta_u so the effective-pressure gate is cleared, not grazed.
 _FORCE_WAKE_U_MARGIN = 1.0
@@ -62,13 +73,11 @@ _FORCE_WAKE_SILENCE_MARGIN_MIN = 5.0
 # listed here is rejected with a clear message, never silently splatted.
 _KIND_FLOAT = "float"
 _KIND_INT = "int"
-_KIND_DESIRE_STATUS = "desire_status"
 _KIND_TIMESTAMP = "timestamp"
 _SET_WHITELIST: dict[str, str] = {
     "u": _KIND_FLOAT,
     "energy": _KIND_FLOAT,
     "fatigue": _KIND_FLOAT,
-    "desire_status": _KIND_DESIRE_STATUS,
     "duration_over_theta": _KIND_FLOAT,
     "decline_count": _KIND_INT,
     "last_exchange_at": _KIND_TIMESTAMP,
@@ -127,7 +136,6 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
         before,
         u=u,
         last_exchange_at=last_exchange_at,
-        desire_status=DesireStatus.NONE.value,  # so on_urge() can birth a fresh desire
         pending_proactive_id=None,
         pending_proactive_since=None,
         decline_count=0,
@@ -139,7 +147,6 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
     fields = [
         "u",
         "last_exchange_at",
-        "desire_status",
         "pending_proactive_id",
         "pending_proactive_since",
         "decline_count",
@@ -152,7 +159,8 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
         "(action_pending cleared -> inhibition=0)",
         f"active-silence window: last_exchange_at backdated {backdate_min:.0f}m "
         f"(window w={w:.0f}m)",
-        "no live desire: desire_status=none, pending_proactive_id/since cleared "
+        "no live desire: any live contact-desire row terminalized + pending_proactive_id/since "
+        "cleared, so the next tick births a fresh one "
         "(in_flight is a per-tick signal, not persisted state -- unaffected by this command)",
         "reject-backoff clear: decline_count=0, declined_at=None",
         "backstop send-allowed: proactive_send_log "
@@ -182,7 +190,6 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
         u=0.0,
         last_contact_at=now_iso,
         last_exchange_at=now_iso,
-        desire_status=DesireStatus.NONE.value,
         pending_proactive_id=None,
         pending_proactive_since=None,
         action_pending_since=None,
@@ -191,7 +198,6 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
         "u",
         "last_contact_at",
         "last_exchange_at",
-        "desire_status",
         "pending_proactive_id",
         "pending_proactive_since",
         "action_pending_since",
@@ -244,13 +250,6 @@ def set_field(before: State, now: datetime, raw_args: str) -> tuple[State | None
             value = int(raw_value)
         except ValueError:
             return None, f"error: field {field_name!r} expects an integer, got {raw_value!r}\n"
-    elif kind == _KIND_DESIRE_STATUS:
-        valid = {status.value for status in DesireStatus}
-        if raw_value not in valid:
-            return None, (
-                f"error: field 'desire_status' must be one of {sorted(valid)}, got {raw_value!r}\n"
-            )
-        value = raw_value
     else:  # _KIND_TIMESTAMP
         value = now.isoformat() if raw_value == "now" else raw_value
 
@@ -262,13 +261,41 @@ def set_field(before: State, now: datetime, raw_args: str) -> tuple[State | None
 # --- directory-level wrappers (the seam `__init__.py` calls) ----------------
 
 
+def _terminalize_live_desire(lm: composition.LifeModel, to_state: str) -> list[MemoryMutation]:
+    """A one-mutation batch that terminalizes the live contact-desire row to
+    *to_state*, or ``[]`` when there is nothing live to terminalize.
+
+    The desire lifecycle is a typed row now (lm-27n.3), so a state command that
+    used to just null a ``State`` flag must move the row through the registry-
+    guarded transition. Reads the singleton row; skips when absent or already
+    terminal (never an illegal transition out of a terminal state)."""
+    if not isinstance(lm.state, MemoryPort):
+        return []
+    record = lm.state.get(DESIRE_KIND, CONTACT_DESIRE_ID)
+    if record is None or record.state in _TERMINAL_DESIRE_STATES:
+        return []
+    return [
+        TransitionOp(
+            kind=DESIRE_KIND,
+            id=CONTACT_DESIRE_ID,
+            from_state=record.state,
+            to_state=to_state,
+        )
+    ]
+
+
 def _apply(
     base_dir: Path,
     compute: Callable[[State, datetime], tuple[State | None, str]],
     *,
     logger: EventLogger | None = None,
+    desire_mutations: Callable[[composition.LifeModel], list[MemoryMutation]] | None = None,
 ) -> str:
-    """Load -> compute a candidate -> re-validate -> commit (or reject)."""
+    """Load -> compute a candidate -> re-validate -> commit (or reject).
+
+    ``desire_mutations`` optionally computes desire-row mutations to commit
+    atomically alongside the ``State`` candidate (one ``commit_tick``), so the
+    row and the vitals never split."""
     lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
     before = lm.state.load()
     now = lm.clock.now()
@@ -279,7 +306,11 @@ def _apply(
         State.from_dict(candidate.to_dict())  # reuse the model's own validation
     except StateCorruptError as exc:
         return f"error: refusing to persist an invalid state: {exc}\n"
-    lm.state.commit(candidate)
+    mutations = desire_mutations(lm) if desire_mutations is not None else []
+    if mutations and isinstance(lm.state, TickCommitPort):
+        lm.state.commit_tick(candidate, mutations)
+    else:
+        lm.state.commit(candidate)
     return message
 
 
@@ -288,11 +319,24 @@ def nudge_for_dir(base_dir: Path, raw_amount: str, *, logger: EventLogger | None
 
 
 def force_wake_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
-    return _apply(base_dir, force_wake, logger=logger)
+    # Terminalize any stuck desire so the NEXT real tick births a fresh one via
+    # the (now-satisfied) gates — the gate-proving path force-wake exists for.
+    return _apply(
+        base_dir,
+        force_wake,
+        logger=logger,
+        desire_mutations=lambda lm: _terminalize_live_desire(lm, str(DesireState.DROPPED)),
+    )
 
 
 def satiate_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
-    return _apply(base_dir, satiate, logger=logger)
+    # A simulated fulfilled contact terminalizes the live desire (satisfied).
+    return _apply(
+        base_dir,
+        satiate,
+        logger=logger,
+        desire_mutations=lambda lm: _terminalize_live_desire(lm, str(DesireState.SATISFIED)),
+    )
 
 
 def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
@@ -310,10 +354,26 @@ def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
     except StateError:
         before = None
     lm.state.reset()
+    _clear_live_desire_row(lm)  # a factory wipe also drops any live desire row
     if before is None:
         return "lifemodel reset  (mutating)\n" + "=" * 30 + "\n\n  (previous state unreadable)\n"
     _, message = reset(before, now)
     return message
+
+
+def _clear_live_desire_row(lm: composition.LifeModel) -> None:
+    """Best-effort: terminalize any live contact-desire row on a factory wipe.
+
+    The state ``reset`` wipes the vitals row; this drops the separate desire
+    record so a reset is truly "as if newly born". Best-effort — a missing memory
+    port or a lost race never blocks the reset, which has already landed."""
+    if not isinstance(lm.state, MemoryPort):
+        return
+    record = lm.state.get(DESIRE_KIND, CONTACT_DESIRE_ID)
+    if record is None or record.state in _TERMINAL_DESIRE_STATES:
+        return
+    with contextlib.suppress(StaleTransition):  # a lost race is fine; the reset already landed
+        lm.state.transition(DESIRE_KIND, CONTACT_DESIRE_ID, record.state, str(DesireState.DROPPED))
 
 
 def set_field_for_dir(base_dir: Path, raw_args: str, *, logger: EventLogger | None = None) -> str:

@@ -72,11 +72,10 @@ class State:
     #: the user (spec §4/§6). Satiates the drive and opens the active-silence
     #: window; ``None`` before the first exchange.
     last_exchange_at: str | None = None
-    #: Where the current contact-desire sits in its lifecycle (spec §4/§5/§7):
-    #: ``"none"`` (no live desire), ``"active"`` (woken, awaiting a verdict), or
-    #: ``"deferred"`` (held for a later release condition — unreachable live in
-    #: Phase 1, kept for parity with the certified ``DesireStatus`` enum).
-    desire_status: str = "none"
+    # NB: the contact-desire *lifecycle* is no longer a ``State`` flag (lm-27n.3):
+    # it lives in the singleton ``kind='desire'`` record ``contact:owner`` (HLA
+    # §4.1), read via ``core.desire_view.live_contact_desire``. Only the residual
+    # policy scalars below (backoff / pending / ActionPending / send-log) stay here.
     #: ISO-8601 UTC timestamp of the most recent REJECT verdict (spec §5/§7),
     #: feeding the growing-backoff gate so a declined desire is not re-tried too
     #: soon. ``None`` until the first reject.
@@ -144,7 +143,6 @@ class State:
             # value, or a tz-*naive* one that would raise ``TypeError`` when
             # compared, is corruption caught loud at load, never a mid-tick crash.
             last_exchange_at=_as_opt_iso(data.get("last_exchange_at"), "last_exchange_at"),
-            desire_status=_as_str(data.get("desire_status", "none"), "desire_status"),
             declined_at=_as_opt_iso(data.get("declined_at"), "declined_at"),
             decline_count=_as_int(data.get("decline_count", 0), "decline_count"),
             pending_proactive_id=_as_opt_str(
@@ -200,15 +198,6 @@ def _as_opt_str(value: object, field_name: str) -> str | None:
     if value is None or isinstance(value, str):
         return value
     raise StateCorruptError(f"field {field_name!r} must be a string or null, got {_type(value)}")
-
-
-def _as_str(value: object, field_name: str) -> str:
-    # Unlike ``_as_opt_str``, ``None`` is not a valid value here: fields routed
-    # through this validator (e.g. ``desire_status``) always default to a
-    # concrete string, never ``null``.
-    if isinstance(value, str):
-        return value
-    raise StateCorruptError(f"field {field_name!r} must be a string, got {_type(value)}")
 
 
 def _as_str_list(data: Mapping[str, Any], key: str, default: list[str]) -> list[str]:

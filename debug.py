@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import cast
 
 from . import composition
+from .core.desire_view import read_live_contact_desire
 from .core.introspect import DebugConfig, Readings, compute_readings
+from .ports.memory import MemoryPort
 from .state.errors import StateError
 
 
@@ -103,7 +105,11 @@ def render_dump_for_dir(base_dir: Path) -> str:
         state = lm.state.load()
     except StateError as exc:
         return f"🫀 **lifemodel debug** (read-only)\n\n<unreadable: {exc}>\n"
-    return render_debug_dump(readings=compute_readings(state, now=now, cfg=_cfg()))
+    desire = read_live_contact_desire(lm.state) if isinstance(lm.state, MemoryPort) else None
+    desire_state = desire.state if desire is not None else "none"
+    return render_debug_dump(
+        readings=compute_readings(state, now=now, cfg=_cfg(), desire_state=desire_state)
+    )
 
 
 def _metrics(pairs: list[tuple[str, str]]) -> list[str]:

@@ -21,10 +21,16 @@ from lifemodel.composition import LifeModel, build_lifemodel
 from lifemodel.core.aggregator import SilentAggregator
 from lifemodel.core.contact_neuron import ContactNeuron
 from lifemodel.core.coreloop import CoreLoop
+from lifemodel.core.desire_view import (
+    build_contact_desire,
+    encode_contact_desire,
+    read_live_contact_desire,
+)
 from lifemodel.core.neuron import Neuron
 from lifemodel.core.registry import ComponentRegistry
 from lifemodel.core.state_actor import StateActor
 from lifemodel.core.taxonomy import exchange_signal
+from lifemodel.domain.objects import DesireState
 from lifemodel.domain.signal import Signal
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
@@ -219,27 +225,50 @@ def test_aggregation_registered_after_neuron(tmp_path: Path) -> None:
     assert any(isinstance(c, ContactAggregation) for c in lm.registry.enabled())
 
 
+def _seed_active_desire(store: SQLiteRuntimeStore) -> None:
+    """Persist a live active contact-desire row through the real store."""
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=3.0)))
+
+
 def test_pipeline_rises_then_wakes_desire(tmp_path: Path) -> None:
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
     # u already high; 1 min elapsed → neuron keeps it high, aggregation wakes a desire
-    store.commit(State(u=3.0, desire_status="none", last_tick_at="2026-07-06T03:59:00+00:00"))
+    store.commit(State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
-    assert store.load().desire_status == "active"
+    desire = read_live_contact_desire(store)  # the desire is now a typed row, not a flag
+    assert desire is not None and desire.state == "active"
+
+
+def test_pipeline_dedups_desire_across_ticks(tmp_path: Path) -> None:
+    # tick 1 births the desire; tick 2 sees it live in the snapshot and dedups —
+    # the singleton row is not re-written (revision stays put), no double-wake.
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit(State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
+    lm.coreloop.tick()
+    born = store.get("desire", "contact:owner")
+    assert born is not None and born.state == "active"
+    lm.coreloop.tick()  # a second high-u tick must not re-birth the desire
+    again = store.get("desire", "contact:owner")
+    assert again is not None and again.revision == born.revision  # untouched -> deduped
 
 
 def test_pipeline_exchange_satiates_and_clears(tmp_path: Path) -> None:
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(u=3.0, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00"))
+    store.commit(State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    _seed_active_desire(store)  # a live desire the exchange must terminalize
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.bus.publish(exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None))
     lm.coreloop.tick()
     final = store.load()
     # neuron rises by alpha*dt then satiates by beta*q (q=1.0 for two_way)
     assert final.u < 3.0  # neuron satiated (reduced)
-    assert final.desire_status == "none"  # aggregation cleared the desire
+    assert read_live_contact_desire(store) is None  # aggregation terminalized the desire
+    assert store.get("desire", "contact:owner").state == "satisfied"
     assert final.last_exchange_at is not None
 
 
@@ -253,14 +282,13 @@ def test_pipeline_send_suppresses_then_recovers(tmp_path: Path) -> None:
     store.commit(
         State(
             u=3.0,
-            desire_status="none",
             action_pending_since="2026-07-06T03:50:00+00:00",
             last_tick_at="2026-07-06T03:59:00+00:00",
         )
     )
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
-    assert store.load().desire_status == "none"  # grace suppresses the wake end-to-end
+    assert read_live_contact_desire(store) is None  # grace suppresses the wake end-to-end
 
 
 # --- Phase C2: Personality component wiring ---

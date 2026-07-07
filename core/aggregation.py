@@ -1,28 +1,45 @@
 """ContactAggregation — the AGGREGATION layer for the contact desire (spec §7, §12).
 
-Stateless: every tick it reconstructs the certified ``sim`` primitives from the
-persisted state and drives the desire lifecycle. It reads the neuron's transient
-``contact`` value plus durable ``exchange``/``verdict``/``in_flight`` inputs,
-applies them in the order exchange → verdict → wake (threaded through locals,
-like ``core/decision.py``'s functions), and emits one ``UpdateState``.
+Stateless: every tick it reads the live contact desire from the start-of-tick
+records snapshot (``ctx.objects``, via :func:`live_contact_desire`) plus the
+neuron's transient ``contact`` value and the durable ``exchange``/``verdict``/
+``in_flight`` inputs, applies them in the order exchange → verdict → wake
+(threaded through locals, like ``core/decision.py``'s functions), and emits at
+most ONE desire-row mutation (a :class:`PutRecord` to birth an ``active`` desire,
+or a :class:`TransitionRecord` to advance a live one) plus the residual-field
+:class:`UpdateState`.
+
+The desire *lifecycle* is a first-class typed row now, not a ``State`` flag
+(lm-27n.3): ``urge → PutRecord(active)``; ``FULFILL → active→satisfied``;
+``REJECT → active→dropped``; ``DEFER → active→deferred``; a real ``exchange``
+terminalizes the live desire (``→satisfied``) and **dominates a same-tick
+verdict**. ``satisfied``/``dropped``/``expired`` are terminal — aggregation never
+transitions out of them (it only ever births a fresh ``active`` desire, an upsert
+on the singleton id). This layer keeps ALL its gates (effective pressure, silence
+window, decline backoff, ActionPending grace/decay, in-flight, the ``evaluate_wake``
+gate); the residual policy scalars (``decline_count``, ``action_pending_since``,
+``pending_proactive_id``, ``proactive_send_log`` …) stay on ``State``.
 
 The neuron owns ``u`` on rise and exchange-satiation; this layer never writes
 ``u`` (send ≠ contact: FULFILL starts an ActionPending inhibition window but does
 not satiate the drive). Only a real exchange clears ActionPending (the neuron
-satiates ``u`` separately). This is the port of ``core/decision.py`` onto the
-layer boundary — the wake/lifecycle math is the reused ``sim`` code, never
-reimplemented here.
+satiates ``u`` separately). Aggregation is the SOLE contact-desire writer in this
+task (top-down/thought desire is a later task), so the start-of-tick snapshot plus
+its single decision are a sufficient in-tick dedup guard.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..sim.aggregation import Aggregator, DesireStatus, Verdict
+from ..domain.memory import PutOp, TransitionOp
+from ..domain.objects import DesireState
+from ..sim.aggregation import Verdict
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .backstop import record_send
 from .component import TickContext
-from .intents import Intent, UpdateState
+from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
+from .intents import Intent, PutRecord, TransitionRecord, UpdateState
 from .invalidation import is_verdict_stale
 from .pressure import effective_pressure, inhibition_at
 from .taxonomy import (
@@ -35,6 +52,9 @@ from .taxonomy import (
     read_verdict_correlation,
 )
 from .timeutil import minutes_between
+
+#: The logical "no live desire" sentinel — the old ``desire_status == "none"``.
+_NONE = "none"
 
 
 class ContactAggregation:
@@ -68,16 +88,25 @@ class ContactAggregation:
         now = ctx.now
         u_now = contact_value(ctx.signals, default=state.u)
 
-        # working copies of the policy fields (threaded like decision.py)
+        # The live desire from the start-of-tick snapshot (active/deferred), and
+        # its logical state threaded through the reducer — the old ``agg.status``.
+        live = live_contact_desire(ctx.objects)
+        desire_state = live.state if live is not None else _NONE
+
+        # working copies of the residual policy fields (threaded like decision.py)
         last_exchange_at = state.last_exchange_at
         declined_at = state.declined_at
         decline_count = state.decline_count
-        agg = Aggregator(status=DesireStatus(state.desire_status))
         last_contact_at = state.last_contact_at
         action_pending_since = state.action_pending_since
         pending_id = state.pending_proactive_id
         pending_since = state.pending_proactive_since
         send_log = state.proactive_send_log
+
+        # The single desire-row action this tick: a create, or a transition
+        # target for the live desire. At most one of the two ever fires.
+        create_desire = False
+        transition_to: str | None = None
 
         # effective pressure at verdict time (from persisted inhibition) — staleness input
         effective_now = effective_pressure(
@@ -91,49 +120,63 @@ class ContactAggregation:
             ),
         )
 
-        # 1) real exchanges reset clocks, clear the desire and ActionPending (before verdict/wake)
-        for sig in ctx.signals:
-            if sig.kind == KIND_EXCHANGE:
-                actor, _label = read_exchange(sig)
-                if actor != "proactive_internal":
-                    last_exchange_at = now.isoformat()
-                    declined_at = None
-                    decline_count = 0
-                    action_pending_since = None
-                    agg.on_exchange()
+        # 1) real exchanges reset clocks and terminalize a live desire (before verdict/wake).
+        #    A real reply this tick dominates any same-tick verdict: it resolves the
+        #    pull, so the verdict loop below is skipped (the desire is already gone).
+        had_exchange = any(
+            sig.kind == KIND_EXCHANGE and read_exchange(sig)[0] != "proactive_internal"
+            for sig in ctx.signals
+        )
+        if had_exchange:
+            last_exchange_at = now.isoformat()
+            declined_at = None
+            decline_count = 0
+            action_pending_since = None
+            if desire_state in (DesireState.ACTIVE, DesireState.DEFERRED):
+                transition_to = DesireState.SATISFIED  # exchange terminalizes the live desire
+            desire_state = _NONE
 
-        # 2) a verdict resolves the woken desire — dropped if stale (async invalidation §7.3)
-        for sig in ctx.signals:
-            if sig.kind != KIND_VERDICT:
-                continue
-            stale, _reason = is_verdict_stale(
-                desire_status=agg.status.value,
-                pending_id=pending_id,
-                verdict_correlation_id=read_verdict_correlation(sig),
-                last_exchange_at=last_exchange_at,
-                pending_since=pending_since,
-                effective=effective_now,
-                threshold=self._theta,
-                now=now,
-                deadline_min=self._verdict_deadline_min,
-            )
-            if stale:
-                continue
-            verdict = read_verdict(sig)
-            agg.apply_verdict(verdict)
-            if verdict is Verdict.FULFILL:
-                action_pending_since = now.isoformat()  # send -> inhibition starts
-                last_contact_at = now.isoformat()
-                send_log = record_send(send_log, now)  # backstop counter (spec §14)
-                pending_id = None
-                pending_since = None
-            elif verdict is Verdict.REJECT:
-                declined_at = now.isoformat()
-                decline_count += 1
-                pending_id = None
-                pending_since = None
+        # 2) a verdict resolves the woken desire — dropped if stale (async invalidation §7.3).
+        #    Only reached when no exchange dominated this tick (exchange-dominates-verdict).
+        if not had_exchange:
+            for sig in ctx.signals:
+                if sig.kind != KIND_VERDICT:
+                    continue
+                stale, _reason = is_verdict_stale(
+                    desire_state=desire_state,
+                    pending_id=pending_id,
+                    verdict_correlation_id=read_verdict_correlation(sig),
+                    last_exchange_at=last_exchange_at,
+                    pending_since=pending_since,
+                    effective=effective_now,
+                    threshold=self._theta,
+                    now=now,
+                    deadline_min=self._verdict_deadline_min,
+                )
+                if stale:
+                    continue
+                verdict = read_verdict(sig)
+                if verdict is Verdict.FULFILL:
+                    transition_to = DesireState.SATISFIED
+                    action_pending_since = now.isoformat()  # send -> inhibition starts
+                    last_contact_at = now.isoformat()
+                    send_log = record_send(send_log, now)  # backstop counter (spec §14)
+                    pending_id = None
+                    pending_since = None
+                    desire_state = _NONE
+                elif verdict is Verdict.REJECT:
+                    transition_to = DesireState.DROPPED
+                    declined_at = now.isoformat()
+                    decline_count += 1
+                    pending_id = None
+                    pending_since = None
+                    desire_state = _NONE
+                else:  # Verdict.DEFER — hold the intention (never reached in live Model A)
+                    transition_to = DesireState.DEFERRED
+                    desire_state = DesireState.DEFERRED
+                break  # a resolved desire is no longer active — later verdicts are stale
 
-        # duration on latent u
+        # duration on latent u (never shrinks; latent, not effective — accrues under inhibition)
         dt = max(0.0, minutes_between(state.last_tick_at, now))
         duration = state.duration_over_theta + dt if u_now >= self._theta else 0.0
 
@@ -158,11 +201,14 @@ class ContactAggregation:
             decline_count=decline_count,
         )
         outcome = evaluate_wake(u=effective, now=0.0, state=lane, params=self._params)
-        if outcome.is_urge:
-            agg.on_urge()
+        # A wake-eligible urge births a desire only when none is live and nothing
+        # resolved one this tick (dedup / anti-drum). After any resolution the
+        # residual gates already veto a same-tick re-wake, so this is behaviour-
+        # identical to the old ``on_urge`` on a ``NONE`` status.
+        if outcome.is_urge and desire_state == _NONE and transition_to is None:
+            create_desire = True
 
         changes: dict[str, object] = {
-            "desire_status": agg.status.value,
             "duration_over_theta": duration,
             "last_exchange_at": last_exchange_at,
             "declined_at": declined_at,
@@ -173,4 +219,22 @@ class ContactAggregation:
             "pending_proactive_since": pending_since,
             "proactive_send_log": send_log,
         }
-        return [UpdateState(changes)]
+        intents: list[Intent] = [UpdateState(changes)]
+
+        if create_desire:
+            desire = build_contact_desire(
+                state=DesireState.ACTIVE, salience=effective, source_drive=u_now
+            )
+            intents.append(PutRecord(op=PutOp(draft=encode_contact_desire(desire))))
+        elif transition_to is not None and live is not None:
+            intents.append(
+                TransitionRecord(
+                    op=TransitionOp(
+                        kind="desire",
+                        id=live.id,
+                        from_state=live.state,
+                        to_state=transition_to,
+                    )
+                )
+            )
+        return intents
