@@ -31,6 +31,25 @@ class _FakeAdapter:
         self.events.append(event)
 
 
+class _FakeAdapterWithPause(_FakeAdapter):
+    """Like ``_FakeAdapter`` but also exposes ``pause_typing_for_chat``, mirroring
+    Hermes' real Telegram adapter (base.py:3896)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.paused_chat_ids: list[Any] = []
+
+    def pause_typing_for_chat(self, chat_id: Any) -> None:
+        self.paused_chat_ids.append(chat_id)
+
+
+class _FakeAdapterPauseRaises(_FakeAdapter):
+    """``pause_typing_for_chat`` blows up — must never fail the delivery."""
+
+    def pause_typing_for_chat(self, chat_id: Any) -> None:
+        raise RuntimeError("boom")
+
+
 class _FakeRunner:
     """Duck-types only what inject_proactive_turn touches."""
 
@@ -104,3 +123,44 @@ def test_inject_unavailable_when_draining() -> None:
         runner, _TARGET, "hi", make_event=_make_event, schedule=lambda c, loop: None
     )
     assert outcome is ReachOutcome.UNAVAILABLE
+
+
+def test_inject_pauses_typing_for_chat_before_delivering() -> None:
+    """Internal impulse turns must not show a visible "typing…" indicator on the
+    user's real chat — pause it on the adapter before scheduling handle_message."""
+    runner = _FakeRunner()
+    adapter = _FakeAdapterWithPause()
+    runner.adapters["telegram"] = adapter
+
+    outcome = inject_proactive_turn(
+        runner, _TARGET, "hello", make_event=_make_event, schedule=lambda c, loop: c.close()
+    )
+
+    assert outcome is ReachOutcome.DELIVERED
+    assert adapter.paused_chat_ids == [runner._source.chat_id]
+
+
+def test_inject_delivered_when_adapter_has_no_pause_typing_for_chat() -> None:
+    """Back-compat: an adapter without pause_typing_for_chat must not crash or
+    change the outcome — the pause is best-effort only."""
+    runner = _FakeRunner()  # runner.adapters["telegram"] is a plain _FakeAdapter
+    assert not hasattr(runner.adapters["telegram"], "pause_typing_for_chat")
+
+    outcome = inject_proactive_turn(
+        runner, _TARGET, "hello", make_event=_make_event, schedule=lambda c, loop: c.close()
+    )
+
+    assert outcome is ReachOutcome.DELIVERED
+
+
+def test_inject_delivered_when_pause_typing_for_chat_raises() -> None:
+    """The pause is cosmetic only — an exception in it must never turn a
+    would-be DELIVERED into FAILED."""
+    runner = _FakeRunner()
+    runner.adapters["telegram"] = _FakeAdapterPauseRaises()
+
+    outcome = inject_proactive_turn(
+        runner, _TARGET, "hello", make_event=_make_event, schedule=lambda c, loop: c.close()
+    )
+
+    assert outcome is ReachOutcome.DELIVERED

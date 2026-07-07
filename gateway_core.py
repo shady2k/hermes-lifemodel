@@ -13,6 +13,7 @@ The being's autonomic loop is hosted as a supervised platform adapter
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -117,6 +118,17 @@ def inject_proactive_turn(
             log.info("reachin_unavailable", reason="no_adapter")
             return ReachOutcome.UNAVAILABLE
         event = make_event(prompt, source, message_id)  # message_id None (spec constraint)
+        # Internal impulse turns must not show a visible "typing…" indicator on the
+        # user's real chat — they're often silent (end in [SILENT]) and would
+        # otherwise flash "typing" for the whole 7-116s turn for no visible reason.
+        # Best-effort only: pause_typing_for_chat is cosmetic, so a missing method
+        # or a raise here must never turn a would-be DELIVERED into FAILED. Hermes'
+        # _keep_typing checks the pause set every iteration and its finally block
+        # auto-clears it when this turn's typing task ends (base.py ~3862/3896), so
+        # no matching resume call is needed here.
+        if hasattr(adapter, "pause_typing_for_chat"):
+            with contextlib.suppress(Exception):
+                adapter.pause_typing_for_chat(source.chat_id)
         schedule(adapter.handle_message(event), runner._gateway_loop)
         log.info("reachin_injected", chat_id=getattr(source, "chat_id", None))
         return ReachOutcome.DELIVERED
