@@ -23,7 +23,7 @@ def test_dump_renders_the_sections(tmp_path) -> None:
 
 def test_dump_puts_one_metric_per_line(tmp_path) -> None:
     # Owner complaint #1: several metrics used to be crammed onto one line.
-    # Every metric now gets its own aligned "label: value" line.
+    # Every metric now gets its own "label: value" line.
     JsonStateStore(tmp_path).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
@@ -48,6 +48,29 @@ def test_dump_puts_one_metric_per_line(tmp_path) -> None:
     assert "send_allowed" not in backstop_line
 
 
+def test_dump_has_no_column_alignment_padding(tmp_path) -> None:
+    # Owner complaint #3: right-padding labels to line up a colon column goes
+    # ragged in Telegram's proportional font. Match Hermes' native /status
+    # style instead: plain "label: value", a single space after the colon,
+    # no leading indent, no padding run lining anything up.
+    JsonStateStore(tmp_path).commit(
+        State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
+    )
+    out = render_dump_for_dir(tmp_path)
+    lines = out.splitlines()
+
+    energy_line = next(line for line in lines if "energy(E)" in line)
+    fatigue_line = next(line for line in lines if line.strip().startswith("fatigue(S):"))
+    assert energy_line == "energy(E): 60%"
+    assert fatigue_line == "fatigue(S): 0.2"
+
+    for line in lines:
+        if ":" not in line:
+            continue
+        assert not line.startswith(" ")  # no leading indent
+        assert ":  " not in line  # no run of spaces after the colon
+
+
 def test_dump_timestamps_render_in_the_hermes_local_timezone(monkeypatch, tmp_path) -> None:
     # Owner complaint #2: UTC confuses the owner (+03:00). Force a fixed
     # non-UTC offset via the single conversion helper and confirm every
@@ -64,6 +87,17 @@ def test_dump_timestamps_render_in_the_hermes_local_timezone(monkeypatch, tmp_pa
     assert "+00:00" not in out  # no raw-UTC timestamp leaks through
     assert "297762" not in out  # microseconds trimmed
     assert "T10:40:42" not in out  # not the raw ISO 'T' separator
+
+
+def test_dump_title_matches_hermes_status_style(tmp_path) -> None:
+    # Match Hermes' own /status command: an emoji title line, no fenced code
+    # block, no "====" divider — just plain lines in the native proportional
+    # font (see the owner-cited /status sample in the bead).
+    JsonStateStore(tmp_path).commit(State(last_tick_at="2026-07-06T00:00:00+00:00"))
+    out = render_dump_for_dir(tmp_path)
+    assert out.startswith("🫀 lifemodel debug (read-only)")
+    assert "```" not in out
+    assert "=" * 10 not in out  # no leftover "====" divider rule
 
 
 def test_resolve_tz_returns_none_offhost_when_hermes_time_is_unavailable() -> None:

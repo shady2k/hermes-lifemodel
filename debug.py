@@ -102,51 +102,52 @@ def render_dump_for_dir(base_dir: Path) -> str:
     try:
         state = lm.state.load()
     except StateError as exc:
-        return f"lifemodel debug  (read-only)\n{'=' * 30}\n\n<unreadable: {exc}>\n"
+        return f"🫀 lifemodel debug (read-only)\n\n<unreadable: {exc}>\n"
     return render_debug_dump(readings=compute_readings(state, now=now, cfg=_cfg()))
 
 
-def _section(pairs: list[tuple[str, str]]) -> list[str]:
-    """Render one section's ``(label, value)`` pairs as an aligned table.
+def _metrics(pairs: list[tuple[str, str]]) -> list[str]:
+    """Render one section's ``(label, value)`` pairs as plain lines.
 
-    One datum per line, colons lined up on the widest label in the section, so
-    the block reads top-to-bottom like a clean table instead of several
-    metrics crammed onto one line.
+    One datum per line, ``label: value`` with a single space after the colon
+    — no column-alignment padding. Telegram renders in a proportional font,
+    where space-padded columns go ragged; this matches Hermes' own
+    ``/status`` command, which reads cleanly precisely because it never tries
+    to line up a colon column.
     """
-    width = max(len(label) for label, _ in pairs) + 1  # +1 for the colon
-    return [f"  {label + ':':<{width}} {value}" for label, value in pairs]
+    return [f"{label}: {value}" for label, value in pairs]
 
 
 def render_debug_dump(*, readings: Readings) -> str:
     r = readings
-    lines: list[str] = ["lifemodel debug  (read-only)", "=" * 30, ""]
+    lines: list[str] = ["🫀 lifemodel debug (read-only)", ""]
 
     phase = r.action_pending_phase
     if r.action_pending_remaining_min:
-        phase += f"   ({_opt(r.action_pending_remaining_min, 'm grace left')})"
+        phase += f" ({_opt(r.action_pending_remaining_min, 'm grace left')})"
 
     pending = str(r.pending)
     if r.pending and r.pending_since:
-        pending += f"   (since {_local(r.pending_since)})"
+        pending += f" (since {_local(r.pending_since)})"
 
     lines.append("PHYSIOLOGY")
-    lines += _section(
+    lines += _metrics(
         [
             ("energy(E)", _pct(r.energy)),
             ("fatigue(S)", _n(r.fatigue)),
             ("circadian(C)", _n(r.circadian)),
-            ("alertness", f"~{_n(r.alertness)}   (higher C, lower S = sharper)"),
+            ("alertness", f"~{_n(r.alertness)} (higher C, lower S = sharper)"),
         ]
     )
     lines.append("")
 
     lines.append("DRIVE (contact)")
-    lines += _section(
+    lines += _metrics(
         [
             ("latent u", _n(r.u)),
             ("inhibition", _n(r.inhibition)),
             ("phase", phase),
-            ("effective", f"{_n(r.effective)}   (= u * (1 - inhibition))"),
+            ("effective", f"{_n(r.effective)} (= u * (1 - inhibition))"),
             ("theta", _n(r.theta)),
             ("pct_to_wake", _pct(r.pct_to_wake)),
             (
@@ -158,7 +159,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     lines.append("")
 
     lines.append("DESIRE")
-    lines += _section(
+    lines += _metrics(
         [
             ("status", r.desire_status),
             ("pending_turn", pending),
@@ -169,7 +170,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     lines.append("")
 
     lines.append("GATES (why wake / no wake)")
-    lines += _section(
+    lines += _metrics(
         [
             ("would_wake", str(r.would_wake)),
             ("reason", r.wake_reason),
@@ -181,7 +182,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     lines.append("")
 
     lines.append("BACKSTOP (hard send limit)")
-    lines += _section(
+    lines += _metrics(
         [
             ("sends_today", f"{r.sends_today}/{r.sends_cap}"),
             ("send_allowed", str(r.send_allowed)),
@@ -190,7 +191,7 @@ def render_debug_dump(*, readings: Readings) -> str:
     lines.append("")
 
     lines.append("HEALTH (is the brain ticking)")
-    lines += _section(
+    lines += _metrics(
         [
             ("brain", "alive" if r.brain_alive else "STALE — loop may be down"),
             ("last_tick", _opt(r.last_tick_ago_min, " min ago")),
