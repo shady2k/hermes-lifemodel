@@ -25,6 +25,15 @@ from .paths import state_dir
 
 __version__ = "0.0.0"
 
+# Single source of truth for `/lifemodel` subcommands: dispatch, the `help`
+# text, and args_hint are all derived from this dict, so adding a subcommand
+# means editing here — nowhere else.
+_SUBCOMMANDS: dict[str, str] = {
+    "status": "Show the one-line plugin status (default).",
+    "debug": "Read-only state/event dump for owner introspection.",
+    "help": "List these subcommands.",
+}
+
 
 def _hermes_home() -> Path:
     """Resolve the active Hermes profile home via the host API.
@@ -47,6 +56,17 @@ def _status_line(profile: str, sdir: Path) -> str:
     return f"lifemodel {__version__} alive · profile={profile} · state_dir={sdir}"
 
 
+def _command_list() -> str:
+    """Render every registered subcommand with its one-line description.
+
+    Shared by the bare `/lifemodel` view and `/lifemodel help` so the two can
+    never drift — both read straight from :data:`_SUBCOMMANDS`.
+    """
+    width = max(len(name) for name in _SUBCOMMANDS)
+    lines = [f"  {name:<{width}}  {description}" for name, description in _SUBCOMMANDS.items()]
+    return "\n".join(["commands:", *lines])
+
+
 def register(ctx: Any) -> None:
     """Register the plugin's surface with Hermes (the adapter boundary).
 
@@ -64,18 +84,27 @@ def register(ctx: Any) -> None:
     logger = EventTee(get_logger("lifemodel"), sink)
 
     def lifemodel_command(raw_args: str = "") -> str:
-        """`/lifemodel` — 'status' (default) or 'debug' (read-only inspection)."""
-        if raw_args.strip() == "debug":
+        """`/lifemodel` — 'status' (default), 'debug', or 'help' (see _SUBCOMMANDS)."""
+        sub = raw_args.strip()
+        if sub == "debug":
             # Owner introspection (NFR9): returned to the caller, never logged,
             # and read-only (HLA §9) — no commit, no bus mutation.
             return render_dump_for_dir(sdir)
-        return _status_line(profile, sdir)
+        if sub == "help":
+            return _command_list() + "\n"
+        status = _status_line(profile, sdir)
+        if sub == "":
+            # Bare invocation: keep the status line, then surface the full
+            # subcommand list (discoverability — no separate `help` round trip
+            # needed just to learn what's available).
+            return f"{status}\n\n{_command_list()}\n"
+        return status
 
     ctx.register_command(
         "lifemodel",
         lifemodel_command,
-        description="Show plugin status, or 'debug' for a read-only state/event dump.",
-        args_hint="status | debug",
+        description="Show plugin status, or 'debug'/'help' for a dump or subcommand list.",
+        args_hint=" | ".join(_SUBCOMMANDS),
     )
 
     logger.info(

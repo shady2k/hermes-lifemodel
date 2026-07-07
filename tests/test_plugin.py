@@ -129,11 +129,61 @@ def test_register_lifemodel_debug_subcommand_returns_dump(
     dump = handler("debug")
     assert "read-only" in dump
     assert "PHYSIOLOGY" in dump
-    # `/lifemodel` (and any other arg) still prints the status line.
-    assert "alive" in handler("")
+    # `/lifemodel status` (and any other unrecognized arg) prints the status line.
     assert "alive" in handler("status")
     # args_hint advertises the new subcommand.
     assert "debug" in ctx.commands["lifemodel"]["args_hint"]
+
+
+def test_register_lifemodel_help_subcommand_lists_subcommands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    text = handler("help")
+    # Every registered subcommand shows up with its one-line description —
+    # the registry is the single source of truth for this text.
+    for name, description in lifemodel._SUBCOMMANDS.items():
+        assert name in text
+        assert description in text
+
+
+def test_register_lifemodel_bare_command_includes_full_command_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    bare = handler("")
+    # Bare `/lifemodel` keeps the status line...
+    assert "alive" in bare
+    # ...and surfaces the full subcommand list (same as `/lifemodel help`),
+    # not a truncated footer — discoverability without a second round trip.
+    for name, description in lifemodel._SUBCOMMANDS.items():
+        assert name in bare
+        assert description in bare
+
+
+def test_register_lifemodel_args_hint_derived_from_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+
+    args_hint = ctx.commands["lifemodel"]["args_hint"]
+    # args_hint must be built from the registry, not a separately hardcoded
+    # string, so the two can never drift apart.
+    for name in lifemodel._SUBCOMMANDS:
+        assert name in args_hint
 
 
 def test_register_tees_plugin_registered_into_events_sink(
