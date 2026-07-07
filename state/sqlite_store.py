@@ -1,29 +1,47 @@
-"""SQLite adapter for :class:`MemoryPort` + :class:`PressureSensorPort` (HLA §4.1/D7).
+"""SQLite adapter for :class:`StatePort` + :class:`MemoryPort` + :class:`PressureSensorPort`
+(HLA §4.1/D7).
 
-Writes ``<base_dir>/lifemodel.sqlite`` — the plugin's first durable SQLite
-runtime store. Purely additive (lm-fib.6.1): nothing in the live tick,
-composition root, or ``core/proactive.py`` constructs this yet; the state
-package's safety-critical store stays :class:`~lifemodel.state.json_store.JsonStateStore`
-until the ``StatePort`` cutover (lm-fib.6.2). Imports nothing from Hermes.
+Writes ``<base_dir>/lifemodel.sqlite`` — the plugin's one durable SQLite runtime
+store. Added purely additively in lm-fib.6.1 (``MemoryPort``/``PressureSensorPort``
+only); lm-fib.6.2 cuts the being's vitals/control ``State`` over to this same
+file too (the composition root now wires this class as the live ``StatePort``,
+retiring ``lifemodel.state.json_store.JsonStateStore`` and ``state.json``
+outright — see :meth:`load`/:meth:`commit`/:meth:`reset` below). Imports
+nothing from Hermes.
+
+**Why one JSON blob, not typed columns (settled, HLA §4.1/D7 v0.7).** ``State``
+is persisted as a single JSON blob in the ``runtime_state`` singleton row
+(``id=1``), not typed-per-field columns: ``State`` already owns
+``to_dict()``/``from_dict()`` with its own validation, and it is still
+actively reshaping (e.g. lm-fib.6.3 removes ``desire_status``) — typed columns
+would be a migration treadmill for a shape that has not settled. The port
+abstraction (:class:`~lifemodel.state.port.StatePort`) lets a later phase
+promote to typed columns if a real query ever needs them, without touching
+callers.
 
 **Connection-per-operation.** Every public method opens a short-lived
 connection (:meth:`_connect`), sets per-connection PRAGMA (``busy_timeout``,
 ``synchronous=NORMAL``, ``foreign_keys=ON``, ``wal_autocheckpoint``), does its
-work, and closes — mirroring ``json_store``'s "no long-lived handle" posture.
-``journal_mode=WAL`` is a *database-level* property (persisted in the file
-header), so it is set once, in :meth:`_ensure_ready`, not per connection.
-Writes run inside ``with conn:`` so a raised exception rolls back rather than
-leaving a half-applied change.
+work, and closes — the retired ``JsonStateStore``'s "no long-lived handle"
+posture, carried over. ``journal_mode=WAL`` is a *database-level* property
+(persisted in the file header), so it is set once, in :meth:`_ensure_ready`,
+not per connection. Writes run inside ``with conn:`` so a raised exception
+rolls back rather than leaving a half-applied change.
 
 **Recovery runs once, in ``__init__``, before any read/write** — never inside
-:meth:`read_pressure_index` (a corruption check on every pressure read would
-be needless overhead and, worse, could itself raise mid-tick). If the DB file
-exists but fails ``PRAGMA quick_check``, the trio (``lifemodel.sqlite`` +
+:meth:`read_pressure_index` or :meth:`load` (a corruption check on every read
+would be needless overhead and, worse, could itself raise mid-tick). If the DB
+file exists but fails ``PRAGMA quick_check``, the trio (``lifemodel.sqlite`` +
 ``-wal`` + ``-shm``) is quarantined — each existing file renamed to
 ``*.corrupt.<epoch_ms>`` — and construction falls through to a fresh bootstrap.
 This step never raises: a raise here would restart-loop the being (the same
 failure mode ``JsonStateStore``'s corruption handling was designed to avoid,
-generalized to a real database file that cannot simply be temp+replace'd).
+generalized to a real database file that cannot simply be temp+replace'd). A
+readable-but-malformed ``runtime_state`` row (bad JSON, wrong shape, an
+unsupported ``schema_version``) is a *separate*, narrower failure — that is
+:meth:`load`'s job, raising :class:`~lifemodel.state.errors.StateCorruptError`/
+:class:`~lifemodel.state.errors.StateSchemaError` exactly where
+``JsonStateStore.load`` used to.
 
 **Migrations** are tracked in ``schema_migrations`` (integer versions, applied
 in order, each in its own transaction). Before applying a migration to a DB
@@ -34,7 +52,8 @@ must still pass, or the backup is restored and the migration raises
 (a genuine migration-code bug, as opposed to on-disk corruption — the
 *next* construction attempt's recovery step is what would quarantine a
 still-bad file). Migration v1 creates ``store_meta``, ``memory_records``, and
-its two indexes; no destructive migration ever runs silently.
+its two indexes; v2 (lm-fib.6.2) creates the ``runtime_state`` singleton row
+table backing ``StatePort``. No destructive migration ever runs silently.
 
 **STRICT tables** are used when the host's SQLite build supports them
 (feature-detected once, at construction, via a throwaway ``:memory:`` table);
@@ -56,7 +75,7 @@ from collections.abc import Callable
 from contextlib import closing, suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from ..domain.memory import (
     JsonObject,
@@ -76,6 +95,8 @@ from ..domain.memory import (
 from ..log import EventLogger, get_logger
 from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
+from .errors import StateCorruptError, StateSchemaError, StateSerializationError
+from .model import SCHEMA_VERSION, State
 
 _DB_FILENAME = "lifemodel.sqlite"
 _BUSY_TIMEOUT_MS = 5_000
@@ -107,7 +128,8 @@ class MigrationFailed(Exception):
 
 
 class SQLiteRuntimeStore:
-    """A :class:`MemoryPort` + :class:`PressureSensorPort` over one SQLite file (HLA §4.1/D7)."""
+    """A :class:`StatePort` + :class:`MemoryPort` + :class:`PressureSensorPort` over one
+    SQLite file (HLA §4.1/D7)."""
 
     def __init__(
         self, base_dir: Path, *, clock: ClockPort, logger: EventLogger | None = None
@@ -259,57 +281,46 @@ class SQLiteRuntimeStore:
         now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
         now_epoch = epoch_ms(now)
 
+        # One atomic UPSERT — NOT a SELECT-then-INSERT/UPDATE. Two writers over
+        # the same file (the 60s tick + a separate-process command) could both
+        # read "no row" and both INSERT (a PRIMARY KEY IntegrityError), or read
+        # the same revision and each write revision+1 (an undercount). ON
+        # CONFLICT collapses that to last-writer-wins with an atomic bump.
+        # ``created_at``/``created_at_epoch`` appear ONLY in the INSERT VALUES,
+        # never in DO UPDATE SET, so an update preserves the original creation
+        # stamp (the pre-existing contract); ``revision`` bumps off the row's
+        # own stored value, so concurrent updates cannot undercount it.
         with closing(self._connect()) as conn, conn:
-            existing = conn.execute(
-                "SELECT created_at, revision FROM memory_records WHERE kind = ? AND id = ?",
-                (draft.kind, draft.id),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
-                    "INSERT INTO memory_records ("
-                    "kind, id, state, recipient_id, payload_json, salience, confidence, "
-                    "expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
-                    "updated_at, updated_at_epoch, revision, schema_version) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1)",
-                    (
-                        draft.kind,
-                        draft.id,
-                        draft.state,
-                        draft.recipient_id,
-                        payload_json,
-                        draft.salience,
-                        draft.confidence,
-                        draft.expires_at,
-                        expires_at_epoch,
-                        draft.source,
-                        now_iso,
-                        now_epoch,
-                        now_iso,
-                        now_epoch,
-                    ),
-                )
-            else:
-                _created_at, revision = existing
-                conn.execute(
-                    "UPDATE memory_records SET state=?, recipient_id=?, payload_json=?, "
-                    "salience=?, confidence=?, expires_at=?, expires_at_epoch=?, source=?, "
-                    "updated_at=?, updated_at_epoch=?, revision=? WHERE kind=? AND id=?",
-                    (
-                        draft.state,
-                        draft.recipient_id,
-                        payload_json,
-                        draft.salience,
-                        draft.confidence,
-                        draft.expires_at,
-                        expires_at_epoch,
-                        draft.source,
-                        now_iso,
-                        now_epoch,
-                        revision + 1,
-                        draft.kind,
-                        draft.id,
-                    ),
-                )
+            conn.execute(
+                "INSERT INTO memory_records ("
+                "kind, id, state, recipient_id, payload_json, salience, confidence, "
+                "expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
+                "updated_at, updated_at_epoch, revision, schema_version) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1) "
+                "ON CONFLICT(kind, id) DO UPDATE SET "
+                "state=excluded.state, recipient_id=excluded.recipient_id, "
+                "payload_json=excluded.payload_json, salience=excluded.salience, "
+                "confidence=excluded.confidence, expires_at=excluded.expires_at, "
+                "expires_at_epoch=excluded.expires_at_epoch, source=excluded.source, "
+                "updated_at=excluded.updated_at, updated_at_epoch=excluded.updated_at_epoch, "
+                "revision=memory_records.revision + 1",
+                (
+                    draft.kind,
+                    draft.id,
+                    draft.state,
+                    draft.recipient_id,
+                    payload_json,
+                    draft.salience,
+                    draft.confidence,
+                    draft.expires_at,
+                    expires_at_epoch,
+                    draft.source,
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
         return draft.id
 
     def get(self, kind: str, id: str) -> MemoryRecord | None:
@@ -418,6 +429,116 @@ class SQLiteRuntimeStore:
         if record is None:  # pragma: no cover - defensive: we just wrote this row
             raise StaleTransition(f"record kind={kind!r} id={id!r} vanished during transition")
         return record
+
+    # ---- StatePort (lm-fib.6.2) -------------------------------------------
+
+    def load(self) -> State:
+        """Return the persisted ``State``, or a default when no row exists yet.
+
+        No ``runtime_state`` row (a fresh DB, or one that has never been
+        committed to) is not an error — it means "first run", so this returns
+        a documented default :class:`~lifemodel.state.model.State`, mirroring
+        ``JsonStateStore.load``'s "missing file -> default" behavior. Once a
+        row exists, this reuses ``State``'s own validation
+        (:meth:`~lifemodel.state.model.State.from_dict`): a bad blob raises
+        :class:`~lifemodel.state.errors.StateCorruptError`, an unsupported
+        ``schema_version`` raises :class:`~lifemodel.state.errors.StateSchemaError`
+        — the exact typed-error contract ``JsonStateStore.load`` used to honor.
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
+        if row is None:
+            return State()
+
+        state_json = row[0]
+        try:
+            data: Any = json.loads(state_json)
+        except json.JSONDecodeError as exc:
+            raise StateCorruptError(f"runtime_state.state_json is not valid JSON: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise StateCorruptError(
+                f"runtime_state.state_json must contain a JSON object, got {type(data).__name__}"
+            )
+
+        # Gate the schema *before* interpreting any fields, exactly as
+        # JsonStateStore did — a newer/unknown version may reuse field names
+        # with different meanings, so the body must not be trusted yet.
+        # Migrations/back-compat for the State *shape itself* remain Phase 7
+        # (HLA §9 / FR16); this bead only migrates the SQLite *table* schema.
+        version = data.get("schema_version")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise StateCorruptError(
+                "runtime_state.state_json is missing a valid integer 'schema_version'"
+            )
+        if version != SCHEMA_VERSION:
+            raise StateSchemaError(
+                f"runtime_state schema_version={version} is not supported by this build "
+                f"(expects {SCHEMA_VERSION}); state migration is Phase 7."
+            )
+
+        return State.from_dict(data)
+
+    def commit(self, state: State) -> None:
+        """UPSERT *state* into the ``runtime_state`` singleton row (``id=1``).
+
+        Fail-closed like ``JsonStateStore.commit``: the payload is serialized
+        with ``allow_nan=False`` *before* the database is touched, so a
+        non-finite float raises :class:`~lifemodel.state.errors.StateSerializationError`
+        with nothing written. ``updated_at``/``updated_at_epoch`` are stamped
+        from the injected clock (canonical UTC via
+        :func:`~lifemodel.domain.memory.stamp_iso_utc`, which rejects a naive
+        clock) and ``revision`` is bumped on every commit past the first.
+
+        One atomic UPSERT — NOT a SELECT-then-INSERT/UPDATE. The 60s tick and a
+        separate-process ``/lifemodel`` command are two writers over the same
+        file; a read-then-write would let both see "no row" and both INSERT
+        (a PRIMARY KEY IntegrityError, worse than the old last-writer-wins
+        rename), or read the same revision and each write revision+1 (an
+        undercount). ON CONFLICT collapses that to atomic last-writer-wins with
+        the bump computed off the row's own stored value.
+        """
+        try:
+            payload = json.dumps(state.to_dict(), allow_nan=False)
+        except ValueError as exc:
+            # Out-of-range float (NaN/Infinity): refuse to persist poison,
+            # before the row is ever touched.
+            raise StateSerializationError(
+                f"refusing to persist a State that is not valid JSON: {exc}"
+            ) from exc
+
+        now = self._clock.now()
+        now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
+        now_epoch = epoch_ms(now)
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO runtime_state "
+                "(id, state_json, updated_at, updated_at_epoch, revision) "
+                "VALUES (1, ?, ?, ?, 0) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "state_json=excluded.state_json, updated_at=excluded.updated_at, "
+                "updated_at_epoch=excluded.updated_at_epoch, "
+                "revision=runtime_state.revision + 1",
+                (payload, now_iso, now_epoch),
+            )
+        self._log.info("state_commit", schema_version=state.schema_version)
+
+    def reset(self) -> State:
+        """Factory-wipe the ``runtime_state`` row to a fresh ``State()``.
+
+        Deliberately does **not** call :meth:`load` first — the whole point is
+        that a reset must succeed even when the existing row is unreadable
+        (garbage ``state_json``, an unsupported ``schema_version``, or no row
+        at all). Construction (:meth:`_ensure_ready`) already ran recovery, so
+        the *database* itself is structurally sound by the time this runs;
+        this only ever needs to overwrite the row's payload, which
+        :meth:`commit` already does safely (and a fresh ``State()`` always
+        serializes, so this never raises :class:`~lifemodel.state.errors.StateSerializationError`
+        in practice).
+        """
+        fresh = State()
+        self.commit(fresh)
+        return fresh
 
     # ---- PressureSensorPort ---------------------------------------------------
 
@@ -549,6 +670,26 @@ def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
     )
 
 
+def _migrate_v2(conn: sqlite3.Connection, strict: bool) -> None:
+    """Create the ``runtime_state`` singleton row table (``StatePort`` cutover,
+    lm-fib.6.2, HLA §4.1/D7 v0.7 — settled: one JSON blob, not typed columns).
+
+    ``id`` is ``CHECK``'d to always equal 1, so the table can only ever hold
+    the being's one ``State`` row — an INSERT with any other id fails loud at
+    the database layer rather than silently accumulating extra rows.
+    """
+    strict_kw = " STRICT" if strict else ""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS runtime_state ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "state_json TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL, "
+        "updated_at_epoch INTEGER NOT NULL, "
+        "revision INTEGER NOT NULL DEFAULT 0)" + strict_kw
+    )
+
+
 _MIGRATIONS: Final[list[tuple[int, Callable[[sqlite3.Connection, bool], None]]]] = [
     (1, _migrate_v1),
+    (2, _migrate_v2),
 ]

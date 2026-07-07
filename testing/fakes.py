@@ -102,6 +102,12 @@ class FakeStateStore:
     def commit(self, state: State) -> None:
         self._state = copy.deepcopy(state)
 
+    def reset(self) -> State:
+        """Factory-wipe to a fresh ``State()`` — never requires a prior
+        successful :meth:`load`, matching :class:`~lifemodel.state.port.StatePort`."""
+        self._state = State()
+        return copy.deepcopy(self._state)
+
 
 class FakeSignalBus(SignalBus):
     """An in-memory :class:`SignalBus` with the same dedup contract (HLA §10).

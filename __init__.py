@@ -35,9 +35,10 @@ __version__ = "0.0.0"
 
 class _Subcommand(NamedTuple):
     """One ``_SUBCOMMANDS`` entry: its help text, plus whether it WRITES to
-    ``state.json`` (owner-facing mutation, via the atomic store) or is
-    read-only. ``help``/the bare view render ``[mutating]`` for the former so
-    the owner never confuses a status peek with a state change."""
+    the being's persisted state (owner-facing mutation, via the ``StatePort``
+    store) or is read-only. ``help``/the bare view render ``[mutating]`` for
+    the former so the owner never confuses a status peek with a state
+    change."""
 
     description: str
     mutating: bool = False
@@ -134,10 +135,11 @@ def register(ctx: Any) -> None:
             return render_dump_for_dir(sdir)
         if sub == "help":
             return _command_list() + "\n"
-        # --- mutating subcommands: all go through the SAME atomic
-        # JsonStateStore the adapter loop uses (via the composition root),
-        # never a hand-edited file and never a synchronous tick — see
-        # lifemodel.state_commands for the gate-satisfaction rationale.
+        # --- mutating subcommands: all go through the SAME StatePort store
+        # (SQLiteRuntimeStore, lm-fib.6.2) the adapter loop uses (via the
+        # composition root), never a hand-edited file and never a synchronous
+        # tick — see lifemodel.state_commands for the gate-satisfaction
+        # rationale.
         if sub == "nudge":
             return nudge_for_dir(sdir, rest, logger=logger)
         if sub == "force-wake":

@@ -34,6 +34,11 @@ class RecordingStore:
         self._state = state
         self.commits.append(state)
 
+    def reset(self) -> State:
+        self._state = State()
+        self.commits.append(self._state)
+        return self._state
+
 
 class Healthy:
     id = "healthy"

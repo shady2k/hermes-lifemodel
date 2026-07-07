@@ -1,18 +1,21 @@
 # tests/test_debug.py
 from __future__ import annotations
 
+import sqlite3
 import sys
 import types
+from contextlib import closing
 from datetime import timedelta, timezone
 
 from lifemodel import debug as debug_mod
+from lifemodel.adapters.clock import SystemClock
 from lifemodel.debug import render_dump_for_dir
-from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 
 
 def test_dump_renders_the_sections(tmp_path) -> None:
-    JsonStateStore(tmp_path).commit(
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
     out = render_dump_for_dir(tmp_path)
@@ -24,7 +27,7 @@ def test_dump_renders_the_sections(tmp_path) -> None:
 def test_dump_puts_one_metric_per_line(tmp_path) -> None:
     # Owner complaint #1: several metrics used to be crammed onto one line.
     # Every metric now gets its own "label: value" line.
-    JsonStateStore(tmp_path).commit(
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
     out = render_dump_for_dir(tmp_path)
@@ -53,7 +56,7 @@ def test_dump_has_no_column_alignment_padding(tmp_path) -> None:
     # ragged in Telegram's proportional font. Match Hermes' native /status
     # style instead: plain "**label:** value", a single space after the bold
     # colon, no leading indent, no padding run lining anything up.
-    JsonStateStore(tmp_path).commit(
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
     out = render_dump_for_dir(tmp_path)
@@ -76,7 +79,7 @@ def test_dump_timestamps_render_in_the_hermes_local_timezone(monkeypatch, tmp_pa
     # non-UTC offset via the single conversion helper and confirm every
     # rendered timestamp uses it — trimmed to whole seconds, not raw UTC.
     monkeypatch.setattr(debug_mod, "_resolve_tz", lambda: timezone(timedelta(hours=3)))
-    JsonStateStore(tmp_path).commit(
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
         State(
             last_contact_at="2026-07-07T07:40:42.297762+00:00",
             last_tick_at="2026-07-06T00:00:00+00:00",
@@ -93,7 +96,9 @@ def test_dump_title_matches_hermes_status_style(tmp_path) -> None:
     # Match Hermes' own /status command: an emoji title line, no fenced code
     # block, no "====" divider — just plain lines in the native proportional
     # font (see the owner-cited /status sample in the bead).
-    JsonStateStore(tmp_path).commit(State(last_tick_at="2026-07-06T00:00:00+00:00"))
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
+        State(last_tick_at="2026-07-06T00:00:00+00:00")
+    )
     out = render_dump_for_dir(tmp_path)
     assert out.startswith("🫀 **lifemodel debug** (read-only)")
     assert "```" not in out
@@ -106,7 +111,7 @@ def test_dump_labels_and_title_are_bold_like_hermes_status(tmp_path) -> None:
     # converts to MarkdownV2 (see locales/en.yaml's "**Session ID:** `{...}`"
     # and "**Agent Running:** {state}"). Title, section headers, and every
     # metric label (colon included) are bold; values stay plain.
-    JsonStateStore(tmp_path).commit(
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
     out = render_dump_for_dir(tmp_path)
@@ -121,7 +126,7 @@ def test_dump_effective_hint_has_no_lone_asterisk(tmp_path) -> None:
     # mistaken for a markdown bold/italic marker by the markdown->MarkdownV2
     # conversion. It must be replaced with an unambiguous multiplication
     # glyph so no stray "*" survives outside the bold-label markers.
-    JsonStateStore(tmp_path).commit(
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
         State(u=2.0, energy=0.6, fatigue=0.2, last_tick_at="2026-07-06T00:00:00+00:00")
     )
     out = render_dump_for_dir(tmp_path)
@@ -159,7 +164,9 @@ def test_resolve_tz_degrades_to_none_on_any_hermes_failure(monkeypatch) -> None:
 
 def test_health_shows_brain_liveness_and_drops_service_alive(tmp_path) -> None:
     # last_tick far in the past (relative to real now) -> brain reads STALE
-    JsonStateStore(tmp_path).commit(State(last_tick_at="2026-07-06T00:00:00+00:00"))
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
+        State(last_tick_at="2026-07-06T00:00:00+00:00")
+    )
     out = render_dump_for_dir(tmp_path)
     assert "HEALTH" in out
     assert "brain" in out.lower()
@@ -168,7 +175,17 @@ def test_health_shows_brain_liveness_and_drops_service_alive(tmp_path) -> None:
 
 
 def test_dump_survives_a_corrupt_store(tmp_path) -> None:
-    (tmp_path / "state.json").write_text("{ not json", encoding="utf-8")
+    # Construct the store first (creates + migrates lifemodel.sqlite), then
+    # plant an unparseable state_json directly -- the DB *file* stays healthy
+    # (so construction's own recovery/quarantine never kicks in); only the
+    # runtime_state row's payload is garbage, which is load()'s job to catch.
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    with closing(sqlite3.connect(str(tmp_path / "lifemodel.sqlite"))) as conn, conn:
+        conn.execute(
+            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
+            "VALUES (1, ?, ?, 0, 0)",
+            ("{ not json", "2026-07-06T00:00:00+00:00"),
+        )
     out = render_dump_for_dir(tmp_path)
     assert "unreadable" in out.lower()  # graceful banner, no crash
     # Same bold title treatment as the healthy-store path, for consistency.

@@ -163,7 +163,7 @@ def ensure_json_serializable(payload: JsonObject) -> None:
     """Raise :class:`MemorySerializationError` if *payload* is not valid JSON.
 
     Shared by every ``MemoryPort`` implementation so the fail-before-write
-    guard (mirrors :meth:`~lifemodel.state.json_store.JsonStateStore.commit`)
+    guard (mirrors :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.commit`)
     is identical everywhere: called *before* a draft/patch touches any backing
     storage. ``allow_nan=False`` also rejects the non-finite-float poison
     ``json.loads`` would otherwise have accepted on the way in.

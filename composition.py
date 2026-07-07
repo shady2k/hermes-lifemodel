@@ -15,8 +15,10 @@ Two call sites this must serve (roadmap 0.4):
 * the cron ``--script`` entrypoint (task 1.1) — wires it from a ``base_dir`` and
   takes the Hermes-free defaults below.
 
-For Phase 0.4 the defaults are the concrete :class:`SystemClock`,
-:class:`JsonStateStore`, and durable :class:`FileSignalBus`, with a
+The defaults are the concrete :class:`SystemClock`,
+:class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` (the ``StatePort``
+adapter since lm-fib.6.2 — it replaced the retired ``JsonStateStore``/
+``state.json``), and durable :class:`FileSignalBus`, with a
 :class:`NoopDelivery` stub for the ``DeliveryPort``. Note the *proactive* outbound
 does **not** go through this port: the supervised platform adapter's tick
 (:mod:`lifemodel.adapters.being_platform` → :func:`lifemodel.core.proactive.proactive_tick`)
@@ -67,8 +69,8 @@ from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
 from .sim.wake import GateParams
-from .state.json_store import JsonStateStore
 from .state.port import StatePort
+from .state.sqlite_store import SQLiteRuntimeStore
 
 CONTACT_ALPHA = 1.0 / 240.0
 CONTACT_BETA = 1.0
@@ -135,9 +137,11 @@ def build_lifemodel(
     this seam). ``None`` means "take the default"; passing an explicit value —
     including an empty ``()`` — overrides it, so callers keep full control.
     """
-    resolved_state: StatePort = state or JsonStateStore(base_dir, logger=logger)
-    resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_clock: ClockPort = clock or SystemClock()
+    resolved_state: StatePort = state or SQLiteRuntimeStore(
+        base_dir, clock=resolved_clock, logger=logger
+    )
+    resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)

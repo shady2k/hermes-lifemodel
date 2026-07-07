@@ -30,7 +30,7 @@ from .errors import StateCorruptError
 #: Current on-disk state schema. Bump this when the persisted shape changes in a
 #: way old readers cannot understand. Reading a *different* version is a Phase-7
 #: concern (migrations / back-compat, HLA §9 / FR16); this build fails loud on
-#: any mismatch (see :meth:`JsonStateStore.load`).
+#: any mismatch (see :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.load`).
 SCHEMA_VERSION = 1
 
 

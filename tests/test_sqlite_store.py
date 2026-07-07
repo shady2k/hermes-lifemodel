@@ -1,12 +1,14 @@
-"""SQLite-only tests for :class:`SQLiteRuntimeStore` (lm-fib.6.1, HLA §4.1/D7).
+"""SQLite-only tests for :class:`SQLiteRuntimeStore` (lm-fib.6.1/6.2, HLA §4.1/D7).
 
 Contract behavior shared with the fake lives in ``test_memory_contract.py``;
 this file covers what only a real database file can exercise: corruption
-recovery, migrations, epoch/PRAGMA storage details, and fail-soft.
+recovery, migrations, epoch/PRAGMA storage details, fail-soft, and — since
+lm-fib.6.2 — the ``StatePort`` cutover (``runtime_state``, the v2 migration).
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -17,6 +19,9 @@ from structlog.testing import capture_logs
 
 import lifemodel.state.sqlite_store as sqlite_store_module
 from lifemodel.domain.memory import MemoryDraft, PressureIndex
+from lifemodel.state.errors import StateCorruptError, StateSchemaError, StateSerializationError
+from lifemodel.state.model import SCHEMA_VERSION, State
+from lifemodel.state.port import StatePort
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
 
@@ -120,7 +125,7 @@ def test_fresh_db_gets_a_schema_migrations_row(tmp_path: Path) -> None:
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert rows == [(1,)]
+    assert rows == [(1,), (2,)]
 
 
 def test_constructing_twice_is_idempotent(tmp_path: Path) -> None:
@@ -130,23 +135,192 @@ def test_constructing_twice_is_idempotent(tmp_path: Path) -> None:
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert rows == [(1,)]
+    assert rows == [(1,), (2,)]
     # a brand-new DB has nothing to back up, and the second construction found
     # no pending migrations either, so no backup file is ever created.
     assert list(tmp_path.glob("*.bak.*")) == []
+
+
+def test_v1_db_upgrades_to_v2_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Simulate a pre-6.2 DB that only ever applied v1 (lm-fib.6.1), then reopen
+    # with the real migration set — v2 must apply cleanly on top of existing data.
+    clock = FakeClock(BASE_TIME)
+    monkeypatch.setattr(sqlite_store_module, "_MIGRATIONS", [sqlite_store_module._MIGRATIONS[0]])
+    SQLiteRuntimeStore(tmp_path, clock=clock).put(_draft())  # a v1-only DB with data
+
+    monkeypatch.undo()  # restore the real (v1+v2) migration set
+    upgraded = SQLiteRuntimeStore(tmp_path, clock=clock)
+
+    with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
+        rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert rows == [(1,), (2,)]
+    assert "runtime_state" in tables
+    assert upgraded.get("desire", "d1") is not None  # pre-existing v1 data survived
+    assert len(list(tmp_path.glob(f"{DB_FILENAME}.bak.*"))) == 1  # backup taken before the upgrade
+
+
+# ---- StatePort over SQLite (lm-fib.6.2) -------------------------------------
+
+
+def test_sqlite_store_satisfies_the_state_port(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    assert isinstance(store, StatePort)
+
+
+def test_load_missing_row_returns_default_state(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    assert store.load() == State()
+
+
+def test_commit_then_load_round_trips_full_fidelity(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    state = State(
+        tick_count=5,
+        u=2.75,
+        energy=0.5,
+        fatigue=0.3,
+        duration_over_theta=4.0,
+        last_exchange_at="2026-07-03T12:00:00+00:00",
+        desire_status="active",
+        declined_at="2026-07-02T00:00:00+00:00",
+        decline_count=2,
+        pending_proactive_id="corr-1",
+        pending_proactive_since="2026-07-03T11:00:00+00:00",
+        last_tick_at="2026-07-03T12:30:00+00:00",
+        last_contact_at="2026-07-03T11:30:00+00:00",
+        action_pending_since="2026-07-03T11:45:00+00:00",
+        proactive_send_log=["2026-07-01T00:00:00+00:00", "2026-07-02T00:00:00+00:00"],
+    )
+    store.commit(state)
+    assert store.load() == state
+
+
+def test_commit_upserts_the_singleton_row_and_bumps_revision(tmp_path: Path) -> None:
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit(State(u=1.0))
+    store.commit(State(u=2.0))
+
+    with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
+        rows = conn.execute("SELECT id, revision FROM runtime_state").fetchall()
+    assert rows == [(1, 1)]  # one singleton row, revision bumped on the 2nd commit
+
+
+def test_commit_rejects_non_finite_float_before_writing(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    with pytest.raises(StateSerializationError):
+        store.commit(State(u=float("nan")))
+
+    with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
+        rows = conn.execute("SELECT * FROM runtime_state").fetchall()
+    assert rows == []  # nothing written
+    assert store.load() == State()  # still the default
+
+
+def test_load_rejects_newer_schema_version(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, json.dumps({"schema_version": SCHEMA_VERSION + 1, "u": 0.0}))
+    with pytest.raises(StateSchemaError):
+        store.load()
+
+
+def test_load_rejects_unknown_older_schema_version(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, json.dumps({"schema_version": 0, "u": 0.0}))
+    with pytest.raises(StateSchemaError):
+        store.load()
+
+
+def test_load_raises_corrupt_on_unparseable_json(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, "{ not json")
+    with pytest.raises(StateCorruptError):
+        store.load()
+
+
+def test_load_raises_corrupt_on_non_object_json(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, "[1, 2, 3]")
+    with pytest.raises(StateCorruptError):
+        store.load()
+
+
+def test_load_raises_corrupt_on_missing_schema_version(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, json.dumps({"u": 0.0}))
+    with pytest.raises(StateCorruptError):
+        store.load()
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_load_rejects_non_finite_tokens(tmp_path: Path, token: str) -> None:
+    # json.loads accepts these non-standard tokens by default; the store must
+    # reject the resulting non-finite floats as corrupt (mirrors JsonStateStore).
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, f'{{"schema_version": {SCHEMA_VERSION}, "u": {token}}}')
+    with pytest.raises(StateCorruptError):
+        store.load()
+
+
+def test_reset_overwrites_and_returns_a_fresh_state(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.commit(State(tick_count=7, u=3.0, desire_status="active"))
+
+    fresh = store.reset()
+
+    assert fresh == State()
+    assert store.load() == State()
+
+
+def test_reset_works_with_no_row_present(tmp_path: Path) -> None:
+    # No prior commit at all -- reset must not require a successful load() first.
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    fresh = store.reset()
+    assert fresh == State()
+    assert store.load() == State()
+
+
+def test_reset_works_when_the_existing_row_is_unreadable_garbage(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(tmp_path, "{ not json at all")
+    with pytest.raises(StateCorruptError):
+        store.load()  # sanity: the row really is unreadable beforehand
+
+    fresh = store.reset()
+
+    assert fresh == State()
+    assert store.load() == State()  # reset replaced the garbage row cleanly
+
+
+def _write_raw_state_json(base_dir: Path, raw: str) -> None:
+    """Directly UPSERT ``raw`` into the ``runtime_state`` singleton row.
+
+    Bypasses :meth:`SQLiteRuntimeStore.commit` (which would refuse malformed
+    payloads) so tests can plant an already-corrupt row, mirroring how
+    ``tests/test_state_store.py`` used to hand-write a bad ``state.json``.
+    """
+    with closing(sqlite3.connect(str(base_dir / DB_FILENAME))) as conn, conn:
+        conn.execute("DELETE FROM runtime_state WHERE id = 1")
+        conn.execute(
+            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
+            "VALUES (1, ?, ?, ?, 0)",
+            (raw, BASE_TIME.isoformat(), int(BASE_TIME.timestamp() * 1000)),
+        )
 
 
 def test_migration_failure_restores_backup_and_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = FakeClock(BASE_TIME)
-    SQLiteRuntimeStore(tmp_path, clock=clock).put(_draft())  # seed a healthy v1 DB
+    # seed a healthy v1+v2 DB (both real migrations, incl. runtime_state, lm-fib.6.2)
+    SQLiteRuntimeStore(tmp_path, clock=clock).put(_draft())
 
-    def _v2(conn: sqlite3.Connection, _strict: bool) -> None:
-        conn.execute("CREATE TABLE v2_marker (x INTEGER)")
+    def _v3(conn: sqlite3.Connection, _strict: bool) -> None:
+        conn.execute("CREATE TABLE v3_marker (x INTEGER)")
 
     monkeypatch.setattr(
-        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (2, _v2)]
+        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (3, _v3)]
     )
 
     real_quick_check_ok = SQLiteRuntimeStore._quick_check_ok
@@ -154,7 +328,7 @@ def test_migration_failure_restores_backup_and_raises(
 
     def fake_quick_check_ok(self: SQLiteRuntimeStore, path: Path) -> bool:
         calls["n"] += 1
-        if calls["n"] == 2:  # the check right after applying the (fake) v2 migration
+        if calls["n"] == 2:  # the check right after applying the (fake) v3 migration
             return False
         return real_quick_check_ok(self, path)
 
@@ -168,11 +342,11 @@ def test_migration_failure_restores_backup_and_raises(
     monkeypatch.undo()  # restore the real _quick_check_ok / _MIGRATIONS for the reopen below
     recovered = SQLiteRuntimeStore(tmp_path, clock=clock)
     record = recovered.get("desire", "d1")
-    assert record is not None  # pre-v2 data survived the restore
+    assert record is not None  # pre-v3 data survived the restore
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert rows == [(1,)]  # the failed v2 migration was rolled back by the restore
+    assert rows == [(1,), (2,)]  # the failed v3 migration was rolled back by the restore
 
 
 def test_migration_that_raises_restores_backup_and_propagates(
@@ -182,17 +356,18 @@ def test_migration_that_raises_restores_backup_and_propagates(
     # advanced. Python's sqlite3 auto-commits DDL, so the CREATE below is NOT
     # rolled back by the transaction — only the backup restore reverts it.
     clock = FakeClock(BASE_TIME)
-    SQLiteRuntimeStore(tmp_path, clock=clock).put(_draft())  # seed a healthy v1 DB
+    # seed a healthy v1+v2 DB (both real migrations, incl. runtime_state, lm-fib.6.2)
+    SQLiteRuntimeStore(tmp_path, clock=clock).put(_draft())
 
     class _MigrationBug(Exception):
         pass
 
-    def _v2(conn: sqlite3.Connection, _strict: bool) -> None:
+    def _v3(conn: sqlite3.Connection, _strict: bool) -> None:
         conn.execute("CREATE TABLE half_applied (x INTEGER)")  # auto-commits
         raise _MigrationBug("bug in migration code")
 
     monkeypatch.setattr(
-        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (2, _v2)]
+        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (3, _v3)]
     )
 
     with pytest.raises(_MigrationBug):
@@ -202,13 +377,13 @@ def test_migration_that_raises_restores_backup_and_propagates(
 
     monkeypatch.undo()
     recovered = SQLiteRuntimeStore(tmp_path, clock=clock)
-    assert recovered.get("desire", "d1") is not None  # pre-v2 data survived
+    assert recovered.get("desire", "d1") is not None  # pre-v3 data survived
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
     assert "half_applied" not in tables  # the restore reverted the auto-committed DDL
-    assert rows == [(1,)]
+    assert rows == [(1,), (2,)]
 
 
 def test_migration_creates_expected_tables_and_indexes(tmp_path: Path) -> None:
@@ -223,8 +398,7 @@ def test_migration_creates_expected_tables_and_indexes(tmp_path: Path) -> None:
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
         }
-    assert {"store_meta", "schema_migrations", "memory_records"} <= tables
-    assert "runtime_state" not in tables  # out of scope for this bead (6.2)
+    assert {"store_meta", "schema_migrations", "memory_records", "runtime_state"} <= tables
     assert "outbound_ledger" not in tables  # out of scope for this bead (6.4)
     assert any("kind" in name and "state" in name for name in indexes)
     assert any("expires_at_epoch" in name for name in indexes)
@@ -308,6 +482,50 @@ def test_null_expires_at_leaves_epoch_column_null(tmp_path: Path) -> None:
             "SELECT expires_at, expires_at_epoch FROM memory_records WHERE id = 'd1'"
         ).fetchone()
     assert row == (None, None)
+
+
+# ---- atomic UPSERT / concurrent writers (ON CONFLICT) -----------------------
+
+
+def test_put_upsert_is_atomic_across_two_store_instances(tmp_path: Path) -> None:
+    # Two SQLiteRuntimeStore handles over the SAME file — a stand-in for the
+    # 60s tick and a separate-process /lifemodel command. Both put() the same
+    # FRESH key with NO preceding get(): a SELECT-then-INSERT/UPDATE would raise
+    # a PRIMARY KEY IntegrityError on the second insert (or undercount revision);
+    # the ON CONFLICT UPSERT must instead land last-writer-wins, bump revision,
+    # and preserve the ORIGINAL created_at.
+    clock = FakeClock(BASE_TIME)
+    store_a = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store_b = SQLiteRuntimeStore(tmp_path, clock=clock)
+
+    store_a.put(_draft(payload={"note": "from-a"}))  # fresh insert
+    created_stamp = clock.now().isoformat()
+    clock.advance(timedelta(minutes=5))
+    store_b.put(_draft(payload={"note": "from-b"}))  # conflict path, no prior read
+
+    record = store_b.get("desire", "d1")
+    assert record is not None
+    assert record.payload == {"note": "from-b"}  # last writer wins
+    assert record.revision == 1  # bumped atomically, not undercounted
+    assert record.created_at == created_stamp  # original creation stamp preserved
+    assert record.updated_at == clock.now().isoformat()  # refreshed on update
+
+
+def test_commit_upsert_is_atomic_across_two_store_instances(tmp_path: Path) -> None:
+    # Same guarantee for the runtime_state singleton row: two handles both
+    # commit() a State with NO preceding load(). No IntegrityError, and the
+    # revision reflects the second (conflicting) write.
+    clock = FakeClock(BASE_TIME)
+    store_a = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store_b = SQLiteRuntimeStore(tmp_path, clock=clock)
+
+    store_a.commit(State(u=1.0))  # fresh insert
+    store_b.commit(State(u=2.0))  # conflict path, no prior load
+
+    assert store_b.load().u == 2.0  # last writer wins
+    with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
+        rows = conn.execute("SELECT id, revision FROM runtime_state").fetchall()
+    assert rows == [(1, 1)]  # one singleton row, revision bumped atomically
 
 
 # ---- fail-soft --------------------------------------------------------------

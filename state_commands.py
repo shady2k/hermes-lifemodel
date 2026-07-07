@@ -1,12 +1,13 @@
 """Owner-facing MUTATING ``/lifemodel`` subcommands (bead lm-2vx).
 
-Today, to force the being to wake for testing, the owner hand-edits
-``state.json`` directly — fragile, and it races the live 60s ``BeingAdapter``
-tick (the loop reads the file, mutates, and commits over a hand-edit that lands
-mid-cycle). These subcommands go through the SAME atomic
-:class:`~lifemodel.state.json_store.JsonStateStore` the adapter loop uses (via
-the composition root, exactly as :mod:`lifemodel.debug` does for the read-only
-dump) — no parallel writer, no hand-editing.
+Before this existed, forcing the being to wake for testing meant hand-editing
+the persisted state directly — fragile, and it races the live 60s
+``BeingAdapter`` tick (the loop reads state, mutates, and commits over a
+hand-edit that lands mid-cycle). These subcommands go through the SAME
+:class:`~lifemodel.state.port.StatePort` the adapter loop uses (via the
+composition root, exactly as :mod:`lifemodel.debug` does for the read-only
+dump — backed by :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`
+since lm-fib.6.2) — no parallel writer, no hand-editing.
 
 Each mutation is a small pure function: ``(before: State, now: datetime, ...)
 -> (candidate: State | None, message: str)``. ``None`` means "reject, nothing
@@ -15,7 +16,10 @@ changed fields before -> after. The ``*_for_dir`` wrappers do the
 load/validate/commit against a real profile directory, re-validating every
 candidate through :meth:`State.from_dict` (the model's own type/shape/tz-aware
 timestamp checks) before it is ever persisted — defense in depth, reusing the
-model's validator rather than inventing a second one.
+model's validator rather than inventing a second one. ``reset`` is the one
+exception: it routes through :meth:`~lifemodel.state.port.StatePort.reset`
+directly (see :func:`reset_for_dir`) so a factory wipe still works even when
+the previously-persisted state is unreadable.
 
 A residual logical race with an in-progress tick (loop reads -> command writes
 -> loop commits over it) is accepted here, as directed: this is a debug tool, a
@@ -43,7 +47,7 @@ from . import composition
 from .core.backstop import allow_send
 from .log import EventLogger
 from .sim.aggregation import DesireStatus
-from .state.errors import StateCorruptError
+from .state.errors import StateCorruptError, StateError
 from .state.model import State
 
 #: Margin above theta_u so the effective-pressure gate is cleared, not grazed.
@@ -292,7 +296,24 @@ def satiate_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str
 
 
 def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
-    return _apply(base_dir, reset, logger=logger)
+    """Factory wipe via :meth:`~lifemodel.state.port.StatePort.reset` directly —
+    NOT through :func:`_apply`'s load-mutate-commit flow, because a reset must
+    still work when the previously-persisted state is unreadable (corrupt, or
+    an unsupported schema version). ``before`` is loaded best-effort purely to
+    render the changed-fields echo; failing that read never blocks the reset
+    itself, it only degrades the message to a generic banner.
+    """
+    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    now = lm.clock.now()
+    try:
+        before: State | None = lm.state.load()
+    except StateError:
+        before = None
+    lm.state.reset()
+    if before is None:
+        return "lifemodel reset  (mutating)\n" + "=" * 30 + "\n\n  (previous state unreadable)\n"
+    _, message = reset(before, now)
+    return message
 
 
 def set_field_for_dir(base_dir: Path, raw_args: str, *, logger: EventLogger | None = None) -> str:

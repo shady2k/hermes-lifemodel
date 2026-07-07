@@ -18,7 +18,10 @@ import structlog
 from structlog.testing import capture_logs
 
 import lifemodel
+from lifemodel.adapters.clock import SystemClock
 from lifemodel.events import EVENTS_FILENAME
+from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 
 
 class FakeCtx:
@@ -227,6 +230,14 @@ def test_register_lifemodel_help_command_list_has_no_column_padding(
         assert "  " not in line, line
 
 
+def _committed_state(tmp_path: Path) -> State:
+    """Read back the being's persisted state through a fresh ``StatePort``
+    handle over the same profile-scoped dir ``register(ctx)`` wired — the
+    SQLite equivalent of the old "read state.json back" assertion."""
+    sdir = tmp_path / "workspace" / "lifemodel"
+    return SQLiteRuntimeStore(sdir, clock=SystemClock()).load()
+
+
 def test_register_lifemodel_nudge_subcommand_mutates_state_via_the_store(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -238,8 +249,7 @@ def test_register_lifemodel_nudge_subcommand_mutates_state_via_the_store(
     out = handler("nudge 2.5")
 
     assert "(mutating)" in out
-    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
-    assert json.loads(state_file.read_text())["u"] == 2.5
+    assert _committed_state(tmp_path).u == 2.5
 
 
 def test_register_lifemodel_reset_subcommand_writes_a_fresh_state(
@@ -253,11 +263,10 @@ def test_register_lifemodel_reset_subcommand_writes_a_fresh_state(
     handler("nudge 5")  # dirty the state first
     handler("reset")
 
-    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
-    persisted = json.loads(state_file.read_text())
-    assert persisted["u"] == 0.0
-    assert persisted["tick_count"] == 0
-    assert persisted["proactive_send_log"] == []
+    persisted = _committed_state(tmp_path)
+    assert persisted.u == 0.0
+    assert persisted.tick_count == 0
+    assert persisted.proactive_send_log == []
 
 
 def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
@@ -271,8 +280,11 @@ def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
     out = handler("set tick_count 99")
 
     assert "not writable" in out
-    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
-    assert not state_file.exists()  # rejected before ever touching the store
+    # Rejected before ever committing: unlike JsonStateStore (which never
+    # touched the filesystem until commit), constructing SQLiteRuntimeStore
+    # always creates lifemodel.sqlite (recovery/migration need the file) —
+    # so "untouched" is checked at the State level, not file existence.
+    assert _committed_state(tmp_path) == State()
 
 
 def test_register_tees_plugin_registered_into_events_sink(

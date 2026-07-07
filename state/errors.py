@@ -12,7 +12,7 @@ appropriately (fail loud vs. recover):
   until then this fails loud.
 * :class:`StateSerializationError` — a commit was refused because the in-memory
   ``State`` cannot be serialized to *valid* JSON (e.g. a non-finite float).
-  Raised before anything is written, so the previous good state.json stands.
+  Raised before anything is written, so the previously persisted state stands.
 
 This module imports nothing — it sits at the bottom of the state package so
 both the model and the adapter can depend on it without import cycles.

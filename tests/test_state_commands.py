@@ -6,9 +6,9 @@ Two layers, matching :mod:`lifemodel.debug`'s pure/impure split:
   ``set_field``) are exercised directly with a fixed ``NOW`` — fully
   deterministic, no filesystem;
 * the ``*_for_dir`` wrappers are exercised against a real ``tmp_path`` (real
-  ``JsonStateStore``, real wall clock — mirroring :mod:`tests.test_debug`'s
-  style), proving the wiring persists through the SAME atomic store the
-  adapter loop uses.
+  ``SQLiteRuntimeStore``, real wall clock — mirroring :mod:`tests.test_debug`'s
+  style), proving the wiring persists through the SAME store the adapter loop
+  uses.
 
 ``test_force_wake_wakes_on_the_next_real_tick`` is the load-bearing proof: it
 seeds a state blocked on every wake gate, force-wakes it, then runs one real
@@ -19,8 +19,13 @@ gate satisfaction proven through the real pipeline, not reimplemented here.
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from lifemodel.adapters.clock import SystemClock
 from lifemodel.composition import (
     CONTACT_GRACE_MIN,
     CONTACT_I0,
@@ -33,8 +38,9 @@ from lifemodel.core.pressure import effective_pressure, inhibition_at
 from lifemodel.core.timeutil import minutes_between
 from lifemodel.log import get_logger
 from lifemodel.sim.wake import LaneState, evaluate_wake
-from lifemodel.state.json_store import JsonStateStore
+from lifemodel.state.errors import StateCorruptError
 from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.state_commands import (
     force_wake,
     force_wake_for_dir,
@@ -347,61 +353,86 @@ def test_set_field_writes_fatigue() -> None:
 # --- *_for_dir wrappers (real store, real wall clock) ------------------------
 
 
+def _store(tmp_path) -> SQLiteRuntimeStore:
+    """A real ``StatePort`` over *tmp_path* — the SAME backend ``_apply``'s
+    ``composition.build_lifemodel`` constructs, so seeding/reading through this
+    proves the wiring persists through the real store, not a stand-in."""
+    return SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+
+
 def test_nudge_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    JsonStateStore(tmp_path).commit(State(u=1.0))
+    _store(tmp_path).commit(State(u=1.0))
     message = nudge_for_dir(tmp_path, "2", logger=get_logger("t"))
     assert "u: 1.0 -> 3.0" in message
-    assert JsonStateStore(tmp_path).load().u == 3.0
+    assert _store(tmp_path).load().u == 3.0
 
 
 def test_force_wake_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    JsonStateStore(tmp_path).commit(_blocked_state())
+    _store(tmp_path).commit(_blocked_state())
     message = force_wake_for_dir(tmp_path, logger=get_logger("t"))
     assert "gates satisfied" in message
-    persisted = JsonStateStore(tmp_path).load()
+    persisted = _store(tmp_path).load()
     assert persisted.desire_status == "none"
     assert persisted.u > CONTACT_PARAMS.theta_u
 
 
 def test_satiate_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    JsonStateStore(tmp_path).commit(State(u=5.0, desire_status="active"))
+    _store(tmp_path).commit(State(u=5.0, desire_status="active"))
     satiate_for_dir(tmp_path, logger=get_logger("t"))
-    persisted = JsonStateStore(tmp_path).load()
+    persisted = _store(tmp_path).load()
     assert persisted.u == 0.0
     assert persisted.desire_status == "none"
     assert persisted.last_exchange_at is not None
 
 
 def test_reset_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    JsonStateStore(tmp_path).commit(State(tick_count=7, u=3.0))
+    _store(tmp_path).commit(State(tick_count=7, u=3.0))
     reset_for_dir(tmp_path, logger=get_logger("t"))
-    assert JsonStateStore(tmp_path).load() == State()
+    assert _store(tmp_path).load() == State()
+
+
+def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> None:
+    # A reset must succeed even when the existing persisted state cannot be
+    # read at all — that's the whole point of routing through StatePort.reset()
+    # rather than the load-mutate-commit flow every other *_for_dir uses.
+    store = _store(tmp_path)  # constructs + migrates the DB
+    with closing(sqlite3.connect(str(tmp_path / "lifemodel.sqlite"))) as conn, conn:
+        conn.execute(
+            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
+            "VALUES (1, ?, ?, 0, 0)",
+            ("{ not json", "2026-01-01T00:00:00+00:00"),
+        )
+    with pytest.raises(StateCorruptError):
+        store.load()  # sanity: really unreadable beforehand
+
+    message = reset_for_dir(tmp_path, logger=get_logger("t"))
+
+    assert "previous state unreadable" in message
+    assert store.load() == State()  # reset still landed cleanly
 
 
 def test_set_field_for_dir_persists_through_the_real_store(tmp_path) -> None:
-    JsonStateStore(tmp_path).commit(State(u=0.0))
+    _store(tmp_path).commit(State(u=0.0))
     set_field_for_dir(tmp_path, "u 9.0", logger=get_logger("t"))
-    assert JsonStateStore(tmp_path).load().u == 9.0
+    assert _store(tmp_path).load().u == 9.0
 
 
 def test_set_field_for_dir_rejects_without_writing(tmp_path) -> None:
     original = State(u=1.0)
-    JsonStateStore(tmp_path).commit(original)
+    _store(tmp_path).commit(original)
     message = set_field_for_dir(tmp_path, "tick_count 5", logger=get_logger("t"))
     assert "not writable" in message
-    assert JsonStateStore(tmp_path).load() == original  # untouched
+    assert _store(tmp_path).load() == original  # untouched
 
 
 def test_set_field_for_dir_rejects_naive_timestamp_without_writing(tmp_path) -> None:
     original = State(u=1.0)
-    JsonStateStore(tmp_path).commit(original)
+    _store(tmp_path).commit(original)
     message = set_field_for_dir(
         tmp_path, "last_exchange_at 2026-01-01T00:00:00", logger=get_logger("t")
     )
     assert "error" in message
-    assert (
-        JsonStateStore(tmp_path).load() == original
-    )  # untouched — round-trip validation caught it
+    assert _store(tmp_path).load() == original  # untouched — round-trip validation caught it
 
 
 # --- the load-bearing end-to-end proof ---------------------------------------
@@ -412,7 +443,7 @@ def test_force_wake_wakes_on_the_next_real_tick(tmp_path) -> None:
     code path), then run one real ``CoreLoop.tick()`` on a FRESH ``LifeModel``
     (mirroring the live adapter's "fresh LifeModel per call" contract) and
     confirm the desire actually wakes."""
-    JsonStateStore(tmp_path).commit(_blocked_state())
+    _store(tmp_path).commit(_blocked_state())
 
     message = force_wake_for_dir(tmp_path, logger=get_logger("t"))
     assert "gates satisfied" in message

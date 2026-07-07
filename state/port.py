@@ -2,13 +2,17 @@
 
 The core (neurons, aggregator, cognition) depends only on this Protocol, never
 on a concrete store, so it stays host- and storage-agnostic and tests inject a
-fake. The JSON file adapter (:mod:`lifemodel.state.json_store`) is one
-implementation; a later phase could add another (e.g. SQLite for high-frequency
-signal traces, HLA §4/D3) without touching the core.
+fake (:class:`~lifemodel.testing.fakes.FakeStateStore`). The live adapter is
+:class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` (lm-fib.6.2), which
+persists ``State`` as one JSON blob in a SQLite singleton row — a settled
+design (HLA §4.1/D7 v0.7): ``State`` still owns its own ``to_dict``/``from_dict``
+validation and is actively reshaping, so typed-per-field columns would be a
+migration treadmill. The retired ``JsonStateStore`` (a single ``state.json``
+file) preceded it.
 
-Kept deliberately small: only the two operations Phase 1 needs. Richer ops
-(short-lock snapshot read, conflict-checked commit — HLA §9) arrive with the
-concurrency work in Phase 7.
+Kept deliberately small: only the operations the being's live wiring needs.
+Richer ops (short-lock snapshot read, conflict-checked commit — HLA §9) arrive
+with the concurrency work in Phase 7.
 """
 
 from __future__ import annotations
@@ -28,4 +32,14 @@ class StatePort(Protocol):
 
     def commit(self, state: State) -> None:
         """Atomically persist *state* as the new source of truth."""
+        ...
+
+    def reset(self) -> State:
+        """Factory-wipe the persisted state to a fresh default, returning it.
+
+        Must succeed even when the previously-persisted state is unreadable
+        (corrupt, or from an unsupported schema version) — it does not require
+        a prior successful :meth:`load`. Used by the owner-facing
+        ``/lifemodel reset`` subcommand (:mod:`lifemodel.state_commands`).
+        """
         ...

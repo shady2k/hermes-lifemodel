@@ -2,7 +2,7 @@
 
 Acceptance (roadmap 0.4):
 * the full graph builds from injected fakes with **no Hermes import**;
-* it also builds with the concrete JSON state store + durable bus over a tmp dir;
+* it also builds with the concrete SQLite state store + durable bus over a tmp dir;
 * every collaborator is overridable (so ``register(ctx)`` can inject real Hermes
   adapters and tests can inject fakes).
 """
@@ -26,8 +26,8 @@ from lifemodel.core.registry import ComponentRegistry
 from lifemodel.core.state_actor import StateActor
 from lifemodel.core.taxonomy import exchange_signal
 from lifemodel.domain.signal import Signal
-from lifemodel.state.json_store import JsonStateStore
 from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock, FakeDelivery, FakeSignalBus, FakeStateStore
 
 
@@ -66,10 +66,10 @@ def test_builds_full_graph_from_injected_fakes_without_hermes(tmp_path: Path) ->
     _assert_no_hermes()
 
 
-def test_builds_with_concrete_json_store_over_tmp_dir(tmp_path: Path) -> None:
+def test_builds_with_concrete_sqlite_store_over_tmp_dir(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
 
-    assert isinstance(lm.state, JsonStateStore)
+    assert isinstance(lm.state, SQLiteRuntimeStore)
     assert isinstance(lm.bus, FileSignalBus)
     assert isinstance(lm.clock, SystemClock)
     assert isinstance(lm.delivery, NoopDelivery)
@@ -163,27 +163,19 @@ def test_contact_neuron_is_registered_enabled(tmp_path: Path) -> None:
 
 def test_pipeline_tick_rises_u_and_persists(tmp_path: Path) -> None:
     # Seed last_tick_at 240 min before the clock; one tick should rise u to ~1.0.
-    from lifemodel.state.json_store import JsonStateStore
-    from lifemodel.state.model import State
-
-    store = JsonStateStore(tmp_path)
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
     store.commit(State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00"))
-    lm = build_lifemodel(
-        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
-    )
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     assert abs(store.load().u - 1.0) < 1e-9
 
 
 def test_pipeline_tick_satiates_on_inbound_exchange(tmp_path: Path) -> None:
-    from lifemodel.state.json_store import JsonStateStore
-    from lifemodel.state.model import State
-
-    store = JsonStateStore(tmp_path)
+    clock = _FixedClock(datetime(2026, 7, 6, 0, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
     store.commit(State(u=1.0, last_tick_at="2026-07-06T00:00:00+00:00"))
-    lm = build_lifemodel(
-        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 0, 0, tzinfo=UTC))
-    )
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.bus.publish(exchange_signal(origin_id="e-1", actor="user", label="two_way", timestamp=None))
     lm.coreloop.tick()
     assert store.load().u == 0.0  # satiated by the two_way exchange
@@ -202,28 +194,20 @@ def test_aggregation_registered_after_neuron(tmp_path: Path) -> None:
 
 
 def test_pipeline_rises_then_wakes_desire(tmp_path: Path) -> None:
-    from lifemodel.state.json_store import JsonStateStore
-    from lifemodel.state.model import State
-
-    store = JsonStateStore(tmp_path)
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
     # u already high; 1 min elapsed → neuron keeps it high, aggregation wakes a desire
     store.commit(State(u=3.0, desire_status="none", last_tick_at="2026-07-06T03:59:00+00:00"))
-    lm = build_lifemodel(
-        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
-    )
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     assert store.load().desire_status == "active"
 
 
 def test_pipeline_exchange_satiates_and_clears(tmp_path: Path) -> None:
-    from lifemodel.state.json_store import JsonStateStore
-    from lifemodel.state.model import State
-
-    store = JsonStateStore(tmp_path)
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
     store.commit(State(u=3.0, desire_status="active", last_tick_at="2026-07-06T03:59:00+00:00"))
-    lm = build_lifemodel(
-        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
-    )
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.bus.publish(exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None))
     lm.coreloop.tick()
     final = store.load()
@@ -237,10 +221,8 @@ def test_pipeline_exchange_satiates_and_clears(tmp_path: Path) -> None:
 
 
 def test_pipeline_send_suppresses_then_recovers(tmp_path: Path) -> None:
-    from lifemodel.state.json_store import JsonStateStore
-    from lifemodel.state.model import State
-
-    store = JsonStateStore(tmp_path)
+    clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
     # high latent, a send 10 min ago -> within grace -> no wake this tick
     store.commit(
         State(
@@ -250,9 +232,7 @@ def test_pipeline_send_suppresses_then_recovers(tmp_path: Path) -> None:
             last_tick_at="2026-07-06T03:59:00+00:00",
         )
     )
-    lm = build_lifemodel(
-        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
-    )
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     assert store.load().desire_status == "none"  # grace suppresses the wake end-to-end
 
@@ -268,14 +248,10 @@ def test_personality_is_registered(tmp_path: Path) -> None:
 
 
 def test_pipeline_tick_recovers_energy_and_decays_fatigue(tmp_path: Path) -> None:
-    from lifemodel.state.json_store import JsonStateStore
-    from lifemodel.state.model import State
-
-    store = JsonStateStore(tmp_path)
+    clock = _FixedClock(datetime(2026, 7, 6, 12, 30, tzinfo=UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
     store.commit(State(energy=0.5, fatigue=0.5, last_tick_at="2026-07-06T12:00:00+00:00"))
-    lm = build_lifemodel(
-        base_dir=tmp_path, clock=_FixedClock(datetime(2026, 7, 6, 12, 30, tzinfo=UTC))
-    )
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     final = store.load()
     assert final.energy > 0.5  # recovered during the idle tick

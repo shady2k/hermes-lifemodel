@@ -22,6 +22,11 @@ class RecordingStore:
         self._state = state
         self.commits.append(state)
 
+    def reset(self) -> State:
+        self._state = State()
+        self.commits.append(self._state)
+        return self._state
+
 
 def test_apply_merges_updates_and_commits_once() -> None:
     store = RecordingStore()

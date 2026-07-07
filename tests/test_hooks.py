@@ -7,7 +7,6 @@ aggregation layer (inside ``coreloop.tick()``) consumes them on the next tick.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from lifemodel.adapters.clock import SystemClock
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.taxonomy import (
     KIND_EXCHANGE,
@@ -26,6 +26,7 @@ from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 
 _T0 = datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
 
@@ -189,12 +190,12 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     assert len(matches) == 1
 
     # The registered callback publishes a verdict signal (not state mutation).
-    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
-    state_file.parent.mkdir(parents=True, exist_ok=True)
+    sdir = tmp_path / "workspace" / "lifemodel"
+    store = SQLiteRuntimeStore(sdir, clock=SystemClock())
     pending_state = State(
         desire_status="active", pending_proactive_id="p1", last_tick_at=_T0.isoformat()
     )
-    state_file.write_text(json.dumps(pending_state.to_dict()))
+    store.commit(pending_state)
 
     matches[0](
         user_message=f"{IMPULSE_LABEL_PREFIX} impulse text",
@@ -202,8 +203,8 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     )
 
     # State is NOT mutated — the hook only publishes a signal.
-    persisted = json.loads(state_file.read_text())
-    assert persisted["desire_status"] == "active"  # unchanged — signal published, not applied
+    persisted = store.load()
+    assert persisted.desire_status == "active"  # unchanged — signal published, not applied
 
 
 def test_register_wires_pre_gateway_dispatch_hook(
@@ -221,13 +222,13 @@ def test_register_wires_pre_gateway_dispatch_hook(
     assert len(matches) == 1
 
     # Genuinely wired: a real inbound message publishes an exchange signal.
-    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(State(u=50.0, last_tick_at=_T0.isoformat()).to_dict()))
+    sdir = tmp_path / "workspace" / "lifemodel"
+    store = SQLiteRuntimeStore(sdir, clock=SystemClock())
+    store.commit(State(u=50.0, last_tick_at=_T0.isoformat()))
 
     matches[0](event=SimpleNamespace(text="hey there", internal=False, id="m-1"))
 
     # State is NOT mutated — the hook only publishes an exchange signal.
-    persisted = json.loads(state_file.read_text())
-    assert persisted["last_exchange_at"] is None  # unchanged
-    assert persisted["u"] == 50.0  # unchanged
+    persisted = store.load()
+    assert persisted.last_exchange_at is None  # unchanged
+    assert persisted.u == 50.0  # unchanged
