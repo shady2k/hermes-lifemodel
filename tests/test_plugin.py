@@ -145,10 +145,11 @@ def test_register_lifemodel_help_subcommand_lists_subcommands(
     handler = ctx.commands["lifemodel"]["handler"]
 
     text = handler("help")
-    # Every registered subcommand shows up with its one-line description —
-    # the registry is the single source of truth for this text.
+    # Every registered subcommand shows up bold (new /status-style house
+    # format: **name** — description) with its one-line description — the
+    # registry is the single source of truth for this text.
     for name, info in lifemodel._SUBCOMMANDS.items():
-        assert name in text
+        assert f"**{name}**" in text
         assert info.description in text
 
 
@@ -167,7 +168,7 @@ def test_register_lifemodel_bare_command_includes_full_command_list(
     # ...and surfaces the full subcommand list (same as `/lifemodel help`),
     # not a truncated footer — discoverability without a second round trip.
     for name, info in lifemodel._SUBCOMMANDS.items():
-        assert name in bare
+        assert f"**{name}**" in bare
         assert info.description in bare
 
 
@@ -197,11 +198,33 @@ def test_register_lifemodel_help_flags_mutating_subcommands(
 
     lines = {line.strip(): line for line in handler("help").splitlines()}
     for name, info in lifemodel._SUBCOMMANDS.items():
-        line = next(text for text in lines.values() if text.strip().startswith(name))
+        line = next(text for text in lines.values() if text.strip().startswith(f"**{name}**"))
         if info.mutating:
             assert "[mutating]" in line, line
         else:
             assert "[mutating]" not in line, line
+
+
+def test_register_lifemodel_help_command_list_has_no_column_padding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The old `_command_list()` space-padded a column to align descriptions
+    (``f"  {name:<{width}}  {description}"``), which goes ragged in
+    Telegram's proportional font. The new /status-style rendering drops that
+    padding entirely: no line should contain a run of 2+ spaces, and every
+    command name renders bold (``**name**``), matching debug.py's
+    ``**label:** value`` convention."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    text = handler("help")
+    for name in lifemodel._SUBCOMMANDS:
+        assert f"**{name}**" in text
+    for line in text.splitlines():
+        assert "  " not in line, line
 
 
 def test_register_lifemodel_nudge_subcommand_mutates_state_via_the_store(

@@ -90,16 +90,20 @@ def _command_list() -> str:
     """Render every registered subcommand with its one-line description.
 
     Shared by the bare `/lifemodel` view and `/lifemodel help` so the two can
-    never drift — both read straight from :data:`_SUBCOMMANDS`. Mutating
-    subcommands are flagged ``[mutating]`` so the owner can tell a status peek
-    from a state change at a glance.
+    never drift — both read straight from :data:`_SUBCOMMANDS`. One command
+    per line, ``**name** — description`` (bold name via standard markdown
+    ``**...**``, an em-dash separator, plain description) — no
+    column-alignment padding, matching the plain-line/bold-label house style
+    ``debug.py``'s ``_metrics`` uses for ``/lifemodel debug`` (Telegram's
+    proportional font makes space-padded columns go ragged). Mutating
+    subcommands keep the ``[mutating]`` marker so the owner can tell a status
+    peek from a state change at a glance.
     """
-    width = max(len(name) for name in _SUBCOMMANDS)
     lines = [
-        f"  {name:<{width}}  {'[mutating] ' if info.mutating else ''}{info.description}"
+        f"**{name}** — {'[mutating] ' if info.mutating else ''}{info.description}"
         for name, info in _SUBCOMMANDS.items()
     ]
-    return "\n".join(["commands:", *lines])
+    return "\n".join(["**commands:**", *lines])
 
 
 def register(ctx: Any) -> None:
