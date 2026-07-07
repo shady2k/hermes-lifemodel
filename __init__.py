@@ -13,7 +13,7 @@ No engine/neurons yet — those land in later tasks (see docs/roadmap.md §0).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
@@ -22,16 +22,46 @@ from .events import EVENTS_FILENAME, EventSink
 from .hooks import make_inbound_observer, make_post_llm_observer
 from .log import EventTee, get_logger
 from .paths import state_dir
+from .state_commands import (
+    force_wake_for_dir,
+    nudge_for_dir,
+    reset_for_dir,
+    satiate_for_dir,
+    set_field_for_dir,
+)
 
 __version__ = "0.0.0"
+
+
+class _Subcommand(NamedTuple):
+    """One ``_SUBCOMMANDS`` entry: its help text, plus whether it WRITES to
+    ``state.json`` (owner-facing mutation, via the atomic store) or is
+    read-only. ``help``/the bare view render ``[mutating]`` for the former so
+    the owner never confuses a status peek with a state change."""
+
+    description: str
+    mutating: bool = False
+
 
 # Single source of truth for `/lifemodel` subcommands: dispatch, the `help`
 # text, and args_hint are all derived from this dict, so adding a subcommand
 # means editing here — nowhere else.
-_SUBCOMMANDS: dict[str, str] = {
-    "status": "Show the one-line plugin status (default).",
-    "debug": "Read-only state/event dump for owner introspection.",
-    "help": "List these subcommands.",
+_SUBCOMMANDS: dict[str, _Subcommand] = {
+    "status": _Subcommand("Show the one-line plugin status (default)."),
+    "debug": _Subcommand("Read-only state/event dump for owner introspection."),
+    "help": _Subcommand("List these subcommands."),
+    "nudge": _Subcommand(
+        "nudge [N] — bump the contact drive: u += N (default +1.0).", mutating=True
+    ),
+    "force-wake": _Subcommand(
+        "Set state so the NEXT real adapter tick wakes (satisfies every wake gate).",
+        mutating=True,
+    ),
+    "satiate": _Subcommand(
+        "Simulate a fulfilled contact: u->0, clocks reset, desire cleared.", mutating=True
+    ),
+    "reset": _Subcommand("Factory wipe: write a fresh State(), as if newly born.", mutating=True),
+    "set": _Subcommand("set <field> <value> — write one whitelisted state field.", mutating=True),
 }
 
 
@@ -60,10 +90,15 @@ def _command_list() -> str:
     """Render every registered subcommand with its one-line description.
 
     Shared by the bare `/lifemodel` view and `/lifemodel help` so the two can
-    never drift — both read straight from :data:`_SUBCOMMANDS`.
+    never drift — both read straight from :data:`_SUBCOMMANDS`. Mutating
+    subcommands are flagged ``[mutating]`` so the owner can tell a status peek
+    from a state change at a glance.
     """
     width = max(len(name) for name in _SUBCOMMANDS)
-    lines = [f"  {name:<{width}}  {description}" for name, description in _SUBCOMMANDS.items()]
+    lines = [
+        f"  {name:<{width}}  {'[mutating] ' if info.mutating else ''}{info.description}"
+        for name, info in _SUBCOMMANDS.items()
+    ]
     return "\n".join(["commands:", *lines])
 
 
@@ -84,14 +119,31 @@ def register(ctx: Any) -> None:
     logger = EventTee(get_logger("lifemodel"), sink)
 
     def lifemodel_command(raw_args: str = "") -> str:
-        """`/lifemodel` — 'status' (default), 'debug', or 'help' (see _SUBCOMMANDS)."""
-        sub = raw_args.strip()
+        """`/lifemodel` — 'status' (default), 'debug', 'help', or a mutating
+        subcommand (nudge/force-wake/satiate/reset/set — see _SUBCOMMANDS)."""
+        parts = raw_args.strip().split(None, 1)
+        sub = parts[0] if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
         if sub == "debug":
             # Owner introspection (NFR9): returned to the caller, never logged,
             # and read-only (HLA §9) — no commit, no bus mutation.
             return render_dump_for_dir(sdir)
         if sub == "help":
             return _command_list() + "\n"
+        # --- mutating subcommands: all go through the SAME atomic
+        # JsonStateStore the adapter loop uses (via the composition root),
+        # never a hand-edited file and never a synchronous tick — see
+        # lifemodel.state_commands for the gate-satisfaction rationale.
+        if sub == "nudge":
+            return nudge_for_dir(sdir, rest, logger=logger)
+        if sub == "force-wake":
+            return force_wake_for_dir(sdir, logger=logger)
+        if sub == "satiate":
+            return satiate_for_dir(sdir, logger=logger)
+        if sub == "reset":
+            return reset_for_dir(sdir, logger=logger)
+        if sub == "set":
+            return set_field_for_dir(sdir, rest, logger=logger)
         status = _status_line(profile, sdir)
         if sub == "":
             # Bare invocation: keep the status line, then surface the full
@@ -103,7 +155,7 @@ def register(ctx: Any) -> None:
     ctx.register_command(
         "lifemodel",
         lifemodel_command,
-        description="Show plugin status, or 'debug'/'help' for a dump or subcommand list.",
+        description="Show plugin status; 'help' lists read-only and mutating subcommands.",
         args_hint=" | ".join(_SUBCOMMANDS),
     )
 

@@ -147,9 +147,9 @@ def test_register_lifemodel_help_subcommand_lists_subcommands(
     text = handler("help")
     # Every registered subcommand shows up with its one-line description —
     # the registry is the single source of truth for this text.
-    for name, description in lifemodel._SUBCOMMANDS.items():
+    for name, info in lifemodel._SUBCOMMANDS.items():
         assert name in text
-        assert description in text
+        assert info.description in text
 
 
 def test_register_lifemodel_bare_command_includes_full_command_list(
@@ -166,9 +166,9 @@ def test_register_lifemodel_bare_command_includes_full_command_list(
     assert "alive" in bare
     # ...and surfaces the full subcommand list (same as `/lifemodel help`),
     # not a truncated footer — discoverability without a second round trip.
-    for name, description in lifemodel._SUBCOMMANDS.items():
+    for name, info in lifemodel._SUBCOMMANDS.items():
         assert name in bare
-        assert description in bare
+        assert info.description in bare
 
 
 def test_register_lifemodel_args_hint_derived_from_registry(
@@ -184,6 +184,72 @@ def test_register_lifemodel_args_hint_derived_from_registry(
     # string, so the two can never drift apart.
     for name in lifemodel._SUBCOMMANDS:
         assert name in args_hint
+
+
+def test_register_lifemodel_help_flags_mutating_subcommands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    lines = {line.strip(): line for line in handler("help").splitlines()}
+    for name, info in lifemodel._SUBCOMMANDS.items():
+        line = next(text for text in lines.values() if text.strip().startswith(name))
+        if info.mutating:
+            assert "[mutating]" in line, line
+        else:
+            assert "[mutating]" not in line, line
+
+
+def test_register_lifemodel_nudge_subcommand_mutates_state_via_the_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("nudge 2.5")
+
+    assert "(mutating)" in out
+    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
+    assert json.loads(state_file.read_text())["u"] == 2.5
+
+
+def test_register_lifemodel_reset_subcommand_writes_a_fresh_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    handler("nudge 5")  # dirty the state first
+    handler("reset")
+
+    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
+    persisted = json.loads(state_file.read_text())
+    assert persisted["u"] == 0.0
+    assert persisted["tick_count"] == 0
+    assert persisted["proactive_send_log"] == []
+
+
+def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("set tick_count 99")
+
+    assert "not writable" in out
+    state_file = tmp_path / "workspace" / "lifemodel" / "state.json"
+    assert not state_file.exists()  # rejected before ever touching the store
 
 
 def test_register_tees_plugin_registered_into_events_sink(
