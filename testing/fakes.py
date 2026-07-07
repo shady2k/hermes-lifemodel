@@ -1,13 +1,23 @@
 """In-memory fakes for every Phase-1 port — "imitations before code" (HLA §13).
 
 The DI contract says tests inject fakes, not real adapters. These are the
-canonical ones: a fake clock, delivery, state store, and signal bus, each
-satisfying its port/ABC. They are shipped in the package (not hidden in a test
-folder) so later tasks (1.1–1.4) reuse the *same* fakes their upstream defined,
-rather than re-rolling subtly different ones. Stdlib only; no Hermes.
+canonical ones: a fake clock, delivery, state store, signal bus, memory store
+and pressure sensor, each satisfying its port/ABC. They are shipped in the
+package (not hidden in a test folder) so later tasks reuse the *same* fakes
+their upstream defined, rather than re-rolling subtly different ones. Stdlib
+only; no Hermes.
 
 Each fake is deliberately transparent — it exposes the recorded inputs
 (``FakeDelivery.sent``, ``FakeClock`` mutators) so a test can assert on them.
+
+``FakeMemoryStore``/``FakePressureSensor`` (lm-fib.6.1, HLA §4.1/D7) back
+:class:`~lifemodel.ports.memory.MemoryPort`/:class:`~lifemodel.ports.pressure.PressureSensorPort`
+with a plain dict, applying the *same* semantics as
+:class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` (upsert keeps
+``created_at``, guarded ``transition``, deterministic ``find`` order, epoch
+expiry) so the shared contract test suite runs identically against fake and
+real store, and higher layers can unit-test against these ports without a
+database. Purely additive — nothing in the live tick uses them yet.
 """
 
 from __future__ import annotations
@@ -16,7 +26,24 @@ import copy
 from datetime import datetime, timedelta
 
 from ..core.signal_bus import SignalBus
+from ..domain.memory import (
+    MemoryDraft,
+    MemoryPatch,
+    MemoryRecord,
+    PressureIndex,
+    StaleTransition,
+    coalesce_patch,
+    describe_stale_transition,
+    ensure_json_serializable,
+    epoch_ms,
+    merge_payload,
+    parse_expires_at_epoch_ms,
+    stamp_iso_utc,
+    summarize_pressure_index,
+)
 from ..domain.signal import Signal
+from ..ports.clock import ClockPort
+from ..ports.memory import OrderBy
 from ..state.model import State
 
 
@@ -115,3 +142,157 @@ class FakeSignalBus(SignalBus):
             seen.add(signal.origin_id)
             fresh.append(signal)
         return fresh
+
+
+class FakeMemoryStore:
+    """An in-memory :class:`~lifemodel.ports.memory.MemoryPort` (+ pressure sensor).
+
+    Backed by a plain ``dict`` keyed by ``(kind, id)`` — no SQL, no epoch
+    columns — applying the same semantics as
+    :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`: upsert keeps
+    ``created_at`` and bumps ``revision``, ``transition`` is guarded on
+    ``from_state``, ``find`` order is deterministic with an ``id`` tiebreak,
+    and expiry is epoch-based. It also implements
+    :class:`~lifemodel.ports.pressure.PressureSensorPort` directly — mirroring
+    how the real store answers both ports from one object — via
+    :func:`~lifemodel.domain.memory.summarize_pressure_index`, so the shared
+    contract test suite can parametrize over "one fake object" / "one real
+    store" symmetrically. Every read returns a deep copy so a caller can never
+    mutate what this fake holds internally.
+    """
+
+    def __init__(self, *, clock: ClockPort) -> None:
+        self._clock = clock
+        self._rows: dict[tuple[str, str], MemoryRecord] = {}
+
+    def put(self, draft: MemoryDraft) -> str:
+        ensure_json_serializable(draft.payload)
+        parse_expires_at_epoch_ms(draft.expires_at)  # validate before writing
+        now = stamp_iso_utc(self._clock.now())  # canonical UTC; rejects a naive clock
+        key = (draft.kind, draft.id)
+        existing = self._rows.get(key)
+        created_at = existing.created_at if existing is not None else now
+        revision = existing.revision + 1 if existing is not None else 0
+        self._rows[key] = MemoryRecord(
+            kind=draft.kind,
+            id=draft.id,
+            state=draft.state,
+            payload=copy.deepcopy(draft.payload),
+            source=draft.source,
+            recipient_id=draft.recipient_id,
+            salience=draft.salience,
+            confidence=draft.confidence,
+            expires_at=draft.expires_at,
+            created_at=created_at,
+            updated_at=now,
+            revision=revision,
+            schema_version=1,
+        )
+        return draft.id
+
+    def get(self, kind: str, id: str) -> MemoryRecord | None:
+        record = self._rows.get((kind, id))
+        return None if record is None else _copy_record(record)
+
+    def find(
+        self,
+        kind: str | None = None,
+        state: str | None = None,
+        limit: int | None = None,
+        order_by: OrderBy = "updated_desc",
+    ) -> list[MemoryRecord]:
+        # Match the real store: SQLite treats `LIMIT -1` as "no limit", so a
+        # bare `records[:limit]` slice would silently diverge — reject instead.
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        records = [
+            record
+            for record in self._rows.values()
+            if (kind is None or record.kind == kind) and (state is None or record.state == state)
+        ]
+        records = _sort_records(records, order_by)
+        if limit is not None:
+            records = records[:limit]
+        return [_copy_record(record) for record in records]
+
+    def transition(
+        self,
+        kind: str,
+        id: str,
+        from_state: str,
+        to_state: str,
+        patch: MemoryPatch | None = None,
+    ) -> MemoryRecord:
+        patch = patch if patch is not None else MemoryPatch()
+        if patch.payload_merge is not None:
+            ensure_json_serializable(patch.payload_merge)
+
+        key = (kind, id)
+        existing = self._rows.get(key)
+        if existing is None or existing.state != from_state:
+            actual_state = existing.state if existing is not None else None
+            raise StaleTransition(describe_stale_transition(kind, id, from_state, actual_state))
+
+        new_expires_at = coalesce_patch(patch.expires_at, existing.expires_at)
+        parse_expires_at_epoch_ms(new_expires_at)  # validate before writing
+        now = stamp_iso_utc(self._clock.now())  # canonical UTC; rejects a naive clock
+        updated = MemoryRecord(
+            kind=existing.kind,
+            id=existing.id,
+            state=to_state,
+            payload=merge_payload(existing.payload, patch.payload_merge),
+            source=coalesce_patch(patch.source, existing.source),
+            recipient_id=existing.recipient_id,
+            salience=coalesce_patch(patch.salience, existing.salience),
+            confidence=coalesce_patch(patch.confidence, existing.confidence),
+            expires_at=new_expires_at,
+            created_at=existing.created_at,
+            updated_at=now,
+            revision=existing.revision + 1,
+            schema_version=existing.schema_version,
+        )
+        self._rows[key] = updated
+        return _copy_record(updated)
+
+    def read_pressure_index(self, now: datetime) -> PressureIndex:
+        return summarize_pressure_index(self._rows.values(), now)
+
+
+class FakePressureSensor:
+    """A standalone :class:`~lifemodel.ports.pressure.PressureSensorPort` fake.
+
+    Wraps a :class:`FakeMemoryStore`'s rows so a test that only wants to fake
+    the pressure-sensor boundary — without depending on the full
+    :class:`~lifemodel.ports.memory.MemoryPort` surface — can inject just this
+    (interface-segregation parity with the two-port split;
+    :class:`SQLiteRuntimeStore` satisfies both ports from one object, but a
+    consumer of only ``PressureSensorPort`` should not have to know that).
+    """
+
+    def __init__(self, store: FakeMemoryStore) -> None:
+        self._store = store
+
+    def read_pressure_index(self, now: datetime) -> PressureIndex:
+        return self._store.read_pressure_index(now)
+
+
+def _copy_record(record: MemoryRecord) -> MemoryRecord:
+    return copy.deepcopy(record)
+
+
+def _sort_records(records: list[MemoryRecord], order_by: OrderBy) -> list[MemoryRecord]:
+    # Two stable passes (minor key ascending, then major key descending) so
+    # ties break by id ASC even though the major key sorts DESC — a single
+    # `reverse=True` over a combined tuple key would reverse the tiebreak too.
+    # Sort timestamps by parsed epoch-ms (NOT the raw ISO string) so ordering is
+    # identical to SQLite's `_epoch` columns under any timezone offset.
+    by_id = sorted(records, key=lambda r: r.id)
+    if order_by == "updated_desc":
+        return sorted(
+            by_id, key=lambda r: epoch_ms(datetime.fromisoformat(r.updated_at)), reverse=True
+        )
+    if order_by == "created_desc":
+        return sorted(
+            by_id, key=lambda r: epoch_ms(datetime.fromisoformat(r.created_at)), reverse=True
+        )
+    return sorted(by_id, key=lambda r: r.salience, reverse=True)

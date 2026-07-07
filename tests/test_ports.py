@@ -14,10 +14,18 @@ from lifemodel.adapters.clock import SystemClock
 from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.signal_bus import SignalBus
-from lifemodel.ports import ClockPort, DeliveryPort, StatePort
+from lifemodel.ports import ClockPort, DeliveryPort, MemoryPort, PressureSensorPort, StatePort
 from lifemodel.ports.clock import ClockPort as ClockPortDirect
 from lifemodel.state.json_store import JsonStateStore
-from lifemodel.testing import FakeClock, FakeDelivery, FakeSignalBus, FakeStateStore
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+from lifemodel.testing import (
+    FakeClock,
+    FakeDelivery,
+    FakeMemoryStore,
+    FakePressureSensor,
+    FakeSignalBus,
+    FakeStateStore,
+)
 
 
 def test_ports_package_re_exports_state_port() -> None:
@@ -44,6 +52,21 @@ def test_state_port_is_satisfied_by_adapter_and_fake(tmp_path: object) -> None:
 def test_signal_bus_is_satisfied_by_adapter_and_fake(tmp_path: object) -> None:
     assert isinstance(FileSignalBus(tmp_path), SignalBus)  # type: ignore[arg-type]
     assert isinstance(FakeSignalBus(), SignalBus)
+
+
+def test_memory_port_is_satisfied_by_sqlite_store_and_fake(tmp_path: object) -> None:
+    clock = FakeClock(datetime.now(UTC))
+    assert isinstance(SQLiteRuntimeStore(tmp_path, clock=clock), MemoryPort)  # type: ignore[arg-type]
+    assert isinstance(FakeMemoryStore(clock=clock), MemoryPort)
+
+
+def test_pressure_sensor_port_is_satisfied_by_sqlite_store_and_fakes(tmp_path: object) -> None:
+    clock = FakeClock(datetime.now(UTC))
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)  # type: ignore[arg-type]
+    fake_store = FakeMemoryStore(clock=clock)
+    assert isinstance(store, PressureSensorPort)
+    assert isinstance(fake_store, PressureSensorPort)
+    assert isinstance(FakePressureSensor(fake_store), PressureSensorPort)
 
 
 def test_clock_adapter_returns_aware_utc() -> None:
