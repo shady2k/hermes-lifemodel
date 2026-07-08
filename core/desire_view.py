@@ -35,6 +35,7 @@ from ..domain.objects import (
     Desire,
     DesireSpring,
     DesireState,
+    Provenance,
     default_registry,
 )
 from ..ports.memory import MemoryPort
@@ -105,6 +106,7 @@ def build_contact_desire(
     source_thought_ids: tuple[str, ...] = (),
     risk_if_ignored: float = 0.0,
     source: str = "contact-aggregation",
+    provenance: Provenance | None = None,
 ) -> Desire:
     """Construct the singleton contact :class:`Desire` in *state*.
 
@@ -120,12 +122,17 @@ def build_contact_desire(
     (the ``[SILENT]`` fix + the lm-8o3 wake-framing seam) rather than a timer-derived
     urge. ``risk_if_ignored`` lets the top-down path carry the thought's stakes;
     every other semantic field is a fixed description (aggregation never reads them
-    back)."""
+    back).
+
+    ``provenance`` (lm-27n.11) records the creation lineage + the tick's execution
+    trace; ``None`` (the default) leaves an un-stamped desire — behaviour-identical to
+    before .11 for the test builders that don't pass one."""
     return Desire(
         id=CONTACT_DESIRE_ID,
         state=str(state),
         source=source,
         salience=salience,
+        provenance=provenance,
         object="owner",
         spring=spring,
         source_drive=source_drive,

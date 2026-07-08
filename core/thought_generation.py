@@ -37,6 +37,7 @@ flood nor drive contact:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 
 from ..domain.memory import MemoryRecord, PutOp
@@ -69,6 +70,7 @@ from .thought_view import (
     selected_thoughts,
 )
 from .timeutil import minutes_between
+from .trace import creation_provenance
 
 # --- Hard caps (the anti-runaway spine, codex). ------------------------------
 #: At/above this many live thoughts in the snapshot, generate NOTHING — let the
@@ -165,6 +167,24 @@ class ThoughtGeneration:
         )
         if thought is None:
             return []  # nothing warranted → no thought, no energy debit
+
+        # Creation provenance (lm-27n.11), immutable per episode. Generation only mints
+        # ids NOT already live (it skips ``existing`` above), so a minted thought is
+        # ALWAYS a new episode → stamp a fresh trace. The preserve-if-live branch is the
+        # uniform safety guard: a future non-idempotent trigger could never rewrite an
+        # already-born thought's birth trace.
+        prior = next((t for t in live if t.id == thought.id), None)
+        provenance = (
+            prior.provenance
+            if prior is not None
+            else creation_provenance(
+                ctx.trace,
+                created_by=self.id,
+                component="generation",
+                reason=f"thought ({thought.trigger})",
+            )
+        )
+        thought = replace(thought, provenance=provenance)
 
         return [
             PutRecord(op=PutOp(draft=encode_thought(thought))),

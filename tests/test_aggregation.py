@@ -690,3 +690,71 @@ def test_top_down_proposal_suppressed_by_receptivity_hard_veto(tmp_path) -> None
     )
     intents = _agg().step(_ctx(state, now, [_proposal()], objects=(rel,), tmp_path=tmp_path))
     assert _desire_intent(intents) is None
+
+
+# --- lm-27n.11: a born desire carries the tick's execution trace in its provenance ---
+
+
+def _decode_desire_provenance(draft):
+    from lifemodel.domain.memory import MemoryRecord
+    from lifemodel.domain.objects import default_registry
+
+    record = MemoryRecord(
+        kind=draft.kind,
+        id=draft.id,
+        state=draft.state,
+        payload=draft.payload,
+        source=draft.source,
+        recipient_id=draft.recipient_id,
+        salience=draft.salience,
+        confidence=draft.confidence,
+        expires_at=draft.expires_at,
+        created_at="2026-07-06T00:00:00+00:00",
+        updated_at="2026-07-06T00:00:00+00:00",
+        revision=0,
+        schema_version=draft.schema_version,
+    )
+    return default_registry().decode(record).provenance
+
+
+def _traced_ctx(state, now, signals, *, tmp_path, trace):
+    return TickContext(
+        state=state,
+        now=now,
+        bus=FileSignalBus(tmp_path),
+        signals=tuple(signals),
+        objects=(),
+        trace=trace,
+    )
+
+
+def test_born_desire_carries_the_tick_trace(tmp_path) -> None:
+    from lifemodel.testing import FakeTracer
+
+    trace = FakeTracer().start_root()
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    draft = _created_desire(
+        _agg().step(_traced_ctx(state, now, [c], tmp_path=tmp_path, trace=trace))
+    )
+    assert draft is not None
+    prov = _decode_desire_provenance(draft)
+    assert prov is not None
+    assert prov.trace_id == trace.trace_id  # logs and durable provenance JOIN on this
+    assert prov.creation_span_id == trace.span_id
+    assert prov.component == "aggregation"
+
+
+def test_untraced_born_desire_has_no_trace_fields(tmp_path) -> None:
+    # No tracer wired -> the desire still carries lineage, but NO trace fields
+    # (ids/timing behaviour-identical to before .11).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    draft = _created_desire(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    assert draft is not None
+    prov = _decode_desire_provenance(draft)
+    assert prov is not None
+    assert prov.component == "aggregation"
+    assert prov.trace_id is None

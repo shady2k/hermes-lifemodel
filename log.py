@@ -15,6 +15,8 @@ described in HLA §13 land in task 0.3.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Protocol, cast
 
 from .events import EventSink
@@ -94,3 +96,27 @@ def get_logger(name: str | None = None, **initial_values: Any) -> EventLogger:
     if _HAVE_STRUCTLOG:
         return cast(EventLogger, structlog.get_logger(name, **initial_values))
     return _StdlibEventLogger(name, **initial_values)
+
+
+@contextmanager
+def bound_log_context(**fields: Any) -> Iterator[None]:
+    """Bind *fields* onto every log line emitted inside the ``with`` block, then reset.
+
+    The CoreLoop wraps a whole tick in this (lm-27n.11) so every ``.info()`` that tick
+    auto-carries ``{trace_id, span_id, parent_span_id, tick}`` and it RESETS at tick
+    end — no stale bind leaks across ticks. Wrapped here so the CoreLoop never imports
+    structlog directly.
+
+    With structlog present it uses the contextvars API (bind on enter, reset on exit
+    even under an exception). Without structlog (the Hermes-host fallback) there are no
+    contextvars, so it is a no-op — nothing to bind, nothing to leak. Empty *fields*
+    (an untraced tick) short-circuits to the no-op, keeping that path byte-identical.
+    """
+    if not _HAVE_STRUCTLOG or not fields:
+        yield
+        return
+    tokens = structlog.contextvars.bind_contextvars(**fields)
+    try:
+        yield
+    finally:
+        structlog.contextvars.reset_contextvars(**tokens)

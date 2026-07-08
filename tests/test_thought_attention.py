@@ -427,3 +427,39 @@ def test_convergence_never_exceeds_the_width_caps(tmp_path) -> None:
     # were scanned only decayed.
     attended = [r for r in store.find(kind="thought") if r.payload["no_progress_count"] == 1]
     assert len(attended) == ATTEND_K
+
+
+# --- lm-27n.11: a field-only update PRESERVES the thought's birth provenance ---
+
+
+def test_field_update_preserves_provenance_via_replace() -> None:
+    # Attention's field update uses ``replace(thought, salience=..., ...)`` — since
+    # provenance is a carried field, replace keeps it, so the typed upsert never drops
+    # the birth trace (lm-27n.11).
+    from lifemodel.core.trace import creation_provenance
+    from lifemodel.testing import FakeTracer
+
+    birth = creation_provenance(
+        FakeTracer().start_root(),
+        created_by="thought-generation",
+        component="generation",
+        reason="thought (event)",
+    )
+    seeded = _record_from_draft(
+        encode_thought(
+            build_thought(
+                id="t-prov",
+                content="something worth remembering",
+                salience=0.9,
+                actionability=0.5,
+                other_regarding_value=0.5,
+                provenance=birth,
+            )
+        )
+    )
+    puts = _puts(list(_component().step(_ctx((seeded,)))))
+    assert len(puts) == 1  # a field-only decay/score update (not a park)
+    updated = default_registry().decode(_record_from_draft(puts[0].op.draft))
+    assert updated.provenance is not None
+    assert updated.provenance.trace_id == birth.trace_id  # preserved through replace()
+    assert updated.provenance.creation_span_id == birth.creation_span_id

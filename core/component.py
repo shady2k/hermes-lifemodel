@@ -15,6 +15,7 @@ from typing import Protocol, runtime_checkable
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
+from ..ports.tracer import TraceContext
 from ..state.model import State
 from .intents import Intent
 from .signal_bus import SignalBus
@@ -29,7 +30,7 @@ class TickContext:
     consistent view (HLA §4.1). Both default to empty so the many existing
     construction sites keep compiling; no component reads them yet (lm-27n.2
     installs the snapshot; aggregation consumes it in .3). Deliberately
-    extensible: a future ``trace`` field (lm-27n.11) slots in additively here.
+    extensible: the ``trace`` field (lm-27n.11) slots in additively here.
     """
 
     state: State
@@ -40,6 +41,11 @@ class TickContext:
     pressure: PressureIndex = PressureIndex()
     #: A bounded snapshot of the being's ``state="active"`` memory records.
     objects: tuple[MemoryRecord, ...] = ()
+    #: THE tick's active execution trace (lm-27n.11) — set by the CoreLoop when a
+    #: tracer is wired, so a creation site stamps the born object's provenance with
+    #: it. ``None`` on an untraced tick (no tracer): stamping omits the trace fields,
+    #: keeping ids/timing behaviour-identical.
+    trace: TraceContext | None = None
 
 
 @runtime_checkable

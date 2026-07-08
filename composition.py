@@ -55,6 +55,7 @@ from pathlib import Path
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
+from .adapters.tracer import StdlibTracer
 from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
 from .core.cognition import Cognition
@@ -76,6 +77,7 @@ from .ports.delivery import DeliveryPort
 from .ports.memory import MemoryPort
 from .ports.pressure import PressureSensorPort
 from .ports.tick_commit import TickCommitPort
+from .ports.tracer import TracerPort
 from .sim.wake import GateParams
 from .state.port import StatePort
 from .state.sqlite_store import SQLiteRuntimeStore
@@ -130,6 +132,7 @@ def build_lifemodel(
     neurons: Sequence[Neuron] | None = None,
     logger: EventLogger | None = None,
     registry: ComponentRegistry | None = None,
+    tracer: TracerPort | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -167,6 +170,11 @@ def build_lifemodel(
     )
     resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
     resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
+    # The execution tracer (lm-27n.11): the DEFAULT mints real W3C ids stdlib-only;
+    # a test injects a deterministic FakeTracer. The CoreLoop mints ONE root trace per
+    # tick from it and threads it through TickContext so creation sites stamp the born
+    # object's provenance with the tick's trace.
+    resolved_tracer: TracerPort = tracer or StdlibTracer()
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
@@ -265,6 +273,7 @@ def build_lifemodel(
         # so parked thoughts + pending intentions are visible, not just active +
         # deferred (the object-core is the single source of what "live" means).
         live_states=default_registry().live_states(),
+        tracer=resolved_tracer,
     )
 
     return LifeModel(

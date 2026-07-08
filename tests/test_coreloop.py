@@ -463,3 +463,127 @@ def test_objects_snapshot_read_is_fail_soft(tmp_path) -> None:
     assert report.ran == ("only",)  # the component still ran
     assert report.committed  # the tick still committed its bookkeeping
     assert rec.objects == ()  # degraded to an empty snapshot, no crash
+
+
+# --- lm-27n.11: the tick mints a trace, threads it, and log-binds it per tick ---
+
+
+class TraceRecorder:
+    """Records the ``TickContext.trace`` it was handed."""
+
+    id = "trace-rec"
+
+    def __init__(self) -> None:
+        self.trace = None  # type: ignore[var-annotated]
+
+    def step(self, ctx: TickContext):  # type: ignore[no-untyped-def]
+        self.trace = ctx.trace
+        return []
+
+
+class ContextRecordingLogger:
+    """Snapshots the bound structlog contextvars at each ``.info`` call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []  # type: ignore[type-arg]
+
+    def info(self, event, **fields):  # type: ignore[no-untyped-def]
+        import structlog
+
+        self.calls.append((event, dict(structlog.contextvars.get_contextvars())))
+
+
+def _clock() -> FixedClock:
+    return FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC))
+
+
+def test_tick_threads_the_minted_trace_onto_tick_context(tmp_path) -> None:
+    from lifemodel.testing import FakeTracer
+
+    reg = ComponentRegistry()
+    rec = TraceRecorder()
+    reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=_clock(),
+        tracer=FakeTracer(),
+    )
+    loop.tick()
+    assert rec.trace is not None
+    assert rec.trace.trace_id == FakeTracer().start_root().trace_id  # deterministic first trace
+    assert rec.trace.parent_span_id is None  # a cron root has no upstream
+
+
+def test_untraced_tick_leaves_trace_none(tmp_path) -> None:
+    reg = ComponentRegistry()
+    rec = TraceRecorder()
+    reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
+    _loop(reg, RecordingStore(), FileSignalBus(tmp_path)).tick()  # no tracer wired
+    assert rec.trace is None  # behaviour-neutral
+
+
+def test_each_tick_gets_a_fresh_trace(tmp_path) -> None:
+    from lifemodel.testing import FakeTracer
+
+    reg = ComponentRegistry()
+    rec = TraceRecorder()
+    reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=_clock(),
+        tracer=FakeTracer(),
+    )
+    loop.tick()
+    first = rec.trace.trace_id  # type: ignore[union-attr]
+    loop.tick()
+    second = rec.trace.trace_id  # type: ignore[union-attr]
+    assert first != second  # a new execution unit per tick
+
+
+def test_tick_binds_trace_on_logs_and_resets_after(tmp_path) -> None:
+    import structlog
+
+    from lifemodel.testing import FakeTracer
+
+    reg = ComponentRegistry()
+    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
+    logger = ContextRecordingLogger()
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=_clock(),
+        logger=logger,
+        tracer=FakeTracer(),
+    )
+    structlog.contextvars.clear_contextvars()  # clean slate
+    loop.tick()  # Broken raises -> "component_failed" is logged WITHIN the bound context
+
+    events = {event: ctx for event, ctx in logger.calls}
+    assert "component_failed" in events
+    bound = events["component_failed"]
+    assert bound["trace_id"] == FakeTracer().start_root().trace_id
+    assert bound["tick"] == 1  # the tick number is bound too
+    assert "span_id" in bound
+
+    # After the tick, the contextvars are reset — a log outside carries no trace_id.
+    assert "trace_id" not in structlog.contextvars.get_contextvars()
+
+
+def test_untraced_tick_binds_nothing(tmp_path) -> None:
+    reg = ComponentRegistry()
+    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
+    logger = ContextRecordingLogger()
+    CoreLoop(  # no tracer -> empty bind -> no-op
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=_clock(),
+        logger=logger,
+    ).tick()
+    events = {event: ctx for event, ctx in logger.calls}
+    assert "trace_id" not in events["component_failed"]  # nothing bound on the untraced path

@@ -39,6 +39,7 @@ from ..domain.objects import (
     CONTACT_INTENTION_ID,
     Intention,
     IntentionState,
+    Provenance,
     default_registry,
 )
 from ..ports.memory import MemoryPort
@@ -146,6 +147,7 @@ def build_contact_intention(
     source_drive: float | None = None,
     source: str = "contact-cognition",
     extra_constraints: tuple[str, ...] = (),
+    provenance: Provenance | None = None,
 ) -> Intention:
     """Construct the singleton contact :class:`Intention` in *state*.
 
@@ -160,12 +162,18 @@ def build_contact_intention(
     (lm-27n.5 — allowed styles, topic sensitivities) for auditability; empty by
     default, so an unpopulated relationship leaves the intention byte-identical to
     .4 (behaviour-neutral).
+
+    ``provenance`` (lm-27n.11) records the creation lineage + the tick's execution
+    trace. Its birth trace is IMMUTABLE per episode: cognition passes the LIVE
+    intention's existing provenance on a delivery-fail retry (preserve), and a fresh
+    one only on a first crystallize — so a retry never rewrites the birth trace.
     """
     return Intention(
         id=CONTACT_INTENTION_ID,
         state=str(state),
         source=source,
         salience=salience,
+        provenance=provenance,
         goal=_GOAL,
         commitment_strength=commitment_strength,
         plan=_PLAN,

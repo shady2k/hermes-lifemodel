@@ -27,11 +27,16 @@ from ..domain.objects import DesireState, IntentionState
 from .component import TickContext
 from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
-from .intention_view import build_contact_intention, encode_contact_intention
+from .intention_view import (
+    build_contact_intention,
+    encode_contact_intention,
+    live_contact_intention,
+)
 from .intents import Intent, LaunchProactive, PutRecord, UpdateState
 from .receptivity import appraise_receptivity
 from .relationship_view import DEFAULT_RELATIONSHIP, live_owner_relationship
 from .thought_view import live_thoughts
+from .trace import creation_provenance
 from .wake_packet import build_wake_packet
 
 
@@ -84,6 +89,23 @@ class Cognition:
             correlation_id=correlation_id,
             thoughts=live_thoughts(ctx.objects),
         )
+        # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
+        # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits
+        # ``PutRecord(intention active)`` while the intention is STILL LIVE in
+        # ctx.objects → PRESERVE its birth provenance (do NOT rewrite the birth trace
+        # with this retry tick's). Only a FIRST crystallize (no live intention) stamps
+        # a fresh trace. Decide from the snapshot, never a hidden read.
+        existing_intention = live_contact_intention(ctx.objects)
+        provenance = (
+            existing_intention.provenance
+            if existing_intention is not None
+            else creation_provenance(
+                ctx.trace,
+                created_by=self.id,
+                component="cognition",
+                reason="crystallized contact intention",
+            )
+        )
         # 0-LLM crystallization: record the committed decision (Bratman act-gate).
         # ``commitment_strength`` is the effective pressure the desire crystallized
         # on (its salience). Born directly ``active`` so it gates + is snapshot-visible
@@ -95,6 +117,7 @@ class Cognition:
             salience=desire.salience,
             source_drive=desire.source_drive,
             extra_constraints=appraisal.constraints,
+            provenance=provenance,
         )
         return [
             PutRecord(op=PutOp(draft=encode_contact_intention(intention))),

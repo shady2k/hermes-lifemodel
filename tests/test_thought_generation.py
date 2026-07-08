@@ -486,3 +486,61 @@ def test_e2e_stream_lives_and_stays_bounded(tmp_path) -> None:
     live = [r for r in store.find(kind="thought") if r.state in {"active", "parked"}]
     assert len(live) <= MAX_LIVE_THOUGHTS  # the .7 brake + caps keep it bounded
     assert len(store.find(kind="thought")) >= 1  # the generative stream is alive
+
+
+# --- lm-27n.11: a minted thought carries the tick's execution trace ---
+
+
+def _decode_provenance(put: PutRecord):
+    from lifemodel.domain.objects import default_registry
+
+    d = put.op.draft
+    record = MemoryRecord(
+        kind=d.kind,
+        id=d.id,
+        state=d.state,
+        payload=d.payload,
+        source=d.source,
+        recipient_id=d.recipient_id,
+        salience=d.salience,
+        confidence=d.confidence,
+        expires_at=d.expires_at,
+        created_at="2026-07-06T00:00:00+00:00",
+        updated_at="2026-07-06T00:00:00+00:00",
+        revision=0,
+        schema_version=d.schema_version,
+    )
+    return default_registry().decode(record).provenance
+
+
+def _traced_ctx(*, signals, trace, state=None, objects=()):
+    return TickContext(
+        state=state if state is not None else _busy_state(),
+        now=_NOW,
+        bus=FakeSignalBus(),
+        signals=tuple(signals),
+        objects=objects,
+        trace=trace,
+    )
+
+
+def test_minted_thought_carries_the_tick_trace() -> None:
+    from lifemodel.testing import FakeTracer
+
+    trace = FakeTracer().start_root()
+    ex = exchange_signal(origin_id="x1", actor="user", label="two_way", timestamp=None)
+    put = _only_put(_component().step(_traced_ctx(signals=[ex], trace=trace)))
+    prov = _decode_provenance(put)
+    assert prov is not None
+    assert prov.trace_id == trace.trace_id
+    assert prov.creation_span_id == trace.span_id
+    assert prov.component == "generation"
+
+
+def test_untraced_minted_thought_has_no_trace_fields() -> None:
+    ex = exchange_signal(origin_id="x1", actor="user", label="two_way", timestamp=None)
+    put = _only_put(_component().step(_ctx(signals=(ex,))))  # no trace
+    prov = _decode_provenance(put)
+    assert prov is not None
+    assert prov.component == "generation"
+    assert prov.trace_id is None

@@ -19,13 +19,16 @@ the expensive cognition layer) slots into the per-component loop in Phase C.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
-from ..log import EventLogger
+from ..log import EventLogger, bound_log_context
 from ..ports.clock import ClockPort
 from ..ports.memory import MemoryPort
 from ..ports.pressure import PressureSensorPort
+from ..ports.tracer import TraceContext, TracerPort
+from ..state.model import State
 from .component import TickContext
 from .intake import IntakeLimits, apply_intake
 from .intents import (
@@ -54,6 +57,23 @@ OBJECTS_SNAPSHOT_LIMIT = 256
 _DEFAULT_LIVE_STATES: frozenset[str] = frozenset({"active", "deferred"})
 
 
+def _tick_log_fields(trace: TraceContext | None, tick: int) -> dict[str, object]:
+    """The fields bound onto every log line for one tick (lm-27n.11).
+
+    Untraced (no tracer wired → ``trace is None``) → empty, so the bind is a no-op and
+    the tick's logs are byte-identical to before .11. Traced → the W3C correlation ids
+    + the tick number, so logs and durable provenance JOIN on ``trace_id``.
+    """
+    if trace is None:
+        return {}
+    return {
+        "trace_id": trace.trace_id,
+        "span_id": trace.span_id,
+        "parent_span_id": trace.parent_span_id,
+        "tick": tick,
+    }
+
+
 @dataclass(frozen=True)
 class TickReport:
     """What happened on one tick — for observability/tests."""
@@ -80,12 +100,14 @@ class CoreLoop:
         pressure_sensor: PressureSensorPort | None = None,
         memory: MemoryPort | None = None,
         live_states: frozenset[str] | None = None,
+        tracer: TracerPort | None = None,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
         self._bus = bus
         self._clock = clock
         self._log = logger
+        self._tracer = tracer
         self._breaker_threshold = breaker_threshold
         self._intake_limits = intake_limits or IntakeLimits()
         self._pressure_sensor = pressure_sensor
@@ -97,6 +119,18 @@ class CoreLoop:
     def tick(self) -> TickReport:
         now = self._clock.now()
         state = self._state_actor.state
+        # Mint THE tick's root trace (continue-or-mint; a cron tick has no upstream).
+        # ONE root span per tick — components read it via ``TickContext.trace``, never
+        # the tracer itself (the tracer is an injected capability; the active trace is
+        # per-tick state, not ambient). No tracer wired → ``None`` → behaviour-neutral.
+        trace = self._tracer.start_root() if self._tracer is not None else None
+        # Bind the trace onto every log line emitted THIS tick, reset at tick end (no
+        # stale bind leaking across ticks). Wrapped in log.py so the CoreLoop never
+        # imports structlog; empty fields (untraced) makes it a no-op.
+        with bound_log_context(**_tick_log_fields(trace, state.tick_count + 1)):
+            return self._run_tick(now=now, state=state, trace=trace)
+
+    def _run_tick(self, *, now: datetime, state: State, trace: TraceContext | None) -> TickReport:
         # Start-of-tick snapshot: read once, before any component runs, so every
         # component this tick sees one consistent view (HLA §4.1). Pure reads —
         # they never change tick output; no component consumes them yet (.3).
@@ -155,6 +189,7 @@ class CoreLoop:
                 signals=tuple(available),
                 pressure=pressure,
                 objects=objects,
+                trace=trace,
             )
             try:
                 produced = component.step(ctx)

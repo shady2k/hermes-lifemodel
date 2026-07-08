@@ -49,6 +49,15 @@ from ..domain.memory import (
 from ..domain.signal import Signal
 from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
+from ..ports.tracer import (
+    TraceContext,
+)
+from ..ports.tracer import (
+    format_traceparent as _format_traceparent,
+)
+from ..ports.tracer import (
+    parse_traceparent as _parse_traceparent,
+)
 from ..state.model import State
 
 
@@ -73,6 +82,63 @@ class FakeClock:
     def set(self, now: datetime) -> None:
         """Pin the clock to an absolute instant."""
         self._now = now
+
+
+class FakeTracer:
+    """A deterministic :class:`~lifemodel.ports.tracer.TracerPort` for tests.
+
+    Mirrors :class:`FakeClock`: instead of random ids it hands out a fixed SEQUENCE
+    — trace ids ``0…01``, ``0…02``, … and span ids ``0…0001``, ``0…0002``, … — so a
+    stamped provenance trace_id / a bound log field is stable to assert on.
+    ``start_root`` consumes the next trace id + span id (a FRESH trace per tick,
+    unless it continues an upstream traceparent, when it keeps that trace and parents
+    onto the upstream span); ``child_of`` keeps the parent's trace and consumes the
+    next span. All ids are valid non-zero W3C hex.
+    """
+
+    def __init__(self) -> None:
+        self._next_trace = 1
+        self._next_span = 1
+
+    def _mint_trace(self) -> str:
+        value = f"{self._next_trace:032x}"
+        self._next_trace += 1
+        return value
+
+    def _mint_span(self) -> str:
+        value = f"{self._next_span:016x}"
+        self._next_span += 1
+        return value
+
+    def start_root(self, *, upstream_traceparent: str | None = None) -> TraceContext:
+        if upstream_traceparent is not None:
+            upstream = _parse_traceparent(upstream_traceparent)
+            return TraceContext(
+                trace_id=upstream.trace_id,
+                span_id=self._mint_span(),
+                parent_span_id=upstream.span_id,
+                trace_flags=upstream.trace_flags,
+            )
+        return TraceContext(
+            trace_id=self._mint_trace(),
+            span_id=self._mint_span(),
+            parent_span_id=None,
+            trace_flags="01",
+        )
+
+    def child_of(self, parent: TraceContext) -> TraceContext:
+        return TraceContext(
+            trace_id=parent.trace_id,
+            span_id=self._mint_span(),
+            parent_span_id=parent.span_id,
+            trace_flags=parent.trace_flags,
+        )
+
+    def format_traceparent(self, ctx: TraceContext) -> str:
+        return _format_traceparent(ctx)
+
+    def parse_traceparent(self, value: str) -> TraceContext:
+        return _parse_traceparent(value)
 
 
 class FakeDelivery:

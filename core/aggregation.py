@@ -60,6 +60,7 @@ from .taxonomy import (
     thought_contact_created_signal,
 )
 from .timeutil import minutes_between
+from .trace import creation_provenance
 
 #: The logical "no live desire" sentinel — the old ``desire_status == "none"``.
 _NONE = "none"
@@ -301,6 +302,21 @@ class ContactAggregation:
                 salience = gated_effective
                 source_thought_ids = ()
                 risk_if_ignored = 0.0
+            # Creation provenance (lm-27n.11): a contact-desire birth ONLY happens when
+            # no live desire exists (create-if-none, guarded by ``desire_state == _NONE``
+            # → ``live is None`` here), so a birth is ALWAYS a NEW episode → stamp a
+            # fresh trace. The ``live is not None`` branch is the uniform preserve-if-live
+            # guard (defensive/documentary — unreachable in the create path today).
+            provenance = (
+                live.provenance
+                if live is not None
+                else creation_provenance(
+                    ctx.trace,
+                    created_by=self.id,
+                    component="aggregation",
+                    reason=f"contact desire ({spring})",
+                )
+            )
             desire = build_contact_desire(
                 state=DesireState.ACTIVE,
                 salience=salience,
@@ -308,6 +324,7 @@ class ContactAggregation:
                 spring=spring,
                 source_thought_ids=source_thought_ids,
                 risk_if_ignored=risk_if_ignored,
+                provenance=provenance,
             )
             intents.append(PutRecord(op=PutOp(draft=encode_contact_desire(desire))))
             # Tell ThoughtAttention (same tick, downstream) the source thought's reason

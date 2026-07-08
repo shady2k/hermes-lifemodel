@@ -8,8 +8,11 @@ from lifemodel.core.component import TickContext
 from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
 from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE
 from lifemodel.core.wake_packet import RECENT_THOUGHTS_HEADER, build_wake_packet
+from lifemodel.domain.memory import MemoryRecord
+from lifemodel.domain.objects import default_registry
 from lifemodel.state.model import State
 from lifemodel.testing import (
+    FakeTracer,
     contact_desire_objects,
     contact_desire_record,
     owner_relationship_record,
@@ -254,3 +257,121 @@ def test_launch_records_appraisal_constraints_on_the_intention(tmp_path) -> None
     constraints = put.op.draft.payload["constraints"]
     assert any(c == "style: playful|concise" for c in constraints)
     assert any(c == "avoid topic: work" for c in constraints)
+
+
+# --- lm-27n.11: creation-provenance is IMMUTABLE per episode (preserve-on-retry) ---
+
+_STAMP = "2026-07-06T00:00:00+00:00"
+
+
+def _record_from_draft(draft, *, state: str | None = None) -> MemoryRecord:
+    """A persisted MemoryRecord from a just-emitted draft (so tick-1's intention can
+    become tick-2's ctx.objects snapshot)."""
+    return MemoryRecord(
+        kind=draft.kind,
+        id=draft.id,
+        state=state if state is not None else draft.state,
+        payload=draft.payload,
+        source=draft.source,
+        recipient_id=draft.recipient_id,
+        salience=draft.salience,
+        confidence=draft.confidence,
+        expires_at=draft.expires_at,
+        created_at=_STAMP,
+        updated_at=_STAMP,
+        revision=0,
+        schema_version=draft.schema_version,
+    )
+
+
+def _intention_provenance(draft):
+    """Decode a just-emitted intention draft back to its typed provenance."""
+    return default_registry().decode(_record_from_draft(draft)).provenance
+
+
+def _traced_ctx(state: State, *, objects, trace, tmp_path) -> TickContext:
+    return TickContext(
+        state=state,
+        now=NOW,
+        bus=FileSignalBus(tmp_path),
+        signals=(),
+        objects=tuple(objects),
+        trace=trace,
+    )
+
+
+def test_first_crystallize_stamps_a_fresh_trace(tmp_path) -> None:
+    trace = FakeTracer().start_root()
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    desire = contact_desire_objects("active", salience=2.5, source_drive=2.0)
+    put = _intention_put(
+        _cog().step(_traced_ctx(state, objects=desire, trace=trace, tmp_path=tmp_path))
+    )
+    assert put is not None
+    prov = _intention_provenance(put.op.draft)
+    assert prov is not None
+    assert prov.trace_id == trace.trace_id  # the tick's trace stamped as the birth
+    assert prov.creation_span_id == trace.span_id
+    assert prov.component == "cognition"
+
+
+def test_intention_retry_preserves_birth_trace_not_the_retry_tick(tmp_path) -> None:
+    # THE test (codex's highest risk): crystallize on tick 1 (trace A); delivery fails,
+    # the intention stays LIVE; tick 2 (trace B) re-emits PutRecord(intention active) ->
+    # the provenance must still carry the BIRTH trace A, NOT the retry tick's trace B.
+    tracer = FakeTracer()
+    trace_a = tracer.start_root()  # tick 1 — birth
+    trace_b = tracer.start_root()  # tick 2 — retry
+    assert trace_a.trace_id != trace_b.trace_id
+
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    desire = contact_desire_objects("active", salience=2.5, source_drive=2.0)
+
+    # Tick 1: no live intention -> FRESH trace A stamped.
+    put1 = _intention_put(
+        _cog().step(_traced_ctx(state, objects=desire, trace=trace_a, tmp_path=tmp_path))
+    )
+    assert put1 is not None
+    assert _intention_provenance(put1.op.draft).trace_id == trace_a.trace_id
+
+    # Delivery fails -> pending cleared, desire still active, the intention is STILL
+    # LIVE (active) in the next tick's snapshot.
+    live_intention = _record_from_draft(put1.op.draft, state="active")
+    objects2 = (*desire, live_intention)
+
+    # Tick 2 (trace B): the retry re-emits PutRecord(intention active) while it is live
+    # -> PRESERVE the birth trace A.
+    put2 = _intention_put(
+        _cog().step(_traced_ctx(state, objects=objects2, trace=trace_b, tmp_path=tmp_path))
+    )
+    assert put2 is not None
+    prov2 = _intention_provenance(put2.op.draft)
+    assert prov2 is not None
+    assert prov2.trace_id == trace_a.trace_id  # BIRTH trace preserved
+    assert prov2.trace_id != trace_b.trace_id  # NOT the retry tick's trace
+    assert prov2.creation_span_id == trace_a.span_id
+
+
+def test_new_episode_after_resolution_gets_a_fresh_trace(tmp_path) -> None:
+    # Once the prior intention resolved (terminal -> absent from the snapshot), the next
+    # crystallize is a NEW episode -> a fresh trace, legitimately.
+    trace = FakeTracer().start_root()
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    desire = contact_desire_objects("active", salience=2.5)  # no live intention present
+    put = _intention_put(
+        _cog().step(_traced_ctx(state, objects=desire, trace=trace, tmp_path=tmp_path))
+    )
+    assert put is not None
+    assert _intention_provenance(put.op.draft).trace_id == trace.trace_id
+
+
+def test_untraced_intention_carries_lineage_without_trace_fields(tmp_path) -> None:
+    # No tracer wired (trace defaults None): the intention still carries lineage, but
+    # NO W3C trace fields — behaviour-neutral for ids/timing.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    put = _intention_put(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert put is not None
+    prov = _intention_provenance(put.op.draft)
+    assert prov is not None
+    assert prov.component == "cognition"
+    assert prov.trace_id is None
