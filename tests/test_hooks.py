@@ -7,6 +7,7 @@ aggregation layer (inside ``coreloop.tick()``) consumes them on the next tick.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import (
@@ -29,7 +31,9 @@ from lifemodel.core.taxonomy import (
 )
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.objects import DesireState
+from lifemodel.events import EventSink
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
+from lifemodel.log import EventTee
 from lifemodel.ports.memory import MemoryPort
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.state.model import State
@@ -39,13 +43,14 @@ _T0 = datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
 
 
 class _RecordingLogger:
-    """A minimal :class:`~lifemodel.log.EventLogger` that records ``.info`` calls."""
+    """A minimal :class:`~lifemodel.log.EventLogger` that records calls per level."""
 
     def __init__(self) -> None:
+        self.debug_calls: list[tuple[str, dict[str, Any]]] = []
         self.info_calls: list[tuple[str, dict[str, Any]]] = []
 
-    def debug(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
+    def debug(self, event: str, **fields: Any) -> None:
+        self.debug_calls.append((event, dict(fields)))
 
     def info(self, event: str, **fields: Any) -> None:
         self.info_calls.append((event, dict(fields)))
@@ -176,6 +181,97 @@ def test_post_llm_does_not_log_outcome_for_uncorrelated_turn(tmp_path: Path) -> 
     lm = _lm_with_pending(tmp_path, logger=logger)
     make_post_llm_observer(lm)(user_message="just a normal user message", assistant_response="hi")
     assert [c for c in logger.info_calls if c[0] == "proactive_outcome"] == []
+
+
+# --- proactive_verdict_detail — DEBUG discovery log (bead lm-otq) -----------
+
+
+def test_post_llm_emits_verdict_detail_at_debug_with_extra_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-detail", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет, скучаю!",
+        reasoning="because X",
+        model="claude",
+    )
+
+    events = [c for c in base.debug_calls if c[0] == "proactive_verdict_detail"]
+    assert len(events) == 1
+    _, fields = events[0]
+    assert fields["correlation_id"] == "p-detail"
+    assert fields["verdict"] == "fulfill"
+    assert fields["assistant_response"] == "Саш, привет, скучаю!"
+    assert fields["extra_fields"]["reasoning"] == "because X"
+    assert fields["extra_fields"]["model"] == "claude"
+
+
+def test_post_llm_does_not_emit_verdict_detail_when_effective_level_is_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "info-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-info", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет, скучаю!",
+        reasoning="because X",
+    )
+
+    assert base.debug_calls == []  # gated — DEBUG never reaches the base logger/sink
+
+
+def test_post_llm_does_not_emit_verdict_detail_for_uncorrelated_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-uncorrelated", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message="just a normal user message",  # not our impulse -> gate short-circuits
+        assistant_response="hi",
+        reasoning="because X",
+    )
+
+    assert base.debug_calls == []
+    assert [c for c in base.info_calls if c[0] == "proactive_outcome"] == []
+
+
+def test_post_llm_verdict_detail_does_not_change_signal_or_outcome_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: adding the DEBUG discovery log must not disturb the existing
+    # verdict signal publish or the INFO proactive_outcome log.
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-regress", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет, скучаю!",
+        reasoning="because X",
+    )
+
+    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
+    assert len(verdicts) == 1
+    assert read_verdict(verdicts[0]) is Verdict.FULFILL
+    assert read_verdict_correlation(verdicts[0]) == "p-regress"
+
+    outcomes = [c for c in base.info_calls if c[0] == "proactive_outcome"]
+    assert len(outcomes) == 1
+    _, fields = outcomes[0]
+    assert fields["outcome"] == "delivered"
+    assert fields["correlation_id"] == "p-regress"
 
 
 # --- make_inbound_observer — signal publishing (spec §7.1) ------------------

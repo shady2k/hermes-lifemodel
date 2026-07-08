@@ -86,6 +86,36 @@ def _log_lint(lm: LifeModel, reason: str) -> None:
         _hooks_logger(lm).info("proactive_output_lint", reason=reason)
 
 
+def _log_verdict_detail(
+    lm: LifeModel,
+    *,
+    correlation_id: str,
+    verdict: Verdict,
+    assistant_response: str,
+    extra: dict[str, Any],
+) -> None:
+    """DEBUG: full discovery detail for a resolved proactive verdict (bead lm-otq).
+
+    The host's ``post_llm_call`` hook may pass MORE than ``user_message`` /
+    ``assistant_response`` — reasoning/thinking, model id, token counts, a full
+    response object — currently swallowed by ``_observer``'s ``**_ignored``. This
+    is the ONE discovery event that captures everything we might learn from that
+    payload in a single shot: the full (untruncated) assistant response, plus a
+    safe string preview of every extra kwarg the host passed, keyed by field
+    name. DEBUG-gated (only visible when the effective log level is DEBUG, unlike
+    the always-on ``proactive_outcome`` INFO log) and best-effort — advisory
+    logging must never break a turn.
+    """
+    with contextlib.suppress(Exception):  # advisory logging must never break a turn
+        _hooks_logger(lm).debug(
+            "proactive_verdict_detail",
+            correlation_id=correlation_id,
+            verdict=verdict.value,
+            assistant_response=assistant_response,
+            extra_fields={k: str(v)[:800] for k, v in extra.items()},
+        )
+
+
 def _log_outcome(lm: LifeModel, *, correlation_id: str, verdict: Verdict) -> None:
     """INFO: the resolved proactive outcome — "it woke and chose silence" vs "it
     woke and reached out" (bead lm-j2w B3, owner's core ask). INFO so it is
@@ -116,6 +146,13 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
             if not lint.ok:
                 _log_lint(lm, lint.reason)
         _log_outcome(lm, correlation_id=state.pending_proactive_id or "", verdict=verdict)
+        _log_verdict_detail(
+            lm,
+            correlation_id=state.pending_proactive_id or "",
+            verdict=verdict,
+            assistant_response=assistant_response,
+            extra=_ignored,
+        )
         now = lm.clock.now()
         lm.bus.publish(
             verdict_signal(
