@@ -31,7 +31,7 @@ from .errors import StateCorruptError
 #: way old readers cannot understand. Reading a *different* version is a Phase-7
 #: concern (migrations / back-compat, HLA §9 / FR16); this build fails loud on
 #: any mismatch (see :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.load`).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -104,6 +104,12 @@ class State:
     #: ``SEND_LOG_KEEP`` (spec §14). The global backstop reads this to enforce
     #: the hard rate limit (≤3/day, ≥60 min apart). Defaults to empty (additive).
     proactive_send_log: list[str] = field(default_factory=list)
+    #: Count of consecutive proactive outreaches sent without a genuine reply
+    #: since (spec §14 / Slice 3, lm-8o3.1). Feeds the unanswered-outbound gate
+    #: so the being does not repeat a pure-longing bid after one unanswered
+    #: outreach; reset to zero by a genuine exchange. Defaults to zero
+    #: (additive).
+    unanswered_outbound_count: int = 0
     # NB: signal dedup does *not* live here. It is owned by the SignalBus
     # consumed-ledger (``signals.consumed``), which persists "already consumed"
     # independently of this State to avoid racing the tick's own commit — see
@@ -171,6 +177,9 @@ class State:
                 data.get("action_pending_since"), "action_pending_since"
             ),
             proactive_send_log=_as_str_list(data, "proactive_send_log", []),
+            unanswered_outbound_count=_as_int(
+                data.get("unanswered_outbound_count", 0), "unanswered_outbound_count"
+            ),
         )
 
 

@@ -14,7 +14,7 @@ from lifemodel.state import SCHEMA_VERSION, State, StateCorruptError
 
 def test_defaults_are_documented_and_current_schema() -> None:
     state = State()
-    assert state.schema_version == SCHEMA_VERSION == 1
+    assert state.schema_version == SCHEMA_VERSION == 2
     assert state.tick_count == 0
     assert state.energy == 1.0
     assert state.last_tick_at is None
@@ -216,3 +216,15 @@ def test_proactive_send_log_defaults_empty_and_roundtrips() -> None:
 def test_proactive_send_log_rejects_non_list() -> None:
     with pytest.raises(StateCorruptError):
         State.from_dict({"proactive_send_log": "nope"})
+
+
+def test_unanswered_outbound_count_defaults_zero_and_roundtrips() -> None:
+    assert State().unanswered_outbound_count == 0
+    assert State.from_dict({}).unanswered_outbound_count == 0  # additive: old file loads clean
+    s = State(unanswered_outbound_count=3)
+    assert State.from_dict(s.to_dict()).unanswered_outbound_count == 3
+
+
+def test_unanswered_outbound_count_rejects_non_int() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"unanswered_outbound_count": "x"})
