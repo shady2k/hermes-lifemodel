@@ -55,6 +55,7 @@ from pathlib import Path
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.signal_bus import FileSignalBus
+from .adapters.trace_export import make_trace_exporter
 from .adapters.tracer import StdlibTracer
 from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
@@ -77,6 +78,7 @@ from .ports.delivery import DeliveryPort
 from .ports.memory import MemoryPort
 from .ports.pressure import PressureSensorPort
 from .ports.tick_commit import TickCommitPort
+from .ports.trace_export import TraceExportPort
 from .ports.tracer import TracerPort
 from .sim.wake import GateParams
 from .state.port import StatePort
@@ -133,6 +135,7 @@ def build_lifemodel(
     logger: EventLogger | None = None,
     registry: ComponentRegistry | None = None,
     tracer: TracerPort | None = None,
+    trace_exporter: TraceExportPort | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -175,6 +178,11 @@ def build_lifemodel(
     # tick from it and threads it through TickContext so creation sites stamp the born
     # object's provenance with the tick's trace.
     resolved_tracer: TracerPort = tracer or StdlibTracer()
+    # The OPTIONAL tick-end trace exporter (lm-27n.10): the factory returns a real
+    # OpenTelemetry exporter only if ``opentelemetry`` is importable, else a no-op —
+    # so in the Hermes venv (no OTel) this is behaviour-neutral. The CoreLoop ships
+    # each finished tick's root span to it best-effort, after the commit.
+    resolved_trace_exporter: TraceExportPort = trace_exporter or make_trace_exporter()
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
@@ -274,6 +282,7 @@ def build_lifemodel(
         # deferred (the object-core is the single source of what "live" means).
         live_states=default_registry().live_states(),
         tracer=resolved_tracer,
+        trace_exporter=resolved_trace_exporter,
     )
 
     return LifeModel(

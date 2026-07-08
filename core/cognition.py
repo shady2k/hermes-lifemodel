@@ -23,7 +23,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ..domain.memory import PutOp
-from ..domain.objects import DesireState, IntentionState
+from ..domain.objects import (
+    CONTACT_DESIRE_ID,
+    DesireState,
+    IntentionState,
+    qualified_id,
+)
 from .component import TickContext
 from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
@@ -104,6 +109,14 @@ class Cognition:
                 created_by=self.id,
                 component="cognition",
                 reason="crystallized contact intention",
+                # The ONE new causal stamp (lm-27n.10): the Intention→Desire edge — the
+                # only lineage the domain has no typed field for ("same id, different
+                # kind" is too implicit for an audit reader). Stamped on the FRESH birth
+                # provenance ONLY; the preserve-on-retry branch keeps its birth
+                # provenance (which already carries this edge), so a retry never rewrites
+                # it. The typed edges (source_thought_ids / parent_id) stay the truth —
+                # they are NOT mirrored here, so no edge is authoritative twice.
+                source_object_ids=(qualified_id("desire", CONTACT_DESIRE_ID),),
             )
         )
         # 0-LLM crystallization: record the committed decision (Bratman act-gate).

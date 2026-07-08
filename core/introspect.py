@@ -23,6 +23,7 @@ from .pressure import effective_pressure, inhibition_at
 from .receptivity import appraise_receptivity
 from .relationship_view import DEFAULT_RELATIONSHIP
 from .timeutil import minutes_between
+from .why_graph import WhyNode, display_id
 
 #: Max age (minutes) of ``last_tick_at`` before the brain reads as STALE. The loop
 #: ticks ~every 60s (stamping ``last_tick_at`` via ``coreloop.tick()``), so a gap
@@ -104,6 +105,45 @@ class Readings:
     last_tick_at: str | None
     last_tick_ago_min: float | None
     brain_alive: bool  # last tick fresh (<= BRAIN_STALE_MIN) => the loop is ticking
+    #: One COMPACT "why did I write" line — the current contact intention's causal
+    #: chain (lm-27n.10), e.g. ``intention:contact:owner <- desire:contact:owner
+    #: (source)``. ``"no current outreach"`` when there is no live/recent intention.
+    #: The FULL graph lives behind ``/lifemodel why`` (not re-walked into every dump).
+    contact_chain: str = "no current outreach"
+
+
+#: How many links the COMPACT contact-chain line follows down its primary lineage —
+#: keeps the debug dump's one-liner one line, however deep the full graph runs.
+_CHAIN_SUMMARY_HOPS = 4
+
+
+def contact_chain_summary(node: WhyNode | None) -> str:
+    """A one-line "why did I write" summary of the contact-intention chain (lm-27n.10).
+
+    Follows the primary (first-edge) lineage down a few hops, e.g. ``intention:
+    contact:owner <- desire:contact:owner (source)``. ``None`` (no live/recent
+    intention) → ``"no current outreach"``. Cycle/missing edges terminate the line
+    with an explicit marker; it is always a single, bounded line."""
+    if node is None:
+        return "no current outreach"
+    parts = [display_id(node.kind, node.id)]
+    current: WhyNode | None = node
+    for _ in range(_CHAIN_SUMMARY_HOPS):
+        if current is None or not current.edges:
+            break
+        edge = current.edges[0]
+        if edge.node is not None:
+            parts.append(f"<- {display_id(edge.node.kind, edge.node.id)} ({edge.label})")
+            current = edge.node
+        elif edge.cycle:
+            parts.append(f"<- [cycle] ({edge.label})")
+            break
+        elif edge.missing_ref is not None:
+            parts.append(f"<- {edge.missing_ref} ({edge.label}) [missing]")
+            break
+        else:  # pragma: no cover - an edge always has node/cycle/missing_ref
+            break
+    return " ".join(parts)
 
 
 def _ago(iso: str | None, now: datetime) -> float | None:
@@ -182,6 +222,7 @@ def compute_readings(
     intention_state: str = "none",
     relationship: Relationship | None = None,
     thoughts: Sequence[Thought] = (),
+    contact_chain: str = "no current outreach",
 ) -> Readings:
     """Compute the debug readings. ``desire_state`` is the live contact-desire's
     lifecycle state (``active``/``deferred``/``none``), read by the caller from
@@ -263,4 +304,5 @@ def compute_readings(
         last_tick_at=state.last_tick_at,
         last_tick_ago_min=last_tick_ago,
         brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,
+        contact_chain=contact_chain,
     )

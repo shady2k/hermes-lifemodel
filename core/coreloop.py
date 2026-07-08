@@ -27,6 +27,7 @@ from ..log import EventLogger, bound_log_context
 from ..ports.clock import ClockPort
 from ..ports.memory import MemoryPort
 from ..ports.pressure import PressureSensorPort
+from ..ports.trace_export import TraceExportPort
 from ..ports.tracer import TraceContext, TracerPort
 from ..state.model import State
 from .component import TickContext
@@ -101,6 +102,7 @@ class CoreLoop:
         memory: MemoryPort | None = None,
         live_states: frozenset[str] | None = None,
         tracer: TracerPort | None = None,
+        trace_exporter: TraceExportPort | None = None,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
@@ -108,6 +110,7 @@ class CoreLoop:
         self._clock = clock
         self._log = logger
         self._tracer = tracer
+        self._trace_exporter = trace_exporter
         self._breaker_threshold = breaker_threshold
         self._intake_limits = intake_limits or IntakeLimits()
         self._pressure_sensor = pressure_sensor
@@ -219,7 +222,7 @@ class CoreLoop:
         had_mutation = any(isinstance(i, PutRecord | TransitionRecord) for i in intents)
         new_state = self._state_actor.apply(intents)
 
-        return TickReport(
+        report = TickReport(
             tick=new_state.tick_count,
             ran=tuple(ran),
             skipped_broken=tuple(sorted(self._broken)),
@@ -227,6 +230,20 @@ class CoreLoop:
             committed=new_state is not state or had_mutation,
             launches=tuple(launches),
         )
+        # Ship the finished tick to the (optional) trace backend AFTER the commit —
+        # BEST-EFFORT: an exporter that raises must never affect the tick outcome
+        # (fail-soft, like the snapshot read). Noop default → behaviour-neutral.
+        self._export_tick(report, trace)
+        return report
+
+    def _export_tick(self, report: TickReport, trace: TraceContext | None) -> None:
+        if self._trace_exporter is None:
+            return
+        try:
+            self._trace_exporter.export_tick(report, trace)
+        except Exception as exc:  # noqa: BLE001 - best-effort; never break the tick
+            if self._log is not None:
+                self._log.info("trace_export_failed", error=repr(exc))
 
     def _record_failure(self, component_id: str, exc: Exception) -> None:
         count = self._failures.get(component_id, 0) + 1

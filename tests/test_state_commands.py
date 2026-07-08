@@ -69,6 +69,7 @@ from lifemodel.state_commands import (
     set_relationship_prefs_for_dir,
     think_for_dir,
     transition_thought_for_dir,
+    why_for_dir,
 )
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -634,3 +635,81 @@ def test_seeded_thought_reaches_the_snapshot_and_renders_in_a_launch(tmp_path) -
     report = lm.coreloop.tick()
     assert report.launches, "cognition should launch for a live active desire"
     assert "did the owner hear back about the flat" in report.launches[0].prompt
+
+
+# --- lm-27n.10: /lifemodel why — the read-only causal-chain reader ----------
+
+
+def _seed_contact_chain(tmp_path) -> None:
+    """Seed a live contact desire + the intention that crystallized from it."""
+    from lifemodel.core.intention_view import build_contact_intention, encode_contact_intention
+    from lifemodel.core.trace import creation_provenance
+    from lifemodel.domain.objects import (
+        CONTACT_DESIRE_ID,
+        IntentionState,
+        qualified_id,
+    )
+    from lifemodel.testing import FakeTracer
+
+    store = _store(tmp_path)
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
+    store.put(
+        encode_contact_intention(
+            build_contact_intention(
+                state=IntentionState.ACTIVE,
+                commitment_strength=2.0,
+                provenance=creation_provenance(
+                    FakeTracer().start_root(),
+                    created_by="cognition",
+                    component="cognition",
+                    reason="crystallized contact intention",
+                    source_object_ids=(qualified_id("desire", CONTACT_DESIRE_ID),),
+                ),
+            )
+        )
+    )
+
+
+def test_why_write_renders_the_current_contact_chain(tmp_path) -> None:
+    _seed_contact_chain(tmp_path)
+    out = why_for_dir(tmp_path, "write")
+    assert "lifemodel why  (read-only)" in out
+    assert "intention:contact:owner [active]" in out
+    assert "crystallized contact intention" in out
+    # the source edge reaches the desire, indented under the intention
+    assert "source -> desire:contact:owner [active]" in out
+
+
+def test_why_defaults_to_the_intention_chain(tmp_path) -> None:
+    _seed_contact_chain(tmp_path)
+    # a bare `why` and `why write` render the same intention chain
+    assert why_for_dir(tmp_path, "") == why_for_dir(tmp_path, "write")
+
+
+def test_why_desire_renders_the_desire_chain(tmp_path) -> None:
+    _seed_contact_chain(tmp_path)
+    out = why_for_dir(tmp_path, "desire")
+    assert "desire:contact:owner [active]" in out
+    assert "intention:contact:owner" not in out  # the desire chain, not the intention
+
+
+def test_why_with_no_live_intention_is_a_clear_message(tmp_path) -> None:
+    _store(tmp_path).commit(State())  # empty store — no intention row
+    out = why_for_dir(tmp_path, "write")
+    assert "no current outreach" in out
+
+
+def test_why_precise_kind_id_and_bad_target(tmp_path) -> None:
+    _seed_contact_chain(tmp_path)
+    precise = why_for_dir(tmp_path, "intention:contact:owner")
+    assert "intention:contact:owner [active]" in precise
+    assert "no such object" in why_for_dir(tmp_path, "desire:nope")
+    assert "usage:" in why_for_dir(tmp_path, "gibberish")
+
+
+def test_why_is_read_only(tmp_path) -> None:
+    _seed_contact_chain(tmp_path)
+    before = _store(tmp_path).load()
+    why_for_dir(tmp_path, "write")
+    after = _store(tmp_path).load()
+    assert before == after  # a read-only audit never mutates state

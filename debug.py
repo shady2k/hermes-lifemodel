@@ -15,9 +15,10 @@ from typing import cast
 from . import composition
 from .core.desire_view import read_live_contact_desire
 from .core.intention_view import read_live_contact_intention
-from .core.introspect import DebugConfig, Readings, compute_readings
+from .core.introspect import DebugConfig, Readings, compute_readings, contact_chain_summary
 from .core.relationship_view import read_owner_relationship
 from .core.thought_view import read_live_thoughts
+from .core.why_graph import why_contact_intention
 from .ports.memory import MemoryPort
 from .state.errors import StateError
 
@@ -129,6 +130,11 @@ def render_dump_for_dir(base_dir: Path) -> str:
     intention_state = intention.state if intention is not None else "none"
     relationship = read_owner_relationship(memory) if memory is not None else None
     thoughts = read_live_thoughts(memory, limit=DEBUG_THOUGHTS_LIMIT) if memory is not None else ()
+    # The COMPACT "why did I write" chain (lm-27n.10): a single summary line, NOT the
+    # full graph each dump. The full walk lives behind `/lifemodel why`.
+    contact_chain = contact_chain_summary(
+        why_contact_intention(memory) if memory is not None else None
+    )
     return render_debug_dump(
         readings=compute_readings(
             state,
@@ -140,6 +146,7 @@ def render_dump_for_dir(base_dir: Path) -> str:
             intention_state=intention_state,
             relationship=relationship,
             thoughts=thoughts,
+            contact_chain=contact_chain,
         )
     )
 
@@ -211,6 +218,7 @@ def render_debug_dump(*, readings: Readings) -> str:
             ("status", r.desire_status),
             ("spring", spring),
             ("intention", r.intention_status),
+            ("why", r.contact_chain),
             ("pending_turn", pending),
             ("last_contact", _local(r.last_contact_at)),
             ("last_exchange", _local(r.last_exchange_at)),

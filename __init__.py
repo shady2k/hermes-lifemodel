@@ -30,6 +30,7 @@ from .state_commands import (
     set_field_for_dir,
     set_relationship_prefs_for_dir,
     think_for_dir,
+    why_for_dir,
 )
 
 __version__ = "0.0.0"
@@ -52,6 +53,10 @@ class _Subcommand(NamedTuple):
 _SUBCOMMANDS: dict[str, _Subcommand] = {
     "status": _Subcommand("Show the one-line plugin status (default)."),
     "debug": _Subcommand("Read-only state/event dump for owner introspection."),
+    "why": _Subcommand(
+        "why [desire|intention|write|<kind>:<id>] — trace the causal chain behind a "
+        "desire/intention (read-only)."
+    ),
     "help": _Subcommand("List these subcommands."),
     "nudge": _Subcommand(
         "nudge [N] — bump the contact drive: u += N (default +1.0).", mutating=True
@@ -145,6 +150,10 @@ def register(ctx: Any) -> None:
             # Owner introspection (NFR9): returned to the caller, never logged,
             # and read-only (HLA §9) — no commit, no bus mutation.
             return render_dump_for_dir(sdir)
+        if sub == "why":
+            # Owner introspection (the "why did I write" audit): read-only, walks the
+            # durable causal chain — no commit, no bus mutation.
+            return why_for_dir(sdir, rest)
         if sub == "help":
             return _command_list() + "\n"
         # --- mutating subcommands: all go through the SAME StatePort store

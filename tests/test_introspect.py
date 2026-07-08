@@ -114,3 +114,57 @@ def test_receptivity_surfaces_an_explicit_hard_veto() -> None:
     r = compute_readings(state, now=NOW, cfg=CFG, relationship=rel)
     assert r.receptivity_allowed is False
     assert r.receptivity_hard_reasons  # non-empty: the "why silent" audit
+
+
+# --- lm-27n.10: the compact "why did I write" contact-chain summary ----------
+
+
+def test_contact_chain_summary_none_is_no_outreach() -> None:
+    from lifemodel.core.introspect import contact_chain_summary
+
+    assert contact_chain_summary(None) == "no current outreach"
+
+
+def test_contact_chain_summary_follows_the_primary_lineage() -> None:
+    from lifemodel.core.introspect import contact_chain_summary
+    from lifemodel.core.why_graph import WhyEdge, WhyNode
+
+    def _node(kind, oid, edges=()):
+        return WhyNode(
+            kind=kind,
+            id=oid,
+            state="active",
+            reason=None,
+            component=None,
+            trace_id=None,
+            creation_span_id=None,
+            created_at="",
+            updated_at="",
+            edges=edges,
+        )
+
+    desire = _node("desire", "contact:owner")
+    intention = _node("intention", "contact:owner", (WhyEdge(label="source", node=desire),))
+    assert (
+        contact_chain_summary(intention)
+        == "intention:contact:owner <- desire:contact:owner (source)"
+    )
+
+
+def test_contact_chain_summary_marks_a_cycle() -> None:
+    from lifemodel.core.introspect import contact_chain_summary
+    from lifemodel.core.why_graph import WhyEdge, WhyNode
+
+    node = WhyNode(
+        kind="thought",
+        id="thought:a",
+        state="active",
+        reason=None,
+        component=None,
+        trace_id=None,
+        creation_span_id=None,
+        created_at="",
+        updated_at="",
+        edges=(WhyEdge(label="parent_thought", cycle=True),),
+    )
+    assert contact_chain_summary(node) == "thought:a <- [cycle] (parent_thought)"

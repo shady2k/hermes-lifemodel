@@ -61,6 +61,13 @@ from .core.thought_view import (
     encode_thought,
     seed_thought_id,
 )
+from .core.why_graph import (
+    WhyNode,
+    build_why_graph,
+    display_id,
+    why_contact_desire,
+    why_contact_intention,
+)
 from .domain.memory import MemoryMutation, PutOp, StaleTransition, TransitionOp
 from .domain.objects import (
     CONTACT_DESIRE_ID,
@@ -656,3 +663,66 @@ def transition_thought_for_dir(
         f"  thought [{thought_id}] {record.state} -> {to}",
     ]
     return "\n".join(lines) + "\n"
+
+
+# --- why (lm-27n.10): the READ-ONLY causal-chain reader ---------------------
+# "Why does this desire/intention exist?" / "Why did I write?" — renders the durable
+# why-graph (core/why_graph.py) as an indented text tree. Pure read: it walks the
+# rows through the MemoryPort, never writes, and the walk is HARD-bounded (cycle /
+# missing / depth / node caps live in the reader).
+
+
+def _render_why_node(node: WhyNode, depth: int, label: str | None, lines: list[str]) -> None:
+    indent = "  " * depth
+    head = f"{label} -> " if label is not None else ""
+    reason = f" - {node.reason}" if node.reason else ""
+    trace = f" (trace {node.trace_id[:8]})" if node.trace_id else ""
+    lines.append(f"{indent}{head}{display_id(node.kind, node.id)} [{node.state}]{reason}{trace}")
+    for edge in node.edges:
+        if edge.node is not None:
+            _render_why_node(edge.node, depth + 1, edge.label, lines)
+        elif edge.cycle:
+            lines.append(f"{'  ' * (depth + 1)}{edge.label} -> [cycle]")
+        elif edge.missing_ref is not None:
+            lines.append(f"{'  ' * (depth + 1)}{edge.label} -> {edge.missing_ref} [missing]")
+
+
+def render_why(node: WhyNode) -> str:
+    """Render a :class:`WhyNode` tree as deterministic, indented text (read-only)."""
+    lines: list[str] = ["lifemodel why  (read-only)", "=" * 30, ""]
+    _render_why_node(node, 0, None, lines)
+    return "\n".join(lines) + "\n"
+
+
+def why_for_dir(base_dir: Path, raw_args: str, *, logger: EventLogger | None = None) -> str:
+    """Answer ``/lifemodel why [desire|intention|write|<kind>:<id>]`` — read-only.
+
+    ``why`` / ``why write`` / ``why intention`` walk the contact intention chain ("why
+    did I decide to write?"); ``why desire`` walks the contact desire chain; a bare
+    ``<kind>:<id>`` walks that precise object. A target with no live/recent row renders
+    a clear "no current outreach" (or "no such object") message — never a crash."""
+    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    memory = lm.state if isinstance(lm.state, MemoryPort) else None
+    if memory is None:  # pragma: no cover - the live store is always a MemoryPort
+        return "error: this store cannot read memory records\n"
+
+    raw = raw_args.strip()
+    target = raw.lower()
+    if target in ("", "write", "intention"):
+        node = why_contact_intention(memory)
+        empty = "lifemodel why: no current outreach — no live or recent contact intention.\n"
+    elif target == "desire":
+        node = why_contact_desire(memory)
+        empty = "lifemodel why: no current outreach — no live or recent contact desire.\n"
+    elif ":" in raw:
+        kind, _, obj_id = raw.partition(":")
+        node = build_why_graph(memory, kind, obj_id)
+        empty = f"lifemodel why: no such object {kind}:{obj_id}\n"
+    else:
+        return (
+            "usage: /lifemodel why [desire | intention | write | <kind>:<id>]\n"
+            "  (no argument = the current contact intention chain)\n"
+        )
+    if node is None:
+        return empty
+    return render_why(node)

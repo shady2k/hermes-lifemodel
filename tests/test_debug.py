@@ -239,3 +239,47 @@ def test_dump_lists_live_thoughts(tmp_path) -> None:
     assert "the book they liked [t-lo]" in out
     assert "handled" not in out  # terminal thought excluded from the audit
     assert out.index("[t-hi]") < out.index("[t-lo]")  # salience order
+
+
+def test_dump_shows_the_compact_contact_chain_when_present(tmp_path) -> None:
+    # lm-27n.10: the debug dump carries ONE compact "why did I write" line — the
+    # current contact intention chain — not the full graph.
+    from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
+    from lifemodel.core.intention_view import build_contact_intention, encode_contact_intention
+    from lifemodel.core.trace import creation_provenance
+    from lifemodel.domain.objects import (
+        CONTACT_DESIRE_ID,
+        DesireState,
+        IntentionState,
+        qualified_id,
+    )
+    from lifemodel.testing import FakeTracer
+
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    store.commit(State(u=2.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
+    store.put(
+        encode_contact_intention(
+            build_contact_intention(
+                state=IntentionState.ACTIVE,
+                commitment_strength=2.0,
+                provenance=creation_provenance(
+                    FakeTracer().start_root(),
+                    created_by="cognition",
+                    component="cognition",
+                    reason="crystallized contact intention",
+                    source_object_ids=(qualified_id("desire", CONTACT_DESIRE_ID),),
+                ),
+            )
+        )
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "**why:** intention:contact:owner <- desire:contact:owner (source)" in out
+
+
+def test_dump_contact_chain_is_no_outreach_when_absent(tmp_path) -> None:
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
+        State(u=2.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "**why:** no current outreach" in out

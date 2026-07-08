@@ -375,3 +375,69 @@ def test_untraced_intention_carries_lineage_without_trace_fields(tmp_path) -> No
     assert prov is not None
     assert prov.component == "cognition"
     assert prov.trace_id is None
+
+
+# --- lm-27n.10: the ONE new causal stamp — the Intention→Desire edge ---
+
+
+def test_fresh_intention_stamps_the_desire_source_edge(tmp_path) -> None:
+    # A freshly-crystallized intention carries exactly the intention->desire link in
+    # source_object_ids (the only edge the domain has no typed field for).
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    put = _intention_put(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert put is not None
+    prov = _intention_provenance(put.op.draft)
+    assert prov is not None
+    assert prov.source_object_ids == ("desire:contact:owner",)
+
+
+def test_intention_source_edge_does_not_duplicate_typed_thought_links(tmp_path) -> None:
+    # Domain links stay the truth: even a THOUGHT-sprung desire's source_thought_ids are
+    # NOT mirrored into the intention's source_object_ids (no drift). Only the desire
+    # edge is stamped.
+    from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
+    from lifemodel.domain.objects import DesireSpring, DesireState
+
+    desire_record = _record_from_draft(
+        encode_contact_desire(
+            build_contact_desire(
+                state=DesireState.ACTIVE,
+                salience=2.0,
+                spring=DesireSpring.THOUGHT,
+                source_thought_ids=("thought:seed:abc",),
+            )
+        )
+    )
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    put = _intention_put(_cog().step(_ctx(state, objects=(desire_record,), tmp_path=tmp_path)))
+    assert put is not None
+    prov = _intention_provenance(put.op.draft)
+    assert prov is not None
+    assert prov.source_object_ids == ("desire:contact:owner",)  # NOT the thought id
+
+
+def test_intention_retry_preserves_the_source_edge_unchanged(tmp_path) -> None:
+    # The preserve-on-retry branch keeps the birth provenance — including its
+    # source_object_ids — unchanged; a retry never re-stamps or duplicates the edge.
+    tracer = FakeTracer()
+    trace_a = tracer.start_root()
+    trace_b = tracer.start_root()
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    desire = contact_desire_objects("active", salience=2.5)
+
+    put1 = _intention_put(
+        _cog().step(_traced_ctx(state, objects=desire, trace=trace_a, tmp_path=tmp_path))
+    )
+    assert put1 is not None
+    assert _intention_provenance(put1.op.draft).source_object_ids == ("desire:contact:owner",)
+
+    live_intention = _record_from_draft(put1.op.draft, state="active")
+    put2 = _intention_put(
+        _cog().step(
+            _traced_ctx(state, objects=(*desire, live_intention), trace=trace_b, tmp_path=tmp_path)
+        )
+    )
+    assert put2 is not None
+    prov2 = _intention_provenance(put2.op.draft)
+    assert prov2 is not None
+    assert prov2.source_object_ids == ("desire:contact:owner",)  # unchanged, not doubled
