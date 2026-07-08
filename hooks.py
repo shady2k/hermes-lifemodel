@@ -99,11 +99,13 @@ def _log_verdict_detail(
     The host's ``post_llm_call`` hook may pass MORE than ``user_message`` /
     ``assistant_response`` — reasoning/thinking, model id, token counts, a full
     response object — currently swallowed by ``_observer``'s ``**_ignored``. This
-    is the ONE discovery event that captures everything we might learn from that
-    payload in a single shot: the full (untruncated) assistant response, plus a
-    safe string preview of every extra kwarg the host passed, keyed by field
-    name. DEBUG-gated (only visible when the effective log level is DEBUG, unlike
-    the always-on ``proactive_outcome`` INFO log) and best-effort — advisory
+    is the discovery event for the top-level fields: the full (untruncated)
+    assistant response, plus a safe string preview of every extra kwarg the
+    host passed, keyed by field name. ``conversation_history`` is captured
+    separately by name in ``_observer`` (not part of ``extra``) and owned by
+    :func:`_log_proactive_reasoning` instead — this event no longer dumps it.
+    DEBUG-gated (only visible when the effective log level is DEBUG, unlike the
+    always-on ``proactive_outcome`` INFO log) and best-effort — advisory
     logging must never break a turn.
     """
     with contextlib.suppress(Exception):  # advisory logging must never break a turn
@@ -113,6 +115,84 @@ def _log_verdict_detail(
             verdict=verdict.value,
             assistant_response=assistant_response,
             extra_fields={k: str(v)[:800] for k, v in extra.items()},
+        )
+
+
+#: Generous per-message cap on logged reasoning text — untruncated in practice
+#: (host reasoning chains are far shorter than this), just a sanity ceiling so
+#: one pathological payload can't blow up the debug sink.
+_REASONING_LOG_CAP = 4000
+
+
+def _summarize_reasoning_message(message: Any) -> dict[str, Any]:
+    """Best-effort, defensive summary of one ``conversation_history`` entry.
+
+    Entries are *expected* to be dicts with ``role``/``finish_reason``/
+    ``tool_calls``/``reasoning`` keys (spec discovery, bead lm-otq step 1), but
+    the host payload is untrusted shape — any key may be missing, or the entry
+    may not be a dict at all. Never raises; degrades to ``None``/``False``.
+    """
+    if not isinstance(message, dict):
+        return {
+            "role": None,
+            "finish_reason": None,
+            "has_tool_calls": False,
+            "tool_call_names": [],
+            "reasoning": None,
+            "entry_type": type(message).__name__,
+        }
+    tool_calls = message.get("tool_calls")
+    tool_call_names: list[str] = []
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else call.get("name")
+            if name is not None:
+                tool_call_names.append(str(name))
+    reasoning = message.get("reasoning")
+    return {
+        "role": message.get("role"),
+        "finish_reason": message.get("finish_reason"),
+        "has_tool_calls": bool(tool_calls),
+        "tool_call_names": tool_call_names,
+        "reasoning": str(reasoning)[:_REASONING_LOG_CAP] if reasoning is not None else None,
+    }
+
+
+def _log_proactive_reasoning(
+    lm: LifeModel, *, correlation_id: str, conversation_history: Any
+) -> None:
+    """DEBUG: the full reasoning chain behind a resolved proactive turn (lm-otq step 2).
+
+    ``conversation_history`` (a ``post_llm_call`` kwarg the host passes
+    alongside ``user_message``/``assistant_response``) is a list of message
+    dicts; assistant entries may carry a ``reasoning`` string — the being's own
+    chain of thought for that turn, including the impulse turn itself (the
+    LAST assistant message). This is the ONE event that surfaces it, per
+    message, untruncated (capped generously). Defensive: never raises on an
+    unexpected shape. DEBUG-gated and best-effort like the sibling discovery
+    log, ``proactive_verdict_detail`` — advisory logging must never break a
+    turn or alter verdict/signal/outcome control flow.
+    """
+    with contextlib.suppress(Exception):  # advisory logging must never break a turn
+        logger = _hooks_logger(lm)
+        if not isinstance(conversation_history, list):
+            logger.debug(
+                "proactive_reasoning",
+                correlation_id=correlation_id,
+                available=False,
+                reason=f"conversation_history is {type(conversation_history).__name__}, not a list",
+            )
+            return
+        messages = [_summarize_reasoning_message(m) for m in conversation_history]
+        logger.debug(
+            "proactive_reasoning",
+            correlation_id=correlation_id,
+            available=True,
+            message_count=len(messages),
+            messages=messages,
         )
 
 
@@ -132,7 +212,13 @@ def _log_outcome(lm: LifeModel, *, correlation_id: str, verdict: Verdict) -> Non
 def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
     """Return a ``post_llm_call`` handler that PUBLISHES a verdict signal (§7.1)."""
 
-    def _observer(*, user_message: str = "", assistant_response: str = "", **_ignored: Any) -> None:
+    def _observer(
+        *,
+        user_message: str = "",
+        assistant_response: str = "",
+        conversation_history: Any = None,
+        **_ignored: Any,
+    ) -> None:
         state = lm.state.load()
         if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
             return
@@ -152,6 +238,11 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
             verdict=verdict,
             assistant_response=assistant_response,
             extra=_ignored,
+        )
+        _log_proactive_reasoning(
+            lm,
+            correlation_id=state.pending_proactive_id or "",
+            conversation_history=conversation_history,
         )
         now = lm.clock.now()
         lm.bus.publish(

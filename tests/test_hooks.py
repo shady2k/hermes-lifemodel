@@ -274,6 +274,166 @@ def test_post_llm_verdict_detail_does_not_change_signal_or_outcome_log(
     assert fields["correlation_id"] == "p-regress"
 
 
+# --- proactive_reasoning — DEBUG discovery log (bead lm-otq step 2) --------
+
+
+def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-reason", logger=logger)
+
+    # Longer than the old 800-char truncation cap, but within the new 4000-char
+    # generous cap — proves this event is untruncated relative to the old one.
+    long_reasoning = "Саша спрашивает про markdown редактор... " + ("x" * 2000)
+    history = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "search_session_history"}}],
+            "finish_reason": "tool_calls",
+            "reasoning": "first pass reasoning",
+        },
+        {
+            "role": "assistant",
+            "content": "Саш, привет!",
+            "finish_reason": "stop",
+            "reasoning": long_reasoning,
+        },
+    ]
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет!",
+        conversation_history=history,
+    )
+
+    events = [c for c in base.debug_calls if c[0] == "proactive_reasoning"]
+    assert len(events) == 1
+    _, fields = events[0]
+    assert fields["correlation_id"] == "p-reason"
+    assert fields["message_count"] == 3
+    messages = fields["messages"]
+    assert len(messages) == 3
+
+    last = messages[-1]
+    assert last["role"] == "assistant"
+    assert last["finish_reason"] == "stop"
+    # untruncated (well beyond any short-preview cap like 800 chars)
+    assert last["reasoning"] == long_reasoning
+    assert len(last["reasoning"]) > 800
+
+    tool_msg = messages[1]
+    assert tool_msg["has_tool_calls"] is True
+    assert "search_session_history" in tool_msg["tool_call_names"]
+    assert tool_msg["reasoning"] == "first pass reasoning"
+
+
+def test_post_llm_proactive_reasoning_unavailable_when_history_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-nohistory", logger=logger)
+
+    # No conversation_history kwarg at all — must not raise.
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет!",
+    )
+
+    events = [c for c in base.debug_calls if c[0] == "proactive_reasoning"]
+    assert len(events) == 1
+    _, fields = events[0]
+    assert fields["available"] is False
+
+
+def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-badtype", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет!",
+        conversation_history="not-a-list",
+    )
+
+    events = [c for c in base.debug_calls if c[0] == "proactive_reasoning"]
+    assert len(events) == 1
+    _, fields = events[0]
+    assert fields["available"] is False
+
+
+def test_post_llm_does_not_emit_proactive_reasoning_when_effective_level_is_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "info-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-info2", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет!",
+        conversation_history=[{"role": "assistant", "reasoning": "should not log"}],
+    )
+
+    assert base.debug_calls == []  # gated — DEBUG never reaches the base logger/sink
+
+
+def test_post_llm_does_not_emit_proactive_reasoning_for_uncorrelated_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-uncorrelated2", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message="just a normal user message",  # not our impulse -> gate short-circuits
+        assistant_response="hi",
+        conversation_history=[{"role": "assistant", "reasoning": "irrelevant"}],
+    )
+
+    assert [c for c in base.debug_calls if c[0] == "proactive_reasoning"] == []
+
+
+def test_post_llm_proactive_reasoning_does_not_change_signal_or_outcome_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: adding proactive_reasoning must not disturb the existing
+    # verdict signal publish or the INFO proactive_outcome log.
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+    lm = _lm_with_pending(tmp_path, corr="p-regress2", logger=logger)
+
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет, скучаю!",
+        conversation_history=[{"role": "assistant", "reasoning": "because X"}],
+    )
+
+    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
+    assert len(verdicts) == 1
+    assert read_verdict(verdicts[0]) is Verdict.FULFILL
+    assert read_verdict_correlation(verdicts[0]) == "p-regress2"
+
+    outcomes = [c for c in base.info_calls if c[0] == "proactive_outcome"]
+    assert len(outcomes) == 1
+    _, fields = outcomes[0]
+    assert fields["outcome"] == "delivered"
+    assert fields["correlation_id"] == "p-regress2"
+
+
 # --- make_inbound_observer — signal publishing (spec §7.1) ------------------
 
 
