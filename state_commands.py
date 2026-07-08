@@ -37,7 +37,6 @@ command deliberately does not touch, bypass, or run synchronously.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import re
 from collections.abc import Callable, Sequence
@@ -503,6 +502,11 @@ def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
     an unsupported schema version). ``before`` is loaded best-effort purely to
     render the changed-fields echo; failing that read never blocks the reset
     itself, it only degrades the message to a generic banner.
+
+    A TRUE factory wipe (lm-7lx) also deletes every ``memory_records`` row —
+    every thought/desire/intention/relationship, not just the vitals row — so
+    a reset being genuinely starts "as if newly born" with no rumination spiral
+    left behind. See :func:`_purge_all_memory` for the best-effort seam.
     """
     lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
     now = lm.clock.now()
@@ -511,26 +515,40 @@ def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
     except StateError:
         before = None
     lm.state.reset()
-    _clear_live_desire_row(lm)  # a factory wipe also drops any live desire row
+    cleared = _purge_all_memory(lm)  # a factory wipe also drops EVERY memory row
+    footer = f"  cleared {cleared} memory records\n"
     if before is None:
-        return "lifemodel reset  (mutating)\n" + "=" * 30 + "\n\n  (previous state unreadable)\n"
+        return (
+            "lifemodel reset  (mutating)\n"
+            + "=" * 30
+            + "\n\n  (previous state unreadable)\n"
+            + footer
+        )
     _, message = reset(before, now)
-    return message
+    return message + footer
 
 
-def _clear_live_desire_row(lm: composition.LifeModel) -> None:
-    """Best-effort: terminalize any live contact-desire row on a factory wipe.
+def _purge_all_memory(lm: composition.LifeModel) -> int:
+    """Best-effort: delete every ``memory_records`` row on a factory wipe.
 
-    The state ``reset`` wipes the vitals row; this drops the separate desire
-    record so a reset is truly "as if newly born". Best-effort — a missing memory
-    port or a lost race never blocks the reset, which has already landed."""
-    if not isinstance(lm.state, MemoryPort):
-        return
-    record = lm.state.get(DESIRE_KIND, CONTACT_DESIRE_ID)
-    if record is None or record.state in _TERMINAL_DESIRE_STATES:
-        return
-    with contextlib.suppress(StaleTransition):  # a lost race is fine; the reset already landed
-        lm.state.transition(DESIRE_KIND, CONTACT_DESIRE_ID, record.state, str(DesireState.DROPPED))
+    Deliberately duck-typed rather than an ``isinstance(lm.state, MemoryPort)``
+    check: a hard delete-everything is out of scope for ``MemoryPort`` itself
+    (that Protocol's own contract is soft-delete only, via guarded
+    ``transition``), so this reaches the concrete
+    :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`'s
+    ``purge_memory_records`` the same permissive way ``_terminalize_live_desire``
+    reaches memory, without importing the concrete adapter into this
+    Hermes-free module. A store without the method (a minimal ``StatePort``
+    fake, or any failure mid-purge) degrades to "0 cleared" — it never blocks
+    the reset, which has already landed by the time this runs."""
+    purge = getattr(lm.state, "purge_memory_records", None)
+    if not callable(purge):
+        return 0
+    try:
+        result = purge()
+    except Exception:  # noqa: BLE001 - best-effort; the reset must never fail here
+        return 0
+    return result if isinstance(result, int) else 0
 
 
 def set_field_for_dir(base_dir: Path, raw_args: str, *, logger: EventLogger | None = None) -> str:

@@ -710,6 +710,25 @@ class SQLiteRuntimeStore:
         self.commit(fresh)
         return fresh
 
+    def purge_memory_records(self) -> int:
+        """Delete every row from ``memory_records`` — the memory-wipe half of a
+        TRUE factory reset (bead lm-7lx: ``/lifemodel reset`` must also drop
+        every thought/desire/intention/relationship row, not just the vitals).
+
+        Touches ONLY ``memory_records`` — ``runtime_state``, ``store_meta``, and
+        ``schema_migrations`` are untouched. Counts the rows before deleting
+        (rather than trusting the ``DELETE``'s own ``cursor.rowcount``, which
+        SQLite's truncate-optimization fast path can under-report for an
+        unconditional ``DELETE FROM`` with no ``WHERE`` on some builds) so the
+        returned count is reliable regardless of the host's SQLite build. One
+        atomic ``with conn:`` transaction, matching every other write here.
+        """
+        with closing(self._connect()) as conn, conn:
+            (count,) = conn.execute("SELECT COUNT(*) FROM memory_records").fetchone()
+            conn.execute("DELETE FROM memory_records")
+        self._log.info("memory_records_purged", count=count)
+        return int(count)
+
     # ---- PressureSensorPort ---------------------------------------------------
 
     def read_pressure_index(self, now: datetime) -> PressureIndex:

@@ -72,7 +72,11 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
     "satiate": _Subcommand(
         "Simulate a fulfilled contact: u->0, clocks reset, desire cleared.", mutating=True
     ),
-    "reset": _Subcommand("Factory wipe: write a fresh State(), as if newly born.", mutating=True),
+    "reset": _Subcommand(
+        "Factory wipe: write a fresh State() AND delete every memory record "
+        "(thoughts/desires/intentions/relationships) — truly as if newly born.",
+        mutating=True,
+    ),
     "set": _Subcommand("set <field> <value> — write one whitelisted state field.", mutating=True),
     "relationship": _Subcommand(
         "relationship <key>=<value> ... — set owner norms (bad-hours, cadence, "

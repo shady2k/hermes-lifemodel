@@ -39,16 +39,19 @@ from lifemodel.core.desire_view import (
     encode_contact_desire,
     read_live_contact_desire,
 )
+from lifemodel.core.intention_view import build_contact_intention, encode_contact_intention
 from lifemodel.core.pressure import effective_pressure, inhibition_at
 from lifemodel.core.receptivity import appraise_receptivity
 from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE, read_owner_relationship
 from lifemodel.core.thought_view import (
+    build_thought,
+    encode_thought,
     read_live_thoughts,
     read_thought,
     seed_thought_id,
 )
 from lifemodel.core.timeutil import minutes_between
-from lifemodel.domain.objects import DesireState, ThoughtState
+from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
 from lifemodel.log import get_logger
 from lifemodel.sim.wake import LaneState, evaluate_wake
 from lifemodel.state.errors import StateCorruptError
@@ -439,6 +442,48 @@ def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> 
 
     assert "previous state unreadable" in message
     assert store.load() == State()  # reset still landed cleanly
+    assert "cleared 0 memory records" in message  # nothing was seeded to purge
+
+
+def test_reset_for_dir_purges_every_memory_record(tmp_path) -> None:
+    # Regression for lm-7lx: a reset used to leave thought/desire/intention rows
+    # behind (a rumination spiral survived a "factory wipe") -- this proves the
+    # purge covers every kind, not just the live contact-desire row the old
+    # `_clear_live_desire_row` helper dropped.
+    store = _store(tmp_path)
+    store.commit(State(tick_count=7, u=3.0))
+    store.put(
+        encode_thought(
+            build_thought(
+                id=seed_thought_id("rumination spiral"),
+                content="rumination spiral",
+                trigger="seed",
+            )
+        )
+    )
+    store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0)))
+    store.put(
+        encode_contact_intention(
+            build_contact_intention(
+                state=IntentionState.ACTIVE, commitment_strength=1.0, salience=1.0
+            )
+        )
+    )
+    assert _store(tmp_path).find() != []  # sanity: seeded
+
+    message = reset_for_dir(tmp_path, logger=get_logger("t"))
+
+    assert _store(tmp_path).find() == []  # every memory_records row gone
+    assert _store(tmp_path).load() == State()
+    assert "cleared 3 memory records" in message
+
+
+def test_reset_for_dir_on_empty_store_reports_zero_cleared_without_crashing(
+    tmp_path,
+) -> None:
+    message = reset_for_dir(tmp_path, logger=get_logger("t"))
+    assert "cleared 0 memory records" in message
+    assert _store(tmp_path).load() == State()
 
 
 def test_set_field_for_dir_persists_through_the_real_store(tmp_path) -> None:
