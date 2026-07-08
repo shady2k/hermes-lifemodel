@@ -12,6 +12,8 @@ No engine/neurons yet — those land in later tasks (see docs/roadmap.md §0).
 
 from __future__ import annotations
 
+import traceback
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -146,35 +148,47 @@ def register(ctx: Any) -> None:
         parts = raw_args.strip().split(None, 1)
         sub = parts[0] if parts else ""
         rest = parts[1] if len(parts) > 1 else ""
-        if sub == "debug":
-            # Owner introspection (NFR9): returned to the caller, never logged,
-            # and read-only (HLA §9) — no commit, no bus mutation.
-            return render_dump_for_dir(sdir)
-        if sub == "why":
-            # Owner introspection (the "why did I write" audit): read-only, walks the
-            # durable causal chain — no commit, no bus mutation.
-            return why_for_dir(sdir, rest)
-        if sub == "help":
-            return _command_list() + "\n"
-        # --- mutating subcommands: all go through the SAME StatePort store
-        # (SQLiteRuntimeStore, lm-fib.6.2) the adapter loop uses (via the
+
+        # Every subcommand handler funnels through this ONE dispatch table so
+        # a bug in ANY of them (read-only or mutating) is caught at the SAME
+        # call site below — never left to propagate out of this command
+        # callback. Left uncaught, Hermes' gateway degrades a handler
+        # exception into a misleading generic "Unknown command /lifemodel"
+        # notice instead of the real reason (lm-zhh; confirmed incident: a
+        # StateSchemaError from `set` surfaced to the owner as "unknown
+        # command"). Mutating subcommands all go through the SAME StatePort
+        # store (SQLiteRuntimeStore, lm-fib.6.2) the adapter loop uses (via the
         # composition root), never a hand-edited file and never a synchronous
         # tick — see lifemodel.state_commands for the gate-satisfaction
-        # rationale.
-        if sub == "nudge":
-            return nudge_for_dir(sdir, rest, logger=logger)
-        if sub == "force-wake":
-            return force_wake_for_dir(sdir, logger=logger)
-        if sub == "satiate":
-            return satiate_for_dir(sdir, logger=logger)
-        if sub == "reset":
-            return reset_for_dir(sdir, logger=logger)
-        if sub == "set":
-            return set_field_for_dir(sdir, rest, logger=logger)
-        if sub == "relationship":
-            return set_relationship_prefs_for_dir(sdir, rest, logger=logger)
-        if sub == "think":
-            return think_for_dir(sdir, rest, logger=logger)
+        # rationale; "debug"/"why" are read-only introspection (NFR9, HLA §9).
+        dispatch: dict[str, Callable[[], str]] = {
+            "debug": lambda: render_dump_for_dir(sdir),
+            "why": lambda: why_for_dir(sdir, rest),
+            "help": lambda: _command_list() + "\n",
+            "nudge": lambda: nudge_for_dir(sdir, rest, logger=logger),
+            "force-wake": lambda: force_wake_for_dir(sdir, logger=logger),
+            "satiate": lambda: satiate_for_dir(sdir, logger=logger),
+            "reset": lambda: reset_for_dir(sdir, logger=logger),
+            "set": lambda: set_field_for_dir(sdir, rest, logger=logger),
+            "relationship": lambda: set_relationship_prefs_for_dir(sdir, rest, logger=logger),
+            "think": lambda: think_for_dir(sdir, rest, logger=logger),
+        }
+        handler = dispatch.get(sub)
+        if handler is not None:
+            try:
+                return handler()
+            except Exception as exc:  # noqa: BLE001 - command boundary: an owner
+                # typing a command must NEVER see "unknown command" for a
+                # handler bug (lm-zhh) — log it (with traceback) and surface
+                # the real reason, one readable owner-facing block.
+                logger.info(
+                    "lifemodel_command_failed",
+                    subcommand=sub,
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
+                return f"lifemodel: команда не выполнена — {exc}\n"
+
         status = _status_line(profile, sdir)
         if sub == "":
             # Bare invocation: keep the status line, then surface the full
