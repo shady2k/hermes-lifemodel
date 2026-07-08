@@ -468,6 +468,59 @@ def test_exchange_resets_unanswered_outbound_count(tmp_path) -> None:
     assert changes["unanswered_outbound_count"] == 0  # a genuine reply resets the longing bid
 
 
+# --- lm-8o3.1 Task 8: the unanswered-outbound HOLD gate ---------------------
+#
+# After one FULFILLED pure-longing send with no reply since (Task 7's
+# ``unanswered_outbound_count >= 1``), a SECOND pure-longing (drive-only, no
+# thought backing) bid must HOLD — no new desire born — until either a
+# genuine exchange resets the counter (Task 7) or a materially-new top-down
+# reason (a crystallized-thought proposal) overrides the gate. This sits
+# alongside, not instead of, the fixed respect gates in ``appraise_receptivity``.
+
+
+def test_repeat_pure_longing_bid_holds_when_unanswered_outbound_pending(tmp_path) -> None:
+    # unanswered_outbound_count=1 (one unreplied longing send already out),
+    # drive-only urge, no proposal -> HOLD: no desire created.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # held — no second pure-longing bid
+
+
+def test_top_down_proposal_overrides_the_unanswered_outbound_hold(tmp_path) -> None:
+    # Same pending-unanswered state, but a crystallized-thought proposal (a
+    # materially-new high-value reason) is admissible -> the gate is
+    # overridden and the desire IS created.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.3, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=0.3, delta=0.0, timestamp=None)  # < theta
+    intents = _agg().step(_ctx(state, now, [c, _proposal(score=0.72)], tmp_path=tmp_path))
+    assert _created_active(intents)  # override — a genuine new reason still fires
+
+
+def test_pure_longing_bid_unheld_when_no_outbound_is_unanswered(tmp_path) -> None:
+    # Baseline, unchanged: unanswered_outbound_count == 0 -> drive-urge alone
+    # still creates the desire, exactly as before Task 8.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, unanswered_outbound_count=0, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _created_active(intents)
+
+
+def test_mixed_spring_urge_also_overrides_the_unanswered_outbound_hold(tmp_path) -> None:
+    # Both springs co-fire (drive_urge AND top_down_admissible) while a bid is
+    # pending -> still overridden (the top-down reason is what matters, not
+    # whether a drive urge happens to also be present).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
+    draft = _created_desire(_agg().step(_ctx(state, now, [c, _proposal()], tmp_path=tmp_path)))
+    assert draft is not None
+    assert draft.payload["spring"] == "mixed"
+
+
 # --- lm-27n.4: atomic Desire<->Intention lifecycle interlock ---
 #
 # On resolution, aggregation transitions BOTH the desire AND the live intention

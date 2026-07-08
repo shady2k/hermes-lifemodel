@@ -271,11 +271,25 @@ class ContactAggregation:
         # only when none is live, nothing resolved one this tick (dedup / anti-drum),
         # AND the appraisal admits it (no explicit-boundary hard veto). With no
         # proposal and the permissive default this is behaviour-identical to .5.
+        # Task 8 HOLD gate (lm-8o3.1): with an unanswered pure-longing send still
+        # out (``unanswered_outbound_count >= 1``, Task 7), a SECOND pure-longing
+        # bid (``drive_urge and not top_down_admissible`` — no materially-new
+        # reason backing it) must HOLD rather than birth another desire. A
+        # top-down-admissible proposal still overrides — it IS a materially-new
+        # reason. Uses the tick-local ``unanswered_outbound_count`` (not
+        # ``state.unanswered_outbound_count`` directly) so a genuine exchange
+        # THIS SAME tick (which resets it to 0 above, §1) already lifts the hold
+        # — the reset is the escape hatch and must be visible same-tick, or a
+        # same-tick exchange+re-urge could spuriously self-deadlock.
+        pure_longing_repeat_hold = (
+            unanswered_outbound_count >= 1 and drive_urge and not top_down_admissible
+        )
         if (
             (drive_urge or top_down_admissible)
             and desire_state == _NONE
             and transition_to is None
             and appraisal.allowed
+            and not pure_longing_repeat_hold
         ):
             create_desire = True
 
