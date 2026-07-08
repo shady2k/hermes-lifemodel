@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
 from lifemodel.domain.memory import MemoryRecord
-from lifemodel.domain.objects import DesireState
+from lifemodel.domain.objects import DesireSpring, DesireState
 
 #: A fixed, timezone-aware stamp for the store-controlled columns of a hand-built
 #: record (the builders never touch a real clock).
@@ -23,6 +23,8 @@ def contact_desire_record(
     *,
     salience: float = 0.0,
     source_drive: float | None = None,
+    spring: DesireSpring = DesireSpring.DRIVE,
+    source_thought_ids: tuple[str, ...] = (),
     created_at: str = _STAMP,
     updated_at: str = _STAMP,
     revision: int = 0,
@@ -31,9 +33,17 @@ def contact_desire_record(
 
     Encodes a real :class:`~lifemodel.domain.objects.Desire` through the registry
     then stamps the store-controlled columns, so the payload/envelope shape is
-    byte-identical to a row the store would hold."""
+    byte-identical to a row the store would hold. ``spring`` defaults to
+    ``DRIVE`` (a pure-longing, bottom-up desire) — pass ``THOUGHT``/``MIXED`` to
+    build a top-down (thought-crystallized) fixture."""
     draft = encode_contact_desire(
-        build_contact_desire(state=DesireState(state), salience=salience, source_drive=source_drive)
+        build_contact_desire(
+            state=DesireState(state),
+            salience=salience,
+            source_drive=source_drive,
+            spring=spring,
+            source_thought_ids=source_thought_ids,
+        )
     )
     return MemoryRecord(
         kind=draft.kind,

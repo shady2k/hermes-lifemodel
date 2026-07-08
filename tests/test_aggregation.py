@@ -27,6 +27,7 @@ from lifemodel.core.taxonomy import (
     in_flight_signal,
     verdict_signal,
 )
+from lifemodel.domain.objects import DesireSpring
 from lifemodel.sim.aggregation import Verdict
 from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
@@ -406,6 +407,65 @@ def test_reject_does_not_record_a_send(tmp_path) -> None:
     v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["proactive_send_log"] == ["2026-07-06T02:00:00+00:00"]  # unchanged
+
+
+# --- lm-8o3.1 Task 7: unanswered pure-longing outreach counter --------------
+#
+# ``State.unanswered_outbound_count`` tracks consecutive FULFILLED pure-longing
+# (drive-sprung, no thought backing) proactive sends with no genuine reply in
+# between. A top-down (thought/mixed-sprung) send is a materially new reason,
+# not a repeat longing bid, so it must NOT bump the counter. Any genuine inbound
+# exchange resets the counter — the same site that resets ``decline_count``.
+
+
+def test_fulfill_pure_longing_increments_unanswered_outbound_count(tmp_path) -> None:
+    # ACTIVE is spring=DRIVE by default (contact_desire_record's default) — a
+    # pure-longing, bottom-up desire with no crystallized-thought backing.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state(unanswered_outbound_count=2)
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
+    assert changes["unanswered_outbound_count"] == 3  # bumped by this longing FULFILL
+
+
+def test_fulfill_top_down_send_does_not_increment_unanswered_outbound_count(tmp_path) -> None:
+    # A thought-crystallized (top-down) send is a materially new reason, not a
+    # repeat longing bid -> the counter must hold, not bump.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state(unanswered_outbound_count=2)
+    objects = contact_desire_objects("active", spring=DesireSpring.THOUGHT)
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=objects, tmp_path=tmp_path)))
+    assert changes["unanswered_outbound_count"] == 2  # unchanged — top-down, not longing
+
+
+def test_fulfill_mixed_spring_send_does_not_increment_unanswered_outbound_count(tmp_path) -> None:
+    # MIXED still carries a source thought (a genuine reason co-fired with the
+    # drive) -> also NOT a pure-longing repeat.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = _live_pending_state(unanswered_outbound_count=2)
+    objects = contact_desire_objects(
+        "active", spring=DesireSpring.MIXED, source_thought_ids=("t-serve",)
+    )
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=objects, tmp_path=tmp_path)))
+    assert changes["unanswered_outbound_count"] == 2  # unchanged — thought-backed, not longing
+
+
+def test_exchange_resets_unanswered_outbound_count(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        unanswered_outbound_count=4,
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path)))
+    assert changes["unanswered_outbound_count"] == 0  # a genuine reply resets the longing bid
 
 
 # --- lm-27n.4: atomic Desire<->Intention lifecycle interlock ---

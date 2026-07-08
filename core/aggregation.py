@@ -129,6 +129,7 @@ class ContactAggregation:
         pending_id = state.pending_proactive_id
         pending_since = state.pending_proactive_since
         send_log = state.proactive_send_log
+        unanswered_outbound_count = state.unanswered_outbound_count
 
         # The single desire-row action this tick: a create, or a transition
         # target for the live desire. At most one of the two ever fires.
@@ -159,6 +160,7 @@ class ContactAggregation:
             declined_at = None
             decline_count = 0
             action_pending_since = None
+            unanswered_outbound_count = 0  # a genuine reply resets the longing bid (Task 7)
             if desire_state in (DesireState.ACTIVE, DesireState.DEFERRED):
                 transition_to = DesireState.SATISFIED  # exchange terminalizes the live desire
             desire_state = _NONE
@@ -188,6 +190,12 @@ class ContactAggregation:
                     action_pending_since = now.isoformat()  # send -> inhibition starts
                     last_contact_at = now.isoformat()
                     send_log = record_send(send_log, now)  # backstop counter (spec §14)
+                    # Pure-longing outreach counter (Task 7, lm-8o3.1): a FULFILLED
+                    # drive-only send (no crystallized-thought backing) is a repeat
+                    # longing bid -> bump. THOUGHT/MIXED carries a genuine new reason
+                    # (a source thought) -> not a repeat, does not bump.
+                    if live is not None and live.spring == DesireSpring.DRIVE:
+                        unanswered_outbound_count += 1
                     pending_id = None
                     pending_since = None
                     desire_state = _NONE
@@ -281,6 +289,7 @@ class ContactAggregation:
             "pending_proactive_id": pending_id,
             "pending_proactive_since": pending_since,
             "proactive_send_log": send_log,
+            "unanswered_outbound_count": unanswered_outbound_count,
         }
         intents: list[Intent] = [UpdateState(changes)]
 
