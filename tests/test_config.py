@@ -53,6 +53,15 @@ def test_read_config_on_missing_directory_returns_empty_dict(tmp_path: Path) -> 
     assert read_config(tmp_path / "does" / "not" / "exist") == {}
 
 
+def test_read_config_on_invalid_utf8_bytes_returns_empty_dict_without_raising(
+    tmp_path: Path,
+) -> None:
+    # A hand-edited/corrupted config.json with invalid UTF-8 bytes must never
+    # take the plugin down at load — same tolerance as malformed JSON.
+    (tmp_path / CONFIG_FILENAME).write_bytes(b"\xff\xfe{not even close to utf-8")
+    assert read_config(tmp_path) == {}
+
+
 def test_write_config_then_read_config_round_trips(tmp_path: Path) -> None:
     write_config(tmp_path, {"a": 1, "b": "two"})
     assert read_config(tmp_path) == {"a": 1, "b": "two"}
@@ -107,6 +116,18 @@ def test_write_log_level_rejects_invalid_name(tmp_path: Path) -> None:
 def test_write_log_level_is_case_insensitive(tmp_path: Path) -> None:
     write_log_level(tmp_path, "DEBUG")
     assert read_log_level(tmp_path) == "debug"
+
+
+def test_read_log_level_on_invalid_persisted_name_falls_back_to_default(
+    tmp_path: Path,
+) -> None:
+    # A hand-edited config.json with a plausible-but-wrong level name (e.g. a
+    # "warn"/"warning" typo) must degrade to the default rather than handing
+    # back a string parse_log_level() would reject — read_log_level() must be
+    # safe-by-construction for every downstream caller, not just the command
+    # layer that has its own validation error path.
+    write_config(tmp_path, {"log_level": "warn"})
+    assert read_log_level(tmp_path) == "info"
 
 
 # --- set_log_level_for_dir (the `/lifemodel loglevel` handler) ---------------

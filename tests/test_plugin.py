@@ -447,6 +447,25 @@ def test_register_lifemodel_loglevel_sets_and_persists_and_applies(
     assert lm_logging._effective_level == logging.DEBUG
 
 
+def test_register_does_not_raise_on_invalid_persisted_log_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A hand-edited config.json with a plausible-but-invalid level name (e.g.
+    # a "warn" typo for "warning") must never take the plugin down at load —
+    # register() degrades to the default level instead of letting
+    # parse_log_level() raise ValueError out of registration.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    sdir = tmp_path / "workspace" / "lifemodel"
+    from lifemodel.config import write_config
+
+    write_config(sdir, {"log_level": "warn"})
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+
+    lifemodel.register(FakeCtx())  # must not raise
+
+    assert lm_logging._effective_level == logging.INFO
+
+
 def test_register_lifemodel_loglevel_invalid_arg_returns_usage_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

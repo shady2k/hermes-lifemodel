@@ -49,7 +49,7 @@ def read_config(base_dir: Path) -> dict[str, Any]:
     path = base_dir / CONFIG_FILENAME
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return {}
     if not raw.strip():
         return {}
@@ -80,13 +80,18 @@ def write_config(base_dir: Path, config: dict[str, Any]) -> None:
 def read_log_level(base_dir: Path) -> str:
     """Return the persisted log level name, or :data:`DEFAULT_LOG_LEVEL`.
 
-    Tolerant like :func:`read_config`: a missing/malformed config, or a
-    ``log_level`` value that isn't a non-empty string, falls back to the
-    default rather than raising — the command layer is where an owner-typed
-    invalid name gets a validation error, not here.
+    Tolerant like :func:`read_config`: a missing/malformed config, a
+    ``log_level`` value that isn't a non-empty string, OR a non-empty string
+    that isn't one of :data:`~lifemodel.log.LOG_LEVEL_NAMES` (e.g. a
+    hand-edited/typo'd ``"warn"``) all fall back to the default rather than
+    raising. This makes the return value safe-by-construction for every
+    caller — in particular :func:`lifemodel.log.parse_log_level`, which
+    startup calls directly on this value and must never see a name it would
+    reject. The command layer still gives an owner-typed invalid name its
+    own readable validation error; this is defense for callers that don't.
     """
     level = read_config(base_dir).get(_LOG_LEVEL_KEY)
-    if isinstance(level, str) and level.strip():
+    if isinstance(level, str) and level.strip().lower() in LOG_LEVEL_NAMES:
         return level.strip().lower()
     return DEFAULT_LOG_LEVEL
 
@@ -133,9 +138,10 @@ def set_log_level_for_dir(base_dir: Path, raw_args: str) -> str:
         new_level = write_log_level(base_dir, requested)
     except ValueError:
         valid = ", ".join(LOG_LEVEL_NAMES)
+        usage = "|".join(LOG_LEVEL_NAMES)
         return (
             f"error: 'loglevel' invalid level {requested!r}. Valid levels: {valid}\n"
-            f"usage: /lifemodel loglevel [{valid}]\n"
+            f"usage: /lifemodel loglevel [{usage}]\n"
         )
     configure(parse_log_level(new_level))
     return f"lifemodel loglevel: {current} -> {new_level}\n"

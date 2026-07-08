@@ -12,6 +12,7 @@ No engine/neurons yet — those land in later tasks (see docs/roadmap.md §0).
 
 from __future__ import annotations
 
+import logging
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -154,7 +155,16 @@ def register(ctx: Any) -> None:
     # calling it on every register() would blow away any processors a host
     # (or a test's structlog.testing.capture_logs()) had layered on top —
     # true idempotence at the call site, not just at the level-int.
-    desired_level = parse_log_level(read_log_level(sdir))
+    # read_log_level() is itself safe-by-construction (falls back to the
+    # default on a missing/malformed config or an invalid persisted name), so
+    # parse_log_level() should never raise here. This try/except is pure
+    # defense in depth: NO failure while resolving the boot level may ever
+    # abort register() and take the plugin down — degrade to logging.INFO
+    # instead (matches log.configure()'s own default) and keep booting.
+    try:
+        desired_level = parse_log_level(read_log_level(sdir))
+    except Exception:
+        desired_level = logging.INFO
     if desired_level != current_level():
         configure(desired_level)
 
