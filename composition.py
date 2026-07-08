@@ -121,6 +121,12 @@ class LifeModel:
     registry: ComponentRegistry = field(default_factory=ComponentRegistry)
     state_actor: StateActor | None = None
     coreloop: CoreLoop | None = None
+    #: The logger this graph was built with (bead lm-j2w B3), so hooks/observers
+    #: that only receive ``lm`` — not a separately threaded ``logger`` param —
+    #: can still log through the SAME collaborator the rest of the graph uses,
+    #: rather than constructing a fresh ad-hoc one. ``None`` when the caller
+    #: (e.g. a bare test ``build_lifemodel(base_dir=...)``) never passed one.
+    logger: EventLogger | None = None
 
 
 def build_lifemodel(
@@ -295,4 +301,5 @@ def build_lifemodel(
         registry=resolved_registry,
         state_actor=resolved_state_actor,
         coreloop=resolved_coreloop,
+        logger=logger,
     )

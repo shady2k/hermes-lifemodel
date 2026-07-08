@@ -38,13 +38,35 @@ from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 _T0 = datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
 
 
+class _RecordingLogger:
+    """A minimal :class:`~lifemodel.log.EventLogger` that records ``.info`` calls."""
+
+    def __init__(self) -> None:
+        self.info_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def debug(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.info_calls.append((event, dict(fields)))
+
+    def warning(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+    def error(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+    def critical(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+
 def _seed_active_desire(store: MemoryPort) -> None:
     """Persist a live active contact-desire row (the old desire_status="active")."""
     store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
 
 
-def _lm_with_pending(tmp_path: Path, corr: str = "p-1") -> Any:
-    lm = build_lifemodel(base_dir=tmp_path)
+def _lm_with_pending(tmp_path: Path, corr: str = "p-1", *, logger: Any = None) -> Any:
+    lm = build_lifemodel(base_dir=tmp_path, logger=logger)
     lm.state.commit(
         State(
             pending_proactive_id=corr,
@@ -118,6 +140,44 @@ def test_post_llm_ignores_when_desire_not_active(tmp_path: Path) -> None:
     assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT] == []
 
 
+# --- B3 (lm-j2w): the resolved outcome, logged at INFO (always visible) -----
+
+
+def test_post_llm_logs_delivered_outcome_at_info_on_real_text(tmp_path: Path) -> None:
+    logger = _RecordingLogger()
+    lm = _lm_with_pending(tmp_path, corr="p-delivered", logger=logger)
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
+        assistant_response="Саш, привет, скучаю!",
+    )
+    outcomes = [c for c in logger.info_calls if c[0] == "proactive_outcome"]
+    assert len(outcomes) == 1
+    _, fields = outcomes[0]
+    assert fields["outcome"] == "delivered"
+    assert fields["correlation_id"] == "p-delivered"
+
+
+def test_post_llm_logs_silent_outcome_at_info_on_no_reply(tmp_path: Path) -> None:
+    logger = _RecordingLogger()
+    lm = _lm_with_pending(tmp_path, corr="p-silent", logger=logger)
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} ...",
+        assistant_response="[SILENT]",
+    )
+    outcomes = [c for c in logger.info_calls if c[0] == "proactive_outcome"]
+    assert len(outcomes) == 1
+    _, fields = outcomes[0]
+    assert fields["outcome"] == "silent"
+    assert fields["correlation_id"] == "p-silent"
+
+
+def test_post_llm_does_not_log_outcome_for_uncorrelated_turn(tmp_path: Path) -> None:
+    logger = _RecordingLogger()
+    lm = _lm_with_pending(tmp_path, logger=logger)
+    make_post_llm_observer(lm)(user_message="just a normal user message", assistant_response="hi")
+    assert [c for c in logger.info_calls if c[0] == "proactive_outcome"] == []
+
+
 # --- make_inbound_observer — signal publishing (spec §7.1) ------------------
 
 
@@ -160,15 +220,19 @@ def test_inbound_still_publishes_exchange_for_normal_chat_message(tmp_path: Path
     assert len(exchanges) == 1
 
 
-def test_inbound_still_publishes_exchange_for_other_slash_commands(tmp_path: Path) -> None:
-    # Only /lifemodel is the being's own control plane — other slash commands
-    # (e.g. /new, /model) still represent genuine user presence and must
-    # continue to count as contact.
+@pytest.mark.parametrize(
+    "text",
+    ["/new", "/model", "/commands", "/lifemodel debug"],
+)
+def test_inbound_ignores_any_slash_command(tmp_path: Path, text: str) -> None:
+    # Owner's decision (lm-ia3): operating the tool via a slash/control command
+    # is not conversing with the being — no slash-prefixed message, regardless
+    # of which command, counts as a genuine two-way exchange.
     lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="/new", internal=False, id="m-4")
+    event = SimpleNamespace(text=text, internal=False, id="m-4")
     make_inbound_observer(lm)(event=event)
     exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
-    assert len(exchanges) == 1
+    assert exchanges == []
 
 
 # --- register(ctx) wiring smoke test ------------------------------------------

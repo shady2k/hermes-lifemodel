@@ -8,6 +8,7 @@ and ``ctx`` is a duck-typed recorder. No real Hermes package is imported.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -18,7 +19,9 @@ import structlog
 from structlog.testing import capture_logs
 
 import lifemodel
+import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
+from lifemodel.config import write_log_level
 from lifemodel.events import EVENTS_FILENAME
 from lifemodel.state.errors import StateSchemaError
 from lifemodel.state.model import State
@@ -375,3 +378,103 @@ def test_uses_the_configured_structlog_pipeline() -> None:
     # so get_logger yields a real structlog logger (not the fallback shim).
     assert structlog is not None
     assert lifemodel.get_logger("lifemodel.probe") is not None
+
+
+# --- loglevel (lm-j2w B2): persisted log level + `/lifemodel loglevel` -------
+
+
+def test_register_boots_at_the_persisted_log_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    sdir = tmp_path / "workspace" / "lifemodel"
+    write_log_level(sdir, "warning")
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+
+    lifemodel.register(FakeCtx())
+
+    assert lm_logging._effective_level == logging.WARNING
+
+
+def test_register_boots_at_info_when_no_config_is_persisted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+
+    lifemodel.register(FakeCtx())
+
+    assert lm_logging._effective_level == logging.INFO
+
+
+def test_loglevel_in_subcommands_registry() -> None:
+    assert "loglevel" in lifemodel._SUBCOMMANDS
+    assert lifemodel._SUBCOMMANDS["loglevel"].mutating is True
+
+
+def test_register_lifemodel_loglevel_no_arg_returns_current_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("loglevel")
+
+    assert "info" in out
+
+
+def test_register_lifemodel_loglevel_sets_and_persists_and_applies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    # Guard against leaking the real (non-monkeypatched) log.configure() call
+    # this test triggers into later tests: monkeypatch reverts _effective_level
+    # to its pre-test value on teardown regardless of what happens in between.
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("loglevel debug")
+
+    assert "info" in out and "debug" in out  # old -> new echoed
+    sdir = tmp_path / "workspace" / "lifemodel"
+    from lifemodel.config import read_log_level
+
+    assert read_log_level(sdir) == "debug"
+    assert lm_logging._effective_level == logging.DEBUG
+
+
+def test_register_does_not_raise_on_invalid_persisted_log_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A hand-edited config.json with a plausible-but-invalid level name (e.g.
+    # a "warn" typo for "warning") must never take the plugin down at load —
+    # register() degrades to the default level instead of letting
+    # parse_log_level() raise ValueError out of registration.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    sdir = tmp_path / "workspace" / "lifemodel"
+    from lifemodel.config import write_config
+
+    write_config(sdir, {"log_level": "warn"})
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+
+    lifemodel.register(FakeCtx())  # must not raise
+
+    assert lm_logging._effective_level == logging.INFO
+
+
+def test_register_lifemodel_loglevel_invalid_arg_returns_usage_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("loglevel loud")
+
+    for name in lm_logging.LOG_LEVEL_NAMES:
+        assert name in out
