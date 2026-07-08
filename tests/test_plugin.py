@@ -20,6 +20,7 @@ from structlog.testing import capture_logs
 import lifemodel
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.events import EVENTS_FILENAME
+from lifemodel.state.errors import StateSchemaError
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 
@@ -304,6 +305,56 @@ def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
     # always creates lifemodel.sqlite (recovery/migration need the file) —
     # so "untouched" is checked at the State level, not file existence.
     assert _committed_state(tmp_path) == State()
+
+
+def test_register_lifemodel_command_catches_handler_exception_and_returns_error_string(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """lm-zhh: when a subcommand handler RAISES (e.g. StateSchemaError, the
+    confirmed incident mechanism -- '/lifemodel set ...' loaded state, hit a
+    newer/unsupported schema, and raised), that exception must NOT propagate
+    out of ``lifemodel_command``. Left uncaught, Hermes' gateway degrades it
+    into a misleading generic "Unknown command /lifemodel" notice instead of
+    the real reason. The command boundary must catch it and return a
+    readable, owner-facing error string carrying the actual reason, and must
+    log the failure too."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    def _boom(*args: Any, **kwargs: Any) -> str:
+        raise StateSchemaError("schema_version=99 is newer than this build supports")
+
+    monkeypatch.setattr(lifemodel, "set_field_for_dir", _boom)
+
+    with capture_logs() as logs:
+        out = handler("set u 1")
+
+    # Owner-facing text: readable, prefixed as a lifemodel error, carries the
+    # real reason -- never the generic "unknown command" degradation.
+    assert "команда не выполнена" in out
+    assert "schema_version=99 is newer than this build supports" in out
+    # The failure is also recorded, not only shown to the owner.
+    failures = [e for e in logs if e.get("event") == "lifemodel_command_failed"]
+    assert len(failures) == 1
+    assert "schema_version=99" in failures[0]["error"]
+
+
+def test_register_lifemodel_command_success_path_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression guard: normal (non-raising) subcommands are unaffected by
+    the exception-catching boundary -- bare/help/status still return their
+    usual output, not an error string."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    assert "alive" in handler("status")
+    assert "alive" in handler("")
+    assert "**help**" in handler("help")
 
 
 def test_register_tees_plugin_registered_into_events_sink(

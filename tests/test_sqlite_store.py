@@ -232,11 +232,56 @@ def test_load_rejects_newer_schema_version(tmp_path: Path) -> None:
         store.load()
 
 
-def test_load_rejects_unknown_older_schema_version(tmp_path: Path) -> None:
+def test_load_forward_compat_older_schema_version_loads_and_restamps(tmp_path: Path) -> None:
+    # lm-oul: an on-disk version OLDER than this build is additive-forward-compat
+    # (State.from_dict already defaults any field missing from the older blob),
+    # so it must load cleanly rather than raise StateSchemaError -- and the
+    # returned State is re-stamped to the current SCHEMA_VERSION so the next
+    # commit persists the upgrade instead of writing the stale version forever.
     store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
     _write_raw_state_json(tmp_path, json.dumps({"schema_version": 0, "u": 0.0}))
-    with pytest.raises(StateSchemaError):
-        store.load()
+
+    loaded = store.load()
+
+    assert loaded.schema_version == SCHEMA_VERSION
+    assert loaded.u == 0.0
+
+
+def test_load_forward_compat_missing_new_field_defaults_and_restamps(tmp_path: Path) -> None:
+    # A real additive bump (SCHEMA_VERSION 1 -> 2 added unanswered_outbound_count,
+    # defaulting to 0): a v1 row that predates the field must load with the
+    # default filled in and the schema_version re-stamped to the current build's,
+    # not crash-loop the being's tick with StateSchemaError.
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    _write_raw_state_json(
+        tmp_path,
+        json.dumps({"schema_version": 1, "tick_count": 3, "u": 1.5}),
+    )
+
+    loaded = store.load()
+
+    assert loaded.schema_version == SCHEMA_VERSION
+    assert loaded.unanswered_outbound_count == 0
+    assert loaded.tick_count == 3
+    assert loaded.u == 1.5
+
+
+def test_load_forward_compat_then_commit_persists_upgraded_schema_version(
+    tmp_path: Path,
+) -> None:
+    # Round-trip: load a v1 row (forward-compat), commit the loaded State back,
+    # reload -- the persisted schema_version must now be the current build's, so
+    # the being does not re-hit the same forward-compat path (and its associated
+    # log line) on every single tick forever.
+    clock = FakeClock(BASE_TIME)
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    _write_raw_state_json(tmp_path, json.dumps({"schema_version": 1, "u": 0.5}))
+
+    loaded = store.load()
+    store.commit(loaded)
+    reloaded = store.load()
+
+    assert reloaded.schema_version == SCHEMA_VERSION
 
 
 def test_load_raises_corrupt_on_unparseable_json(tmp_path: Path) -> None:
