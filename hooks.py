@@ -11,8 +11,10 @@ still active, decides ``FULFILL`` (any text) vs ``REJECT`` (a silence marker),
 runs ``lint_proactive`` on a FULFILL and logs a mechanical leak (advisory), then
 publishes a ``verdict`` signal carrying the ``correlation_id``.
 
-``make_inbound_observer`` — on a genuine (non-internal, non-own-impulse) inbound
-message, publishes an ``exchange`` signal.
+``make_inbound_observer`` — on a genuine (non-internal, non-own-impulse,
+non-slash-command) inbound message, publishes an ``exchange`` signal. Any
+slash-prefixed message is a control command operating the tool, not dialogue,
+and is excluded (owner's decision, spec §7.1 / lm-ia3).
 
 Neither mutates ``State``.
 """
@@ -107,17 +109,18 @@ def _is_own_impulse(text: str) -> bool:
     return text.strip().startswith(IMPULSE_LABEL_PREFIX)
 
 
-def _is_own_command(text: str) -> bool:
-    """True when *text* is the being's own ``/lifemodel`` control-plane command.
+def _is_control_command(text: str) -> bool:
+    """True when *text* is a slash/control command, not conversational dialogue.
 
-    ``pre_gateway_dispatch`` fires before the command router forks, so a
-    ``/lifemodel force-wake`` (or even a read-only ``/lifemodel debug``) sent
-    over the being's own channel would otherwise look like a genuine inbound
-    exchange. Scoped to ``/lifemodel`` only: other slash commands (e.g.
-    ``/new``, ``/model``) still mean the user is present and must keep
-    counting as contact.
+    ``pre_gateway_dispatch`` fires before the command router forks, so any
+    ``/...`` message — ``/lifemodel force-wake``, ``/lifemodel debug``,
+    ``/new``, ``/model``, ``/commands``, etc. — would otherwise look like a
+    genuine inbound exchange. Owner's decision: operating the tool via a
+    slash command is not conversing with the being, so ANY slash-prefixed
+    message is a control command and must NOT count as a two-way exchange
+    (reverses the prior ``/lifemodel``-only scoping).
     """
-    return text.strip().startswith("/lifemodel")
+    return text.strip().startswith("/")
 
 
 def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
@@ -127,7 +130,7 @@ def make_inbound_observer(lm: LifeModel) -> Callable[..., None]:
         if event is None or getattr(event, "internal", False):
             return
         text = getattr(event, "text", "") or ""
-        if _is_own_impulse(text) or _is_own_command(text):
+        if _is_own_impulse(text) or _is_control_command(text):
             return
         now = lm.clock.now()
         origin = (

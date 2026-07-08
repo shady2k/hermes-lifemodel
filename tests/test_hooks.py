@@ -160,15 +160,19 @@ def test_inbound_still_publishes_exchange_for_normal_chat_message(tmp_path: Path
     assert len(exchanges) == 1
 
 
-def test_inbound_still_publishes_exchange_for_other_slash_commands(tmp_path: Path) -> None:
-    # Only /lifemodel is the being's own control plane — other slash commands
-    # (e.g. /new, /model) still represent genuine user presence and must
-    # continue to count as contact.
+@pytest.mark.parametrize(
+    "text",
+    ["/new", "/model", "/commands", "/lifemodel debug"],
+)
+def test_inbound_ignores_any_slash_command(tmp_path: Path, text: str) -> None:
+    # Owner's decision (lm-ia3): operating the tool via a slash/control command
+    # is not conversing with the being — no slash-prefixed message, regardless
+    # of which command, counts as a genuine two-way exchange.
     lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="/new", internal=False, id="m-4")
+    event = SimpleNamespace(text=text, internal=False, id="m-4")
     make_inbound_observer(lm)(event=event)
     exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
-    assert len(exchanges) == 1
+    assert exchanges == []
 
 
 # --- register(ctx) wiring smoke test ------------------------------------------
