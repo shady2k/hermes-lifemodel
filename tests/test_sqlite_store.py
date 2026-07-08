@@ -345,6 +345,40 @@ def test_reset_works_when_the_existing_row_is_unreadable_garbage(tmp_path: Path)
     assert store.load() == State()  # reset replaced the garbage row cleanly
 
 
+def test_purge_memory_records_deletes_all_rows_and_returns_count(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.put(_draft(kind="thought", id="t1"))
+    store.put(_draft(kind="desire", id="d1"))
+    store.put(_draft(kind="intention", id="i1"))
+
+    count = store.purge_memory_records()
+
+    assert count == 3
+    assert store.find() == []
+
+
+def test_purge_memory_records_on_empty_store_returns_zero(tmp_path: Path) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    assert store.purge_memory_records() == 0
+    assert store.find() == []
+
+
+def test_purge_memory_records_does_not_touch_runtime_state_or_meta_tables(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.commit(State(tick_count=7, u=3.0))
+    store.put(_draft())
+
+    purged = store.purge_memory_records()
+
+    assert purged == 1
+    assert store.load() == State(tick_count=7, u=3.0)  # runtime_state untouched
+    with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
+        migrations = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
+    assert migrations == 2  # schema_migrations untouched (v1 + v2 still recorded)
+
+
 def _write_raw_state_json(base_dir: Path, raw: str) -> None:
     """Directly UPSERT ``raw`` into the ``runtime_state`` singleton row.
 
