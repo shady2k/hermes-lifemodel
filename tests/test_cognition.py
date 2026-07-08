@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import UTC, datetime
 
 from lifemodel.adapters.signal_bus import FileSignalBus
@@ -37,9 +39,9 @@ def _cog() -> Cognition:
     return Cognition(fast_cost=0.02, send_cost=0.03, alpha=2.0)
 
 
-def _ctx(state: State, *, objects=(), tmp_path) -> TickContext:
+def _ctx(state: State, *, objects=(), tmp_path, now: datetime = NOW) -> TickContext:
     return TickContext(
-        state=state, now=NOW, bus=FileSignalBus(tmp_path), signals=(), objects=tuple(objects)
+        state=state, now=now, bus=FileSignalBus(tmp_path), signals=(), objects=tuple(objects)
     )
 
 
@@ -200,14 +202,76 @@ def test_explicit_quiet_hours_holds_the_launch(tmp_path) -> None:
 # --- lm-27n.6: live thoughts render into the wake packet ---
 
 
+def test_launch_prompt_carries_situational_brief(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert launch is not None
+    assert "несколько часов назад" in launch.prompt  # NOW is 2026-07-06 12:00, 180 min
+    assert "вспомни, на чём вы остановились" in launch.prompt
+    assert re.search(r"\d", launch.prompt) is None
+
+
 def test_launch_prompt_has_no_thoughts_block_without_thoughts(tmp_path) -> None:
     # Behavior-neutral: a desire but no live thought -> the launch prompt is
-    # byte-identical to the no-thoughts wake packet (no Recent Thoughts block).
-    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    # byte-identical to the no-thoughts wake packet (no Recent Thoughts block),
+    # now built WITH the same situational context the cognition path passes.
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+    )
     launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
     assert RECENT_THOUGHTS_HEADER not in launch.prompt
-    expected = build_wake_packet(value=2.0, theta=1.0, correlation_id=launch.correlation_id).prompt
-    assert launch.prompt == expected  # byte-identical to before .6
+    expected = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id=launch.correlation_id,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+    ).prompt
+    assert launch.prompt == expected
+
+
+# --- lm-8o3.1 Task 9: unanswered-bid line threaded through cognition -------
+
+
+def test_launch_prompt_carries_unanswered_bid_line_when_pending(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+        unanswered_outbound_count=1,
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert launch is not None
+    assert "пока без ответа" in launch.prompt
+    assert re.search(r"\d", launch.prompt) is None
+
+
+def test_launch_prompt_omits_unanswered_bid_line_when_zero(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+        unanswered_outbound_count=0,
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert launch is not None
+    assert "пока без ответа" not in launch.prompt
 
 
 def test_launch_prompt_renders_live_thoughts_from_the_snapshot(tmp_path) -> None:
@@ -414,6 +478,45 @@ def test_intention_source_edge_does_not_duplicate_typed_thought_links(tmp_path) 
     prov = _intention_provenance(put.op.draft)
     assert prov is not None
     assert prov.source_object_ids == ("desire:contact:owner",)  # NOT the thought id
+
+
+# --- lm-8o3: deterministic launch jitter (human unpredictability, not a timer) ---
+
+# sha256(f"proactive-{NOW.isoformat()}").digest()[0] % 5: module NOW (12:00) hashes
+# to bucket 3 (not held) -- confirmed clear of every existing launch test above.
+JITTER_HOLD_NOW = datetime(2026, 7, 6, 12, 5, tzinfo=UTC)  # digest[0] % 5 == 0 -> HOLD
+JITTER_LAUNCH_NOW = datetime(2026, 7, 6, 12, 1, tzinfo=UTC)  # digest[0] % 5 != 0 -> launches
+
+
+def _jitter_bucket(now: datetime) -> int:
+    # Mirrors core/cognition.py's jitter_seed derivation exactly, so this test
+    # breaks loudly (rather than JITTER_HOLD_NOW/JITTER_LAUNCH_NOW silently
+    # meaning something other than "hold"/"launch") if either the hash input
+    # (the correlation_id format) or the "% 5" rule ever changes.
+    correlation_id = f"proactive-{now.isoformat()}"
+    return hashlib.sha256(correlation_id.encode()).digest()[0] % 5
+
+
+def test_jitter_now_constants_hash_to_the_buckets_their_names_promise() -> None:
+    assert _jitter_bucket(JITTER_HOLD_NOW) == 0  # hold bucket
+    assert _jitter_bucket(JITTER_LAUNCH_NOW) != 0  # any non-hold bucket
+
+
+def test_seeded_tick_holds_the_launch_without_resolving_the_desire(tmp_path) -> None:
+    # A correlation-id that hashes into the hold bucket defers an otherwise-
+    # launchable ACTIVE desire by one tick: no LaunchProactive, no intention, no
+    # state update -- the desire is NOT resolved, so the next admissible tick fires.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path, now=JITTER_HOLD_NOW))
+    assert list(intents) == []
+
+
+def test_non_seeded_tick_launches_normally(tmp_path) -> None:
+    # A correlation-id outside the hold bucket launches exactly as before.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path, now=JITTER_LAUNCH_NOW))
+    assert _launch(intents) is not None
+    assert _intention_put(intents) is not None
 
 
 def test_intention_retry_preserves_the_source_edge_unchanged(tmp_path) -> None:

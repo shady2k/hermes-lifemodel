@@ -20,6 +20,7 @@ being sends (that stays this gate + aggregation's upstream gates).
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 
 from ..domain.memory import PutOp
@@ -85,6 +86,17 @@ class Cognition:
         energy_after, _reservation = reserved
 
         correlation_id = f"proactive-{ctx.now.isoformat()}"
+        # Launch jitter (lm-8o3, design point 6): a small, deterministic fraction of
+        # ticks HOLD here — one more beat of human unpredictability, not a timer. It
+        # is seeded off ``correlation_id`` (== ctx.now.isoformat()) via sha256, so it
+        # is fully reproducible and testable, NEVER a random-module/wall-clock read.
+        # Placed strictly AFTER the receptivity re-check and the energy reservation
+        # above: jitter only ever delays an otherwise-permitted launch, it never
+        # overrides a respect or energy gate. On hold, nothing is emitted — the
+        # desire is NOT resolved, so the next admissible tick launches normally.
+        jitter_seed = hashlib.sha256(correlation_id.encode()).digest()[0]
+        if jitter_seed % 5 == 0:  # ~20% of correlation-ids deferred by one tick
+            return []
         # Render the live thoughts (active/parked, most-salient first) as the
         # first-person "Recent Thoughts" CONTEXT block. No thoughts → no block →
         # the prompt is byte-identical to before (behavior-neutral, lm-27n.6).
@@ -93,6 +105,11 @@ class Cognition:
             theta=1.0,
             correlation_id=correlation_id,
             thoughts=live_thoughts(ctx.objects),
+            last_exchange_at=state.last_exchange_at,
+            now=ctx.now,
+            decline_count=state.decline_count,
+            energy=state.energy,
+            unanswered_outbound_count=state.unanswered_outbound_count,
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits

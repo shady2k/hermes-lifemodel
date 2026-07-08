@@ -19,8 +19,12 @@ from lifemodel.core.component import TickContext
 from lifemodel.core.intents import EmitSignal, Intent, PutRecord, TransitionRecord
 from lifemodel.core.taxonomy import KIND_THOUGHT_CONTACT_PROPOSAL, read_thought_contact_proposal
 from lifemodel.core.thought_crystallization import (
+    ACTIONABILITY_MIN,
     CRYSTALLIZE_SALIENCE,
+    OTHER_REGARDING_MIN,
     PERSIST_MIN,
+    STRONG_LONGING_PERSIST,
+    STRONG_LONGING_SALIENCE,
     ThoughtCrystallization,
     should_crystallize,
     strong_event_trigger,
@@ -156,6 +160,48 @@ def test_strong_own_longing_is_a_gated_reason() -> None:
     assert not strong_own_longing(t, action_pending=True)
     assert (
         should_crystallize(t, receptivity_allowed=True, pending=False, action_pending=True) is False
+    )
+
+
+def test_strong_longing_crystallizes_below_the_actionability_and_other_regarding_bar() -> None:
+    # Characterizes design point (2) of lm-8o3 (the "sliding reason-threshold keyed
+    # to accumulated longing"): a strong-longing drive/event thought — high salience,
+    # STRONGER persistence, no send pressure — crystallizes even though BOTH the
+    # actionability AND other-regarding scores sit BELOW their ordinary floors. The
+    # own-longing path is a substitute reason, not an addition on top of those
+    # floors, so longing genuinely lowers the actionability/other-regarding bar to
+    # zero (not just "a little"), in exchange for a stricter salience + persistence
+    # requirement — the respect gates (receptivity/pending/action_pending) are
+    # untouched and still fully enforced by ``should_crystallize`` itself.
+    longing = _thought(
+        salience=STRONG_LONGING_SALIENCE,
+        other_regarding=OTHER_REGARDING_MIN - 0.1,
+        actionability=ACTIONABILITY_MIN - 0.1,
+        sustained=STRONG_LONGING_PERSIST,
+        trigger="drive",
+    )
+    assert longing.other_regarding_value < OTHER_REGARDING_MIN
+    assert longing.actionability < ACTIONABILITY_MIN
+    assert strong_own_longing(longing, action_pending=False)
+    assert should_crystallize(
+        longing, receptivity_allowed=True, pending=False, action_pending=False
+    )
+
+    # The SAME low actionability/other-regarding and the SAME persistence, but an
+    # idle trigger (no own-longing path available) — the ordinary reason bar still
+    # applies and blocks it, proving the lower bar is genuinely longing-gated, not a
+    # side effect of salience or persistence alone.
+    neutral = _thought(
+        salience=STRONG_LONGING_SALIENCE,
+        other_regarding=OTHER_REGARDING_MIN - 0.1,
+        actionability=ACTIONABILITY_MIN - 0.1,
+        sustained=STRONG_LONGING_PERSIST,
+        trigger="idle",
+    )
+    assert not strong_own_longing(neutral, action_pending=False)
+    assert (
+        should_crystallize(neutral, receptivity_allowed=True, pending=False, action_pending=False)
+        is False
     )
 
 
