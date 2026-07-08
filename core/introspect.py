@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..domain.objects import Relationship, Thought
+from ..domain.objects import Relationship, Thought, ThoughtState
 from ..sim.wake import GateParams, LaneState, backoff_interval, evaluate_wake
 from ..state.model import State
 from .backstop import allow_send
@@ -89,8 +89,10 @@ class Readings:
     receptivity_hard_reasons: tuple[str, ...]
     receptivity_soft_reasons: tuple[str, ...]
     receptivity_constraints: tuple[str, ...]
-    # thoughts (what the being is turning over — lm-27n.6)
-    thoughts: tuple[str, ...]  # live thoughts rendered "content [id]", most-salient first
+    # thoughts (what the being is turning over — lm-27n.6/.7)
+    #: live thoughts rendered "content [id] score=… np=… [parked]", most-salient
+    #: first — the attention engine's score/loop/park state (lm-27n.7) surfaced.
+    thoughts: tuple[str, ...]
     # health / timing
     last_tick_at: str | None
     last_tick_ago_min: float | None
@@ -99,6 +101,17 @@ class Readings:
 
 def _ago(iso: str | None, now: datetime) -> float | None:
     return None if iso is None else minutes_between(iso, now)
+
+
+def _render_thought(t: Thought) -> str:
+    """Render one live thought for the audit: content, id, the attention engine's
+    last score, its no-progress (loop) counter, and a ``parked`` marker (lm-27n.7).
+
+    Keeps the ``"{content} [{id}]"`` prefix the .6 dump established, then appends
+    the .7 attention state — so a reader sees not just *what* is turned over but
+    how hard it is competing and whether the brake has parked it."""
+    parked = " [parked]" if t.state == ThoughtState.PARKED.value else ""
+    return f"{t.content} [{t.id}] score={t.attention_score:.2f} np={t.no_progress_count}{parked}"
 
 
 def _action_pending(
@@ -235,7 +248,7 @@ def compute_readings(
         receptivity_hard_reasons=appraisal.hard_reasons,
         receptivity_soft_reasons=appraisal.soft_reasons,
         receptivity_constraints=appraisal.constraints,
-        thoughts=tuple(f"{t.content} [{t.id}]" for t in thoughts),
+        thoughts=tuple(_render_thought(t) for t in thoughts),
         last_tick_at=state.last_tick_at,
         last_tick_ago_min=last_tick_ago,
         brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,

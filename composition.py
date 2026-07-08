@@ -65,6 +65,8 @@ from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
 from .core.state_actor import StateActor
+from .core.thought_attention import ThoughtAttention
+from .core.thought_score import THOUGHT_SALIENCE_HALFLIFE_MIN
 from .domain.objects import default_registry
 from .log import EventLogger
 from .ports.clock import ClockPort
@@ -199,6 +201,18 @@ def build_lifemodel(
         )
         resolved_registry.register(
             aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
+        )
+    try:
+        resolved_registry.manifest("thought-attention")
+    except UnknownComponent:
+        # The 0-LLM anti-rumination brake (lm-27n.7): scores/selects/decays/parks
+        # the being's live thoughts. Registered AFTER contact-aggregation (so the
+        # snapshot's thoughts are already settled) and BEFORE cognition (which
+        # CONSUMES the attended set) — the enabled() order is asserted by the
+        # composition tests, mirroring the neuron→aggregation ordering.
+        thought_attention = ThoughtAttention(halflife_min=THOUGHT_SALIENCE_HALFLIFE_MIN)
+        resolved_registry.register(
+            thought_attention, ComponentManifest(id=thought_attention.id, type="attention")
         )
     try:
         resolved_registry.manifest("cognition")

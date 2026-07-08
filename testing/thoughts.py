@@ -28,6 +28,13 @@ def thought_record(
     salience: float = 0.0,
     trigger: str = "seed",
     parent_id: str | None = None,
+    attention_score: float = 0.0,
+    no_progress_count: int = 0,
+    loop_signature: str = "",
+    parked_until: str | None = None,
+    park_count: int = 0,
+    actionability: float = 0.0,
+    other_regarding_value: float = 0.0,
     created_at: str = _STAMP,
     updated_at: str = _STAMP,
     revision: int = 0,
@@ -38,7 +45,9 @@ def thought_record(
     with distinct content get distinct ids. Encodes a real
     :class:`~lifemodel.domain.objects.Thought` through the registry then stamps
     the store-controlled columns, so the payload/envelope shape is byte-identical
-    to a row the store would hold."""
+    to a row the store would hold. The attention fields (``no_progress_count``,
+    ``parked_until``, ``park_count`` …) are exposed so lm-27n.7 attention/parking
+    tests can seed a thought mid-loop or mid-park."""
     draft = encode_thought(
         build_thought(
             id=id if id is not None else seed_thought_id(content),
@@ -47,6 +56,13 @@ def thought_record(
             salience=salience,
             trigger=trigger,
             parent_id=parent_id,
+            attention_score=attention_score,
+            no_progress_count=no_progress_count,
+            loop_signature=loop_signature,
+            parked_until=parked_until,
+            park_count=park_count,
+            actionability=actionability,
+            other_regarding_value=other_regarding_value,
         )
     )
     return MemoryRecord(

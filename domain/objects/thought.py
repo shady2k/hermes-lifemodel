@@ -66,6 +66,12 @@ class Thought(BaseObject):
     no_progress_count: int
     loop_signature: str
     parked_until: str | None
+    #: How many times this thought has been parked — the exponential-backoff
+    #: cycle counter (lm-27n.7). Bumped on each ``active→parked`` and used to widen
+    #: the next park window (6h/24h/72h); once it exceeds the cap the thought
+    #: expires rather than re-arming. A declared field (not a stray payload key) so
+    #: the anti-rumination engine tracks the cycle through the typed registry door.
+    park_count: int
     actionability: float
     other_regarding_value: float
 
@@ -81,6 +87,7 @@ class Thought(BaseObject):
             "no_progress_count": self.no_progress_count,
             "loop_signature": self.loop_signature,
             "parked_until": self.parked_until,
+            "park_count": self.park_count,
             "actionability": self.actionability,
             "other_regarding_value": self.other_regarding_value,
         }
@@ -96,6 +103,7 @@ class Thought(BaseObject):
             no_progress_count=req_int(payload, "no_progress_count"),
             loop_signature=req_str(payload, "loop_signature"),
             parked_until=opt_str(payload, "parked_until"),
+            park_count=req_int(payload, "park_count"),
             actionability=req_float(payload, "actionability"),
             other_regarding_value=req_float(payload, "other_regarding_value"),
         )

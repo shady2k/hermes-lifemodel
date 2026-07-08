@@ -324,6 +324,21 @@ def test_cognition_registered_after_aggregation(tmp_path: Path) -> None:
     assert any(isinstance(c, Cognition) for c in lm.registry.enabled())
 
 
+# --- lm-27n.7: the ThoughtAttention brake sits between aggregation and cognition ---
+
+
+def test_thought_attention_registered_between_aggregation_and_cognition(tmp_path: Path) -> None:
+    from lifemodel.core.thought_attention import ThoughtAttention
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = [c.id for c in lm.registry.enabled()]
+    # The 0-LLM brake reads the settled snapshot (after aggregation) and feeds the
+    # attended set to cognition (before it) — the enabled() order is the contract.
+    assert ids.index("contact-aggregation") < ids.index("thought-attention")
+    assert ids.index("thought-attention") < ids.index("cognition")
+    assert any(isinstance(c, ThoughtAttention) for c in lm.registry.enabled())
+
+
 # --- lm-27n.4: the Intention decision record, end-to-end through the store ---
 
 
