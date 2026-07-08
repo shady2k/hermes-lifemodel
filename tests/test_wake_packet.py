@@ -199,3 +199,28 @@ def test_build_wake_packet_unanswered_bid_defaults_to_absent() -> None:
     )
     assert with_default.prompt == explicit_zero.prompt
     assert "пока без ответа" not in with_default.prompt
+
+
+def test_wake_packet_maximal_brief_weaves_every_line_and_keeps_no_digits() -> None:
+    # Combinatorial worst case: every brief line switched on at once (elapsed +
+    # orient from history, tone from declines, energy restraint, and the
+    # unanswered-bid line) -- proves they compose without clobbering each other
+    # AND that the no-raw-numbers invariant still holds under the full combination,
+    # not just each condition in isolation.
+    p = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id="c",
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=2,
+        energy=0.1,
+        unanswered_outbound_count=3,
+    )
+    assert "несколько часов назад" in p.prompt  # elapsed
+    assert "вспомни, на чём вы остановились" in p.prompt  # orient
+    assert "не дави" in p.prompt  # tone (declines)
+    assert "Сил сейчас немного" in p.prompt  # energy restraint
+    assert "пока без ответа" in p.prompt  # unanswered-bid
+    assert "не повторяйся ради самого жеста" in p.prompt  # unanswered-bid (second half)
+    assert re.search(r"\d", p.prompt) is None  # global invariant, worst case

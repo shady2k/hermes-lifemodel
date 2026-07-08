@@ -75,6 +75,20 @@ from lifemodel.state_commands import (
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 
 
+class _FixedClock:
+    """A deterministic clock seam (see ``tests/test_composition.py``'s same-named
+    helper and ``build_lifemodel(..., clock=...)``). Used where a test's outcome
+    is sensitive to ``ctx.now`` -- e.g. the launch jitter in ``core/cognition.py``
+    is seeded off ``sha256(f"proactive-{now.isoformat()}")``, so a real wall
+    clock makes such a test flaky."""
+
+    def __init__(self, moment: datetime) -> None:
+        self._m = moment
+
+    def now(self) -> datetime:
+        return self._m
+
+
 def _ago(minutes: float, *, base: datetime = NOW) -> str:
     return (base - timedelta(minutes=minutes)).isoformat()
 
@@ -617,7 +631,11 @@ def test_seeded_thought_reaches_the_snapshot_and_renders_in_a_launch(tmp_path) -
     # End-to-end: a thought seeded through the bus reaches the next tick's
     # start-of-tick snapshot and cognition renders it into the proactive prompt.
     think_for_dir(tmp_path, "did the owner hear back about the flat", logger=get_logger("t"))
-    lm = build_lifemodel(base_dir=tmp_path)
+    # Fixed clock in a non-hold jitter bucket (lm-8o3's launch jitter holds when
+    # sha256(f"proactive-{now.isoformat()}").digest()[0] % 5 == 0; NOW hashes to
+    # bucket 3, not 0) so the tick deterministically launches every run instead
+    # of ~20% flaking on a real wall clock.
+    lm = build_lifemodel(base_dir=tmp_path, clock=_FixedClock(NOW))
     # a live active desire + an affordable, past-silence, un-inhibited state so
     # cognition launches this tick
     lm.state.put(

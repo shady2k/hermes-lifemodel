@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime
 
@@ -485,6 +486,20 @@ def test_intention_source_edge_does_not_duplicate_typed_thought_links(tmp_path) 
 # to bucket 3 (not held) -- confirmed clear of every existing launch test above.
 JITTER_HOLD_NOW = datetime(2026, 7, 6, 12, 5, tzinfo=UTC)  # digest[0] % 5 == 0 -> HOLD
 JITTER_LAUNCH_NOW = datetime(2026, 7, 6, 12, 1, tzinfo=UTC)  # digest[0] % 5 != 0 -> launches
+
+
+def _jitter_bucket(now: datetime) -> int:
+    # Mirrors core/cognition.py's jitter_seed derivation exactly, so this test
+    # breaks loudly (rather than JITTER_HOLD_NOW/JITTER_LAUNCH_NOW silently
+    # meaning something other than "hold"/"launch") if either the hash input
+    # (the correlation_id format) or the "% 5" rule ever changes.
+    correlation_id = f"proactive-{now.isoformat()}"
+    return hashlib.sha256(correlation_id.encode()).digest()[0] % 5
+
+
+def test_jitter_now_constants_hash_to_the_buckets_their_names_promise() -> None:
+    assert _jitter_bucket(JITTER_HOLD_NOW) == 0  # hold bucket
+    assert _jitter_bucket(JITTER_LAUNCH_NOW) != 0  # any non-hold bucket
 
 
 def test_seeded_tick_holds_the_launch_without_resolving_the_desire(tmp_path) -> None:
