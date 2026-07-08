@@ -38,9 +38,9 @@ def _cog() -> Cognition:
     return Cognition(fast_cost=0.02, send_cost=0.03, alpha=2.0)
 
 
-def _ctx(state: State, *, objects=(), tmp_path) -> TickContext:
+def _ctx(state: State, *, objects=(), tmp_path, now: datetime = NOW) -> TickContext:
     return TickContext(
-        state=state, now=NOW, bus=FileSignalBus(tmp_path), signals=(), objects=tuple(objects)
+        state=state, now=now, bus=FileSignalBus(tmp_path), signals=(), objects=tuple(objects)
     )
 
 
@@ -445,6 +445,31 @@ def test_intention_source_edge_does_not_duplicate_typed_thought_links(tmp_path) 
     prov = _intention_provenance(put.op.draft)
     assert prov is not None
     assert prov.source_object_ids == ("desire:contact:owner",)  # NOT the thought id
+
+
+# --- lm-8o3: deterministic launch jitter (human unpredictability, not a timer) ---
+
+# sha256(f"proactive-{NOW.isoformat()}").digest()[0] % 5: module NOW (12:00) hashes
+# to bucket 3 (not held) -- confirmed clear of every existing launch test above.
+JITTER_HOLD_NOW = datetime(2026, 7, 6, 12, 5, tzinfo=UTC)  # digest[0] % 5 == 0 -> HOLD
+JITTER_LAUNCH_NOW = datetime(2026, 7, 6, 12, 1, tzinfo=UTC)  # digest[0] % 5 != 0 -> launches
+
+
+def test_seeded_tick_holds_the_launch_without_resolving_the_desire(tmp_path) -> None:
+    # A correlation-id that hashes into the hold bucket defers an otherwise-
+    # launchable ACTIVE desire by one tick: no LaunchProactive, no intention, no
+    # state update -- the desire is NOT resolved, so the next admissible tick fires.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path, now=JITTER_HOLD_NOW))
+    assert list(intents) == []
+
+
+def test_non_seeded_tick_launches_normally(tmp_path) -> None:
+    # A correlation-id outside the hold bucket launches exactly as before.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path, now=JITTER_LAUNCH_NOW))
+    assert _launch(intents) is not None
+    assert _intention_put(intents) is not None
 
 
 def test_intention_retry_preserves_the_source_edge_unchanged(tmp_path) -> None:
