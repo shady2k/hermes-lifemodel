@@ -132,3 +132,70 @@ def test_wake_packet_without_now_is_brief_free() -> None:
     p = build_wake_packet(value=2.0, theta=1.0, correlation_id="c")
     assert "Вы общались" not in p.prompt
     assert "вспомни, на чём вы остановились" not in p.prompt
+
+
+# --- lm-8o3.1 Task 9: unanswered-bid line in the situational brief ----------
+
+
+def test_brief_unanswered_bid_line_present_when_count_at_least_one() -> None:
+    brief = render_situational_brief(
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+        unanswered_outbound_count=1,
+    )
+    assert "пока без ответа" in brief
+    assert "не повторяйся ради самого жеста" in brief
+
+
+def test_brief_unanswered_bid_line_absent_when_count_zero() -> None:
+    brief = render_situational_brief(
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+        unanswered_outbound_count=0,
+    )
+    assert "пока без ответа" not in brief
+    assert "не повторяйся ради самого жеста" not in brief
+
+
+def test_wake_packet_weaves_unanswered_bid_and_keeps_no_digits() -> None:
+    p = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id="c",
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+        unanswered_outbound_count=2,
+    )
+    assert "пока без ответа" in p.prompt
+    assert re.search(r"\d", p.prompt) is None  # global invariant
+
+
+def test_build_wake_packet_unanswered_bid_defaults_to_absent() -> None:
+    # back-compat: the default (0) leaves the prompt unchanged from before this task
+    with_default = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id="c",
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+    )
+    explicit_zero = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id="c",
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+        unanswered_outbound_count=0,
+    )
+    assert with_default.prompt == explicit_zero.prompt
+    assert "пока без ответа" not in with_default.prompt

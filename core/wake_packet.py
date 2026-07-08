@@ -65,7 +65,12 @@ def render_thoughts_block(thoughts: Sequence[Thought]) -> str:
 
 
 def render_situational_brief(
-    *, last_exchange_at: str | None, now: datetime | None, decline_count: int, energy: float
+    *,
+    last_exchange_at: str | None,
+    now: datetime | None,
+    decline_count: int,
+    energy: float,
+    unanswered_outbound_count: int = 0,
 ) -> str:
     """First-person situational context for the wake, word-only (no digits).
 
@@ -91,6 +96,15 @@ def render_situational_brief(
         )
     if energy < 0.3:
         lines.append("Сил сейчас немного — коротко и мягко, без длинных заходов.")
+    if unanswered_outbound_count >= 1:
+        # lm-8o3.1 Task 9: a still-unanswered prior bid — placed after the
+        # tone/energy lines (it reads like one more restraint on HOW to
+        # reach out) and before the closing orient-on-the-thread line (which
+        # is about WHAT to say, a natural last beat before writing).
+        lines.append(
+            "Ты уже потянулся и пока без ответа — не повторяйся ради самого "
+            "жеста; пиши, только если появилось что-то по-настоящему новое."
+        )
     if last_exchange_at is not None:
         lines.append(
             "Прежде чем писать, вспомни, на чём вы остановились в прошлый раз — "
@@ -109,6 +123,7 @@ def build_wake_packet(
     now: datetime | None = None,
     decline_count: int = 0,
     energy: float = 1.0,
+    unanswered_outbound_count: int = 0,
 ) -> ProactivePrompt:
     """Build the proactive-turn prompt from the projected desire-frame + guidance.
 
@@ -126,7 +141,11 @@ def build_wake_packet(
     desire_frame, projection_id = project_contact(value, theta=theta, seed=correlation_id)
     prompt = f"Внутри у тебя сейчас: {desire_frame}."
     brief = render_situational_brief(
-        last_exchange_at=last_exchange_at, now=now, decline_count=decline_count, energy=energy
+        last_exchange_at=last_exchange_at,
+        now=now,
+        decline_count=decline_count,
+        energy=energy,
+        unanswered_outbound_count=unanswered_outbound_count,
     )
     if brief:
         prompt = f"{prompt}\n\n{brief}"

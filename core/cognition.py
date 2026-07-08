@@ -109,6 +109,7 @@ class Cognition:
             now=ctx.now,
             decline_count=state.decline_count,
             energy=state.energy,
+            unanswered_outbound_count=state.unanswered_outbound_count,
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits

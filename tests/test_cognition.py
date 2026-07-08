@@ -241,6 +241,38 @@ def test_launch_prompt_has_no_thoughts_block_without_thoughts(tmp_path) -> None:
     assert launch.prompt == expected
 
 
+# --- lm-8o3.1 Task 9: unanswered-bid line threaded through cognition -------
+
+
+def test_launch_prompt_carries_unanswered_bid_line_when_pending(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+        unanswered_outbound_count=1,
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert launch is not None
+    assert "пока без ответа" in launch.prompt
+    assert re.search(r"\d", launch.prompt) is None
+
+
+def test_launch_prompt_omits_unanswered_bid_line_when_zero(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+        unanswered_outbound_count=0,
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert launch is not None
+    assert "пока без ответа" not in launch.prompt
+
+
 def test_launch_prompt_renders_live_thoughts_from_the_snapshot(tmp_path) -> None:
     # A live thought in the start-of-tick snapshot surfaces (CONTENT only, no id)
     # in the launch prompt, most-salient first.
