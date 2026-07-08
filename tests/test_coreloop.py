@@ -337,6 +337,54 @@ def test_snapshot_includes_deferred_not_only_active(tmp_path) -> None:
     assert ids == {"a", "d"}  # active + deferred, never the terminal 'satisfied'
 
 
+def test_snapshot_includes_parked_thought_and_pending_intention(tmp_path) -> None:
+    # lm-27n.6: the registry-aware live-state snapshot surfaces EVERY non-terminal
+    # row — active + deferred + pending + parked — fixing the earlier active+deferred
+    # gap that hid parked thoughts and pending intentions. Terminal rows stay absent.
+    from lifemodel.domain.objects import default_registry
+
+    clock = FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC))
+    mem = FakeMemoryStore(clock=clock)
+    mem.put(MemoryDraft(kind="thought", id="t-parked", state="parked", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="intention", id="i-pending", state="pending", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="desire", id="d-active", state="active", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="desire", id="d-deferred", state="deferred", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="thought", id="t-dropped", state="dropped", payload={}, source="t"))
+    rec = SnapshotRecorder("only")
+    reg = ComponentRegistry()
+    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=clock,
+        memory=mem,
+        live_states=default_registry().live_states(),
+    ).tick()
+    ids = {o.id for o in rec.objects}
+    assert ids == {"t-parked", "i-pending", "d-active", "d-deferred"}  # never the dropped thought
+
+
+def test_default_snapshot_stays_active_and_deferred_only(tmp_path) -> None:
+    # Without an injected live-state set the coreloop keeps the legacy pair, so a
+    # parked thought stays invisible — behavior-neutral for callers that don't wire it.
+    clock = FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC))
+    mem = FakeMemoryStore(clock=clock)
+    mem.put(MemoryDraft(kind="thought", id="t-parked", state="parked", payload={}, source="t"))
+    mem.put(MemoryDraft(kind="desire", id="d-active", state="active", payload={}, source="t"))
+    rec = SnapshotRecorder("only")
+    reg = ComponentRegistry()
+    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=clock,
+        memory=mem,
+    ).tick()
+    assert {o.id for o in rec.objects} == {"d-active"}  # parked hidden without wiring
+
+
 def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
     counting = CountingMemory(_seeded_memory())
     reg = ComponentRegistry()

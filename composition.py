@@ -65,6 +65,7 @@ from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
 from .core.state_actor import StateActor
+from .domain.objects import default_registry
 from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
@@ -217,6 +218,10 @@ def build_lifemodel(
         logger=logger,
         pressure_sensor=resolved_pressure,
         memory=resolved_memory,
+        # The registry-derived live (non-terminal) state-set drives the snapshot,
+        # so parked thoughts + pending intentions are visible, not just active +
+        # deferred (the object-core is the single source of what "live" means).
+        live_states=default_registry().live_states(),
     )
 
     return LifeModel(

@@ -17,8 +17,13 @@ from .core.desire_view import read_live_contact_desire
 from .core.intention_view import read_live_contact_intention
 from .core.introspect import DebugConfig, Readings, compute_readings
 from .core.relationship_view import read_owner_relationship
+from .core.thought_view import read_live_thoughts
 from .ports.memory import MemoryPort
 from .state.errors import StateError
+
+#: How many live thoughts the debug audit lists (most-salient first). Bounded so
+#: a large open-loop set never floods the read-only dump.
+DEBUG_THOUGHTS_LIMIT = 10
 
 
 def _cfg() -> DebugConfig:
@@ -121,6 +126,7 @@ def render_dump_for_dir(base_dir: Path) -> str:
     intention = read_live_contact_intention(memory) if memory is not None else None
     intention_state = intention.state if intention is not None else "none"
     relationship = read_owner_relationship(memory) if memory is not None else None
+    thoughts = read_live_thoughts(memory, limit=DEBUG_THOUGHTS_LIMIT) if memory is not None else ()
     return render_debug_dump(
         readings=compute_readings(
             state,
@@ -129,6 +135,7 @@ def render_dump_for_dir(base_dir: Path) -> str:
             desire_state=desire_state,
             intention_state=intention_state,
             relationship=relationship,
+            thoughts=thoughts,
         )
     )
 
@@ -234,6 +241,11 @@ def render_debug_dump(*, readings: Readings) -> str:
             ("constraints", _reasons(r.receptivity_constraints)),
         ]
     )
+    lines.append("")
+
+    lines.append("**THOUGHTS (what I'm turning over)**")
+    lines += _metrics([("live", "none" if not r.thoughts else str(len(r.thoughts)))])
+    lines += [f"— {thought}" for thought in r.thoughts]
     lines.append("")
 
     lines.append("**HEALTH (is the brain ticking)**")

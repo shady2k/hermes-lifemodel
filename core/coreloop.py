@@ -41,10 +41,17 @@ from .signal_bus import SignalBus
 from .state_actor import StateActor
 from .taxonomy import lane_of
 
-#: How many ``state="active"`` records the start-of-tick snapshot pulls. A
-#: per-tick active-scan is fine at current scale (lm-fib.6.5 tracks scaling);
-#: the cap keeps it bounded. Unused until aggregation reads the snapshot (.3).
+#: How many records the start-of-tick snapshot pulls *per live state*. A per-tick
+#: scan is fine at current scale (lm-fib.6.5 tracks scaling); the cap keeps it
+#: bounded. Read by aggregation/cognition since .3.
 OBJECTS_SNAPSHOT_LIMIT = 256
+
+#: The fallback live (non-terminal) state-set used when no registry-derived set is
+#: injected — the historical ``active`` + ``deferred`` pair. The composition root
+#: injects the registry's full :meth:`~lifemodel.domain.objects.KindRegistry.live_states`
+#: (``{active, deferred, pending, parked}``) so parked thoughts and pending
+#: intentions — both non-terminal, previously invisible — appear in the snapshot.
+_DEFAULT_LIVE_STATES: frozenset[str] = frozenset({"active", "deferred"})
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,7 @@ class CoreLoop:
         intake_limits: IntakeLimits | None = None,
         pressure_sensor: PressureSensorPort | None = None,
         memory: MemoryPort | None = None,
+        live_states: frozenset[str] | None = None,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
@@ -82,6 +90,7 @@ class CoreLoop:
         self._intake_limits = intake_limits or IntakeLimits()
         self._pressure_sensor = pressure_sensor
         self._memory = memory
+        self._live_states = live_states if live_states is not None else _DEFAULT_LIVE_STATES
         self._failures: dict[str, int] = {}
         self._broken: set[str] = set()
 
@@ -96,19 +105,24 @@ class CoreLoop:
             if self._pressure_sensor is not None
             else PressureIndex()
         )
-        # The live (non-terminal) objects snapshot: active AND deferred. A deferred
-        # desire is still LIVE — held, not gone (e.g. a backstop-blocked contact
-        # desire) — so it must be visible, else next tick's dedup would miss it and
-        # a high-pressure urge would re-create an active row over the held one.
-        # Terminal rows (satisfied/dropped/expired/archived) are absence, excluded.
+        # The live (non-terminal) objects snapshot — one bounded find per state in
+        # the registry's live-state set (``{active, deferred, pending, parked}``),
+        # unioned. A row in any of these is still LIVE: a deferred/held desire, a
+        # pending intention awaiting its trigger, a parked thought — all must be
+        # visible, else next tick's dedup/render would miss them (the earlier
+        # active+deferred-only snapshot silently dropped parked thoughts and pending
+        # intentions). Each state is one state of exactly one row, so the finds are
+        # disjoint; iterating sorted keeps the union order deterministic. Terminal
+        # rows (satisfied/dropped/expired/archived/...) are absence, never fetched.
         # Fail-soft like the pressure read: a transient DB error degrades to an
         # empty snapshot rather than failing the tick before component isolation.
         objects: tuple[MemoryRecord, ...] = ()
         if self._memory is not None:
             try:
-                objects = tuple(
-                    self._memory.find(state="active", limit=OBJECTS_SNAPSHOT_LIMIT)
-                ) + tuple(self._memory.find(state="deferred", limit=OBJECTS_SNAPSHOT_LIMIT))
+                found: list[MemoryRecord] = []
+                for live_state in sorted(self._live_states):
+                    found.extend(self._memory.find(state=live_state, limit=OBJECTS_SNAPSHOT_LIMIT))
+                objects = tuple(found)
             except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
                 if self._log is not None:
                     self._log.info("objects_snapshot_failed", error=repr(exc))

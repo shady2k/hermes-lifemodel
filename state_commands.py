@@ -54,8 +54,23 @@ from .core.relationship_view import (
     encode_owner_relationship,
     read_owner_relationship,
 )
+from .core.thought_view import (
+    LIVE_THOUGHT_STATES,
+    THOUGHT_KIND,
+    build_thought,
+    encode_thought,
+    seed_thought_id,
+)
 from .domain.memory import MemoryMutation, PutOp, StaleTransition, TransitionOp
-from .domain.objects import CONTACT_DESIRE_ID, DesireState, Relationship
+from .domain.objects import (
+    CONTACT_DESIRE_ID,
+    DesireState,
+    InvalidTransition,
+    Provenance,
+    Relationship,
+    ThoughtState,
+    default_registry,
+)
 from .log import EventLogger
 from .ports.memory import MemoryPort
 from .ports.tick_commit import TickCommitPort
@@ -542,3 +557,102 @@ def set_relationship_prefs_for_dir(
     else:  # pragma: no cover - the live store is always a TickCommitPort
         return "error: this store cannot persist a relationship record\n"
     return message
+
+
+# --- thoughts (lm-27n.6) ----------------------------------------------------
+# The being's thought engine has no generation yet (idle/event/chaining land
+# later), so the ONLY way to create a thought in .6 is this owner/debug seed
+# path — it lets persist → render → snapshot → transition be tested end-to-end
+# and lets the owner inspect the mechanism. It builds a typed ``Thought`` (active,
+# a deterministic content-digest id, a seed provenance) and commits it through the
+# SAME atomic bus (a ``PutRecord``/``TransitionRecord`` via ``commit_tick``) the
+# tick pipeline uses — NOT direct SQL. Transitions (park/resolve/drop) go through
+# the registry's guarded edge; nothing DRIVES them yet (that engine is .7).
+
+#: The seed provenance stamped on an owner/debug-created thought — records who/why
+#: for the audit trail (no trace ids: this is a manual seed, not a traced turn).
+_SEED_PROVENANCE = Provenance(
+    created_by="owner",
+    component="state_commands.think",
+    reason="owner-seeded thought (lm-27n.6 debug/seed path — no generation yet)",
+)
+
+
+def think_for_dir(base_dir: Path, content: str, *, logger: EventLogger | None = None) -> str:
+    """Seed one typed ``kind='thought'`` row (active) through the intent bus.
+
+    The debug/owner path that creates a thought so persist+render+snapshot are
+    testable end-to-end (generation is deferred). Builds a typed ``Thought`` with
+    a deterministic content-digest id — so re-seeding identical content upserts
+    ONE row, not a pile — and commits it via the SAME atomic ``commit_tick`` the
+    tick uses (the unchanged vitals ride along so the two never split)."""
+    content = content.strip()
+    if not content:
+        return "usage: /lifemodel think <content>\n"
+    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    thought = build_thought(
+        id=seed_thought_id(content),
+        content=content,
+        trigger="seed",
+        source="owner-seed",
+        provenance=_SEED_PROVENANCE,
+    )
+    state = lm.state.load()
+    put = PutOp(draft=encode_thought(thought))
+    if not isinstance(lm.state, TickCommitPort):  # pragma: no cover - live store always commits
+        return "error: this store cannot persist a thought record\n"
+    lm.state.commit_tick(state, [put])
+    lines = [
+        "lifemodel think  (mutating)",
+        "=" * 30,
+        "",
+        f"  thought seeded (active) [{thought.id}]",
+        f"  {content}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def transition_thought_for_dir(
+    base_dir: Path,
+    thought_id: str,
+    to_state: ThoughtState | str,
+    *,
+    logger: EventLogger | None = None,
+) -> str:
+    """Move a live thought through a guarded, registry-legal edge (park/resolve/
+    drop/...), committed atomically through the bus.
+
+    The debug/helper transition path: reads the row, validates the edge is legal
+    for the thought state machine (the registry is the single door), then commits
+    a ``TransitionRecord`` via ``commit_tick``. Rejects an absent/terminal row or
+    an illegal edge with a clear message — never a raw write. Nothing DRIVES these
+    transitions yet (the engine is .7)."""
+    to = str(to_state)
+    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    memory = lm.state if isinstance(lm.state, MemoryPort) else None
+    if memory is None:  # pragma: no cover - the live store is always a MemoryPort
+        return "error: this store cannot read thought records\n"
+    record = memory.get(THOUGHT_KIND, thought_id)
+    if record is None:
+        return f"error: no thought {thought_id!r}\n"
+    if record.state not in LIVE_THOUGHT_STATES:
+        return f"error: thought {thought_id!r} is already terminal ({record.state})\n"
+    try:
+        default_registry().validate_transition(THOUGHT_KIND, record.state, to)
+    except InvalidTransition as exc:
+        return f"error: {exc}\n"
+    state = lm.state.load()
+    op = TransitionOp(kind=THOUGHT_KIND, id=thought_id, from_state=record.state, to_state=to)
+    if not isinstance(lm.state, TickCommitPort):  # pragma: no cover - live store always commits
+        return "error: this store cannot persist a thought transition\n"
+    try:
+        lm.state.commit_tick(state, [op])
+    except StaleTransition as exc:  # a lost race with a concurrent tick
+        return f"error: {exc}\n"
+    lines = [
+        "lifemodel think transition  (mutating)",
+        "=" * 30,
+        "",
+        f"  thought [{thought_id}] {record.state} -> {to}",
+    ]
+    return "\n".join(lines) + "\n"

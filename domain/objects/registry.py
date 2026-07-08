@@ -110,6 +110,31 @@ class KindRegistry:
         self._require(kind)
         return frozenset(self._transitions[kind])
 
+    def terminal_states_of(self, kind: str) -> frozenset[str]:
+        """The *terminal* states of *kind* — those with an empty transition
+        out-set (no legal edge leaves them). Its complement in
+        :meth:`states_of` is the kind's non-terminal (live) states."""
+        self._require(kind)
+        return frozenset(s for s, outs in self._transitions[kind].items() if not outs)
+
+    def live_states(self) -> frozenset[str]:
+        """The union of every kind's NON-terminal states — the *live* state-set.
+
+        A state is terminal for a kind iff its transition out-set is empty
+        (:meth:`terminal_states_of`); non-terminal (live) otherwise. This unions
+        the live states across the whole catalog, so a single ``find(state=s)``
+        sweep over it surfaces every non-terminal row of every kind — for the
+        four-kind catalog that is ``{active, deferred, pending, parked}``.
+
+        Safe because our catalog is *terminal-consistent*: no state string is
+        terminal for one kind and non-terminal for another (asserted by the
+        object-kinds tests), so a fetch by this union never returns a row that is
+        terminal for its own kind."""
+        live: set[str] = set()
+        for transitions in self._transitions.values():
+            live.update(s for s, outs in transitions.items() if outs)
+        return frozenset(live)
+
     def validate_transition(self, kind: str, from_state: str, to_state: str) -> None:
         """Raise unless *kind* allows the edge ``from_state -> to_state``.
 

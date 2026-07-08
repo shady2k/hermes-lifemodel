@@ -252,6 +252,25 @@ def test_register_lifemodel_nudge_subcommand_mutates_state_via_the_store(
     assert _committed_state(tmp_path).u == 2.5
 
 
+def test_register_lifemodel_think_subcommand_seeds_a_thought(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lifemodel.core.thought_view import read_live_thoughts
+
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("think did the owner ever hear back")
+
+    assert "(mutating)" in out
+    store = SQLiteRuntimeStore(tmp_path / "workspace" / "lifemodel", clock=SystemClock())
+    thoughts = read_live_thoughts(store)
+    assert len(thoughts) == 1
+    assert thoughts[0].content == "did the owner ever hear back"
+
+
 def test_register_lifemodel_reset_subcommand_writes_a_fresh_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

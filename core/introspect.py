@@ -10,10 +10,11 @@ composition, no debug).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..domain.objects import Relationship
+from ..domain.objects import Relationship, Thought
 from ..sim.wake import GateParams, LaneState, backoff_interval, evaluate_wake
 from ..state.model import State
 from .backstop import allow_send
@@ -88,6 +89,8 @@ class Readings:
     receptivity_hard_reasons: tuple[str, ...]
     receptivity_soft_reasons: tuple[str, ...]
     receptivity_constraints: tuple[str, ...]
+    # thoughts (what the being is turning over — lm-27n.6)
+    thoughts: tuple[str, ...]  # live thoughts rendered "content [id]", most-salient first
     # health / timing
     last_tick_at: str | None
     last_tick_ago_min: float | None
@@ -156,6 +159,7 @@ def compute_readings(
     desire_state: str = "none",
     intention_state: str = "none",
     relationship: Relationship | None = None,
+    thoughts: Sequence[Thought] = (),
 ) -> Readings:
     """Compute the debug readings. ``desire_state`` is the live contact-desire's
     lifecycle state (``active``/``deferred``/``none``), read by the caller from
@@ -165,7 +169,9 @@ def compute_readings(
     live owner relationship (lm-27n.5); ``None`` falls back to the permissive
     :data:`~lifemodel.core.relationship_view.DEFAULT_RELATIONSHIP`, so the
     receptivity readings surface ``allowed=True / multiplier=1.0`` — the "why
-    silent" audit is behaviour-neutral until the owner sets prefs."""
+    silent" audit is behaviour-neutral until the owner sets prefs. ``thoughts``
+    are the being's live thoughts (lm-27n.6), most-salient first — the "what am I
+    turning over" audit; empty until one is seeded/generated."""
     appraisal = appraise_receptivity(relationship or DEFAULT_RELATIONSHIP, state, now)
     last_tick_ago = _ago(state.last_tick_at, now)
     dt = max(0.0, minutes_between(state.last_tick_at, now))
@@ -229,6 +235,7 @@ def compute_readings(
         receptivity_hard_reasons=appraisal.hard_reasons,
         receptivity_soft_reasons=appraisal.soft_reasons,
         receptivity_constraints=appraisal.constraints,
+        thoughts=tuple(f"{t.content} [{t.id}]" for t in thoughts),
         last_tick_at=state.last_tick_at,
         last_tick_ago_min=last_tick_ago,
         brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,

@@ -7,11 +7,13 @@ from lifemodel.core.cognition import Cognition
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
 from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE
+from lifemodel.core.wake_packet import RECENT_THOUGHTS_HEADER, build_wake_packet
 from lifemodel.state.model import State
 from lifemodel.testing import (
     contact_desire_objects,
     contact_desire_record,
     owner_relationship_record,
+    thought_record,
 )
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -190,6 +192,50 @@ def test_explicit_quiet_hours_holds_the_launch(tmp_path) -> None:
     assert _launch(intents) is None  # held
     assert _intention_put(intents) is None
     assert list(intents) == []  # nothing committed -> the desire survives
+
+
+# --- lm-27n.6: live thoughts render into the wake packet ---
+
+
+def test_launch_prompt_has_no_thoughts_block_without_thoughts(tmp_path) -> None:
+    # Behavior-neutral: a desire but no live thought -> the launch prompt is
+    # byte-identical to the no-thoughts wake packet (no Recent Thoughts block).
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert RECENT_THOUGHTS_HEADER not in launch.prompt
+    expected = build_wake_packet(value=2.0, theta=1.0, correlation_id=launch.correlation_id).prompt
+    assert launch.prompt == expected  # byte-identical to before .6
+
+
+def test_launch_prompt_renders_live_thoughts_from_the_snapshot(tmp_path) -> None:
+    # A live thought in the start-of-tick snapshot surfaces (CONTENT only, no id)
+    # in the launch prompt, most-salient first.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    objects = (
+        contact_desire_record("active"),
+        thought_record("the owner sounded tired last week", "active", id="t-hi", salience=0.9),
+        thought_record("also that book they mentioned", "parked", id="t-lo", salience=0.2),
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=objects, tmp_path=tmp_path)))
+    assert RECENT_THOUGHTS_HEADER in launch.prompt
+    assert "the owner sounded tired last week" in launch.prompt
+    assert "also that book they mentioned" in launch.prompt  # parked is live too
+    # salience order (most-salient first); ids are never rendered to the model
+    hi = launch.prompt.index("the owner sounded tired last week")
+    lo = launch.prompt.index("also that book they mentioned")
+    assert hi < lo
+    assert "t-hi" not in launch.prompt and "t-lo" not in launch.prompt
+
+
+def test_terminal_thought_does_not_render(tmp_path) -> None:
+    # A resolved/dropped thought is gone — never surfaces in the prompt.
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    objects = (
+        contact_desire_record("active"),
+        thought_record("already dealt with this", "resolved", id="t-dead", salience=0.9),
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=objects, tmp_path=tmp_path)))
+    assert RECENT_THOUGHTS_HEADER not in launch.prompt
 
 
 def test_launch_records_appraisal_constraints_on_the_intention(tmp_path) -> None:

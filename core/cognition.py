@@ -31,6 +31,7 @@ from .intention_view import build_contact_intention, encode_contact_intention
 from .intents import Intent, LaunchProactive, PutRecord, UpdateState
 from .receptivity import appraise_receptivity
 from .relationship_view import DEFAULT_RELATIONSHIP, live_owner_relationship
+from .thought_view import live_thoughts
 from .wake_packet import build_wake_packet
 
 
@@ -74,7 +75,15 @@ class Cognition:
         energy_after, _reservation = reserved
 
         correlation_id = f"proactive-{ctx.now.isoformat()}"
-        packet = build_wake_packet(value=state.u, theta=1.0, correlation_id=correlation_id)
+        # Render the live thoughts (active/parked, most-salient first) as the
+        # first-person "Recent Thoughts" CONTEXT block. No thoughts → no block →
+        # the prompt is byte-identical to before (behavior-neutral, lm-27n.6).
+        packet = build_wake_packet(
+            value=state.u,
+            theta=1.0,
+            correlation_id=correlation_id,
+            thoughts=live_thoughts(ctx.objects),
+        )
         # 0-LLM crystallization: record the committed decision (Bratman act-gate).
         # ``commitment_strength`` is the effective pressure the desire crystallized
         # on (its salience). Born directly ``active`` so it gates + is snapshot-visible

@@ -42,8 +42,13 @@ from lifemodel.core.desire_view import (
 from lifemodel.core.pressure import effective_pressure, inhibition_at
 from lifemodel.core.receptivity import appraise_receptivity
 from lifemodel.core.relationship_view import EXPLICIT_CONFIDENCE, read_owner_relationship
+from lifemodel.core.thought_view import (
+    read_live_thoughts,
+    read_thought,
+    seed_thought_id,
+)
 from lifemodel.core.timeutil import minutes_between
-from lifemodel.domain.objects import DesireState
+from lifemodel.domain.objects import DesireState, ThoughtState
 from lifemodel.log import get_logger
 from lifemodel.sim.wake import LaneState, evaluate_wake
 from lifemodel.state.errors import StateCorruptError
@@ -62,6 +67,8 @@ from lifemodel.state_commands import (
     set_field_for_dir,
     set_relationship_prefs,
     set_relationship_prefs_for_dir,
+    think_for_dir,
+    transition_thought_for_dir,
 )
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -536,3 +543,94 @@ def test_set_relationship_prefs_for_dir_leaves_vitals_untouched(tmp_path) -> Non
     persisted = _store(tmp_path).load()
     assert persisted.u == 5.0  # relationship set does not touch the being's vitals
     assert persisted.decline_count == 3
+
+
+# --- think / thought transitions (lm-27n.6) ---------------------------------
+
+
+def test_think_for_dir_rejects_empty_content(tmp_path) -> None:
+    message = think_for_dir(tmp_path, "   ", logger=get_logger("t"))
+    assert "usage:" in message
+    assert read_live_thoughts(_store(tmp_path)) == ()  # nothing persisted
+
+
+def test_think_for_dir_persists_a_live_active_thought(tmp_path) -> None:
+    _store(tmp_path).commit(State(u=5.0, decline_count=3))
+    message = think_for_dir(tmp_path, "did the owner ever hear back", logger=get_logger("t"))
+    assert "(mutating)" in message
+    thoughts = read_live_thoughts(_store(tmp_path))
+    assert len(thoughts) == 1
+    assert thoughts[0].content == "did the owner ever hear back"
+    assert thoughts[0].state == ThoughtState.ACTIVE.value
+    # committed through the bus leaves the being's vitals untouched
+    persisted = _store(tmp_path).load()
+    assert persisted.u == 5.0
+    assert persisted.decline_count == 3
+
+
+def test_think_for_dir_is_idempotent_on_identical_content(tmp_path) -> None:
+    think_for_dir(tmp_path, "one and the same", logger=get_logger("t"))
+    think_for_dir(tmp_path, "one and the same", logger=get_logger("t"))
+    assert len(read_live_thoughts(_store(tmp_path))) == 1  # deterministic id -> one row
+
+
+def test_transition_thought_to_terminal_removes_it_from_live(tmp_path) -> None:
+    think_for_dir(tmp_path, "let this one go", logger=get_logger("t"))
+    tid = seed_thought_id("let this one go")
+    message = transition_thought_for_dir(
+        tmp_path, tid, ThoughtState.RESOLVED, logger=get_logger("t")
+    )
+    assert "(mutating)" in message
+    assert read_live_thoughts(_store(tmp_path)) == ()  # resolved -> gone from the live set
+    assert read_thought(_store(tmp_path), tid) is None  # and no longer a live thought
+
+
+def test_transition_thought_park_keeps_it_live(tmp_path) -> None:
+    think_for_dir(tmp_path, "hold this thought", logger=get_logger("t"))
+    tid = seed_thought_id("hold this thought")
+    transition_thought_for_dir(tmp_path, tid, ThoughtState.PARKED, logger=get_logger("t"))
+    live = read_live_thoughts(_store(tmp_path))
+    assert [t.id for t in live] == [tid]  # parked is still live
+    assert live[0].state == ThoughtState.PARKED.value
+
+
+def test_transition_thought_rejects_illegal_edge(tmp_path) -> None:
+    # "archived" is not a thought state at all -> the registry rejects the edge,
+    # nothing is written.
+    think_for_dir(tmp_path, "stays active", logger=get_logger("t"))
+    tid = seed_thought_id("stays active")
+    message = transition_thought_for_dir(tmp_path, tid, "archived", logger=get_logger("t"))
+    assert "error" in message.lower()
+    assert read_live_thoughts(_store(tmp_path))[0].state == ThoughtState.ACTIVE.value  # unchanged
+
+
+def test_transition_thought_absent_is_rejected(tmp_path) -> None:
+    _store(tmp_path).commit(State())
+    message = transition_thought_for_dir(
+        tmp_path, "thought:nope", "resolved", logger=get_logger("t")
+    )
+    assert "no thought" in message
+
+
+def test_seeded_thought_reaches_the_snapshot_and_renders_in_a_launch(tmp_path) -> None:
+    # End-to-end: a thought seeded through the bus reaches the next tick's
+    # start-of-tick snapshot and cognition renders it into the proactive prompt.
+    think_for_dir(tmp_path, "did the owner hear back about the flat", logger=get_logger("t"))
+    lm = build_lifemodel(base_dir=tmp_path)
+    # a live active desire + an affordable, past-silence, un-inhibited state so
+    # cognition launches this tick
+    lm.state.put(
+        encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0))
+    )
+    now = lm.clock.now()
+    lm.state.commit(
+        State(
+            u=2.0,
+            energy=1.0,
+            fatigue=0.0,
+            last_exchange_at=(now - timedelta(hours=2)).isoformat(),
+        )
+    )
+    report = lm.coreloop.tick()
+    assert report.launches, "cognition should launch for a live active desire"
+    assert "did the owner hear back about the flat" in report.launches[0].prompt

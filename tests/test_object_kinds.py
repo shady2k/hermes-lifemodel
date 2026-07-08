@@ -296,3 +296,50 @@ class TestRegistryIsClosed:
 
     def test_kind_registry_type_is_the_only_door(self) -> None:
         assert isinstance(default_registry(), KindRegistry)
+
+
+class TestLiveStates:
+    """``KindRegistry.live_states`` (lm-27n.6): the union of non-terminal states
+    that drives the registry-aware coreloop snapshot."""
+
+    def test_live_states_is_the_catalog_union(self) -> None:
+        assert default_registry().live_states() == frozenset(
+            {"active", "deferred", "pending", "parked"}
+        )
+
+    def test_live_states_equals_the_nonterminal_union_of_the_tables(self) -> None:
+        expected: set[str] = set()
+        for table in TRANSITION_TABLES.values():
+            expected |= {state for state, outs in table.items() if outs}
+        assert default_registry().live_states() == frozenset(expected)
+
+    def test_terminal_states_of_matches_empty_out_sets(self) -> None:
+        reg = default_registry()
+        for kind, table in TRANSITION_TABLES.items():
+            assert reg.terminal_states_of(kind) == frozenset(
+                state for state, outs in table.items() if not outs
+            )
+
+    def test_terminal_nonterminal_consistency_invariant(self) -> None:
+        # The load-bearing invariant behind a union-state snapshot: NO state string
+        # may be terminal for one kind while non-terminal (live) for another — else
+        # a live_states() sweep would fetch a row that is terminal for its own kind.
+        # A future kind that violates it must fail HERE, loudly.
+        reg = default_registry()
+        terminal: set[str] = set()
+        live: set[str] = set()
+        for kind in TRANSITION_TABLES:
+            terminal |= reg.terminal_states_of(kind)
+            live |= reg.states_of(kind) - reg.terminal_states_of(kind)
+        conflict = terminal & live
+        assert not conflict, (
+            f"states terminal for one kind but live for another: {sorted(conflict)}"
+        )
+
+    def test_live_states_excludes_every_kinds_own_terminals(self) -> None:
+        # A corollary of the invariant: a state terminal in its own kind never
+        # appears in live_states(), so the snapshot never surfaces a dead row.
+        reg = default_registry()
+        live = reg.live_states()
+        for kind in TRANSITION_TABLES:
+            assert reg.terminal_states_of(kind).isdisjoint(live)

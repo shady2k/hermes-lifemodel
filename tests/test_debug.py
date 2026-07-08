@@ -209,3 +209,33 @@ def test_dump_renders_the_receptivity_section(tmp_path) -> None:
     out = render_dump_for_dir(tmp_path)
     assert "RECEPTIVITY" in out
     assert "allowed" in out.lower()
+
+
+def test_dump_renders_the_thoughts_section_empty_by_default(tmp_path) -> None:
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
+        State(u=2.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "THOUGHTS" in out
+    assert "**live:** none" in out  # behavior-neutral: no thoughts -> "none"
+
+
+def test_dump_lists_live_thoughts(tmp_path) -> None:
+    from lifemodel.core.thought_view import build_thought, encode_thought
+    from lifemodel.domain.objects import ThoughtState
+
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    store.commit(State(u=2.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    store.put(encode_thought(build_thought(id="t-hi", content="the flat question", salience=0.9)))
+    store.put(encode_thought(build_thought(id="t-lo", content="the book they liked", salience=0.2)))
+    store.put(
+        encode_thought(
+            build_thought(id="t-dead", content="handled", state=ThoughtState.DROPPED, salience=1.0)
+        )
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "**live:** 2" in out  # the two live ones, not the dropped one
+    assert "the flat question [t-hi]" in out
+    assert "the book they liked [t-lo]" in out
+    assert "handled" not in out  # terminal thought excluded from the audit
+    assert out.index("[t-hi]") < out.index("[t-lo]")  # salience order

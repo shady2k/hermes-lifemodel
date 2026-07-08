@@ -29,6 +29,7 @@ from .state_commands import (
     satiate_for_dir,
     set_field_for_dir,
     set_relationship_prefs_for_dir,
+    think_for_dir,
 )
 
 __version__ = "0.0.0"
@@ -67,6 +68,11 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
     "relationship": _Subcommand(
         "relationship <key>=<value> ... — set owner norms (bad-hours, cadence, "
         "privacy, topics, styles, ...) that gate proactive contact.",
+        mutating=True,
+    ),
+    "think": _Subcommand(
+        "think <content> — seed a thought (active) the being turns over and "
+        "surfaces in its proactive prompt.",
         mutating=True,
     ),
 }
@@ -158,6 +164,8 @@ def register(ctx: Any) -> None:
             return set_field_for_dir(sdir, rest, logger=logger)
         if sub == "relationship":
             return set_relationship_prefs_for_dir(sdir, rest, logger=logger)
+        if sub == "think":
+            return think_for_dir(sdir, rest, logger=logger)
         status = _status_line(profile, sdir)
         if sub == "":
             # Bare invocation: keep the status line, then surface the full
