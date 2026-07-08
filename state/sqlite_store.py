@@ -68,6 +68,7 @@ other. All ordering/expiry comparisons use the epoch columns.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 import sqlite3
@@ -484,9 +485,14 @@ class SQLiteRuntimeStore:
         ``JsonStateStore.load``'s "missing file -> default" behavior. Once a
         row exists, this reuses ``State``'s own validation
         (:meth:`~lifemodel.state.model.State.from_dict`): a bad blob raises
-        :class:`~lifemodel.state.errors.StateCorruptError`, an unsupported
-        ``schema_version`` raises :class:`~lifemodel.state.errors.StateSchemaError`
-        — the exact typed-error contract ``JsonStateStore.load`` used to honor.
+        :class:`~lifemodel.state.errors.StateCorruptError`; a ``schema_version``
+        NEWER than this build raises :class:`~lifemodel.state.errors.StateSchemaError`
+        (untrustworthy — a newer build may reuse field names with different
+        meanings). A version OLDER than this build is additive-forward-compat
+        (lm-oul): it is loaded via ``from_dict`` (missing new fields default
+        cleanly, per the "extend, don't rewrite" invariant) and the returned
+        ``State`` is re-stamped to the current ``SCHEMA_VERSION`` so the next
+        commit persists the upgrade. NON-additive migrations remain Phase 7.
         """
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
@@ -507,18 +513,42 @@ class SQLiteRuntimeStore:
         # Gate the schema *before* interpreting any fields, exactly as
         # JsonStateStore did — a newer/unknown version may reuse field names
         # with different meanings, so the body must not be trusted yet.
-        # Migrations/back-compat for the State *shape itself* remain Phase 7
-        # (HLA §9 / FR16); this bead only migrates the SQLite *table* schema.
+        # Non-additive migrations/back-compat for the State *shape itself*
+        # remain Phase 7 (HLA §9 / FR16); this bead only migrates the SQLite
+        # *table* schema.
         version = data.get("schema_version")
         if isinstance(version, bool) or not isinstance(version, int):
             raise StateCorruptError(
                 "runtime_state.state_json is missing a valid integer 'schema_version'"
             )
-        if version != SCHEMA_VERSION:
+        if version > SCHEMA_VERSION:
+            # A version NEWER than this build may reuse field names with
+            # different meanings — genuinely unsafe to interpret, so this
+            # still fails loud (unchanged from before lm-oul).
             raise StateSchemaError(
-                f"runtime_state schema_version={version} is not supported by this build "
-                f"(expects {SCHEMA_VERSION}); state migration is Phase 7."
+                f"runtime_state schema_version={version} is newer than this build "
+                f"supports (expects {SCHEMA_VERSION}); state migration is Phase 7."
             )
+        if version < SCHEMA_VERSION:
+            # lm-oul: additive-forward-compat load. The project invariant is
+            # "extend, don't rewrite" — new fields are always added with a
+            # default (State.from_dict already tolerates a missing key), so an
+            # OLDER on-disk version is safe to interpret with today's field
+            # semantics; only a NEWER version above is untrustworthy. Without
+            # this, a purely additive schema bump (e.g. v1 -> v2 adding
+            # unanswered_outbound_count) would hard-crash-loop the being's
+            # tick on every load of a state written before the bump. Re-stamp
+            # the loaded State's schema_version so the *next* commit persists
+            # the upgrade instead of writing the stale version forever. This
+            # never trusts a NEWER version — only forward-loads OLDER ones;
+            # NON-additive migrations remain Phase 7.
+            loaded = dataclasses.replace(State.from_dict(data), schema_version=SCHEMA_VERSION)
+            self._log.info(
+                "state_schema_forward_compat_upgrade",
+                on_disk_version=version,
+                build_version=SCHEMA_VERSION,
+            )
+            return loaded
 
         return State.from_dict(data)
 
