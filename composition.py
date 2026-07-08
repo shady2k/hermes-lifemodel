@@ -66,6 +66,7 @@ from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponen
 from .core.signal_bus import SignalBus
 from .core.state_actor import StateActor
 from .core.thought_attention import ThoughtAttention
+from .core.thought_crystallization import ThoughtCrystallization
 from .core.thought_generation import ThoughtGeneration
 from .core.thought_score import THOUGHT_SALIENCE_HALFLIFE_MIN
 from .domain.objects import default_registry
@@ -188,6 +189,20 @@ def build_lifemodel(
     except UnknownComponent:
         contact = ContactNeuron(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
         resolved_registry.register(contact, ComponentManifest(id=contact.id, type="neuron"))
+    try:
+        resolved_registry.manifest("thought-crystallization")
+    except UnknownComponent:
+        # The TOP-DOWN desire spring (lm-27n.9): a PURE PROPOSER that reads the
+        # settled thought snapshot and, on the Rubicon gate, emits a transient
+        # ``thought_contact_proposal`` (writes NOTHING). Registered AFTER the neuron
+        # and BEFORE contact-aggregation so its in-tick EmitSignal reaches aggregation
+        # (the sole desire writer) AND thought-attention (the sole thought writer)
+        # the SAME tick — the enabled() order is asserted by the composition tests.
+        thought_crystallization = ThoughtCrystallization()
+        resolved_registry.register(
+            thought_crystallization,
+            ComponentManifest(id=thought_crystallization.id, type="crystallization"),
+        )
     try:
         resolved_registry.manifest("contact-aggregation")
     except UnknownComponent:

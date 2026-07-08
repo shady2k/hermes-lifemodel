@@ -86,6 +86,7 @@ def build_thought(
     loop_signature: str = "",
     parked_until: str | None = None,
     park_count: int = 0,
+    sustained_attention_count: int = 0,
     actionability: float = 0.0,
     other_regarding_value: float = 0.0,
     source: str = "thought-seed",
@@ -112,6 +113,7 @@ def build_thought(
         loop_signature=loop_signature,
         parked_until=parked_until,
         park_count=park_count,
+        sustained_attention_count=sustained_attention_count,
         actionability=actionability,
         other_regarding_value=other_regarding_value,
     )

@@ -67,6 +67,13 @@ class Readings:
     duration_over_theta: float
     # desire lifecycle
     desire_status: str
+    #: Where the live contact desire sprang from (lm-27n.9): ``drive`` (bottom-up
+    #: pressure), ``thought`` (a crystallized deliberation), or ``mixed`` — the
+    #: "why" behind a proactive reach, the [SILENT] audit.
+    desire_spring: str
+    #: The source thought id(s) a top-down/mixed desire crystallized from (empty for
+    #: a pure drive spring) — the concrete reason carried for lm-8o3's wake framing.
+    desire_source_thought_ids: tuple[str, ...]
     intention_status: str  # the live decision record: active/deferred/none
     pending: bool
     pending_since: str | None
@@ -170,6 +177,8 @@ def compute_readings(
     now: datetime,
     cfg: DebugConfig,
     desire_state: str = "none",
+    desire_spring: str = "drive",
+    desire_source_thought_ids: tuple[str, ...] = (),
     intention_state: str = "none",
     relationship: Relationship | None = None,
     thoughts: Sequence[Thought] = (),
@@ -224,6 +233,8 @@ def compute_readings(
         pct_to_wake=(effective / cfg.theta) if cfg.theta else 0.0,
         duration_over_theta=state.duration_over_theta,
         desire_status=desire_state,
+        desire_spring=desire_spring,
+        desire_source_thought_ids=desire_source_thought_ids,
         intention_status=intention_state,
         pending=state.pending_proactive_id is not None,
         pending_since=state.pending_proactive_since,

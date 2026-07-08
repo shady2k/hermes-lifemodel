@@ -101,30 +101,41 @@ def build_contact_desire(
     state: DesireState,
     salience: float = 0.0,
     source_drive: float | None = None,
+    spring: DesireSpring = DesireSpring.DRIVE,
+    source_thought_ids: tuple[str, ...] = (),
+    risk_if_ignored: float = 0.0,
     source: str = "contact-aggregation",
 ) -> Desire:
     """Construct the singleton contact :class:`Desire` in *state*.
 
     The one constructor for the ``contact:owner`` desire. ``salience`` is stamped
-    from the effective pressure at creation so cognition / the pressure index can
-    read intensity; ``source_drive`` records the latent drive ``u``. Every other
-    semantic field is a fixed description (aggregation never reads them back).
-    """
+    from the effective pressure (or, top-down, the proposal score) at creation so
+    cognition / the pressure index can read intensity; ``source_drive`` records the
+    latent drive ``u``.
+
+    Two springs (lm-27n.9): the bottom-up default is ``spring=DRIVE`` with no
+    ``source_thought_ids`` — behaviour-identical to .3. A top-down crystallization
+    passes ``spring=THOUGHT`` (or ``MIXED`` when a drive urge co-fires) and the
+    source thought id(s), so the desire carries the CONCRETE reason it sprang from
+    (the ``[SILENT]`` fix + the lm-8o3 wake-framing seam) rather than a timer-derived
+    urge. ``risk_if_ignored`` lets the top-down path carry the thought's stakes;
+    every other semantic field is a fixed description (aggregation never reads them
+    back)."""
     return Desire(
         id=CONTACT_DESIRE_ID,
         state=str(state),
         source=source,
         salience=salience,
         object="owner",
-        spring=DesireSpring.DRIVE,
+        spring=spring,
         source_drive=source_drive,
-        source_thought_ids=(),
+        source_thought_ids=source_thought_ids,
         intensity=salience,
         valence="connection",
         urgency=salience,
         satiation_condition="a genuine two-way exchange with the owner",
         risk_if_acted=0.0,
-        risk_if_ignored=0.0,
+        risk_if_ignored=risk_if_ignored,
     )
 
 

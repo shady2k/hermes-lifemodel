@@ -324,6 +324,44 @@ def test_cognition_registered_after_aggregation(tmp_path: Path) -> None:
     assert any(isinstance(c, Cognition) for c in lm.registry.enabled())
 
 
+# --- lm-27n.9: ThoughtCrystallization proposes BEFORE aggregation + attention ---
+
+
+def test_thought_crystallization_registered_before_aggregation_and_attention(
+    tmp_path: Path,
+) -> None:
+    from lifemodel.core.thought_crystallization import ThoughtCrystallization
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = [c.id for c in lm.registry.enabled()]
+    # The pure proposer runs AFTER the neuron and BEFORE the two writers so its
+    # in-tick EmitSignal reaches aggregation (desire writer) + attention (thought
+    # writer) the SAME tick — the reordered pipeline's contract.
+    assert ids.index("contact") < ids.index("thought-crystallization")
+    assert ids.index("thought-crystallization") < ids.index("contact-aggregation")
+    assert ids.index("thought-crystallization") < ids.index("thought-attention")
+    assert any(isinstance(c, ThoughtCrystallization) for c in lm.registry.enabled())
+
+
+def test_full_pipeline_order_is_asserted(tmp_path: Path) -> None:
+    # The whole reordered spine (lm-27n.9): personality -> neuron ->
+    # thought-crystallization -> contact-aggregation -> thought-attention ->
+    # thought-generation -> cognition.
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = [c.id for c in lm.registry.enabled()]
+    spine = [
+        "personality",
+        "contact",
+        "thought-crystallization",
+        "contact-aggregation",
+        "thought-attention",
+        "thought-generation",
+        "cognition",
+    ]
+    positions = [ids.index(cid) for cid in spine]
+    assert positions == sorted(positions), ids
+
+
 # --- lm-27n.7: the ThoughtAttention brake sits between aggregation and cognition ---
 
 

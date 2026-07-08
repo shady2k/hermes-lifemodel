@@ -23,9 +23,12 @@ gate); the residual policy scalars (``decline_count``, ``action_pending_since``,
 The neuron owns ``u`` on rise and exchange-satiation; this layer never writes
 ``u`` (send ≠ contact: FULFILL starts an ActionPending inhibition window but does
 not satiate the drive). Only a real exchange clears ActionPending (the neuron
-satiates ``u`` separately). Aggregation is the SOLE contact-desire writer in this
-task (top-down/thought desire is a later task), so the start-of-tick snapshot plus
-its single decision are a sufficient in-tick dedup guard.
+satiates ``u`` separately). Aggregation is the SOLE contact-desire writer — it folds
+BOTH springs into the singleton (lm-27n.9): bottom-up drive AND the top-down
+``thought_contact_proposal`` that ``ThoughtCrystallization`` emits (in-tick, just
+upstream). ``spring`` = drive / thought / mixed accordingly. So the start-of-tick
+snapshot plus its single decision remain a sufficient in-tick dedup guard even with
+two springs.
 """
 
 from __future__ import annotations
@@ -33,14 +36,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ..domain.memory import PutOp, TransitionOp
-from ..domain.objects import DesireState, IntentionState
+from ..domain.objects import DesireSpring, DesireState, IntentionState
 from ..sim.aggregation import Verdict
 from ..sim.wake import GateParams, LaneState, evaluate_wake
 from .backstop import record_send
 from .component import TickContext
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
 from .intention_view import live_contact_intention
-from .intents import Intent, PutRecord, TransitionRecord, UpdateState
+from .intents import EmitSignal, Intent, PutRecord, TransitionRecord, UpdateState
 from .invalidation import is_verdict_stale
 from .pressure import effective_pressure, inhibition_at
 from .receptivity import appraise_receptivity
@@ -51,8 +54,10 @@ from .taxonomy import (
     contact_value,
     is_in_flight,
     read_exchange,
+    read_thought_contact_proposal,
     read_verdict,
     read_verdict_correlation,
+    thought_contact_created_signal,
 )
 from .timeutil import minutes_between
 
@@ -234,13 +239,31 @@ class ContactAggregation:
             decline_count=decline_count,
         )
         outcome = evaluate_wake(u=gated_effective, now=0.0, state=lane, params=self._params)
-        # A wake-eligible urge births a desire only when none is live, nothing
-        # resolved one this tick (dedup / anti-drum), AND the appraisal admits it
-        # (no explicit-boundary hard veto). After any resolution the residual gates
-        # already veto a same-tick re-wake, so with the permissive default this is
-        # behaviour-identical to the old ``on_urge`` on a ``NONE`` status.
+        drive_urge = outcome.is_urge
+
+        # Top-down spring (lm-27n.9): a crystallized-thought proposal from the
+        # in-tick signal (ThoughtCrystallization ran just before this component).
+        # It BYPASSES the drive threshold — contact from a genuine reason, not
+        # accumulated pressure — but STILL respects every appropriateness gate:
+        # in-flight / silence window / decline backoff (re-evaluated by forcing the
+        # threshold pass while keeping the real lane state), the receptivity hard
+        # veto (``appraisal.allowed`` below — AUTHORITATIVE here), and the singleton
+        # dedup (``desire_state == _NONE``). Energy is inherited downstream (cognition
+        # will not launch a turn it cannot afford), exactly as the bottom-up path.
+        proposal = read_thought_contact_proposal(ctx.signals)
+        top_down_admissible = (
+            proposal is not None
+            and evaluate_wake(
+                u=max(gated_effective, self._theta), now=0.0, state=lane, params=self._params
+            ).is_urge
+        )
+
+        # A wake-eligible urge (bottom-up drive OR top-down proposal) births a desire
+        # only when none is live, nothing resolved one this tick (dedup / anti-drum),
+        # AND the appraisal admits it (no explicit-boundary hard veto). With no
+        # proposal and the permissive default this is behaviour-identical to .5.
         if (
-            outcome.is_urge
+            (drive_urge or top_down_admissible)
             and desire_state == _NONE
             and transition_to is None
             and appraisal.allowed
@@ -261,12 +284,44 @@ class ContactAggregation:
         intents: list[Intent] = [UpdateState(changes)]
 
         if create_desire:
-            # Salience is the gated effective pressure — the pressure that actually
-            # cleared the wake bar (with the permissive default, == ``effective``).
+            # Fold the two springs into the singleton (lm-27n.9). Bottom-up only →
+            # ``spring=DRIVE``, salience = the gated effective pressure that cleared
+            # the wake bar (behaviour-identical to .5). Top-down proposal only →
+            # ``spring=THOUGHT``, salience from the proposal score, carrying
+            # ``source_thought_ids`` (the concrete reason — the [SILENT] fix). Both
+            # in one tick → ``spring=MIXED`` (still carrying the source thought).
+            source_thought_ids: tuple[str, ...]
+            if top_down_admissible and proposal is not None:
+                spring = DesireSpring.MIXED if drive_urge else DesireSpring.THOUGHT
+                salience = max(gated_effective, proposal.score) if drive_urge else proposal.score
+                source_thought_ids = (proposal.thought_id,)
+                risk_if_ignored = proposal.other_regarding
+            else:
+                spring = DesireSpring.DRIVE
+                salience = gated_effective
+                source_thought_ids = ()
+                risk_if_ignored = 0.0
             desire = build_contact_desire(
-                state=DesireState.ACTIVE, salience=gated_effective, source_drive=u_now
+                state=DesireState.ACTIVE,
+                salience=salience,
+                source_drive=u_now,
+                spring=spring,
+                source_thought_ids=source_thought_ids,
+                risk_if_ignored=risk_if_ignored,
             )
             intents.append(PutRecord(op=PutOp(draft=encode_contact_desire(desire))))
+            # Tell ThoughtAttention (same tick, downstream) the source thought's reason
+            # ACTUALLY became a desire, so it resolves that thought. Only on genuine
+            # creation — a proposal aggregation suppressed leaves its thought live
+            # (lm-27n.9; codex): the reason is not silently spent by timing.
+            for thought_id in source_thought_ids:
+                intents.append(
+                    EmitSignal(
+                        signal=thought_contact_created_signal(
+                            origin_id=self.id, thought_id=thought_id, timestamp=now.isoformat()
+                        )
+                    )
+                )
         elif transition_to is not None and live is not None:
             intents.append(
                 TransitionRecord(

@@ -72,6 +72,16 @@ class Thought(BaseObject):
     #: expires rather than re-arming. A declared field (not a stray payload key) so
     #: the anti-rumination engine tracks the cycle through the typed registry door.
     park_count: int
+    #: How many ticks this thought has sustained *viable* contact-candidate
+    #: attention — the top-down Rubicon persistence counter (lm-27n.9). Bumped ONLY
+    #: by :class:`~lifemodel.core.thought_attention.ThoughtAttention` (the sole
+    #: thought writer) when the attended thought is a viable contact candidate, and
+    #: read next tick by :class:`~lifemodel.core.thought_crystallization.ThoughtCrystallization`
+    #: to gate crystallization (a fresh idle thought, at 0, can never mint contact).
+    #: A DECLARED field — a raw payload key would be rejected by the registry — and
+    #: deliberately DISTINCT from ``no_progress_count`` (the rumination brake):
+    #: coupling them would park good thoughts faster.
+    sustained_attention_count: int
     actionability: float
     other_regarding_value: float
 
@@ -88,6 +98,7 @@ class Thought(BaseObject):
             "loop_signature": self.loop_signature,
             "parked_until": self.parked_until,
             "park_count": self.park_count,
+            "sustained_attention_count": self.sustained_attention_count,
             "actionability": self.actionability,
             "other_regarding_value": self.other_regarding_value,
         }
@@ -104,6 +115,7 @@ class Thought(BaseObject):
             loop_signature=req_str(payload, "loop_signature"),
             parked_until=opt_str(payload, "parked_until"),
             park_count=req_int(payload, "park_count"),
+            sustained_attention_count=req_int(payload, "sustained_attention_count"),
             actionability=req_float(payload, "actionability"),
             other_regarding_value=req_float(payload, "other_regarding_value"),
         )

@@ -124,3 +124,64 @@ def test_verdict_correlation_defaults_empty() -> None:
     from lifemodel.core.taxonomy import read_verdict_correlation
 
     assert read_verdict_correlation(sig) == ""
+
+
+# --- lm-27n.9: the thought_contact_proposal transient signal -----------------
+
+
+def test_thought_contact_proposal_round_trips() -> None:
+    from lifemodel.core.taxonomy import (
+        KIND_THOUGHT_CONTACT_PROPOSAL,
+        read_thought_contact_proposal,
+        thought_contact_proposal_signal,
+    )
+
+    sig = thought_contact_proposal_signal(
+        origin_id="thought-crystallization",
+        thought_id="t-serve",
+        score=0.72,
+        reason="other-serving",
+        other_regarding=0.6,
+        actionability=0.3,
+        salience=0.8,
+        timestamp=None,
+    )
+    assert sig.kind == KIND_THOUGHT_CONTACT_PROPOSAL
+    proposal = read_thought_contact_proposal([sig])
+    assert proposal is not None
+    assert proposal.thought_id == "t-serve"
+    assert proposal.score == 0.72
+    assert proposal.reason == "other-serving"
+    assert proposal.other_regarding == 0.6
+
+
+def test_read_proposal_none_when_absent_or_malformed() -> None:
+    from lifemodel.core.taxonomy import KIND_THOUGHT_CONTACT_PROPOSAL, read_thought_contact_proposal
+    from lifemodel.domain.signal import Signal
+
+    assert read_thought_contact_proposal([]) is None
+    # a malformed payload (missing thought_id / bad score) degrades to None, not a crash.
+    bad = Signal(origin_id="x", kind=KIND_THOUGHT_CONTACT_PROPOSAL, payload={"score": "high"})
+    assert read_thought_contact_proposal([bad]) is None
+
+
+def test_read_proposal_returns_the_freshest() -> None:
+    from lifemodel.core.taxonomy import (
+        read_thought_contact_proposal,
+        thought_contact_proposal_signal,
+    )
+
+    def _p(tid: str):
+        return thought_contact_proposal_signal(
+            origin_id="c",
+            thought_id=tid,
+            score=0.7,
+            reason="r",
+            other_regarding=0.5,
+            actionability=0.5,
+            salience=0.7,
+            timestamp=None,
+        )
+
+    latest = read_thought_contact_proposal([_p("t-a"), _p("t-b")])
+    assert latest is not None and latest.thought_id == "t-b"

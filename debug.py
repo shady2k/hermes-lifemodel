@@ -123,6 +123,8 @@ def render_dump_for_dir(base_dir: Path) -> str:
     memory = lm.state if isinstance(lm.state, MemoryPort) else None
     desire = read_live_contact_desire(memory) if memory is not None else None
     desire_state = desire.state if desire is not None else "none"
+    desire_spring = str(desire.spring) if desire is not None else "drive"
+    desire_source_thought_ids = desire.source_thought_ids if desire is not None else ()
     intention = read_live_contact_intention(memory) if memory is not None else None
     intention_state = intention.state if intention is not None else "none"
     relationship = read_owner_relationship(memory) if memory is not None else None
@@ -133,6 +135,8 @@ def render_dump_for_dir(base_dir: Path) -> str:
             now=now,
             cfg=_cfg(),
             desire_state=desire_state,
+            desire_spring=desire_spring,
+            desire_source_thought_ids=desire_source_thought_ids,
             intention_state=intention_state,
             relationship=relationship,
             thoughts=thoughts,
@@ -197,10 +201,15 @@ def render_debug_dump(*, readings: Readings) -> str:
     )
     lines.append("")
 
+    spring = r.desire_spring
+    if r.desire_source_thought_ids:
+        spring += f" (from {', '.join(r.desire_source_thought_ids)})"
+
     lines.append("**DESIRE**")
     lines += _metrics(
         [
             ("status", r.desire_status),
+            ("spring", spring),
             ("intention", r.intention_status),
             ("pending_turn", pending),
             ("last_contact", _local(r.last_contact_at)),

@@ -34,8 +34,12 @@ def _component() -> ThoughtAttention:
     return ThoughtAttention()
 
 
-def _ctx(objects: tuple[MemoryRecord, ...], now: datetime = _NOW) -> TickContext:
-    return TickContext(state=State(), now=now, bus=FakeSignalBus(), objects=objects)
+def _ctx(
+    objects: tuple[MemoryRecord, ...], now: datetime = _NOW, signals: tuple = ()
+) -> TickContext:
+    return TickContext(
+        state=State(), now=now, bus=FakeSignalBus(), objects=objects, signals=signals
+    )
 
 
 def _puts(intents: list[Intent]) -> list[PutRecord]:
@@ -245,6 +249,163 @@ def test_convergence_a_never_resolved_thought_parks_then_unparks(tmp_path) -> No
     revived = store.get("thought", "t-loop")
     assert revived.state == "active"
     assert revived.payload["no_progress_count"] == 0
+
+
+# --- lm-27n.9: sustained_attention_count (the top-down Rubicon persistence) -----
+
+
+def test_viable_attended_thought_accrues_sustained_attention() -> None:
+    # A salient, other-serving, attended thought accrues one tick of persistence.
+    objects = (
+        thought_record(
+            "check in on the owner",
+            "active",
+            id="t1",
+            salience=0.8,
+            other_regarding_value=0.6,
+            sustained_attention_count=1,
+        ),
+    )
+    put = _puts(list(_component().step(_ctx(objects))))[0]
+    assert put.op.draft.payload["sustained_attention_count"] == 2  # bumped
+    assert put.op.draft.payload["no_progress_count"] == 1  # attended
+
+
+def test_idle_wandering_thought_never_accrues_sustained_attention() -> None:
+    # A low-salience idle thought is attended (it is the only one) but is NOT a
+    # viable contact candidate -> sustained_attention_count stays put (anti-frivolity
+    # at the counter: idle wandering can never persist into contact).
+    objects = (
+        thought_record(
+            "just wandering",
+            "active",
+            id="t1",
+            salience=0.15,
+            trigger="idle",
+            other_regarding_value=0.10,
+            actionability=0.05,
+            sustained_attention_count=0,
+        ),
+    )
+    put = _puts(list(_component().step(_ctx(objects))))[0]
+    assert put.op.draft.payload["sustained_attention_count"] == 0  # not viable -> no accrual
+    assert put.op.draft.payload["no_progress_count"] == 1  # ...but still attended/decayed
+
+
+def test_unattended_viable_thought_does_not_accrue_sustained_attention() -> None:
+    # Two viable thoughts; only the top-scoring is attended (K=1). The other stays at
+    # its sustained count (persistence needs sustained ATTENTION, not mere existence).
+    objects = (
+        thought_record(
+            "high",
+            "active",
+            id="t-hi",
+            salience=0.9,
+            other_regarding_value=0.6,
+            sustained_attention_count=1,
+        ),
+        thought_record(
+            "low",
+            "active",
+            id="t-lo",
+            salience=0.6,
+            other_regarding_value=0.6,
+            sustained_attention_count=1,
+        ),
+    )
+    by_id = {p.op.draft.id: p.op.draft for p in _puts(list(_component().step(_ctx(objects))))}
+    assert by_id["t-hi"].payload["sustained_attention_count"] == 2  # attended -> accrues
+    assert by_id["t-lo"].payload["sustained_attention_count"] == 1  # not attended -> held
+
+
+def test_sustained_attention_is_not_coupled_to_no_progress() -> None:
+    # A viable thought accrues persistence while its no_progress climbs independently:
+    # the two counters are distinct (coupling would park good thoughts faster).
+    objects = (
+        thought_record(
+            "check in on the owner",
+            "active",
+            id="t1",
+            salience=0.8,
+            other_regarding_value=0.6,
+            sustained_attention_count=0,
+            no_progress_count=0,
+        ),
+    )
+    put = _puts(list(_component().step(_ctx(objects))))[0]
+    # both bumped this tick, but from independent counters — no shared arithmetic.
+    assert put.op.draft.payload["sustained_attention_count"] == 1
+    assert put.op.draft.payload["no_progress_count"] == 1
+
+
+# --- lm-27n.9: resolve the crystallized thought on the CREATED signal -------------
+
+
+def _created(thought_id: str):
+    # Aggregation emits this ONLY when it actually creates a top-down desire — attention
+    # resolves the source thought on genuine creation, never on a mere proposal.
+    from lifemodel.core.taxonomy import thought_contact_created_signal
+
+    return thought_contact_created_signal(
+        origin_id="contact-aggregation", thought_id=thought_id, timestamp=None
+    )
+
+
+def test_created_signal_resolves_the_source_thought_instead_of_decaying_it() -> None:
+    # On the "contact desire CREATED from this thought" signal, attention (the SOLE
+    # thought writer) resolves the source thought (active->resolved) INSTEAD of the
+    # decay PutRecord — its reason became a desire; it must not also re-crystallize.
+    objects = (
+        thought_record(
+            "check in on the owner",
+            "active",
+            id="t-serve",
+            salience=0.8,
+            other_regarding_value=0.6,
+            sustained_attention_count=2,
+        ),
+    )
+    intents = list(_component().step(_ctx(objects, signals=(_created("t-serve"),))))
+    assert len(intents) == 1
+    tr = intents[0]
+    assert isinstance(tr, TransitionRecord)
+    assert tr.op.from_state == "active" and tr.op.to_state == "resolved"
+    assert not _puts(intents)  # NOT decayed via a PutRecord
+
+
+def test_created_signal_for_an_absent_thought_is_a_noop_for_others() -> None:
+    # A created-signal naming a thought not in the snapshot resolves nothing; the live
+    # thought is attended/decayed as usual.
+    objects = (thought_record("some worry", "active", id="t1", salience=0.5),)
+    intents = list(_component().step(_ctx(objects, signals=(_created("t-ghost"),))))
+    assert not _transitions(intents)
+    assert len(_puts(intents)) == 1  # the live thought still just decays
+
+
+def test_bare_proposal_without_creation_does_not_resolve_the_thought() -> None:
+    # The P1 fix (codex): a PROPOSAL that aggregation did NOT turn into a desire
+    # (suppressed by silence window / backoff / in-flight) must NOT resolve the source
+    # thought — the reason stays live (decays/parks normally), not silently spent.
+    from lifemodel.core.taxonomy import thought_contact_proposal_signal
+
+    proposal = thought_contact_proposal_signal(
+        origin_id="thought-crystallization",
+        thought_id="t-serve",
+        score=0.7,
+        reason="other-serving",
+        other_regarding=0.6,
+        actionability=0.3,
+        salience=0.8,
+        timestamp=None,
+    )
+    objects = (
+        thought_record(
+            "check in on the owner", "active", id="t-serve", salience=0.8, other_regarding_value=0.6
+        ),
+    )
+    intents = list(_component().step(_ctx(objects, signals=(proposal,))))
+    assert not _transitions(intents)  # NOT resolved on a bare proposal
+    assert len(_puts(intents)) == 1  # the thought stays live and just decays
 
 
 def test_convergence_never_exceeds_the_width_caps(tmp_path) -> None:

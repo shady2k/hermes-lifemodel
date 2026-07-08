@@ -136,6 +136,7 @@ def _thought() -> Thought:
         loop_signature="alex-move",
         parked_until=None,
         park_count=0,
+        sustained_attention_count=0,
         actionability=0.7,
         other_regarding_value=0.8,
         **_ENVELOPE,  # type: ignore[arg-type]

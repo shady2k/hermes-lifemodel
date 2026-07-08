@@ -51,6 +51,7 @@ from ..domain.memory import JsonObject, MemoryPatch, PutOp, TransitionOp
 from ..domain.objects import Thought, ThoughtState
 from .component import TickContext
 from .intents import Intent, PutRecord, TransitionRecord
+from .taxonomy import read_thought_contact_created
 from .thought_score import (
     ATTEND_K,
     MAX_PARK_CYCLES,
@@ -66,6 +67,27 @@ from .thought_score import (
 )
 from .thought_view import encode_thought, live_thought_records
 from .timeutil import minutes_between
+
+#: Persistence-increment viability (lm-27n.9): the attended thought only accrues
+#: ``sustained_attention_count`` (the top-down Rubicon counter) when it is a genuine
+#: contact candidate — salient enough AND meaningfully other-serving/actionable. An
+#: idle wandering thought (salience ~0.15, other-regarding ~0.10) never qualifies,
+#: so it can never accumulate the persistence crystallization needs (anti-frivolity).
+VIABLE_SALIENCE = 0.45
+VIABLE_RELEVANCE = 0.3
+
+
+def is_viable_contact_candidate(thought: Thought) -> bool:
+    """Is *thought* a viable contact candidate this tick (worth accruing persistence)?
+
+    Salient enough to matter AND meaningfully serving the owner or actionable —
+    deliberately looser than the Rubicon gate (this only decides whether to COUNT a
+    tick of attention; :func:`~lifemodel.core.thought_crystallization.should_crystallize`
+    is the actual bar), but strict enough that idle mind-wandering never accrues."""
+    return thought.salience >= VIABLE_SALIENCE and (
+        thought.other_regarding_value >= VIABLE_RELEVANCE
+        or thought.actionability >= VIABLE_RELEVANCE
+    )
 
 
 class ThoughtAttention:
@@ -101,11 +123,23 @@ class ThoughtAttention:
         active_ids = [t.id for _r, t in candidates if t.state == ThoughtState.ACTIVE.value]
         attended = set(sorted(active_ids, key=lambda tid: (-scores[tid], tid))[: self._attend_k])
 
+        # Resolve on genuine CREATION, not on a mere proposal (lm-27n.9; codex): a
+        # thought's reason ACTUALLY became a contact desire this tick (aggregation
+        # emits ``thought_contact_created`` only when it creates one) → RESOLVE that
+        # thought here (attention is the SOLE thought writer, so it commits the
+        # active→resolved edge; the thought does not decay/park/re-crystallize). A
+        # proposal aggregation SUPPRESSED (silence window / backoff / in-flight) emits
+        # no created-signal, so its thought stays live — the reason is not silently
+        # spent by timing; it re-competes and is bounded by normal decay/parking.
+        crystallized_id = read_thought_contact_created(ctx.signals)
+
         intents: list[Intent] = []
         touched = 0
         for record, thought in candidates:
             score = scores[thought.id]
-            if thought.state == ThoughtState.PARKED.value:
+            if thought.id == crystallized_id and thought.state == ThoughtState.ACTIVE.value:
+                mutation: Intent | None = self._resolve_intent(thought)
+            elif thought.state == ThoughtState.PARKED.value:
                 mutation = self._parked_intent(thought, score, now)
             else:
                 mutation = self._active_intent(
@@ -120,6 +154,21 @@ class ThoughtAttention:
         assert touched <= self._scan_width, (touched, self._scan_width)
         assert len(attended) <= self._attend_k, (len(attended), self._attend_k)
         return intents
+
+    def _resolve_intent(self, thought: Thought) -> Intent:
+        """Resolve a crystallized thought (active→resolved) — its reason became a
+        contact desire this tick (lm-27n.9). Emitted INSTEAD of the decay/park
+        mutation, so attention stays the SOLE thought writer (no same-tick conflict
+        with crystallization/aggregation) and the resolved thought neither decays,
+        parks, nor re-crystallizes. ``active→resolved`` is a legal THOUGHT edge."""
+        return TransitionRecord(
+            op=TransitionOp(
+                kind="thought",
+                id=thought.id,
+                from_state=ThoughtState.ACTIVE.value,
+                to_state=ThoughtState.RESOLVED.value,
+            )
+        )
 
     def _parked_intent(self, thought: Thought, score: float, now: datetime) -> Intent | None:
         """Unpark an elapsed parked thought (or expire a chronic looper); a parked
@@ -184,6 +233,17 @@ class ThoughtAttention:
                 )
             )
 
+        # Persistence bump (lm-27n.9): a viable, attended contact candidate accrues
+        # one tick of ``sustained_attention_count`` — the top-down Rubicon counter
+        # crystallization reads NEXT tick. Only when attended AND viable; an idle
+        # wanderer (low salience / weak relevance) never accrues, so it can never
+        # persist into contact (anti-frivolity). This is the ONLY writer of the
+        # counter, and it is DISTINCT from ``no_progress_count`` (the park brake) —
+        # a thought can be persistent without being near the brake, and vice versa.
+        new_sustained = thought.sustained_attention_count + (
+            1 if (is_attended and is_viable_contact_candidate(thought)) else 0
+        )
+
         # Field-only update (no state change): the typed upsert through the door.
         updated = replace(
             thought,
@@ -191,5 +251,6 @@ class ThoughtAttention:
             attention_score=score,
             no_progress_count=new_no_progress,
             loop_signature=sig,
+            sustained_attention_count=new_sustained,
         )
         return PutRecord(op=PutOp(draft=encode_thought(updated)))

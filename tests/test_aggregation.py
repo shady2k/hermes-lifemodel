@@ -569,3 +569,124 @@ def test_soft_downweight_raises_the_effective_wake_bar(tmp_path) -> None:
     rel = owner_relationship_record(known_load="busy at work")
     intents = _agg().step(_ctx(state, now, [c], objects=(rel,), tmp_path=tmp_path))
     assert _desire_intent(intents) is None
+
+
+# --- lm-27n.9: the two-springs fold (drive + top-down thought) --------------
+#
+# Aggregation stays the SOLE contact-desire writer; the CREATE path now folds a
+# ThoughtCrystallization ``thought_contact_proposal`` (an in-tick signal) with the
+# bottom-up drive urge. drive-only -> DRIVE (unchanged .3 behaviour); thought-only
+# -> THOUGHT (bypasses the drive threshold, respects the appropriateness gates +
+# receptivity); both -> MIXED. The source thought id is carried on the desire.
+
+
+def _proposal(thought_id: str = "t-serve", score: float = 0.72):
+    from lifemodel.core.taxonomy import thought_contact_proposal_signal
+
+    return thought_contact_proposal_signal(
+        origin_id="thought-crystallization",
+        thought_id=thought_id,
+        score=score,
+        reason="other-serving",
+        other_regarding=0.6,
+        actionability=0.3,
+        salience=0.8,
+        timestamp=None,
+    )
+
+
+def _created_desire(intents):
+    di = _desire_intent(intents)
+    return di.op.draft if isinstance(di, PutRecord) else None
+
+
+def test_drive_only_urge_springs_a_drive_desire(tmp_path) -> None:
+    # Bottom-up unchanged (.3): a drive urge with no proposal -> spring=DRIVE, no
+    # source thoughts.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
+    draft = _created_desire(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
+    assert draft is not None
+    assert draft.payload["spring"] == "drive"
+    assert draft.payload["source_thought_ids"] == []
+
+
+def test_top_down_proposal_springs_a_thought_desire_below_drive_threshold(tmp_path) -> None:
+    # No drive urge (u=0.3 < theta), a crystallization proposal -> a THOUGHT-sprung
+    # desire is born ANYWAY (contact from a reason, not accumulated pressure), and it
+    # carries the source thought id + the proposal score as salience.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.3, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=0.3, delta=0.0, timestamp=None)  # < theta
+    draft = _created_desire(
+        _agg().step(_ctx(state, now, [c, _proposal(score=0.72)], tmp_path=tmp_path))
+    )
+    assert draft is not None
+    assert draft.state == "active"
+    assert draft.payload["spring"] == "thought"
+    assert draft.payload["source_thought_ids"] == ["t-serve"]
+    assert draft.salience == 0.72  # salience from the proposal score
+
+
+def test_drive_and_proposal_together_spring_a_mixed_desire(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    c = contact_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
+    draft = _created_desire(_agg().step(_ctx(state, now, [c, _proposal()], tmp_path=tmp_path)))
+    assert draft is not None
+    assert draft.payload["spring"] == "mixed"
+    assert draft.payload["source_thought_ids"] == ["t-serve"]
+
+
+def test_top_down_proposal_deduped_when_a_live_desire_exists(tmp_path) -> None:
+    # The singleton is taken — a proposal must not double-create over a live desire.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.3, last_tick_at="2026-07-06T03:59:00+00:00")
+    intents = _agg().step(_ctx(state, now, [_proposal()], objects=ACTIVE, tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
+
+
+def test_top_down_proposal_suppressed_by_silence_window(tmp_path) -> None:
+    # A top-down desire BYPASSES the drive threshold but still respects the silence
+    # window: a real exchange 5 min ago (< w=15) blocks the birth.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=0.3,
+        last_exchange_at="2026-07-06T03:55:00+00:00",
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    intents = _agg().step(_ctx(state, now, [_proposal()], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
+
+
+def test_top_down_proposal_suppressed_by_decline_backoff(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=0.3,
+        declined_at="2026-07-06T03:59:00+00:00",  # 1 min ago, < r0=30
+        decline_count=1,
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    intents = _agg().step(_ctx(state, now, [_proposal()], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
+
+
+def test_top_down_proposal_suppressed_by_in_flight_turn(tmp_path) -> None:
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.3, last_tick_at="2026-07-06T03:59:00+00:00")
+    inflight = in_flight_signal(origin_id="if1", value=True, timestamp=None)
+    intents = _agg().step(_ctx(state, now, [_proposal(), inflight], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
+
+
+def test_top_down_proposal_suppressed_by_receptivity_hard_veto(tmp_path) -> None:
+    # The receptivity hard veto is AUTHORITATIVE in aggregation — an explicit
+    # no-proactive-contact boundary blocks even a top-down spring.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.3, last_tick_at="2026-07-06T03:59:00+00:00")
+    rel = owner_relationship_record(
+        privacy_boundaries=("no_proactive_contact",), confidence=EXPLICIT_CONFIDENCE
+    )
+    intents = _agg().step(_ctx(state, now, [_proposal()], objects=(rel,), tmp_path=tmp_path))
+    assert _desire_intent(intents) is None
