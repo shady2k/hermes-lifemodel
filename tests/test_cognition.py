@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 from lifemodel.adapters.signal_bus import FileSignalBus
@@ -200,14 +201,44 @@ def test_explicit_quiet_hours_holds_the_launch(tmp_path) -> None:
 # --- lm-27n.6: live thoughts render into the wake packet ---
 
 
+def test_launch_prompt_carries_situational_brief(tmp_path) -> None:
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+    )
+    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    assert launch is not None
+    assert "несколько часов назад" in launch.prompt  # NOW is 2026-07-06 12:00, 180 min
+    assert "вспомни, на чём вы остановились" in launch.prompt
+    assert re.search(r"\d", launch.prompt) is None
+
+
 def test_launch_prompt_has_no_thoughts_block_without_thoughts(tmp_path) -> None:
     # Behavior-neutral: a desire but no live thought -> the launch prompt is
-    # byte-identical to the no-thoughts wake packet (no Recent Thoughts block).
-    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    # byte-identical to the no-thoughts wake packet (no Recent Thoughts block),
+    # now built WITH the same situational context the cognition path passes.
+    state = State(
+        u=2.0,
+        energy=1.0,
+        fatigue=0.0,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        decline_count=0,
+    )
     launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
     assert RECENT_THOUGHTS_HEADER not in launch.prompt
-    expected = build_wake_packet(value=2.0, theta=1.0, correlation_id=launch.correlation_id).prompt
-    assert launch.prompt == expected  # byte-identical to before .6
+    expected = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id=launch.correlation_id,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        now=NOW,
+        decline_count=0,
+        energy=1.0,
+    ).prompt
+    assert launch.prompt == expected
 
 
 def test_launch_prompt_renders_live_thoughts_from_the_snapshot(tmp_path) -> None:

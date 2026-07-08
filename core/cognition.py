@@ -93,6 +93,10 @@ class Cognition:
             theta=1.0,
             correlation_id=correlation_id,
             thoughts=live_thoughts(ctx.objects),
+            last_exchange_at=state.last_exchange_at,
+            now=ctx.now,
+            decline_count=state.decline_count,
+            energy=state.energy,
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits
