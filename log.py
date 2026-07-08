@@ -191,6 +191,17 @@ def configure(level: int = logging.INFO) -> None:
     )
 
 
+def current_level() -> int:
+    """Return the module's current effective log level (see :func:`configure`).
+
+    Purely additive read accessor (bead lm-j2w B2) so callers — e.g. plugin
+    startup deciding whether a persisted level actually needs applying — can
+    check the current level without reaching into the private
+    ``_effective_level`` global directly.
+    """
+    return _effective_level
+
+
 def get_logger(name: str | None = None, **initial_values: Any) -> EventLogger:
     """Return an :class:`EventLogger` — structlog when available, else a shim."""
     if _HAVE_STRUCTLOG:

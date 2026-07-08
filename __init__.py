@@ -19,10 +19,11 @@ from typing import Any, NamedTuple
 
 from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
+from .config import read_log_level, set_log_level_for_dir
 from .debug import render_dump_for_dir
 from .events import EVENTS_FILENAME, EventSink
 from .hooks import make_inbound_observer, make_post_llm_observer
-from .log import EventTee, get_logger
+from .log import EventTee, configure, current_level, get_logger, parse_log_level
 from .paths import state_dir
 from .state_commands import (
     force_wake_for_dir,
@@ -82,6 +83,11 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
         "surfaces in its proactive prompt.",
         mutating=True,
     ),
+    "loglevel": _Subcommand(
+        "loglevel [level] — show the current log level, or set it "
+        "(debug|info|warning|error|critical); persists across restarts.",
+        mutating=True,
+    ),
 }
 
 
@@ -137,6 +143,21 @@ def register(ctx: Any) -> None:
     home = _hermes_home()
     sdir = state_dir(home)
 
+    # Boot at the persisted log level (lm-j2w B2) — defaults to 'info' when no
+    # config.json exists yet (a fresh being), same default log.configure()
+    # itself uses. Must run before get_logger() below so the structlog
+    # pipeline (when present) is configured at the right level from the very
+    # first event this registration emits, not just from the next owner
+    # `/lifemodel loglevel` call. Skipped when the persisted level already
+    # matches the current effective level: log.configure() unconditionally
+    # rebuilds the WHOLE structlog processor chain (not just the level), so
+    # calling it on every register() would blow away any processors a host
+    # (or a test's structlog.testing.capture_logs()) had layered on top —
+    # true idempotence at the call site, not just at the level-int.
+    desired_level = parse_log_level(read_log_level(sdir))
+    if desired_level != current_level():
+        configure(desired_level)
+
     # Tee structured events into a bounded on-disk sink so the debug command can
     # query them (HLA §12/§13) instead of scraping operator logs.
     sink = EventSink(sdir / EVENTS_FILENAME)
@@ -172,6 +193,7 @@ def register(ctx: Any) -> None:
             "set": lambda: set_field_for_dir(sdir, rest, logger=logger),
             "relationship": lambda: set_relationship_prefs_for_dir(sdir, rest, logger=logger),
             "think": lambda: think_for_dir(sdir, rest, logger=logger),
+            "loglevel": lambda: set_log_level_for_dir(sdir, rest),
         }
         handler = dispatch.get(sub)
         if handler is not None:
