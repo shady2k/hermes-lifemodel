@@ -71,7 +71,14 @@ def proactive_tick(
         logger.info("proactive_backstop_blocked")
         _rollback(lm, actor, launch.reserved_energy, defer=True)  # hold: active -> deferred
     else:
-        outcome = egress.reach_out(target, IMPULSE_LABEL_PREFIX + launch.prompt)
+        full_prompt = IMPULSE_LABEL_PREFIX + launch.prompt
+        # The owner's core observability ask (lm-j2w B3): "I want to know what
+        # we handed the agent." DEBUG-only (a no-op unless the owner has set
+        # loglevel=debug) and carries the COMPLETE, untruncated text — byte-
+        # identical to what egress.reach_out is about to receive — plus the
+        # correlation_id shared with the outcome verdict logged in hooks.py.
+        logger.debug("proactive_prompt", correlation_id=launch.correlation_id, prompt=full_prompt)
+        outcome = egress.reach_out(target, full_prompt)
         if outcome is not ReachOutcome.DELIVERED:
             logger.info("proactive_launch_failed", outcome=outcome.value)
             _rollback(lm, actor, launch.reserved_energy, defer=False)  # keep active, retry

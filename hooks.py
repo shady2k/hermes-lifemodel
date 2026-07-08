@@ -21,6 +21,7 @@ Neither mutates ``State``.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from typing import Any
 
@@ -63,16 +64,39 @@ def _is_pending_proactive_turn(pending_proactive_id: str | None, user_message: s
     return user_message.strip().startswith(IMPULSE_LABEL_PREFIX)
 
 
+def _hooks_logger(lm: LifeModel) -> Any:
+    """Return the logger this graph was built with, falling back to a fresh one.
+
+    Prefers ``lm.logger`` — the SAME collaborator ``register(ctx)`` threads into
+    ``build_lifemodel(..., logger=logger)`` — so hooks observability shares the
+    plugin's one configured sink instead of constructing an ad-hoc logger. Bare
+    test/script callers that never pass a logger (``lm.logger is None``) still
+    get a working one via :func:`~lifemodel.log.get_logger`.
+    """
+    from .log import get_logger
+
+    return lm.logger or get_logger("lifemodel.hooks")
+
+
 def _log_lint(lm: LifeModel, reason: str) -> None:
     """Advisory: record that a delivered proactive message tripped the output-lint
     (mechanical timer / filler). Model A can't block the native send — this is
     observability feeding future prompt tuning (spec §13)."""
-    try:
-        from .log import get_logger
+    with contextlib.suppress(Exception):  # advisory logging must never break a turn
+        _hooks_logger(lm).info("proactive_output_lint", reason=reason)
 
-        get_logger("lifemodel.hooks").info("proactive_output_lint", reason=reason)
-    except Exception:  # noqa: BLE001 - advisory logging must never break a turn
-        pass
+
+def _log_outcome(lm: LifeModel, *, correlation_id: str, verdict: Verdict) -> None:
+    """INFO: the resolved proactive outcome — "it woke and chose silence" vs "it
+    woke and reached out" (bead lm-j2w B3, owner's core ask). INFO so it is
+    ALWAYS visible (unlike the DEBUG-gated full prompt logged at launch in
+    ``core/proactive.py``), keyed by the SAME ``correlation_id`` so the two
+    events correlate end-to-end. Reuses the verdict this observer already
+    computed (REJECT on a silence marker, FULFILL on real text) rather than
+    re-deriving "silent vs delivered" a second way."""
+    outcome = "silent" if verdict is Verdict.REJECT else "delivered"
+    with contextlib.suppress(Exception):  # advisory logging must never break a turn
+        _hooks_logger(lm).info("proactive_outcome", correlation_id=correlation_id, outcome=outcome)
 
 
 def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
@@ -91,6 +115,7 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
             lint = lint_proactive(assistant_response)
             if not lint.ok:
                 _log_lint(lm, lint.reason)
+        _log_outcome(lm, correlation_id=state.pending_proactive_id or "", verdict=verdict)
         now = lm.clock.now()
         lm.bus.publish(
             verdict_signal(

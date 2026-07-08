@@ -10,8 +10,11 @@ no Hermes.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+from typing import Any
 
+import lifemodel.log as lm_logging
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import (
     build_contact_desire,
@@ -23,8 +26,33 @@ from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
-from lifemodel.log import get_logger
+from lifemodel.events import EventSink
+from lifemodel.log import EventTee, get_logger
 from lifemodel.state.model import State
+
+
+class _RecordingLogger:
+    """A minimal :class:`~lifemodel.log.EventLogger` that records calls per level."""
+
+    def __init__(self) -> None:
+        self.debug_calls: list[tuple[str, dict[str, Any]]] = []
+        self.info_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def debug(self, event: str, **fields: Any) -> None:
+        self.debug_calls.append((event, dict(fields)))
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.info_calls.append((event, dict(fields)))
+
+    def warning(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+    def error(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+    def critical(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
+        pass
+
 
 TARGET = {"platform": "telegram", "chat_id": "1", "thread_id": None}
 
@@ -156,3 +184,38 @@ def test_does_not_stamp_egress_service_alive_at(tmp_path) -> None:
     # liveness is NOT a separate stamp anymore; last_tick_at (dt clock) carries it
     assert getattr(lm.state.load(), "egress_service_alive_at", None) is None
     assert lm.state.load().last_tick_at == NOW.isoformat()  # coreloop stamped the tick
+
+
+# --- B3 (lm-j2w): the FULL assembled prompt, logged at DEBUG only ------------
+
+
+def test_proactive_prompt_logged_at_debug_with_full_untruncated_text(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+
+    lm = _lm(tmp_path, _active(), NOW)
+    egress = FakeEgress()
+    proactive_tick(lm, egress, TARGET, logger=logger)
+
+    assert len(egress.calls) == 1
+    _, delivered_impulse = egress.calls[0]  # the exact text handed to egress
+
+    prompt_events = [c for c in base.debug_calls if c[0] == "proactive_prompt"]
+    assert len(prompt_events) == 1
+    _, fields = prompt_events[0]
+    # Complete, untruncated — byte-identical to what was actually delivered.
+    assert fields["prompt"] == delivered_impulse
+    assert fields["prompt"].startswith(IMPULSE_LABEL_PREFIX)
+    assert fields["correlation_id"]
+
+
+def test_proactive_prompt_not_emitted_when_effective_level_is_info(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    base = _RecordingLogger()
+    logger = EventTee(base, EventSink(tmp_path / "info-events.jsonl"))
+
+    lm = _lm(tmp_path, _active(), NOW)
+    proactive_tick(lm, FakeEgress(), TARGET, logger=logger)
+
+    assert base.debug_calls == []  # gated — DEBUG never reaches the base logger/sink
