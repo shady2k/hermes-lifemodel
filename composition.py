@@ -66,6 +66,7 @@ from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponen
 from .core.signal_bus import SignalBus
 from .core.state_actor import StateActor
 from .core.thought_attention import ThoughtAttention
+from .core.thought_generation import ThoughtGeneration
 from .core.thought_score import THOUGHT_SALIENCE_HALFLIFE_MIN
 from .domain.objects import default_registry
 from .log import EventLogger
@@ -213,6 +214,19 @@ def build_lifemodel(
         thought_attention = ThoughtAttention(halflife_min=THOUGHT_SALIENCE_HALFLIFE_MIN)
         resolved_registry.register(
             thought_attention, ComponentManifest(id=thought_attention.id, type="attention")
+        )
+    try:
+        resolved_registry.manifest("thought-generation")
+    except UnknownComponent:
+        # The 0-LLM generative stream (lm-27n.8): mints ≤1 templated thought per
+        # tick from event/chaining/idle triggers, bounded + energy-costed. Registered
+        # AFTER thought-attention (so it reads the same settled snapshot and can
+        # chain the just-attended thought) and BEFORE cognition (a generated thought
+        # is visible only NEXT tick, so it never launches a turn it created) — the
+        # enabled() order is asserted by the composition tests.
+        thought_generation = ThoughtGeneration(alpha=COST_ALPHA, theta=CONTACT_PARAMS.theta_u)
+        resolved_registry.register(
+            thought_generation, ComponentManifest(id=thought_generation.id, type="generation")
         )
     try:
         resolved_registry.manifest("cognition")

@@ -339,6 +339,22 @@ def test_thought_attention_registered_between_aggregation_and_cognition(tmp_path
     assert any(isinstance(c, ThoughtAttention) for c in lm.registry.enabled())
 
 
+# --- lm-27n.8: ThoughtGeneration sits between the attention brake and cognition ---
+
+
+def test_thought_generation_registered_between_attention_and_cognition(tmp_path: Path) -> None:
+    from lifemodel.core.thought_generation import ThoughtGeneration
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = [c.id for c in lm.registry.enabled()]
+    # The 0-LLM generative stream reads the settled snapshot (after the .7 brake so
+    # it can chain the just-attended thought) and runs before cognition (a generated
+    # thought is visible only NEXT tick, so it can never launch a turn it created).
+    assert ids.index("thought-attention") < ids.index("thought-generation")
+    assert ids.index("thought-generation") < ids.index("cognition")
+    assert any(isinstance(c, ThoughtGeneration) for c in lm.registry.enabled())
+
+
 # --- lm-27n.4: the Intention decision record, end-to-end through the store ---
 
 
