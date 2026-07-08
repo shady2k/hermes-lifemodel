@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from ..domain.objects import Thought
 from .projection import project_contact
+from .timeutil import humanize_elapsed, minutes_between
 
 #: Marker prefixed to an injected proactive prompt so the being's own hooks
 #: recognise their own nudge (correlation + self-exclusion). Was `impulse.py`.
@@ -62,12 +64,51 @@ def render_thoughts_block(thoughts: Sequence[Thought]) -> str:
     return "\n".join(lines)
 
 
+def render_situational_brief(
+    *, last_exchange_at: str | None, now: datetime | None, decline_count: int, energy: float
+) -> str:
+    """First-person situational context for the wake, word-only (no digits).
+
+    Empty string when ``now`` is None (caller passed no time → no brief)."""
+    if now is None:
+        return ""
+    lines: list[str] = []
+    if last_exchange_at is None:
+        # word-only, and MUST contain the lowercase substring the Task-2 test
+        # asserts ("вы ещё толком не общались")
+        lines.append("С ним вы ещё толком не общались.")
+        lines.append(
+            "Конкретики под рукой нет — не выдумывай повод: если сказать нечего "
+            "настоящего, честно промолчи."
+        )
+    else:
+        elapsed = minutes_between(last_exchange_at, now)
+        lines.append(f"Вы общались {humanize_elapsed(elapsed)}.")
+    if decline_count > 0:
+        lines.append(
+            "Недавно ты уже тянулся и промолчал — тем более не дави, потянись "
+            "только если есть что-то настоящее."
+        )
+    if energy < 0.3:
+        lines.append("Сил сейчас немного — коротко и мягко, без длинных заходов.")
+    if last_exchange_at is not None:
+        lines.append(
+            "Прежде чем писать, вспомни, на чём вы остановились в прошлый раз — "
+            "есть ли живая нить, которую хочется продолжить."
+        )
+    return "\n".join(lines)
+
+
 def build_wake_packet(
     *,
     value: float,
     theta: float,
     correlation_id: str,
     thoughts: Sequence[Thought] = (),
+    last_exchange_at: str | None = None,
+    now: datetime | None = None,
+    decline_count: int = 0,
+    energy: float = 1.0,
 ) -> ProactivePrompt:
     """Build the proactive-turn prompt from the projected desire-frame + guidance.
 
@@ -75,9 +116,21 @@ def build_wake_packet(
     cognition read from the tick snapshot. When there are none the prompt is
     byte-identical to before (behavior-neutral, lm-27n.6); only when a thought
     exists is a first-person "Recent Thoughts" CONTEXT block appended — it informs
-    the being's own turn, it is NOT the outward message."""
+    the being's own turn, it is NOT the outward message.
+
+    *last_exchange_at*/*now*/*decline_count*/*energy* feed the situational brief
+    (:func:`render_situational_brief`) — real context (how long since you talked,
+    whether you already declined recently, how much energy you have) instead of a
+    bare drive-level feeling. All default so existing callers are unaffected: with
+    no ``now`` the brief is empty and the prompt carries no brief at all."""
     desire_frame, projection_id = project_contact(value, theta=theta, seed=correlation_id)
-    prompt = f"Внутри у тебя сейчас: {desire_frame}.\n\n{GUIDANCE}"
+    prompt = f"Внутри у тебя сейчас: {desire_frame}."
+    brief = render_situational_brief(
+        last_exchange_at=last_exchange_at, now=now, decline_count=decline_count, energy=energy
+    )
+    if brief:
+        prompt = f"{prompt}\n\n{brief}"
+    prompt = f"{prompt}\n\n{GUIDANCE}"
     if thoughts:
         prompt = f"{prompt}\n\n{render_thoughts_block(thoughts)}"
     return ProactivePrompt(

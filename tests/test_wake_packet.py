@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 from lifemodel.core.thought_view import build_thought
 from lifemodel.core.wake_packet import (
@@ -9,7 +10,10 @@ from lifemodel.core.wake_packet import (
     THOUGHTS_RENDER_LIMIT,
     ProactivePrompt,
     build_wake_packet,
+    render_situational_brief,
 )
+
+NOW = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
 
 
 def test_packet_carries_desire_frame_and_guidance() -> None:
@@ -69,3 +73,62 @@ def test_thoughts_block_is_bounded() -> None:
     p = build_wake_packet(value=2.0, theta=1.0, correlation_id="c", thoughts=thoughts)
     rendered = sum(1 for line in p.prompt.splitlines() if line.startswith("— "))
     assert rendered == THOUGHTS_RENDER_LIMIT  # top-N only, order preserved from the caller
+
+
+# --- lm-8o3: situational brief woven into the wake packet -------------------
+
+
+def test_brief_frames_elapsed_in_words() -> None:
+    brief = render_situational_brief(
+        last_exchange_at="2026-07-08T09:00:00+00:00", now=NOW, decline_count=0, energy=1.0
+    )
+    assert "несколько часов назад" in brief  # 180 min
+    assert "вспомни, на чём вы остановились" in brief
+
+
+def test_brief_fresh_history_does_not_fabricate() -> None:
+    brief = render_situational_brief(last_exchange_at=None, now=NOW, decline_count=0, energy=1.0)
+    assert "вы ещё толком не общались" in brief
+    assert "не выдумывай повод" in brief
+    assert "вспомни, на чём вы остановились" not in brief  # nothing to mine
+
+
+def test_brief_rebuff_tone_only_when_declined() -> None:
+    hot = render_situational_brief(
+        last_exchange_at="2026-07-08T09:00:00+00:00", now=NOW, decline_count=2, energy=1.0
+    )
+    cold = render_situational_brief(
+        last_exchange_at="2026-07-08T09:00:00+00:00", now=NOW, decline_count=0, energy=1.0
+    )
+    assert "не дави" in hot
+    assert "не дави" not in cold
+
+
+def test_brief_energy_restraint_only_when_low() -> None:
+    low = render_situational_brief(
+        last_exchange_at="2026-07-08T09:00:00+00:00", now=NOW, decline_count=0, energy=0.1
+    )
+    assert "Сил сейчас немного" in low
+
+
+def test_wake_packet_weaves_brief_and_keeps_no_digits() -> None:
+    p = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id="c",
+        last_exchange_at="2026-07-08T09:00:00+00:00",
+        now=NOW,
+        decline_count=1,
+        energy=0.1,
+    )
+    assert "несколько часов назад" in p.prompt
+    assert "не дави" in p.prompt
+    assert "Сил сейчас немного" in p.prompt
+    assert re.search(r"\d", p.prompt) is None  # global invariant
+
+
+def test_wake_packet_without_now_is_brief_free() -> None:
+    # back-compat: no `now` -> no situational brief in the prompt
+    p = build_wake_packet(value=2.0, theta=1.0, correlation_id="c")
+    assert "Вы общались" not in p.prompt
+    assert "вспомни, на чём вы остановились" not in p.prompt
