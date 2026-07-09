@@ -7,8 +7,7 @@ layer inside ``coreloop.tick()`` consumes them on the next tick.
 
 ``make_post_llm_observer`` — on a correlated proactive turn (``pending_proactive_id``
 set AND ``user_message`` starts with ``IMPULSE_LABEL_PREFIX``) whose desire is
-still active, decides ``FULFILL`` (any text) vs ``REJECT`` (a silence marker),
-runs ``lint_proactive`` on a FULFILL and logs a mechanical leak (advisory), then
+still active, decides ``FULFILL`` (any text) vs ``REJECT`` (a silence marker), then
 publishes a ``verdict`` signal carrying the ``correlation_id``.
 
 ``make_inbound_observer`` — on a genuine (non-internal, non-own-impulse,
@@ -28,7 +27,6 @@ from typing import Any
 from .composition import LifeModel
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
-from .core.output_lint import lint_proactive
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import exchange_signal, verdict_signal
 from .core.wake_packet import IMPULSE_LABEL_PREFIX
@@ -262,11 +260,6 @@ def _emit_async_outcome(
             bridge.logger, reason=SuppressionReason.ACT_GATE_SILENT, component="hooks"
         )
     else:
-        lint = lint_proactive(assistant_response)
-        if not lint.ok:
-            # Advisory (spec §13): a delivered proactive message tripped the output-lint
-            # (mechanical timer / filler) — feeds future prompt tuning, never blocks.
-            bridge.logger.info("proactive_output_lint", reason=lint.reason)
         bridge.span.end(status="ok", ended_at=now)
     bridge.persist(ended_at=now)
 

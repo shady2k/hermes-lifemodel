@@ -220,7 +220,7 @@ def register(ctx: Any) -> None:
                     f"{type(exc).__name__}: {exc}",
                     exc_info=True,
                 )
-                return f"lifemodel: команда не выполнена — {exc}\n"
+                return f"lifemodel: command failed — {exc}\n"
 
         status = _status_line(profile, sdir)
         if sub == "":

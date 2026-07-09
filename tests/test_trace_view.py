@@ -106,7 +106,7 @@ def populated(tmp_path: Path):
 
         make_post_llm_observer(lm)(
             user_message=f"{IMPULSE_LABEL_PREFIX} impulse",
-            assistant_response="привет!",
+            assistant_response="hi!",
         )
         clock.advance(timedelta(minutes=2))
         lm.bus.publish(

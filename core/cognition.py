@@ -110,7 +110,7 @@ class CognitionLauncher:
         # owner's local zone (self._display_tz, from the Hermes boundary): NO
         # procedural brief (the [SILENT]-regression cure), just the two bare
         # zone-labelled timestamps the being reads for appropriateness — it derives
-        # "new day / morning / is he asleep / hours since" itself.
+        # "new day / morning / are they asleep / hours since" itself.
         packet = build_wake_packet(
             value=state.u,
             theta=1.0,

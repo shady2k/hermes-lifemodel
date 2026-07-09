@@ -4,9 +4,10 @@ Every other producer (neurons, layers, Hermes hooks, cron) only *returns* or
 *enqueues* intents; this is the one place that mutates :class:`State` and calls
 :meth:`StatePort.commit`. It merges a batch of :class:`UpdateState` intents into
 one patch, applies it atomically with :func:`dataclasses.replace`, and commits
-(checkpoints) exactly once — and only if something actually changed (spec §6:
-"Checkpoint — это интент, который state-actor генерирует сам в конце тика, если
-были мутации"). Intents it does not own (e.g. ``EmitSignal``) are ignored here.
+(checkpoints) exactly once — and only if something actually changed (spec §6: "a
+Checkpoint is an intent the state-actor generates itself at the end of a tick, if
+there were mutations"). Intents it does not own (e.g. ``EmitSignal``) are ignored
+here.
 
 State is loaded lazily on first access (``.state`` or ``.apply``) so that
 constructing an actor never raises — the composition root can wire one

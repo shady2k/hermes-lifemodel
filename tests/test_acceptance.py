@@ -39,7 +39,7 @@ def test_silence_to_threshold_to_a_delivered_message(tmp_path) -> None:
     assert launch.delivered_impulse
     # the [SILENT] cure (T6): the wake-packet is the owner-approved felt impulse —
     # it names the longing (the feeling) and its cause as a sufficient reason.
-    assert "miss him" in launch.delivered_impulse.lower()
+    assert "miss them" in launch.delivered_impulse.lower()
     assert "reason enough" in launch.delivered_impulse.lower()
     u_at_launch = launch.u
 

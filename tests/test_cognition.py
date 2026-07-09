@@ -254,10 +254,6 @@ def test_launch_prompt_is_the_impulse_and_temporal_facts_without_thoughts_or_bri
     launch = _launch(_cog(MSK).step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
     assert launch is not None
     assert RECENT_THOUGHTS_HEADER not in launch.prompt
-    # none of the removed procedural brief survives, even with declines + a pending bid
-    assert "вспомни, на чём вы остановились" not in launch.prompt
-    assert "не дави" not in launch.prompt
-    assert "пока без ответа" not in launch.prompt
     # the raw temporal facts DO thread through: now (ctx.now, 12:00 UTC → 15:00 MSK)
     # + the stored last_exchange_at (09:00 UTC → 12:00 MSK), as bare zone-labelled
     # timestamps in the owner's local zone — NOT UTC — with no derived label of ours

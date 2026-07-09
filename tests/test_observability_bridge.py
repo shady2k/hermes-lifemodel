@@ -75,8 +75,8 @@ def test_one_proactive_attempt_is_one_trace_id(tmp_path: Path) -> None:
 
         # --- post_llm: the async outcome, woven under origin T (real text = FULFILL) ---
         make_post_llm_observer(lm)(
-            user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-            assistant_response="Саш, привет!",
+            user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+            assistant_response="Hey, hi!",
         )
 
         # --- tick N+k: the verdict resolves the desire → resolution span under T ---

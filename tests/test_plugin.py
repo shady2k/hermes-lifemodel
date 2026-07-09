@@ -345,7 +345,7 @@ def test_register_lifemodel_command_catches_handler_exception_and_returns_error_
 
     # Owner-facing text: readable, prefixed as a lifemodel error, carries the
     # real reason -- never the generic "unknown command" degradation.
-    assert "команда не выполнена" in out
+    assert "command failed" in out
     assert "schema_version=99 is newer than this build supports" in out
     # The failure is also recorded, not only shown to the owner.
     failures = [

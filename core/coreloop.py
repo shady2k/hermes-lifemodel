@@ -2,7 +2,7 @@
 
 Runs the enabled components each tick, isolated so no component fault can crash
 the heart: every ``step`` call is wrapped; an exception skips that component and
-counts toward a per-component circuit-breaker ("живёт без органа").
+counts toward a per-component circuit-breaker ("living without an organ").
 
 Signal dataflow (spec §7.4): durable external inputs are consumed from the bus
 **once** at tick start; each component then sees those inputs plus every

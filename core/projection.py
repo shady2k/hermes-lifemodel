@@ -5,8 +5,10 @@ Raw affect never reaches the LLM. A drive value is bucketed into a band, and a
 band maps to a small set of *synonymic* human phrasings; the choice is
 pseudo-random but deterministic — a stable hash of the seed (the desire's
 correlation id) — so a preamble is neither monotonous nor unreproducible. The
-phrasing carries feeling, never numbers. Default strings are Russian (the being's
-language); they are content, localizable later.
+phrasing carries feeling, never numbers. The default strings are English; they are
+content, localizable later. NB: the phrasing text is currently discarded by the
+wake packet (only ``projection_id`` is kept) — but the band → synonym shape is what
+stamps that id, so the tuple structure is load-bearing even though the text is not.
 """
 
 from __future__ import annotations
@@ -18,22 +20,22 @@ _CONTACT_BANDS: tuple[tuple[float, tuple[str, ...]], ...] = (
     (
         2.5,
         (
-            "заметно соскучился — тянет написать первым",
-            "давно хочется на связь, скучаешь по нему",
+            "really missing them — I want to reach out first",
+            "I've wanted to reconnect for a while, missing them",
         ),
     ),
     (
         1.5,
         (
-            "ловишь себя на мыслях о нём",
-            "хочется услышать, как он там",
+            "catching myself thinking of them",
+            "wanting to hear how they're doing",
         ),
     ),
     (
         1.0,
         (
-            "тихое желание побыть на связи",
-            "лёгкая тяга черкнуть пару слов",
+            "a quiet wish to stay in touch",
+            "a light pull to drop a few words",
         ),
     ),
 )
@@ -53,4 +55,4 @@ def project_contact(value: float, *, theta: float, seed: str) -> tuple[str, str]
             projection_id = f"contact.b{band_index}.s{choice}"
             return synonyms[choice], projection_id
     # below threshold — no pull worth framing (defensive; cognition gates on wake)
-    return "нет заметной тяги к контакту", "contact.none"
+    return "no notable pull toward contact", "contact.none"

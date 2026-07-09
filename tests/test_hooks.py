@@ -87,7 +87,7 @@ def test_is_no_reply_matches_all_markers_case_insensitively() -> None:
 def test_is_no_reply_rejects_prose_mentioning_a_marker() -> None:
     assert _is_no_reply("I considered NO_REPLY but decided to say hi!") is False
     assert _is_no_reply("") is False
-    assert _is_no_reply("Привет! Как ты?") is False
+    assert _is_no_reply("Hi! How are you?") is False
 
 
 # --- make_post_llm_observer — signal publishing (spec §7.1) ------------------
@@ -97,8 +97,8 @@ def test_post_llm_publishes_fulfill_verdict_signal(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-1")
     obs = make_post_llm_observer(lm)
     obs(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет, скучаю!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi, I miss you!",
     )
     signals = lm.bus.peek_unprocessed()
     verdicts = [s for s in signals if s.kind == KIND_VERDICT]
@@ -138,8 +138,8 @@ def test_post_llm_weaves_delivered_outcome_under_origin_trace(tmp_path: Path) ->
     # with the ORIGIN trace_id (§4.4) — one attempt, one trace_id, not a fresh root.
     lm = _lm_with_pending(tmp_path, corr="p-delivered")
     make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет, скучаю!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi, I miss you!",
     )
     outcomes = _ring_events(lm, "proactive_outcome")
     assert len(outcomes) == 1
@@ -202,8 +202,8 @@ def test_post_llm_emits_verdict_detail_under_origin_with_extra_fields(tmp_path: 
     lm = _lm_with_pending(tmp_path, corr="p-detail")
 
     make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет, скучаю!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi, I miss you!",
         reasoning="because X",
         model="claude",
     )
@@ -213,7 +213,7 @@ def test_post_llm_emits_verdict_detail_under_origin_with_extra_fields(tmp_path: 
     fields = events[0]
     assert fields["correlation_id"] == "p-detail"
     assert fields["verdict"] == "fulfill"
-    assert fields["assistant_response"] == "Саш, привет, скучаю!"
+    assert fields["assistant_response"] == "Hey, hi, I miss you!"
     assert fields["extra_fields"]["reasoning"] == "because X"
     assert fields["extra_fields"]["model"] == "claude"
     assert fields["trace_id"] == _ORIGIN_TRACE_ID  # under the launch's trace
@@ -238,8 +238,8 @@ def test_post_llm_verdict_detail_does_not_change_signal_or_outcome(tmp_path: Pat
     lm = _lm_with_pending(tmp_path, corr="p-regress")
 
     make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет, скучаю!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi, I miss you!",
         reasoning="because X",
     )
 
@@ -262,7 +262,7 @@ def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(tmp_path:
 
     # Longer than the old 800-char truncation cap, but within the new 4000-char
     # generous cap — proves this event is untruncated relative to the old one.
-    long_reasoning = "Саша спрашивает про markdown редактор... " + ("x" * 2000)
+    long_reasoning = "Sasha asks about a markdown editor... " + ("x" * 2000)
     history = [
         {"role": "user", "content": "hi"},
         {
@@ -274,15 +274,15 @@ def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(tmp_path:
         },
         {
             "role": "assistant",
-            "content": "Саш, привет!",
+            "content": "Hey, hi!",
             "finish_reason": "stop",
             "reasoning": long_reasoning,
         },
     ]
 
     make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi!",
         conversation_history=history,
     )
 
@@ -313,8 +313,8 @@ def test_post_llm_proactive_reasoning_unavailable_when_history_missing(tmp_path:
 
     # No conversation_history kwarg at all — must not raise.
     make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi!",
     )
 
     events = _ring_events(lm, "proactive_reasoning")
@@ -326,8 +326,8 @@ def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(tmp_pa
     lm = _lm_with_pending(tmp_path, corr="p-badtype")
 
     make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет!",
+        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
+        assistant_response="Hey, hi!",
         conversation_history="not-a-list",
     )
 
@@ -353,7 +353,7 @@ def test_post_llm_does_not_emit_proactive_reasoning_for_uncorrelated_turn(tmp_pa
 
 def test_inbound_publishes_exchange_signal(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="привет!", internal=False, id="m-42")
+    event = SimpleNamespace(text="hi!", internal=False, id="m-42")
     make_inbound_observer(lm)(event=event)
     exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
     assert len(exchanges) == 1
@@ -384,7 +384,7 @@ def test_inbound_ignores_own_lifemodel_debug_command(tmp_path: Path) -> None:
 
 def test_inbound_still_publishes_exchange_for_normal_chat_message(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="привет", internal=False, id="m-3")
+    event = SimpleNamespace(text="hi", internal=False, id="m-3")
     make_inbound_observer(lm)(event=event)
     exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
     assert len(exchanges) == 1

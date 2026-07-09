@@ -1,6 +1,6 @@
 """``ActGate`` — the restraint extension point on outgoing acts (HLA §1/§7).
 
-Cognition may *want* to speak or act; the act-gate is the "говорить или молчать"
+Cognition may *want* to speak or act; the act-gate is the "speak or stay silent"
 check that sits between the wish and the world (HLA §1). It weighs receptivity,
 quiet-hours, budget and cooldown, then returns a
 :class:`~lifemodel.domain.act.Decision`. Enforcement of actions in the world is

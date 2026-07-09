@@ -2,8 +2,8 @@
 
 The Hermes boundary for the wake-packet's temporal facts (HLA §11): the core
 renders ``now`` / ``last_exchange_at`` in the owner's local zone so the being
-judges "morning / evening / is he asleep" against the owner's wall clock, not UTC
-(UTC 22:00 = 01:00 MSK reads as a false "evening" while he sleeps). The core stays
+judges "morning / evening / are they asleep" against the owner's wall clock, not UTC
+(UTC 22:00 = 01:00 MSK reads as a false "evening" while they sleep). The core stays
 Hermes-free — it takes a plain stdlib ``tzinfo``; THIS adapter is the only place
 that reaches into Hermes to obtain it.
 
