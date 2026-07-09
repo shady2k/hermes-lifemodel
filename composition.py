@@ -50,6 +50,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import tzinfo
 from pathlib import Path
 
 from .adapters.clock import SystemClock
@@ -144,6 +145,7 @@ def build_lifemodel(
     registry: ComponentRegistry | None = None,
     tracer: TracerPort | None = None,
     trace_exporter: TraceExportPort | None = None,
+    display_tz: tzinfo | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -158,6 +160,12 @@ def build_lifemodel(
     the in-process service is the sole brain via ``core/decision``, bypassing
     this seam). ``None`` means "take the default"; passing an explicit value —
     including an empty ``()`` — overrides it, so callers keep full control.
+
+    ``display_tz`` is the owner's local timezone for the wake-packet's temporal
+    facts, resolved from Hermes at the adapter boundary (this module imports no
+    Hermes) and forwarded to the :class:`CognitionLauncher` as a plain stdlib
+    ``tzinfo``; ``None`` (the default, and every test/CLI caller) falls back to
+    server-local then UTC.
     """
     resolved_clock: ClockPort = clock or SystemClock()
     resolved_state: StatePort = state or SQLiteRuntimeStore(
@@ -250,6 +258,11 @@ def build_lifemodel(
             fast_cost=COGNITION_FAST_COST,
             send_cost=COGNITION_SEND_COST,
             alpha=COST_ALPHA,
+            # The owner's local zone for the wake-packet's temporal facts. Resolved
+            # from Hermes at the adapter boundary (this module imports no Hermes) and
+            # threaded through as a plain stdlib ``tzinfo``; ``None`` → server-local
+            # then UTC (see wake_packet._fmt_ts).
+            display_tz=display_tz,
         )
         resolved_registry.register(launcher, ComponentManifest(id=launcher.id, type="launcher"))
     resolved_state_actor = StateActor(resolved_state, committer=resolved_committer, logger=logger)

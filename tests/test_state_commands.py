@@ -119,8 +119,26 @@ def test_nudge_default_bumps_u_by_one() -> None:
     after, message = nudge(State(u=0.5), NOW, "")
     assert after is not None
     assert after.u == 1.5
-    assert "u: 0.5 -> 1.5" in message
+    assert "u: 0.50 -> 1.50" in message
     assert "(mutating)" in message
+
+
+def test_command_echoes_round_floats_and_leave_no_long_tails() -> None:
+    # lm-25t: human-facing echoes show floats at 2 decimals (DISPLAY ONLY) — never
+    # raw noise like "u: 1.419954456041666 -> ...". The stored value stays
+    # unrounded (proven by test_nudge_for_dir_persists_through_the_real_store).
+    import re
+
+    dirty = State(u=1.419954456041666, energy=0.6333333333, fatigue=0.2166666667)
+    echoes = [
+        nudge(dirty, NOW, "")[1],
+        force_wake(dirty, NOW)[1],
+        satiate(dirty, NOW)[1],
+        set_field(dirty, NOW, "energy 0.777777")[1],
+    ]
+    for echo in echoes:
+        assert re.search(r"\d\.\d{3,}", echo) is None, echo  # no long float tail
+    assert "u: 1.42 -> " in nudge(dirty, NOW, "")[1]  # the rounded value is what shows
 
 
 def test_nudge_explicit_amount() -> None:
@@ -391,7 +409,7 @@ def _store(tmp_path) -> SQLiteRuntimeStore:
 def test_nudge_for_dir_persists_through_the_real_store(tmp_path) -> None:
     _store(tmp_path).commit(State(u=1.0))
     message = nudge_for_dir(tmp_path, "2", logger=get_logger("t"))
-    assert "u: 1.0 -> 3.0" in message
+    assert "u: 1.00 -> 3.00" in message
     assert _store(tmp_path).load().u == 3.0
 
 

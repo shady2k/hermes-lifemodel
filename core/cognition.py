@@ -28,6 +28,7 @@ rather than re-stamping it with the retry tick's trace.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import tzinfo
 
 from ..domain.memory import PutOp
 from ..domain.objects import (
@@ -64,12 +65,19 @@ class CognitionLauncher:
         fast_cost: float,
         send_cost: float,
         alpha: float,
+        display_tz: tzinfo | None = None,
         id: str = "cognition-launcher",
     ) -> None:
         self.id = id
         self._fast_cost = fast_cost
         self._send_cost = send_cost
         self._alpha = alpha
+        # The owner's local zone for rendering the wake-packet's temporal facts
+        # (resolved from Hermes at the composition boundary and injected here — the
+        # core never imports Hermes). ``None`` → server-local, then UTC (see
+        # wake_packet._fmt_ts). Fixed per graph; a config change takes effect on the
+        # next gateway restart, like every other adapter-wired dependency.
+        self._display_tz = display_tz
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
@@ -94,13 +102,19 @@ class CognitionLauncher:
         # T6: thoughts are no longer born in the tick (the thought machinery moved
         # to Phase 6 in T7), so the launcher passes no thoughts — build_wake_packet
         # renders no "Recent Thoughts" block when none are supplied (empty-safe).
-        # The wake packet is the fixed owner-approved felt impulse: it carries no
-        # situational/procedural brief (the [SILENT]-regression cure), so no
-        # last-exchange/decline/energy context is threaded into the prompt.
+        # The wake packet carries the fixed owner-approved felt impulse plus the raw
+        # temporal facts of the moment (now + last_exchange_at, §11), rendered in the
+        # owner's local zone (self._display_tz, from the Hermes boundary): NO
+        # procedural brief (the [SILENT]-regression cure), just the two bare
+        # zone-labelled timestamps the being reads for appropriateness — it derives
+        # "new day / morning / is he asleep / hours since" itself.
         packet = build_wake_packet(
             value=state.u,
             theta=1.0,
             correlation_id=correlation_id,
+            now=ctx.now,
+            last_exchange_at=state.last_exchange_at,
+            tz=self._display_tz,
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits

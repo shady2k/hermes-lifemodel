@@ -33,6 +33,7 @@ from ..composition import build_lifemodel
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..log import EventLogger, get_logger
+from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
 
 PLATFORM_NAME = "lifemodel"
@@ -63,7 +64,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
 
     def _tick(self) -> None:
         """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
-        lm = build_lifemodel(base_dir=self._base_dir, logger=self._log)
+        # Resolve the owner's display timezone from Hermes at the boundary and inject
+        # it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
+        # None → server-local, so a timezone quirk never drops a tick (HLA §11).
+        lm = build_lifemodel(
+            base_dir=self._base_dir, logger=self._log, display_tz=resolve_owner_tz()
+        )
         proactive_tick(lm, self._egress, self._target, logger=self._log)
 
     def _on_loop_death(self, exc: BaseException | None) -> None:

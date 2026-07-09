@@ -24,6 +24,25 @@ def test_dump_renders_the_sections(tmp_path) -> None:
     assert "effective" in out.lower()
 
 
+def test_dump_rounds_floats_and_leaves_no_long_tails(tmp_path) -> None:
+    # lm-25t: the read-only dump shows numbers at a readable precision — no raw
+    # tails like "0.4199544..." or "u=5.250034172361112". DISPLAY ONLY: the
+    # persisted state keeps full precision (asserted below).
+    import re
+
+    dirty = State(
+        u=5.250034172361112,
+        energy=0.6333333333,
+        fatigue=0.2166666667,
+        last_tick_at="2026-07-09T11:59:00+00:00",
+    )
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(dirty)
+    out = render_dump_for_dir(tmp_path)
+    assert re.search(r"\d\.\d{3,}", out) is None, out  # no long float tail
+    assert "**latent u:** 5.25" in out  # the rounded value is what shows
+    assert SQLiteRuntimeStore(tmp_path, clock=SystemClock()).load().u == 5.250034172361112
+
+
 def test_dump_puts_one_metric_per_line(tmp_path) -> None:
     # Owner complaint #1: several metrics used to be crammed onto one line.
     # Every metric now gets its own "label: value" line.
@@ -65,7 +84,7 @@ def test_dump_has_no_column_alignment_padding(tmp_path) -> None:
     energy_line = next(line for line in lines if "energy(E)" in line)
     fatigue_line = next(line for line in lines if line.strip().startswith("**fatigue(S):**"))
     assert energy_line == "**energy(E):** 60%"
-    assert fatigue_line == "**fatigue(S):** 0.2"
+    assert fatigue_line == "**fatigue(S):** 0.20"
 
     for line in lines:
         if ":" not in line:

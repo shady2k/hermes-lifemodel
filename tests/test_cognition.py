@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.cognition import CognitionLauncher
@@ -16,6 +16,9 @@ from lifemodel.testing import (
 )
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+# the owner's local zone for the wake-packet's temporal facts (fixed-offset MSK so
+# the render is deterministic regardless of the test host's own local zone)
+MSK = timezone(timedelta(hours=3), "MSK")
 
 # a live active-desire snapshot (what the old ``desire_status="active"`` meant)
 ACTIVE = contact_desire_objects("active")
@@ -29,8 +32,8 @@ def _intention_put(intents):
     )
 
 
-def _cog() -> CognitionLauncher:
-    return CognitionLauncher(fast_cost=0.02, send_cost=0.03, alpha=2.0)
+def _cog(display_tz: tzinfo | None = None) -> CognitionLauncher:
+    return CognitionLauncher(fast_cost=0.02, send_cost=0.03, alpha=2.0, display_tz=display_tz)
 
 
 def _ctx(state: State, *, objects=(), tmp_path, now: datetime = NOW) -> TickContext:
@@ -96,12 +99,13 @@ def test_launch_carries_the_reserved_energy(tmp_path) -> None:
     assert abs(launch.reserved_energy - 0.05) < 1e-9
 
 
-def test_prompt_has_no_raw_numbers(tmp_path) -> None:
-    import re
-
+def test_prompt_does_not_leak_the_drive_value(tmp_path) -> None:
+    # The drive level never reaches the model-facing text (it feeds only the audit
+    # projection_id). The raw wall-clock timestamps are now the ONLY numbers the
+    # prompt carries — the drive value must not appear among them.
     state = State(u=3.2, energy=1.0)
     launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
-    assert not re.search(r"\d", launch.prompt)
+    assert "3.2" not in launch.prompt
 
 
 # --- lm-27n.4: 0-LLM crystallization of the Bratman decision record ---
@@ -170,11 +174,15 @@ def test_deferred_desire_crystallizes_nothing(tmp_path) -> None:
 # --- lm-27n.6: live thoughts render into the wake packet ---
 
 
-def test_launch_prompt_is_the_bare_impulse_without_thoughts_or_brief(tmp_path) -> None:
-    # A desire but no live thought -> the launch prompt is byte-identical to the
-    # bare owner-approved impulse (no Recent Thoughts block). The wake packet no
-    # longer carries any situational/procedural brief (the [SILENT]-regression
-    # cure), so last-exchange/decline/unanswered context never threads into it.
+def test_launch_prompt_is_the_impulse_and_temporal_facts_without_thoughts_or_brief(
+    tmp_path,
+) -> None:
+    # A desire but no live thought -> the launch prompt is the owner-approved impulse
+    # plus the moment's RAW temporal facts (now + last_exchange_at, §11), rendered in
+    # the owner's local zone (MSK), with no Recent Thoughts block. It threads NO
+    # procedural brief (the [SILENT]-regression cure): decline/unanswered context
+    # never reaches the prompt, and last_exchange_at enters ONLY as a bare zone-
+    # labelled timestamp fact — no derived "morning / hours ago" label.
     state = State(
         u=2.0,
         energy=1.0,
@@ -183,17 +191,28 @@ def test_launch_prompt_is_the_bare_impulse_without_thoughts_or_brief(tmp_path) -
         decline_count=2,
         unanswered_outbound_count=1,
     )
-    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
+    launch = _launch(_cog(MSK).step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
     assert launch is not None
     assert RECENT_THOUGHTS_HEADER not in launch.prompt
     # none of the removed procedural brief survives, even with declines + a pending bid
     assert "вспомни, на чём вы остановились" not in launch.prompt
     assert "не дави" not in launch.prompt
     assert "пока без ответа" not in launch.prompt
+    # the raw temporal facts DO thread through: now (ctx.now, 12:00 UTC → 15:00 MSK)
+    # + the stored last_exchange_at (09:00 UTC → 12:00 MSK), as bare zone-labelled
+    # timestamps in the owner's local zone — NOT UTC — with no derived label of ours
+    assert "It is now 2026-07-06 15:00 MSK." in launch.prompt
+    assert "The last time we exchanged messages was 2026-07-06 12:00 MSK." in launch.prompt
+    assert "UTC" not in launch.prompt
+    for derived in ("morning", "hours ago", "yesterday", "today"):
+        assert derived not in launch.prompt.lower()
     expected = build_wake_packet(
         value=2.0,
         theta=1.0,
         correlation_id=launch.correlation_id,
+        now=NOW,
+        last_exchange_at="2026-07-06T09:00:00+00:00",
+        tz=MSK,
     ).prompt
     assert launch.prompt == expected
 
