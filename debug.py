@@ -50,7 +50,10 @@ def _pct(x: float) -> str:
 
 
 def _n(x: float) -> str:
-    return f"{x:.4g}"
+    # Display precision (lm-25t): 2 decimals so the read-only dump reads cleanly
+    # (0.22, not 0.2167). The stored/computed value keeps full precision — this
+    # only formats the echo.
+    return f"{x:.2f}"
 
 
 def _opt(x: float | None, unit: str = "") -> str:

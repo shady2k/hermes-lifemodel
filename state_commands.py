@@ -113,9 +113,23 @@ _SET_WHITELIST: dict[str, str] = {
 }
 
 
+def _fmt_value(value: object) -> str:
+    """Render a State field value for a human echo (lm-25t).
+
+    DISPLAY ONLY: floats are rounded to 2 decimals so echoes read cleanly
+    (``u: 1.42 -> 2.00``, not ``u: 1.419954456041666 -> 2.0``). The persisted
+    value is untouched — this formats the ``before``/``after`` snapshot, it never
+    rewrites state. Everything else (ints, strings, timestamps, None, lists)
+    renders via ``repr`` so it reads exactly as stored."""
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return repr(value)
+
+
 def _field_lines(before: State, after: State, field_names: Sequence[str]) -> list[str]:
     return [
-        f"  {name}: {getattr(before, name)!r} -> {getattr(after, name)!r}" for name in field_names
+        f"  {name}: {_fmt_value(getattr(before, name))} -> {_fmt_value(getattr(after, name))}"
+        for name in field_names
     ]
 
 
