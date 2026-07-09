@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 
 from lifemodel.adapters.signal_bus import FileSignalBus
@@ -171,76 +170,32 @@ def test_deferred_desire_crystallizes_nothing(tmp_path) -> None:
 # --- lm-27n.6: live thoughts render into the wake packet ---
 
 
-def test_launch_prompt_carries_situational_brief(tmp_path) -> None:
+def test_launch_prompt_is_the_bare_impulse_without_thoughts_or_brief(tmp_path) -> None:
+    # A desire but no live thought -> the launch prompt is byte-identical to the
+    # bare owner-approved impulse (no Recent Thoughts block). The wake packet no
+    # longer carries any situational/procedural brief (the [SILENT]-regression
+    # cure), so last-exchange/decline/unanswered context never threads into it.
     state = State(
         u=2.0,
         energy=1.0,
         fatigue=0.0,
         last_exchange_at="2026-07-06T09:00:00+00:00",
-        decline_count=0,
-    )
-    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
-    assert launch is not None
-    assert "несколько часов назад" in launch.prompt  # NOW is 2026-07-06 12:00, 180 min
-    assert "вспомни, на чём вы остановились" in launch.prompt
-    assert re.search(r"\d", launch.prompt) is None
-
-
-def test_launch_prompt_has_no_thoughts_block_without_thoughts(tmp_path) -> None:
-    # Behavior-neutral: a desire but no live thought -> the launch prompt is
-    # byte-identical to the no-thoughts wake packet (no Recent Thoughts block),
-    # now built WITH the same situational context the cognition path passes.
-    state = State(
-        u=2.0,
-        energy=1.0,
-        fatigue=0.0,
-        last_exchange_at="2026-07-06T09:00:00+00:00",
-        decline_count=0,
-    )
-    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
-    assert RECENT_THOUGHTS_HEADER not in launch.prompt
-    expected = build_wake_packet(
-        value=2.0,
-        theta=1.0,
-        correlation_id=launch.correlation_id,
-        last_exchange_at="2026-07-06T09:00:00+00:00",
-        now=NOW,
-        decline_count=0,
-        energy=1.0,
-    ).prompt
-    assert launch.prompt == expected
-
-
-# --- lm-8o3.1 Task 9: unanswered-bid line threaded through cognition -------
-
-
-def test_launch_prompt_carries_unanswered_bid_line_when_pending(tmp_path) -> None:
-    state = State(
-        u=2.0,
-        energy=1.0,
-        fatigue=0.0,
-        last_exchange_at="2026-07-06T09:00:00+00:00",
-        decline_count=0,
+        decline_count=2,
         unanswered_outbound_count=1,
     )
     launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
     assert launch is not None
-    assert "пока без ответа" in launch.prompt
-    assert re.search(r"\d", launch.prompt) is None
-
-
-def test_launch_prompt_omits_unanswered_bid_line_when_zero(tmp_path) -> None:
-    state = State(
-        u=2.0,
-        energy=1.0,
-        fatigue=0.0,
-        last_exchange_at="2026-07-06T09:00:00+00:00",
-        decline_count=0,
-        unanswered_outbound_count=0,
-    )
-    launch = _launch(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
-    assert launch is not None
+    assert RECENT_THOUGHTS_HEADER not in launch.prompt
+    # none of the removed procedural brief survives, even with declines + a pending bid
+    assert "вспомни, на чём вы остановились" not in launch.prompt
+    assert "не дави" not in launch.prompt
     assert "пока без ответа" not in launch.prompt
+    expected = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id=launch.correlation_id,
+    ).prompt
+    assert launch.prompt == expected
 
 
 # --- lm-27n.11: creation-provenance is IMMUTABLE per episode (preserve-on-retry) ---

@@ -6,7 +6,8 @@ pipeline: personality → neuron → aggregation → cognition, committed by the
 state-actor). If the pipeline surfaces a ``LaunchProactive`` intent, it applies the
 global backstop (:func:`core.backstop.allow_send`, fail-closed rate limit) and, if
 allowed, injects the being's native proactive turn via
-``egress.reach_out(target, IMPULSE_LABEL_PREFIX + launch.prompt)``.
+``egress.reach_out(target, launch.prompt)`` — the prompt already opens with the
+self-attribution line that doubles as the being's self-exclusion marker.
 
 Launch ≠ fulfilment: a delivered launch leaves the contact desire ``active`` with
 ``pending_proactive_id`` set (the FULFILL/REJECT verdict resolves it next tick). A
@@ -41,7 +42,6 @@ from .intention_view import read_live_contact_intention
 from .intents import Intent, TransitionRecord, UpdateState
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
-from .wake_packet import IMPULSE_LABEL_PREFIX
 
 
 def proactive_tick(
@@ -88,7 +88,11 @@ def proactive_tick(
         logger.info("proactive_tick", launches=len(report.launches), outcome=None)
         return None
 
-    full_prompt = IMPULSE_LABEL_PREFIX + launch.prompt
+    # The prompt already opens with the self-attribution line (build_wake_packet),
+    # which is also the marker the being's own hooks self-exclude on — so nothing
+    # is prepended here; a machine label would only re-invite the meta-analysis the
+    # phenomenological self-state is meant to cure ([SILENT] regression).
+    full_prompt = launch.prompt
     # The owner's core observability ask (lm-j2w B3): "I want to know what
     # we handed the agent." DEBUG-only (a no-op unless the owner has set
     # loglevel=debug) and carries the COMPLETE, untruncated text — byte-

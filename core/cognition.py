@@ -94,15 +94,13 @@ class CognitionLauncher:
         # T6: thoughts are no longer born in the tick (the thought machinery moved
         # to Phase 6 in T7), so the launcher passes no thoughts — build_wake_packet
         # renders no "Recent Thoughts" block when none are supplied (empty-safe).
+        # The wake packet is the fixed owner-approved felt impulse: it carries no
+        # situational/procedural brief (the [SILENT]-regression cure), so no
+        # last-exchange/decline/energy context is threaded into the prompt.
         packet = build_wake_packet(
             value=state.u,
             theta=1.0,
             correlation_id=correlation_id,
-            last_exchange_at=state.last_exchange_at,
-            now=ctx.now,
-            decline_count=state.decline_count,
-            energy=state.energy,
-            unanswered_outbound_count=state.unanswered_outbound_count,
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits
