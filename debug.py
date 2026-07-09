@@ -19,6 +19,7 @@ from .core.introspect import DebugConfig, Readings, compute_readings, contact_ch
 from .core.relationship_view import read_owner_relationship
 from .core.thought_view import read_live_thoughts
 from .core.why_graph import why_contact_intention
+from .ports.clock import ClockPort
 from .ports.memory import MemoryPort
 from .state.errors import StateError
 
@@ -117,8 +118,11 @@ def _local(iso: str | None) -> str:
     return local.strftime("%Y-%m-%d %H:%M:%S") + " " + offset
 
 
-def render_dump_for_dir(base_dir: Path) -> str:
-    lm = composition.build_lifemodel(base_dir=base_dir)
+def render_dump_for_dir(base_dir: Path, *, clock: ClockPort | None = None) -> str:
+    # ``clock`` is injectable for deterministic tests (lm-5ac): the drive `u` is
+    # reconstructed from elapsed time since ``last_tick_at``, so a pinned clock
+    # keeps the rendered `u` stable. Production passes nothing → live SystemClock.
+    lm = composition.build_lifemodel(base_dir=base_dir, clock=clock)
     now = lm.clock.now()
     try:
         state = lm.state.load()

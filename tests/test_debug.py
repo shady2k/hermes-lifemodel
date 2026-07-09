@@ -5,13 +5,14 @@ import sqlite3
 import sys
 import types
 from contextlib import closing
-from datetime import timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from lifemodel import debug as debug_mod
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.debug import render_dump_for_dir
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+from lifemodel.testing import FakeClock
 
 
 def test_dump_renders_the_sections(tmp_path) -> None:
@@ -37,7 +38,10 @@ def test_dump_rounds_floats_and_leaves_no_long_tails(tmp_path) -> None:
         last_tick_at="2026-07-09T11:59:00+00:00",
     )
     SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(dirty)
-    out = render_dump_for_dir(tmp_path)
+    # Pin the clock to last_tick_at so the drive `u` is reconstructed with zero
+    # elapsed time (== the stored value); otherwise render's live SystemClock
+    # lets `u` rise with wall-clock and the assertion drifts (lm-5ac).
+    out = render_dump_for_dir(tmp_path, clock=FakeClock(datetime(2026, 7, 9, 11, 59, tzinfo=UTC)))
     assert re.search(r"\d\.\d{3,}", out) is None, out  # no long float tail
     assert "**latent u:** 5.25" in out  # the rounded value is what shows
     assert SQLiteRuntimeStore(tmp_path, clock=SystemClock()).load().u == 5.250034172361112
