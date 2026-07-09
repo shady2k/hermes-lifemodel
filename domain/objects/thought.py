@@ -73,14 +73,12 @@ class Thought(BaseObject):
     #: the anti-rumination engine tracks the cycle through the typed registry door.
     park_count: int
     #: How many ticks this thought has sustained *viable* contact-candidate
-    #: attention — the top-down Rubicon persistence counter (lm-27n.9). Bumped ONLY
-    #: by :class:`~lifemodel.core.thought_attention.ThoughtAttention` (the sole
-    #: thought writer) when the attended thought is a viable contact candidate, and
-    #: read next tick by :class:`~lifemodel.core.thought_crystallization.ThoughtCrystallization`
-    #: to gate crystallization (a fresh idle thought, at 0, can never mint contact).
-    #: A DECLARED field — a raw payload key would be rejected by the registry — and
-    #: deliberately DISTINCT from ``no_progress_count`` (the rumination brake):
-    #: coupling them would park good thoughts faster.
+    #: attention — the top-down Rubicon persistence counter (lm-27n.9). A DECLARED
+    #: field — a raw payload key would be rejected by the registry — and deliberately
+    #: DISTINCT from ``no_progress_count`` (the rumination brake): coupling them
+    #: would park good thoughts faster. (T7: the thought engine that bumped/read this
+    #: is gone — thoughts return in Phase 6; the field stays declared so seeded rows
+    #: still round-trip through the registry.)
     sustained_attention_count: int
     actionability: float
     other_regarding_value: float

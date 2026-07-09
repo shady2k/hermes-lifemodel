@@ -34,11 +34,13 @@ def creation_provenance(
 ) -> Provenance:
     """Build the :class:`Provenance` stamped on a NEW episode's object.
 
-    When *trace* is ``None`` (an untraced tick — no tracer wired) the result carries
-    the lineage fields but NO W3C trace fields, so object ids/timing stay
-    behaviour-identical to before .11 (only the descriptive provenance is added).
-    When *trace* is present the tick's root span is recorded as the object's creation
-    context (``span_id`` → ``creation_span_id``; never "the object's live span").
+    On the live tick *trace* is always present (spec §5: tracing is mandatory — the
+    tracer is a required CoreLoop dependency, and each component runs in a child span
+    passed in as ``ctx.trace``); the component's span is recorded as the object's
+    creation context (``span_id`` → ``creation_span_id``; never "the object's live
+    span"). The ``None`` branch is retained only as a defensive fallback for direct
+    unit-test construction of a ``TickContext`` without a span — it omits the W3C
+    trace fields while keeping the lineage, so a bare test fixture still builds.
     """
     if trace is None:
         return Provenance(

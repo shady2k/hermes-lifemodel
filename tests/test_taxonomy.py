@@ -20,7 +20,7 @@ from lifemodel.core.taxonomy import (
 from lifemodel.core.taxonomy import (
     contact_signal as _contact_signal,
 )
-from lifemodel.sim.aggregation import Verdict
+from lifemodel.domain.egress import Verdict
 
 
 def test_contact_signal_carries_value_and_delta() -> None:

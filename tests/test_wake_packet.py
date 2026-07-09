@@ -31,10 +31,17 @@ def test_packet_has_no_raw_numbers() -> None:
     assert not re.search(r"\d", p.prompt)  # never leaks the value/hours
 
 
-def test_guidance_permits_silence_and_owns_the_wish() -> None:
-    # the guidance must invite [SILENT] and frame the motive as desire, not a timer
-    assert "[SILENT]" in GUIDANCE
-    assert "хочешь" in GUIDANCE.lower()
+def test_guidance_makes_longing_the_reason_without_defaulting_to_silence() -> None:
+    # The [SILENT] cure (spec §7): the guidance must NOT instruct silence as the
+    # default, must own the wish as the being's own, and must make its acute longing
+    # itself a sufficient reason to write warmly — never "don't invent a reason".
+    assert "[SILENT]" not in GUIDANCE  # no longer taught to default to silence
+    assert "не выдумывай" not in GUIDANCE.lower()  # no "don't invent a reason"
+    assert "хочешь" in GUIDANCE.lower()  # owns the wish (desire, not a timer)
+    assert "тоска" in GUIDANCE.lower()  # the longing is named
+    assert "повод" in GUIDANCE.lower()  # ...and framed as a sufficient reason
+    # silence stays permitted, but as a conscious choice — not the default
+    assert "сознательный" in GUIDANCE.lower()
 
 
 # --- lm-27n.6: Recent Thoughts render (behavior-neutral when empty) ----------
@@ -86,11 +93,33 @@ def test_brief_frames_elapsed_in_words() -> None:
     assert "вспомни, на чём вы остановились" in brief
 
 
-def test_brief_fresh_history_does_not_fabricate() -> None:
+def test_brief_fresh_history_does_not_gate_on_a_reason() -> None:
+    # cold start: no shared history, but the brief must NOT tell the being to "not
+    # invent a reason" — the longing itself is the reason ([SILENT] cure, spec §7).
     brief = render_situational_brief(last_exchange_at=None, now=NOW, decline_count=0, energy=1.0)
     assert "вы ещё толком не общались" in brief
-    assert "не выдумывай повод" in brief
+    assert "не выдумывай" not in brief  # no "don't invent a reason" gate
     assert "вспомни, на чём вы остановились" not in brief  # nothing to mine
+
+
+def test_drive_only_longing_prompt_allows_a_warm_message() -> None:
+    # spec §7 acceptance: on a "pure acute longing" input (a drive desire, NO
+    # thoughts — incl. the cold-start situational brief), the prompt CONTRACT permits
+    # a warm short message: no instruction to be silent / "don't invent", the longing
+    # named as a sufficient reason, and no empty "Recent Thoughts" block.
+    p = build_wake_packet(
+        value=2.0,
+        theta=1.0,
+        correlation_id="c",
+        last_exchange_at=None,  # cold start — exercises the brief too
+        now=NOW,
+    )
+    assert "[SILENT]" not in p.prompt  # no silence-as-default instruction
+    assert "не выдумывай" not in p.prompt.lower()  # no "don't invent a reason"
+    assert "тоска" in p.prompt.lower()  # the longing is named
+    assert "повод" in p.prompt.lower()  # ...and framed as a sufficient reason
+    assert "тепло" in p.prompt.lower()  # a warm short message is permitted
+    assert RECENT_THOUGHTS_HEADER not in p.prompt  # no empty thoughts block
 
 
 def test_brief_rebuff_tone_only_when_declined() -> None:

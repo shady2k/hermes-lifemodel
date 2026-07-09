@@ -40,6 +40,7 @@ from .desire_view import read_live_contact_desire
 from .intention_view import read_live_contact_intention
 from .intents import Intent, TransitionRecord, UpdateState
 from .state_actor import StateActor
+from .suppression import SuppressionReason, emit_suppression_span
 from .wake_packet import IMPULSE_LABEL_PREFIX
 
 
@@ -49,42 +50,80 @@ def proactive_tick(
     target: Mapping[str, str | None],
     *,
     logger: EventLogger,
-) -> ReachOutcome:
+) -> ReachOutcome | None:
     """Run one proactive tick: pipeline → backstop → deliver. Never raises past
     the injected collaborators. Assumes a fresh ``LifeModel`` per call (the loop
-    builds one each tick), so the rollback reconciliation commit is safe."""
+    builds one each tick), so the rollback reconciliation commit is safe.
+
+    Returns a :class:`ReachOutcome` ONLY for a real delivery attempt (delivered /
+    failed / unavailable — the egress boundary, spec §9). A QUIET tick returns
+    ``None``: either no launch was produced (the core stayed quiet — its reason is
+    already a suppression span logged in-tick by aggregation/CognitionLauncher) or
+    the backstop held the launch (logged here as a ``backstop_rate_limited``
+    suppression span). ``DELIVERED`` means the turn was queued — whether the being
+    actually spoke is the async ``proactive_outcome`` read-back, not this return."""
     assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
     assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
     report = lm.coreloop.tick()  # pipeline runs + state committed by the state-actor
 
+    # No reach attempted — the core stayed quiet. This is a core DECISION, not a
+    # delivery outcome: aggregation/CognitionLauncher already logged the reason as a
+    # suppression span during the tick (spec §5). No egress outcome to report.
     if not report.launches:
-        logger.info("proactive_tick", launches=0, outcome=ReachOutcome.SKIPPED_BUSY.value)
-        return ReachOutcome.SKIPPED_BUSY
+        logger.info("proactive_tick", launches=0, outcome=None)
+        return None
 
     launch = report.launches[0]
     actor = lm.state_actor
     state = actor.state  # post-tick committed state (energy already reserved by cognition)
     now = lm.clock.now()
-    outcome = ReachOutcome.SKIPPED_BUSY
 
     if not allow_send(state.proactive_send_log, now):
+        # Backstop held fire (fail-closed rate limit): a core decision to HOLD, not a
+        # delivery attempt. Log the reason as a suppression span, defer the desire,
+        # and return None (quiet — no egress outcome).
+        _emit_backstop_suppression(lm, logger=logger, tick=state.tick_count)
         logger.info("proactive_backstop_blocked")
         _rollback(lm, actor, launch.reserved_energy, defer=True)  # hold: active -> deferred
-    else:
-        full_prompt = IMPULSE_LABEL_PREFIX + launch.prompt
-        # The owner's core observability ask (lm-j2w B3): "I want to know what
-        # we handed the agent." DEBUG-only (a no-op unless the owner has set
-        # loglevel=debug) and carries the COMPLETE, untruncated text — byte-
-        # identical to what egress.reach_out is about to receive — plus the
-        # correlation_id shared with the outcome verdict logged in hooks.py.
-        logger.debug("proactive_prompt", correlation_id=launch.correlation_id, prompt=full_prompt)
-        outcome = egress.reach_out(target, full_prompt)
-        if outcome is not ReachOutcome.DELIVERED:
-            logger.info("proactive_launch_failed", outcome=outcome.value)
-            _rollback(lm, actor, launch.reserved_energy, defer=False)  # keep active, retry
+        logger.info("proactive_tick", launches=len(report.launches), outcome=None)
+        return None
+
+    full_prompt = IMPULSE_LABEL_PREFIX + launch.prompt
+    # The owner's core observability ask (lm-j2w B3): "I want to know what
+    # we handed the agent." DEBUG-only (a no-op unless the owner has set
+    # loglevel=debug) and carries the COMPLETE, untruncated text — byte-
+    # identical to what egress.reach_out is about to receive — plus the
+    # correlation_id shared with the outcome verdict logged in hooks.py.
+    logger.debug("proactive_prompt", correlation_id=launch.correlation_id, prompt=full_prompt)
+    outcome = egress.reach_out(target, full_prompt)
+    if outcome is not ReachOutcome.DELIVERED:
+        logger.info("proactive_launch_failed", outcome=outcome.value)
+        _rollback(lm, actor, launch.reserved_energy, defer=False)  # keep active, retry
 
     logger.info("proactive_tick", launches=len(report.launches), outcome=outcome.value)
     return outcome
+
+
+def _emit_backstop_suppression(lm: LifeModel, *, logger: EventLogger, tick: int) -> None:
+    """Log a backstop-held launch as a ``backstop_rate_limited`` suppression span.
+
+    The egress runs out-of-tick (after ``coreloop.tick()`` returns), so there is no
+    in-tick span to bind to; mint a fresh root span on the graph's tracer so the
+    suppression still carries the §5 minimum (``reason``/``component``/``trace_id``/
+    ``span_id``/``tick``). Best-effort: a graph without a tracer (a hand-built
+    test ``LifeModel``) skips the span — the ``proactive_backstop_blocked`` log line
+    still records the hold."""
+    tracer = lm.tracer
+    if tracer is None:
+        return
+    span = tracer.start_root()
+    emit_suppression_span(
+        logger=logger,
+        reason=SuppressionReason.BACKSTOP_RATE_LIMITED,
+        component="proactive",
+        span=span,
+        tick=tick,
+    )
 
 
 def _rollback(lm: LifeModel, actor: StateActor, reserved_energy: float, *, defer: bool) -> None:

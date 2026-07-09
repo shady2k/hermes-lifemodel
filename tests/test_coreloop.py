@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
+import pytest
+
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext
 from lifemodel.core.coreloop import CoreLoop, TickReport
@@ -13,7 +15,7 @@ from lifemodel.core.taxonomy import contact_signal
 from lifemodel.domain.memory import MemoryDraft, MemoryMutation, PressureIndex
 from lifemodel.domain.signal import Signal
 from lifemodel.state.model import State
-from lifemodel.testing import FakeMemoryStore
+from lifemodel.testing import FakeMemoryStore, FakeTracer
 
 
 class FixedClock:
@@ -115,6 +117,7 @@ def _loop(
         bus=bus,
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         breaker_threshold=breaker_threshold,
+        tracer=FakeTracer(),
     )
 
 
@@ -224,6 +227,7 @@ def test_coreloop_bounds_a_flood_and_survives(tmp_path) -> None:
         bus=bus,
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         intake_limits=IntakeLimits(max_control=256, max_sensor=64),
+        tracer=FakeTracer(),
     )
     report = loop.tick()  # must not raise
     assert report.committed
@@ -306,6 +310,7 @@ def test_tick_context_snapshot_populated_once_and_shared(tmp_path) -> None:
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         pressure_sensor=mem,
         memory=mem,
+        tracer=FakeTracer(),
     )
     loop.tick()
 
@@ -332,6 +337,7 @@ def test_snapshot_includes_deferred_not_only_active(tmp_path) -> None:
         bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         memory=mem,
+        tracer=FakeTracer(),
     ).tick()
     ids = {o.id for o in rec.objects}
     assert ids == {"a", "d"}  # active + deferred, never the terminal 'satisfied'
@@ -360,6 +366,7 @@ def test_snapshot_includes_parked_thought_and_pending_intention(tmp_path) -> Non
         clock=clock,
         memory=mem,
         live_states=default_registry().live_states(),
+        tracer=FakeTracer(),
     ).tick()
     ids = {o.id for o in rec.objects}
     assert ids == {"t-parked", "i-pending", "d-active", "d-deferred"}  # never the dropped thought
@@ -381,6 +388,7 @@ def test_default_snapshot_stays_active_and_deferred_only(tmp_path) -> None:
         bus=FileSignalBus(tmp_path),
         clock=clock,
         memory=mem,
+        tracer=FakeTracer(),
     ).tick()
     assert {o.id for o in rec.objects} == {"d-active"}  # parked hidden without wiring
 
@@ -396,6 +404,7 @@ def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
         bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         memory=counting,  # type: ignore[arg-type]
+        tracer=FakeTracer(),
     )
     loop.tick()
     # The live snapshot is built ONCE per tick — two bounded finds (active +
@@ -418,6 +427,7 @@ def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         pressure_sensor=mem,
         memory=mem,
+        tracer=FakeTracer(),
     ).tick()
 
     reg_without = ComponentRegistry()
@@ -458,6 +468,7 @@ def test_objects_snapshot_read_is_fail_soft(tmp_path) -> None:
         bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         memory=RaisingMemory(),  # type: ignore[arg-type]
+        tracer=FakeTracer(),
     )
     report = loop.tick()
     assert report.ran == ("only",)  # the component still ran
@@ -497,9 +508,11 @@ def _clock() -> FixedClock:
     return FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC))
 
 
-def test_tick_threads_the_minted_trace_onto_tick_context(tmp_path) -> None:
-    from lifemodel.testing import FakeTracer
-
+def test_component_runs_in_a_child_span_of_the_tick_root(tmp_path) -> None:
+    # spec §4.2/§5: each component runs in its OWN child span of the tick root — the
+    # span tree that makes a tick fully observable. ctx.trace is that CHILD span
+    # (not the root), so a creation site stamps the component's span and the
+    # component's logs bind to it.
     reg = ComponentRegistry()
     rec = TraceRecorder()
     reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
@@ -511,17 +524,54 @@ def test_tick_threads_the_minted_trace_onto_tick_context(tmp_path) -> None:
         tracer=FakeTracer(),
     )
     loop.tick()
+    # A fresh FakeTracer mirrors the loop's own deterministic sequence: start_root
+    # consumes trace#1 + span#1; child_of consumes span#2 parented on span#1.
+    mirror = FakeTracer()
+    root = mirror.start_root()
+    child = mirror.child_of(root)
     assert rec.trace is not None
-    assert rec.trace.trace_id == FakeTracer().start_root().trace_id  # deterministic first trace
-    assert rec.trace.parent_span_id is None  # a cron root has no upstream
+    assert rec.trace.trace_id == root.trace_id == child.trace_id  # same trace
+    assert rec.trace.span_id == child.span_id  # the component's own span
+    assert rec.trace.span_id != root.span_id  # distinct from the root span
+    assert rec.trace.parent_span_id == root.span_id  # parented on the tick root
 
 
-def test_untraced_tick_leaves_trace_none(tmp_path) -> None:
+def test_every_component_gets_a_distinct_child_span(tmp_path) -> None:
+    # The span tree has one child per component, all parented on the root, all in the
+    # same trace — so "which component did what" is distinguishable from the spans.
     reg = ComponentRegistry()
-    rec = TraceRecorder()
-    reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
-    _loop(reg, RecordingStore(), FileSignalBus(tmp_path)).tick()  # no tracer wired
-    assert rec.trace is None  # behaviour-neutral
+    rec_a = TraceRecorder()
+    rec_b = TraceRecorder()
+    rec_a.id = "trace-a"
+    rec_b.id = "trace-b"
+    reg.register(rec_a, ComponentManifest(id="trace-a", type="neuron"))
+    reg.register(rec_b, ComponentManifest(id="trace-b", type="aggregation"))
+    CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=_clock(),
+        tracer=FakeTracer(),
+    ).tick()
+    assert rec_a.trace is not None and rec_b.trace is not None
+    assert rec_a.trace.trace_id == rec_b.trace.trace_id  # same tick trace
+    assert rec_a.trace.span_id != rec_b.trace.span_id  # distinct child spans
+    # Both parented on the root span (FakeTracer: root span#1, children span#2/##3).
+    assert rec_a.trace.parent_span_id == rec_b.trace.parent_span_id
+    assert rec_a.trace.parent_span_id is not None
+
+
+def test_coreloop_requires_a_tracer_untraced_tick_is_impossible(tmp_path) -> None:
+    # spec §5: a log/decision without an active trace+span is STRUCTURALLY impossible
+    # — not by discipline. The tracer is a required CoreLoop dependency, so a CoreLoop
+    # cannot even be assembled without one: an untraced tick cannot exist.
+    with pytest.raises(TypeError):
+        CoreLoop(  # type: ignore[call-arg]
+            registry=ComponentRegistry(),
+            state_actor=StateActor(RecordingStore()),
+            bus=FileSignalBus(tmp_path),
+            clock=_clock(),
+        )
 
 
 def test_each_tick_gets_a_fresh_trace(tmp_path) -> None:
@@ -574,16 +624,30 @@ def test_tick_binds_trace_on_logs_and_resets_after(tmp_path) -> None:
     assert "trace_id" not in structlog.contextvars.get_contextvars()
 
 
-def test_untraced_tick_binds_nothing(tmp_path) -> None:
+def test_component_failure_log_binds_to_the_component_child_span(tmp_path) -> None:
+    # The "component_failed" log binds to the FAILING component's child span — not the
+    # tick root — so the span tree records WHICH component faulted. The child span_id
+    # is distinct from the root's (FakeTracer: root span#1, component child span#2),
+    # and parented on it. A log without an active span never appears.
+    import structlog
+
     reg = ComponentRegistry()
     reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
     logger = ContextRecordingLogger()
-    CoreLoop(  # no tracer -> empty bind -> no-op
+    loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
         bus=FileSignalBus(tmp_path),
         clock=_clock(),
         logger=logger,
-    ).tick()
+        tracer=FakeTracer(),
+    )
+    structlog.contextvars.clear_contextvars()  # clean slate
+    loop.tick()  # Broken raises -> "component_failed" logged WITHIN the child-span bind
+
     events = {event: ctx for event, ctx in logger.calls}
-    assert "trace_id" not in events["component_failed"]  # nothing bound on the untraced path
+    bound = events["component_failed"]
+    root_span_id = FakeTracer().start_root().span_id  # span#1
+    assert bound["span_id"] != root_span_id  # the component's child span, not the root
+    assert bound["parent_span_id"] == root_span_id  # parented on the tick root
+    assert bound["tick"] == 1

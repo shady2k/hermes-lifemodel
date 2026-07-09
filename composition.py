@@ -59,18 +59,15 @@ from .adapters.trace_export import make_trace_exporter
 from .adapters.tracer import StdlibTracer
 from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
-from .core.cognition import Cognition
-from .core.contact_neuron import ContactNeuron
+from .core.cognition import CognitionLauncher
+from .core.contact_neuron import PresenceNeuron
 from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
 from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
+from .core.solitude_drive import SolitudeDrive
 from .core.state_actor import StateActor
-from .core.thought_attention import ThoughtAttention
-from .core.thought_crystallization import ThoughtCrystallization
-from .core.thought_generation import ThoughtGeneration
-from .core.thought_score import THOUGHT_SALIENCE_HALFLIFE_MIN
 from .domain.objects import default_registry
 from .log import EventLogger
 from .ports.clock import ClockPort
@@ -127,6 +124,11 @@ class LifeModel:
     #: rather than constructing a fresh ad-hoc one. ``None`` when the caller
     #: (e.g. a bare test ``build_lifemodel(base_dir=...)``) never passed one.
     logger: EventLogger | None = None
+    #: The execution tracer (lm-27n.11) the graph was built with — the SAME one
+    #: wired into the CoreLoop. Exposed so out-of-tick paths (e.g. the egress
+    #: backstop in :func:`proactive_tick`) can mint a span for a suppression.
+    #: Always set by :func:`build_lifemodel`; ``None`` only for a hand-built graph.
+    tracer: TracerPort | None = None
 
 
 def build_lifemodel(
@@ -209,22 +211,20 @@ def build_lifemodel(
     try:
         resolved_registry.manifest("contact")
     except UnknownComponent:
-        contact = ContactNeuron(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
-        resolved_registry.register(contact, ComponentManifest(id=contact.id, type="neuron"))
+        # T2 split (spec §3): the instantaneous, stateless contact-channel sensor.
+        # PresenceNeuron keeps the historical ``contact`` slot id; it measures the
+        # channel now and emits a raw ``contact_presence`` reading — it writes NO u.
+        presence = PresenceNeuron()
+        resolved_registry.register(presence, ComponentManifest(id=presence.id, type="neuron"))
     try:
-        resolved_registry.manifest("thought-crystallization")
+        resolved_registry.manifest("solitude-drive")
     except UnknownComponent:
-        # The TOP-DOWN desire spring (lm-27n.9): a PURE PROPOSER that reads the
-        # settled thought snapshot and, on the Rubicon gate, emits a transient
-        # ``thought_contact_proposal`` (writes NOTHING). Registered AFTER the neuron
-        # and BEFORE contact-aggregation so its in-tick EmitSignal reaches aggregation
-        # (the sole desire writer) AND thought-attention (the sole thought writer)
-        # the SAME tick — the enabled() order is asserted by the composition tests.
-        thought_crystallization = ThoughtCrystallization()
-        resolved_registry.register(
-            thought_crystallization,
-            ComponentManifest(id=thought_crystallization.id, type="crystallization"),
-        )
+        # T2 split: the AUTONOMIC integrator that OWNS and writes u. Registered
+        # AFTER the sensor (it consumes the sensor's contact_presence reading) and
+        # BEFORE aggregation (which reads the fresh u from the drive's contact
+        # signal, since the drive's UpdateState is only visible after commit).
+        drive = SolitudeDrive(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
+        resolved_registry.register(drive, ComponentManifest(id=drive.id, type="drive"))
     try:
         resolved_registry.manifest("contact-aggregation")
     except UnknownComponent:
@@ -241,39 +241,17 @@ def build_lifemodel(
             aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
         )
     try:
-        resolved_registry.manifest("thought-attention")
+        resolved_registry.manifest("cognition-launcher")
     except UnknownComponent:
-        # The 0-LLM anti-rumination brake (lm-27n.7): scores/selects/decays/parks
-        # the being's live thoughts. Registered AFTER contact-aggregation (so the
-        # snapshot's thoughts are already settled) and BEFORE cognition (which
-        # CONSUMES the attended set) — the enabled() order is asserted by the
-        # composition tests, mirroring the neuron→aggregation ordering.
-        thought_attention = ThoughtAttention(halflife_min=THOUGHT_SALIENCE_HALFLIFE_MIN)
-        resolved_registry.register(
-            thought_attention, ComponentManifest(id=thought_attention.id, type="attention")
-        )
-    try:
-        resolved_registry.manifest("thought-generation")
-    except UnknownComponent:
-        # The 0-LLM generative stream (lm-27n.8): mints ≤1 templated thought per
-        # tick from event/chaining/idle triggers, bounded + energy-costed. Registered
-        # AFTER thought-attention (so it reads the same settled snapshot and can
-        # chain the just-attended thought) and BEFORE cognition (a generated thought
-        # is visible only NEXT tick, so it never launches a turn it created) — the
-        # enabled() order is asserted by the composition tests.
-        thought_generation = ThoughtGeneration(alpha=COST_ALPHA, theta=CONTACT_PARAMS.theta_u)
-        resolved_registry.register(
-            thought_generation, ComponentManifest(id=thought_generation.id, type="generation")
-        )
-    try:
-        resolved_registry.manifest("cognition")
-    except UnknownComponent:
-        cognition = Cognition(
+        # T4: the 0-LLM launcher (renamed from Cognition) — reserves energy, builds
+        # the wake-packet, emits LaunchProactive + Intention. No synchronous LLM in
+        # core; the real act-gate is the async Hermes turn (verdict read back next tick).
+        launcher = CognitionLauncher(
             fast_cost=COGNITION_FAST_COST,
             send_cost=COGNITION_SEND_COST,
             alpha=COST_ALPHA,
         )
-        resolved_registry.register(cognition, ComponentManifest(id=cognition.id, type="cognition"))
+        resolved_registry.register(launcher, ComponentManifest(id=launcher.id, type="launcher"))
     resolved_state_actor = StateActor(resolved_state, committer=resolved_committer, logger=logger)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,
@@ -302,4 +280,5 @@ def build_lifemodel(
         state_actor=resolved_state_actor,
         coreloop=resolved_coreloop,
         logger=logger,
+        tracer=resolved_tracer,
     )

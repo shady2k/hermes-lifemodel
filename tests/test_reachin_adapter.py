@@ -41,7 +41,6 @@ def test_reach_out_does_not_self_skip_on_running_agents() -> None:
         inject=lambda *a, **k: calls.append((a, k)) or ReachOutcome.DELIVERED,
     )
     out = egress.reach_out(_TARGET, "hi")
-    assert out is not ReachOutcome.SKIPPED_BUSY
     assert out is ReachOutcome.DELIVERED
     assert calls  # inject IS called even though _running_agents is truthy
 

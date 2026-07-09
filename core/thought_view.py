@@ -35,12 +35,10 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from datetime import datetime
 
 from ..domain.memory import MemoryDraft, MemoryRecord
 from ..domain.objects import Provenance, Thought, ThoughtState, default_registry, derive_id
 from ..ports.memory import MemoryPort
-from .thought_score import SCAN_WIDTH, attention_score
 
 #: The kind of a thought record (``kind`` column, HLA §4.1).
 THOUGHT_KIND = "thought"
@@ -149,45 +147,10 @@ def live_thoughts(objects: Sequence[MemoryRecord]) -> tuple[Thought, ...]:
     Scans the start-of-tick :attr:`~lifemodel.core.component.TickContext.objects`
     snapshot for every non-terminal thought and returns them typed, most-salient
     first (deterministic ``id`` tiebreak). Empty when there are none — so the
-    wake-packet render stays behavior-neutral."""
+    wake-packet render stays behavior-neutral. (T7: the generative/attention engine
+    that BIRTHED thoughts is gone — thoughts return in Phase 6 — so this is empty in
+    the live tick until thoughts are seeded out-of-band; it must not crash.)"""
     return _ordered([t for record in objects if (t := _decode_live(record)) is not None])
-
-
-def live_thought_records(
-    objects: Sequence[MemoryRecord],
-) -> tuple[tuple[MemoryRecord, Thought], ...]:
-    """The live thoughts paired with their source records, most-salient first.
-
-    Like :func:`live_thoughts`, but keeps each :class:`MemoryRecord` next to its
-    decoded :class:`Thought` — the attention engine (lm-27n.7) needs the record's
-    ``updated_at`` (for elapsed-time salience decay) and ``state`` (the
-    transition's ``from_state``), neither of which the typed object carries. Same
-    predicate and ordering (salience desc, ``id`` tiebreak) as
-    :func:`live_thoughts`, so the two never disagree on what is live."""
-    pairs = [(record, t) for record in objects if (t := _decode_live(record)) is not None]
-    return tuple(sorted(pairs, key=lambda rt: (-rt[1].salience, rt[1].id)))
-
-
-def selected_thoughts(
-    objects: Sequence[MemoryRecord], now: datetime, *, limit: int = 1
-) -> tuple[Thought, ...]:
-    """The top-*limit* ATTENDED thoughts — the attention selection, recomputed.
-
-    Recomputes the deterministic
-    :func:`~lifemodel.core.thought_score.attention_score` over the live *active*
-    thoughts and returns the highest-scoring ``limit`` of them (score desc,
-    salience desc, ``id`` asc). No global state: a later consumer (lm-27n.8's
-    generation) asks the SAME pure question of the snapshot — the engine having run
-    this tick is not a precondition. Parked thoughts are excluded: they are
-    suspended, not selected for development.
-
-    Drawn from the SAME ``SCAN_WIDTH`` salience-ranked window the engine attends
-    within, so a consumer can never select a thought the engine did not scan/update
-    this tick (they stay in lockstep)."""
-    candidates = live_thought_records(objects)[:SCAN_WIDTH]
-    active = [t for _record, t in candidates if t.state == ThoughtState.ACTIVE.value]
-    ranked = sorted(active, key=lambda t: (-attention_score(t, now), -t.salience, t.id))
-    return tuple(ranked[: max(0, limit)])
 
 
 def read_thought(memory: MemoryPort, id: str) -> Thought | None:

@@ -161,7 +161,7 @@ def _metrics(pairs: list[tuple[str, str]]) -> list[str]:
     never tries to line up a colon column. The bold wrapping (standard
     markdown ``**...**``, colon included inside the markers) matches
     ``/status`` byte-for-byte — see e.g. ``locales/en.yaml``'s
-    ``"**Session ID:** \`{session_id}\`"`` and ``"**Agent Running:** {state}"``
+    ``"**Session ID:** \\`{session_id}\\`"`` and ``"**Agent Running:** {state}"``
     — which the Telegram adapter converts to MarkdownV2 and auto-escapes
     around.
     """

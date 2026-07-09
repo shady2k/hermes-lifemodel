@@ -11,12 +11,10 @@ from lifemodel.core.thought_view import (
     THOUGHT_KIND,
     build_thought,
     encode_thought,
-    live_thought_records,
     live_thoughts,
     read_live_thoughts,
     read_thought,
     seed_thought_id,
-    selected_thoughts,
     thought_id,
 )
 from lifemodel.domain.objects import Thought, ThoughtState, derive_id
@@ -121,37 +119,3 @@ def test_read_live_thoughts_orders_and_filters_and_bounds() -> None:
 
 def test_read_thought_absent_is_none() -> None:
     assert read_thought(FakeMemoryStore(clock=_CLOCK), "nope") is None
-
-
-# --- live_thought_records + selected_thoughts (lm-27n.7) --------------------
-
-
-def test_live_thought_records_pairs_record_with_decoded_thought() -> None:
-    objects = (
-        thought_record("high", "active", id="t-hi", salience=0.9),
-        thought_record("low", "active", id="t-lo", salience=0.2),
-    )
-    pairs = live_thought_records(objects)
-    assert [t.id for _r, t in pairs] == ["t-hi", "t-lo"]  # salience order
-    for record, thought in pairs:
-        assert record.id == thought.id  # the record travels with its typed thought
-        assert record.updated_at  # the field the attention engine needs for decay
-
-
-def test_selected_thoughts_picks_top_active_by_score() -> None:
-    now = datetime(2026, 7, 6, 0, 0, tzinfo=UTC)
-    objects = (
-        thought_record("actionable", "active", id="t-act", salience=0.6, actionability=0.9),
-        thought_record("idle mid", "active", id="t-idle", salience=0.6, trigger="idle"),
-    )
-    selected = selected_thoughts(objects, now, limit=1)
-    assert len(selected) == 1
-    assert selected[0].id == "t-act"  # higher relevance → higher score at equal salience
-
-
-def test_selected_thoughts_excludes_parked_and_empty() -> None:
-    now = datetime(2026, 7, 6, 0, 0, tzinfo=UTC)
-    future = "2026-07-07T00:00:00+00:00"
-    objects = (thought_record("resting", "parked", id="t-p", salience=0.9, parked_until=future),)
-    assert selected_thoughts(objects, now) == ()  # parked never selected
-    assert selected_thoughts((), now) == ()
