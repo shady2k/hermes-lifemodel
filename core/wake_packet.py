@@ -25,11 +25,17 @@ principle): state the WHY — the real feeling and its cause — never the HOW; 
 never name the mechanism (timer/pressure/threshold/…), which would drag that
 frame back in.
 
-The impulse text is the owner-approved self-state, first-person and
-self-attributed. Its opening line ("This is my own feeling, not a message from
-him.") tells the being the nudge is its own AND doubles as the correlation /
-self-exclusion marker its own hooks match on (:data:`IMPULSE_LABEL_PREFIX`) —
-carrying the marker as natural self-talk, not as a system-signal to reason about.
+The whole model-facing impulse is wrapped in an ``<internal_impulse>…</internal_impulse>``
+tag. That structural frame cures a perspective inversion prose alone could not:
+delivered as a user-role message into the DM session, the bare self-attribution
+line was read as the USER confiding a feeling ("Sasha is sharing that he misses
+someone"), and the being answered him therapeutically. The tag says, unmistakably,
+"this block is an internal impulse, not a line of dialogue." The open tag also
+doubles as the correlation / self-exclusion marker the being's own hooks match on
+(:data:`IMPULSE_LABEL_PREFIX`, ``startswith``). Inside the tag the self-attribution
+line names the user explicitly ("not a message from the user" — the earlier ``him``
+was the very ambiguity the being tripped on), and the owner-approved feeling body
+is verbatim.
 """
 
 from __future__ import annotations
@@ -41,16 +47,28 @@ from datetime import UTC, datetime, tzinfo
 from ..domain.objects import Thought
 from .projection import project_contact
 
-#: The impulse's opening line. FIRST-PERSON self-attribution the being reads
-#: ("this feeling is mine, not an inbound message"), NOT a machine/brand tag (the
-#: old ``[lifemodel · внутренний импульс — не от пользователя]`` label the being
-#: meta-analysed away). It ALSO doubles as the machine marker the being's OWN
-#: hooks match on (``startswith``) to correlate the proactive verdict and
-#: self-exclude the nudge from the inbound-exchange signal (hooks.py). Because it
-#: reads as natural self-talk it carries the marker WITHOUT handing the model a
-#: system-signal to reason about. The delivered turn always begins with this line
-#: (build_wake_packet emits it first), so proactive.py no longer prepends a label.
-IMPULSE_LABEL_PREFIX = "This is my own feeling, not a message from him."
+#: The impulse's opening TAG — a STRUCTURAL signal the model reads far more
+#: reliably than prose: "this whole block is an internal impulse, not a line of
+#: dialogue." It cures the perspective inversion prose could not: injected as a
+#: user-role message into the DM session, the bare "This is my own feeling…" line
+#: was read as the USER sharing a feeling ("Sasha is sharing that he misses
+#: someone"), and the being replied therapeutically. The tag makes the frame
+#: unmistakable. It ALSO doubles as the machine marker the being's OWN hooks match
+#: on (``startswith``) to correlate the proactive verdict and self-exclude the nudge
+#: from the inbound-exchange signal (hooks.py): the delivered turn always begins
+#: with this exact tag (build_wake_packet emits it first). Kept under the name
+#: ``IMPULSE_LABEL_PREFIX`` for the hooks import — the value is now the open tag.
+IMPULSE_LABEL_PREFIX = "<internal_impulse>"
+
+#: The matching close tag; build_wake_packet emits it on its own final line so the
+#: whole model-facing impulse is wrapped ``<internal_impulse>…</internal_impulse>``.
+_IMPULSE_CLOSE_TAG = "</internal_impulse>"
+
+#: The first-person self-attribution line, INSIDE the tag. Says the feeling is the
+#: being's own and, explicitly, "not a message from the user" — the word ``user``
+#: (was the ambiguous ``him``, which the being mistook for a third party) makes the
+#: reference unmistakable. Owner-approved wording — do not paraphrase.
+_SELF_ATTRIBUTION = "This is my own feeling, not a message from the user."
 
 #: The rest of the owner-approved self-state: the feeling AND its cause (the WHY),
 #: with no procedure, no mechanism, and no "how"/"when" to act. Verbatim per the
@@ -179,17 +197,18 @@ def build_wake_packet(
 ) -> ProactivePrompt:
     """Build the proactive-turn prompt: the felt impulse plus the moment's raw facts.
 
-    Three paragraphs: the fixed phenomenological self-state opens
-    (:data:`IMPULSE_LABEL_PREFIX`), then the RAW temporal facts of the moment
+    The whole thing is wrapped in an ``<internal_impulse>…</internal_impulse>`` tag
+    (the structural frame that cures the perspective inversion — see the module
+    docstring). Inside, three paragraphs: the first-person self-attribution line
+    (:data:`_SELF_ATTRIBUTION`), then the RAW temporal facts of the moment
     (:func:`render_temporal_facts` — ``now`` and ``last_exchange_at``, §11), then
     the feeling and its cause (:data:`_IMPULSE_BODY`). It carries NO machine label,
     NO procedure, NO mechanism talk, and NO derived time-of-day/recap: that framing
     is exactly what taught the being to discount the nudge as a system signal (the
     [SILENT] regression); the temporal anchor is bare facts the being reads for
-    appropriateness, not an instruction. The delivered turn still begins with the
-    self-attribution line, so the being's own hooks self-exclude it
-    (``startswith(IMPULSE_LABEL_PREFIX)`` — the temporal facts follow it, never
-    precede it).
+    appropriateness, not an instruction. The delivered turn begins with the open tag
+    (:data:`IMPULSE_LABEL_PREFIX`), so the being's own hooks self-exclude it
+    (``startswith(IMPULSE_LABEL_PREFIX)``).
 
     *value*/*theta* do NOT shape the text (the self-state is fixed): they feed
     :func:`project_contact` solely to stamp ``projection_id`` — an audit reference
@@ -203,16 +222,20 @@ def build_wake_packet(
     :func:`_fmt_ts`), so the being reads the owner's wall clock, not UTC.
 
     *thoughts* are the live (active/parked) thoughts, most-salient first — only
-    when one exists is a first-person "Recent Thoughts" CONTEXT block appended; it
-    informs the being's own turn, it is NOT the outward message."""
+    when one exists is a first-person "Recent Thoughts" CONTEXT block appended
+    (inside the tag, before the close); it informs the being's own turn, it is NOT
+    the outward message."""
     # projection_id: an audit stamp of the woken drive's band. The phrasing is
     # deliberately discarded — the impulse TEXT is the fixed owner-approved
     # self-state, it does not vary with the drive level.
     projection_id = project_contact(value, theta=theta, seed=correlation_id)[1]
     temporal_facts = render_temporal_facts(now, last_exchange_at, tz)
-    prompt = f"{IMPULSE_LABEL_PREFIX}\n\n{temporal_facts}\n\n{_IMPULSE_BODY}"
+    inner = f"{_SELF_ATTRIBUTION}\n\n{temporal_facts}\n\n{_IMPULSE_BODY}"
     if thoughts:
-        prompt = f"{prompt}\n\n{render_thoughts_block(thoughts)}"
+        inner = f"{inner}\n\n{render_thoughts_block(thoughts)}"
+    # Wrap the ENTIRE model-facing impulse: open tag on its own line, the content,
+    # then the close tag on its own final line.
+    prompt = f"{IMPULSE_LABEL_PREFIX}\n{inner}\n{_IMPULSE_CLOSE_TAG}"
     return ProactivePrompt(
         prompt=prompt, projection_id=projection_id, correlation_id=correlation_id
     )
