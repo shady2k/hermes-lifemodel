@@ -90,6 +90,15 @@ class State:
     #: ISO-8601 UTC timestamp the pending proactive turn above was launched at,
     #: or ``None`` when no proactive turn is outstanding.
     pending_proactive_since: str | None = None
+    #: The load-bearing async-correlation anchor (spec §4.4): the FULL W3C
+    #: ``traceparent`` of the launch span that minted ``pending_proactive_id``,
+    #: written atomically beside it so the async read-back (``post_llm`` hook) and
+    #: the resolving tick can re-bind the SAME origin trace across the Hermes
+    #: boundary (which carries no in-band trace channel). Lives in the *precious*
+    #: ``runtime_state`` (not the disposable trace DB) so losing the trace store
+    #: never breaks the weave. ``None`` whenever ``pending_proactive_id`` is —
+    #: cleared in lockstep at every clear-site (§4.4).
+    pending_proactive_origin_traceparent: str | None = None
     #: ISO-8601 UTC timestamp of the last neuron tick, or ``None`` before the
     #: first tick.
     last_tick_at: str | None = None
@@ -156,6 +165,12 @@ class State:
             ),
             pending_proactive_since=_as_opt_iso(
                 data.get("pending_proactive_since"), "pending_proactive_since"
+            ),
+            # The async-correlation anchor is a W3C traceparent string, not a
+            # timestamp — validated only as opt-str (an opaque header we round-trip).
+            pending_proactive_origin_traceparent=_as_opt_str(
+                data.get("pending_proactive_origin_traceparent"),
+                "pending_proactive_origin_traceparent",
             ),
             last_tick_at=_as_opt_str(data.get("last_tick_at"), "last_tick_at"),
             # last_contact_at is a timestamp the engine threads into datetime

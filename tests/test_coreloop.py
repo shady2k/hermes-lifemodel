@@ -243,7 +243,13 @@ class Launcher:
     id = "launcher"
 
     def step(self, ctx) -> list:
-        return [LaunchProactive(prompt="hi", correlation_id="c-1")]
+        return [
+            LaunchProactive(
+                prompt="hi",
+                correlation_id="c-1",
+                origin_traceparent="00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            )
+        ]
 
 
 def test_launch_proactive_is_surfaced_in_report(tmp_path) -> None:

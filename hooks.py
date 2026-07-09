@@ -26,12 +26,15 @@ from collections.abc import Callable
 from typing import Any
 
 from .composition import LifeModel
+from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.output_lint import lint_proactive
+from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import exchange_signal, verdict_signal
 from .core.wake_packet import IMPULSE_LABEL_PREFIX
 from .domain.egress import Verdict
 from .domain.objects import DesireState
+from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 
 #: The exact silence markers Hermes' own gateway treats as intentional silence.
@@ -64,30 +67,8 @@ def _is_pending_proactive_turn(pending_proactive_id: str | None, user_message: s
     return user_message.strip().startswith(IMPULSE_LABEL_PREFIX)
 
 
-def _hooks_logger(lm: LifeModel) -> Any:
-    """Return the logger this graph was built with, falling back to a fresh one.
-
-    Prefers ``lm.logger`` — the SAME collaborator ``register(ctx)`` threads into
-    ``build_lifemodel(..., logger=logger)`` — so hooks observability shares the
-    plugin's one configured sink instead of constructing an ad-hoc logger. Bare
-    test/script callers that never pass a logger (``lm.logger is None``) still
-    get a working one via :func:`~lifemodel.log.get_logger`.
-    """
-    from .log import get_logger
-
-    return lm.logger or get_logger("lifemodel.hooks")
-
-
-def _log_lint(lm: LifeModel, reason: str) -> None:
-    """Advisory: record that a delivered proactive message tripped the output-lint
-    (mechanical timer / filler). Model A can't block the native send — this is
-    observability feeding future prompt tuning (spec §13)."""
-    with contextlib.suppress(Exception):  # advisory logging must never break a turn
-        _hooks_logger(lm).info("proactive_output_lint", reason=reason)
-
-
 def _log_verdict_detail(
-    lm: LifeModel,
+    logger: SpanBoundLogger,
     *,
     correlation_id: str,
     verdict: Verdict,
@@ -104,18 +85,18 @@ def _log_verdict_detail(
     host passed, keyed by field name. ``conversation_history`` is captured
     separately by name in ``_observer`` (not part of ``extra``) and owned by
     :func:`_log_proactive_reasoning` instead — this event no longer dumps it.
-    DEBUG-gated (only visible when the effective log level is DEBUG, unlike the
-    always-on ``proactive_outcome`` INFO log) and best-effort — advisory
-    logging must never break a turn.
+
+    Emitted through the origin-trace :class:`~lifemodel.log.SpanBoundLogger`
+    (§4.4) so this DEBUG detail is durable in ``trace_events`` under the attempt's
+    trace — the 5th-source collapse (§4.3), not a hindsight/DEBUG-log side channel.
     """
-    with contextlib.suppress(Exception):  # advisory logging must never break a turn
-        _hooks_logger(lm).debug(
-            "proactive_verdict_detail",
-            correlation_id=correlation_id,
-            verdict=verdict.value,
-            assistant_response=assistant_response,
-            extra_fields={k: str(v)[:800] for k, v in extra.items()},
-        )
+    logger.debug(
+        "proactive_verdict_detail",
+        correlation_id=correlation_id,
+        verdict=verdict.value,
+        assistant_response=assistant_response,
+        extra_fields={k: str(v)[:800] for k, v in extra.items()},
+    )
 
 
 #: Generous per-message cap on logged reasoning text — untruncated in practice
@@ -162,7 +143,7 @@ def _summarize_reasoning_message(message: Any) -> dict[str, Any]:
 
 
 def _log_proactive_reasoning(
-    lm: LifeModel, *, correlation_id: str, conversation_history: Any
+    logger: SpanBoundLogger, *, correlation_id: str, conversation_history: Any
 ) -> None:
     """DEBUG: the full reasoning chain behind a resolved proactive turn (lm-otq step 2).
 
@@ -172,41 +153,122 @@ def _log_proactive_reasoning(
     chain of thought for that turn, including the impulse turn itself (the
     LAST assistant message). This is the ONE event that surfaces it, per
     message, untruncated (capped generously). Defensive: never raises on an
-    unexpected shape. DEBUG-gated and best-effort like the sibling discovery
-    log, ``proactive_verdict_detail`` — advisory logging must never break a
-    turn or alter verdict/signal/outcome control flow.
+    unexpected shape. Emitted through the origin-trace
+    :class:`~lifemodel.log.SpanBoundLogger` so the reasoning lands durably in
+    ``trace_events`` under the attempt's trace (§4.3, 5th-source collapse).
     """
-    with contextlib.suppress(Exception):  # advisory logging must never break a turn
-        logger = _hooks_logger(lm)
-        if not isinstance(conversation_history, list):
-            logger.debug(
-                "proactive_reasoning",
-                correlation_id=correlation_id,
-                available=False,
-                reason=f"conversation_history is {type(conversation_history).__name__}, not a list",
-            )
-            return
-        messages = [_summarize_reasoning_message(m) for m in conversation_history]
+    if not isinstance(conversation_history, list):
         logger.debug(
             "proactive_reasoning",
             correlation_id=correlation_id,
-            available=True,
-            message_count=len(messages),
-            messages=messages,
+            available=False,
+            reason=f"conversation_history is {type(conversation_history).__name__}, not a list",
         )
+        return
+    messages = [_summarize_reasoning_message(m) for m in conversation_history]
+    logger.debug(
+        "proactive_reasoning",
+        correlation_id=correlation_id,
+        available=True,
+        message_count=len(messages),
+        messages=messages,
+    )
 
 
-def _log_outcome(lm: LifeModel, *, correlation_id: str, verdict: Verdict) -> None:
-    """INFO: the resolved proactive outcome — "it woke and chose silence" vs "it
-    woke and reached out" (bead lm-j2w B3, owner's core ask). INFO so it is
-    ALWAYS visible (unlike the DEBUG-gated full prompt logged at launch in
-    ``core/proactive.py``), keyed by the SAME ``correlation_id`` so the two
-    events correlate end-to-end. Reuses the verdict this observer already
-    computed (REJECT on a silence marker, FULFILL on real text) rather than
-    re-deriving "silent vs delivered" a second way."""
+def _emit_async_outcome(
+    lm: LifeModel,
+    *,
+    origin_traceparent: str | None,
+    correlation_id: str,
+    verdict: Verdict,
+    assistant_response: str,
+    conversation_history: Any,
+    extra: dict[str, Any],
+) -> None:
+    """Weave the async proactive outcome onto its ORIGIN trace (spec §4.4/§5 step 5).
+
+    This is the read-back the whole bridge exists for: the being's own Hermes turn
+    (``[SILENT]`` → REJECT, real text → FULFILL) is observed HERE, in our
+    ``post_llm`` hook, on the far side of a boundary that carries no in-band trace
+    channel. So we raise the launch's ``origin_traceparent`` from the state anchor and
+    ``child_of`` it — the outcome/verdict/reasoning (and, on a REJECT, the
+    ``ACT_GATE_SILENT`` suppression, the 4th reason) land UNDER THE SAME ``trace_id``
+    as the launch, delivery, and resolving tick.
+
+    **Miss policy (load-bearing, §4.4):** if the anchor is gone (``None``), NEVER
+    attach the outcome to a fresh/foreign trace — emit an explicit
+    ``orphan_async_outcome`` on its own trace so the viewer can show "async
+    correlation missing", and leave every real trace untouched.
+
+    Best-effort/fail-open (§4.2): a graph with no tracer/ring (a bare test
+    ``LifeModel``) skips silently; the caller wraps this so a trace hiccup can never
+    break the verdict-signal control flow.
+    """
+    tracer = lm.tracer
+    ring = lm.event_ring
+    if tracer is None or ring is None:
+        return
+    now = lm.clock.now().isoformat()
+
+    if origin_traceparent is None:
+        orphan = open_correlated_span(
+            tracer=tracer,
+            writer=lm.trace_writer,
+            ring=ring,
+            origin_traceparent=None,  # a fresh orphan root — NOT a foreign trace
+            component="hooks",
+            started_at=now,
+        )
+        orphan.span.set(
+            correlation_id=correlation_id,
+            verdict=verdict.value,
+            reason="async_correlation_missing",
+        )
+        orphan.logger.warning(
+            "orphan_async_outcome", correlation_id=correlation_id, verdict=verdict.value
+        )
+        orphan.span.end(status="ok", ended_at=now)
+        orphan.persist(ended_at=now)
+        return
+
+    bridge = open_correlated_span(
+        tracer=tracer,
+        writer=lm.trace_writer,
+        ring=ring,
+        origin_traceparent=origin_traceparent,
+        component="hooks",
+        started_at=now,
+    )
     outcome = "silent" if verdict is Verdict.REJECT else "delivered"
-    with contextlib.suppress(Exception):  # advisory logging must never break a turn
-        _hooks_logger(lm).info("proactive_outcome", correlation_id=correlation_id, outcome=outcome)
+    bridge.span.set(correlation_id=correlation_id, verdict=verdict.value, outcome=outcome)
+    # INFO: the always-visible "woke and chose silence" vs "woke and reached out"
+    # (bead lm-j2w B3), keyed by the SAME correlation_id as the launch/delivery.
+    bridge.logger.info("proactive_outcome", correlation_id=correlation_id, outcome=outcome)
+    _log_verdict_detail(
+        bridge.logger,
+        correlation_id=correlation_id,
+        verdict=verdict,
+        assistant_response=assistant_response,
+        extra=extra,
+    )
+    _log_proactive_reasoning(
+        bridge.logger, correlation_id=correlation_id, conversation_history=conversation_history
+    )
+    if verdict is Verdict.REJECT:
+        # The 4th suppression reason (phase-2 carryover): the async act-gate returned
+        # [SILENT] — a CONSCIOUS verdict, logged as a suppression under the origin
+        # trace. ``emit_suppression_span`` sets ``reason`` + ends the span "suppressed".
+        emit_suppression_span(
+            bridge.logger, reason=SuppressionReason.ACT_GATE_SILENT, component="hooks"
+        )
+    else:
+        lint = lint_proactive(assistant_response)
+        if not lint.ok:
+            # Advisory (spec §13): a delivered proactive message tripped the output-lint
+            # (mechanical timer / filler) — feeds future prompt tuning, never blocks.
+            bridge.logger.info("proactive_output_lint", reason=lint.reason)
+        bridge.span.end(status="ok", ended_at=now)
+    bridge.persist(ended_at=now)
 
 
 def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
@@ -227,30 +289,27 @@ def make_post_llm_observer(lm: LifeModel) -> Callable[..., None]:
         if desire is None or desire.state != DesireState.ACTIVE:
             return
         verdict = Verdict.REJECT if _is_no_reply(assistant_response) else Verdict.FULFILL
-        if verdict is Verdict.FULFILL:
-            lint = lint_proactive(assistant_response)
-            if not lint.ok:
-                _log_lint(lm, lint.reason)
-        _log_outcome(lm, correlation_id=state.pending_proactive_id or "", verdict=verdict)
-        _log_verdict_detail(
-            lm,
-            correlation_id=state.pending_proactive_id or "",
-            verdict=verdict,
-            assistant_response=assistant_response,
-            extra=_ignored,
-        )
-        _log_proactive_reasoning(
-            lm,
-            correlation_id=state.pending_proactive_id or "",
-            conversation_history=conversation_history,
-        )
+        correlation_id = state.pending_proactive_id or ""
+        # Weave the outcome onto the ORIGIN trace (§4.4). Best-effort: the async trace
+        # is observability, NEVER the verdict control flow below — a trace hiccup (or a
+        # lost origin anchor) must not stop the desire from resolving.
+        with contextlib.suppress(Exception):  # advisory: must never break a turn
+            _emit_async_outcome(
+                lm,
+                origin_traceparent=state.pending_proactive_origin_traceparent,
+                correlation_id=correlation_id,
+                verdict=verdict,
+                assistant_response=assistant_response,
+                conversation_history=conversation_history,
+                extra=_ignored,
+            )
         now = lm.clock.now()
         lm.bus.publish(
             verdict_signal(
                 origin_id=f"verdict-{state.pending_proactive_id}",
                 verdict=verdict,
                 timestamp=now.isoformat(),
-                correlation_id=state.pending_proactive_id or "",
+                correlation_id=correlation_id,
             )
         )
 

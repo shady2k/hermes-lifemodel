@@ -37,6 +37,7 @@ command deliberately does not touch, bypass, or run synchronously.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import re
 from collections.abc import Callable, Sequence
@@ -80,8 +81,10 @@ from .domain.objects import (
 from .log import EventLogger
 from .ports.memory import MemoryPort
 from .ports.tick_commit import TickCommitPort
+from .ports.tracer import parse_traceparent
 from .state.errors import StateCorruptError, StateError
 from .state.model import State
+from .state.trace_store import observability_db_path, peek_trace_writer
 
 #: The terminal desire states — a live desire in any other state can still be
 #: terminalized; one already here is left alone.
@@ -180,6 +183,7 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
         last_exchange_at=last_exchange_at,
         pending_proactive_id=None,
         pending_proactive_since=None,
+        pending_proactive_origin_traceparent=None,  # clear the async anchor in lockstep (§4.4)
         decline_count=0,
         declined_at=None,
         action_pending_since=None,  # clears ActionPending inhibition too
@@ -191,6 +195,7 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
         "last_exchange_at",
         "pending_proactive_id",
         "pending_proactive_since",
+        "pending_proactive_origin_traceparent",
         "decline_count",
         "declined_at",
         "action_pending_since",
@@ -234,6 +239,7 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
         last_exchange_at=now_iso,
         pending_proactive_id=None,
         pending_proactive_since=None,
+        pending_proactive_origin_traceparent=None,  # clear the async anchor in lockstep (§4.4)
         action_pending_since=None,
     )
     fields = [
@@ -242,6 +248,7 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
         "last_exchange_at",
         "pending_proactive_id",
         "pending_proactive_since",
+        "pending_proactive_origin_traceparent",
         "action_pending_since",
     ]
     return after, _echo("satiate", before, after, fields)
@@ -481,7 +488,38 @@ def _apply(
         lm.state.commit_tick(candidate, mutations)
     else:
         lm.state.commit(candidate)
+    # A mutation that clears an in-flight proactive attempt (force-wake / satiate) is
+    # a §4.4 clear-site: retire its disposable index correlation so retention can
+    # reclaim the origin trace (the precious state anchor is already cleared above).
+    if before.pending_proactive_id and candidate.pending_proactive_id is None:
+        _mark_pending_correlation_resolved(base_dir, before, now)
     return message
+
+
+def _mark_pending_correlation_resolved(base_dir: Path, before: State, now: datetime) -> None:
+    """Best-effort: stamp ``resolved_at`` on the disposable correlation index for a
+    pending proactive attempt an admin command just cleared (§4.4), so retention can
+    reclaim its origin trace instead of protecting it forever on an unresolved row.
+
+    Reaches the LIVE in-process writer via :func:`peek_trace_writer` (no refcount): a
+    ``/lifemodel`` command runs inside the gateway process that holds the singleton,
+    so this shares it. A bare CLI process with no live being simply no-ops — the
+    *precious* state anchor was already cleared, and the trace DB is disposable."""
+    correlation_id = before.pending_proactive_id
+    origin = before.pending_proactive_origin_traceparent
+    if not correlation_id or not origin:
+        return
+    writer = peek_trace_writer(observability_db_path(base_dir))
+    if writer is None:
+        return
+    with contextlib.suppress(ValueError):
+        stamp = now.isoformat()
+        writer.submit_correlation(
+            correlation_id=correlation_id,
+            origin_trace_id=parse_traceparent(origin).trace_id,
+            created_at=stamp,
+            resolved_at=stamp,
+        )
 
 
 def nudge_for_dir(base_dir: Path, raw_amount: str, *, logger: EventLogger | None = None) -> str:
@@ -529,6 +567,10 @@ def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
     except StateError:
         before = None
     lm.state.reset()
+    # Factory-wipe is a §4.4 clear-site too: the fresh ``State()`` has no anchor, so
+    # retire any in-flight index correlation the wiped state carried.
+    if before is not None:
+        _mark_pending_correlation_resolved(base_dir, before, now)
     cleared = _purge_all_memory(lm)  # a factory wipe also drops EVERY memory row
     footer = f"  cleared {cleared} memory records\n"
     if before is None:

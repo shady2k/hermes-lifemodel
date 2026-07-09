@@ -22,10 +22,11 @@ from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
 from .debug import render_dump_for_dir
-from .events import EVENTS_FILENAME, EventSink
+from .events import EVENTS_FILENAME, EventRing, EventSink
 from .hooks import make_inbound_observer, make_post_llm_observer
 from .log import EventTee, configure, current_level, get_logger, parse_log_level
 from .paths import state_dir
+from .state.trace_store import acquire_trace_writer, observability_db_path
 from .state_commands import (
     force_wake_for_dir,
     nudge_for_dir,
@@ -257,7 +258,20 @@ def register(ctx: Any) -> None:
     # correlation-needs-field-verification caveat. Best-effort: a host without
     # post_llm_call in VALID_HOOKS, or any wiring hiccup, must not break load.
     try:
-        verdict_lm = build_lifemodel(base_dir=sdir, logger=logger)
+        # The async read-back MUST reach the LIVE durable trace writer (spec §4.4):
+        # ``acquire_trace_writer`` returns the SAME singleton-per-db-path instance the
+        # ``BeingAdapter.connect()`` tick loop acquires (both resolve
+        # ``observability_db_path(sdir)`` to one registry key), so the outcome span the
+        # hook writes lands in the SAME ``observability.sqlite`` as the launch — one
+        # attempt, one ``trace_id``. This refcount is held for the plugin's lifetime
+        # (register has no teardown), independent of the platform connect/disconnect
+        # cycle, so the hook can always write regardless of loop state.
+        verdict_lm = build_lifemodel(
+            base_dir=sdir,
+            logger=logger,
+            trace_writer=acquire_trace_writer(observability_db_path(sdir)),
+            event_ring=EventRing(),
+        )
         ctx.register_hook("post_llm_call", make_post_llm_observer(verdict_lm))
         logger.info("post_llm_observer_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load

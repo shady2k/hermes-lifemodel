@@ -715,6 +715,17 @@ class TraceSink(Protocol):
         attrs: Mapping[str, Any] | None = None,
     ) -> bool: ...
 
+    def submit_correlation(
+        self,
+        *,
+        correlation_id: str,
+        origin_trace_id: str,
+        created_at: str,
+        origin_traceparent: str | None = None,
+        kind: str | None = None,
+        resolved_at: str | None = None,
+    ) -> bool: ...
+
 
 class _NullTraceWriter:
     """A :class:`TraceSink` that accepts and discards — the off-being default.
@@ -751,6 +762,18 @@ class _NullTraceWriter:
         ended_at: str | None = None,
         status: str | None = None,
         attrs: Mapping[str, Any] | None = None,
+    ) -> bool:
+        return True
+
+    def submit_correlation(
+        self,
+        *,
+        correlation_id: str,
+        origin_trace_id: str,
+        created_at: str,
+        origin_traceparent: str | None = None,
+        kind: str | None = None,
+        resolved_at: str | None = None,
     ) -> bool:
         return True
 
@@ -814,6 +837,20 @@ def acquire_trace_writer(
         handle.refcount += 1
         handle.writer.start()  # idempotent — covers a caller that stopped it directly
         return handle.writer
+
+
+def peek_trace_writer(db_path: Path) -> TraceWriter | None:
+    """Return the LIVE singleton writer for *db_path* WITHOUT taking a refcount.
+
+    For best-effort out-of-band index touches from a code path that has no writer
+    of its own but runs in the SAME process as the live being — e.g. the admin
+    ``/lifemodel force-wake`` command marking a cleared correlation ``resolved_at``
+    so retention can eventually reclaim its origin trace (§4.4). ``None`` when no
+    writer is running for that path (a bare CLI process): the disposable index
+    simply goes untouched — the *precious* state anchor was already cleared."""
+    with _registry_lock:
+        handle = _registry.get(_registry_key(db_path))
+        return handle.writer if handle is not None else None
 
 
 def release_trace_writer(db_path: Path, *, flush: bool = True) -> None:

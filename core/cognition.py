@@ -37,6 +37,7 @@ from ..domain.objects import (
     IntentionState,
     qualified_id,
 )
+from ..ports.tracer import format_traceparent
 from .component import TickContext
 from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
@@ -154,16 +155,35 @@ class CognitionLauncher:
                 energy_after=energy_after,
                 salience=desire.salience,
             )
+        # The async-correlation anchor (spec §4.4): the FULL W3C traceparent of THIS
+        # launch span (``ctx.trace`` — cognition's child span this tick), so every
+        # out-of-band span of this one attempt (delivery, the async outcome, the
+        # resolving tick) continues the SAME trace. It rides the intent AND — the
+        # durable half — is committed atomically beside ``pending_proactive_id`` in
+        # ``runtime_state``. The ``trace_correlations`` row is a best-effort DISPOSABLE
+        # mirror for the viewer; the state anchor is the load-bearing source of truth.
+        origin_traceparent = format_traceparent(ctx.trace)
+        ctx.trace_writer.submit_correlation(
+            correlation_id=correlation_id,
+            origin_trace_id=ctx.trace.trace_id,
+            origin_traceparent=origin_traceparent,
+            kind="proactive",
+            created_at=ctx.now.isoformat(),
+        )
         return [
             PutRecord(op=PutOp(draft=encode_contact_intention(intention))),
             LaunchProactive(
-                prompt=packet.prompt, correlation_id=correlation_id, reserved_energy=estimate
+                prompt=packet.prompt,
+                correlation_id=correlation_id,
+                origin_traceparent=origin_traceparent,
+                reserved_energy=estimate,
             ),
             UpdateState(
                 {
                     "energy": energy_after,
                     "pending_proactive_id": correlation_id,
                     "pending_proactive_since": ctx.now.isoformat(),
+                    "pending_proactive_origin_traceparent": origin_traceparent,
                 }
             ),
         ]

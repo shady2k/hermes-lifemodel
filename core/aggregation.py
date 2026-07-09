@@ -41,6 +41,7 @@ from ..domain.objects import DesireSpring, DesireState, IntentionState
 from ..sim.wake import GateParams, LaneState, WakeOutcome, evaluate_wake
 from .backstop import record_send
 from .component import TickContext
+from .correlate import open_correlated_span
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
 from .intention_view import live_contact_intention
 from .intents import Intent, PutRecord, TransitionRecord, UpdateState
@@ -137,8 +138,17 @@ class ContactAggregation:
         action_pending_since = state.action_pending_since
         pending_id = state.pending_proactive_id
         pending_since = state.pending_proactive_since
+        # The async-correlation anchor (spec §4.4), threaded in lockstep with
+        # ``pending_id``: cleared exactly when the verdict resolves the attempt below.
+        pending_origin = state.pending_proactive_origin_traceparent
         send_log = state.proactive_send_log
         unanswered_outbound_count = state.unanswered_outbound_count
+
+        # Captured when a verdict resolves an in-flight attempt this tick, so the
+        # resolution span is woven UNDER THE ORIGIN TRACE (§4.4) after the reducer.
+        resolved_correlation: str | None = None
+        resolved_origin: str | None = None
+        resolved_verdict: Verdict | None = None
 
         # The single desire-row action this tick: a create, or a transition
         # target for the live desire. At most one of the two ever fires.
@@ -205,15 +215,23 @@ class ContactAggregation:
                     # materially-new reason -> not a repeat, does not bump.
                     if live is not None and live.spring == DesireSpring.DRIVE:
                         unanswered_outbound_count += 1
+                    resolved_correlation = read_verdict_correlation(sig)
+                    resolved_origin = pending_origin
+                    resolved_verdict = verdict
                     pending_id = None
                     pending_since = None
+                    pending_origin = None
                     desire_state = _NONE
                 elif verdict is Verdict.REJECT:
                     transition_to = DesireState.DROPPED
                     declined_at = now.isoformat()
                     decline_count += 1
+                    resolved_correlation = read_verdict_correlation(sig)
+                    resolved_origin = pending_origin
+                    resolved_verdict = verdict
                     pending_id = None
                     pending_since = None
+                    pending_origin = None
                     desire_state = _NONE
                 else:  # Verdict.DEFER — hold the intention (never reached in live Model A)
                     transition_to = DesireState.DEFERRED
@@ -274,6 +292,7 @@ class ContactAggregation:
             "action_pending_since": action_pending_since,
             "pending_proactive_id": pending_id,
             "pending_proactive_since": pending_since,
+            "pending_proactive_origin_traceparent": pending_origin,
             "proactive_send_log": send_log,
             "unanswered_outbound_count": unanswered_outbound_count,
         }
@@ -354,5 +373,46 @@ class ContactAggregation:
                 )
                 if reason is not None:
                     emit_suppression_span(ctx.logger, reason=reason, component=self.id)
+
+        # Async-bridge resolution span (spec §4.4 / §5 step 6): when this tick
+        # consumes the verdict that resolves an in-flight proactive attempt, weave the
+        # resolution UNDER THE ORIGIN TRACE (raised from the state anchor, NOT this
+        # tick's trace) and stamp ``resolved_at`` on the disposable correlation index
+        # so retention can eventually reclaim the origin trace. The anchor itself is
+        # already cleared in ``changes`` above (durable half); this is the observable
+        # + index half. Best-effort, fail-open (§4.2): a bare context skips it.
+        if (
+            resolved_correlation
+            and resolved_origin is not None
+            and ctx.tracer is not None
+            and ctx.event_ring is not None
+        ):
+            resolved_at = now.isoformat()
+            verdict_value = resolved_verdict.value if resolved_verdict is not None else None
+            bridge = open_correlated_span(
+                tracer=ctx.tracer,
+                writer=ctx.trace_writer,
+                ring=ctx.event_ring,
+                origin_traceparent=resolved_origin,
+                component=self.id,
+                tick=state.tick_count + 1,
+                started_at=now.isoformat(),
+            )
+            bridge.span.set(
+                correlation_id=resolved_correlation,
+                verdict=verdict_value,
+                resolved_at=resolved_at,
+            )
+            bridge.logger.info(
+                "proactive_resolution", correlation_id=resolved_correlation, verdict=verdict_value
+            )
+            bridge.span.end(status="ok", ended_at=resolved_at)
+            bridge.persist(ended_at=resolved_at)
+            ctx.trace_writer.submit_correlation(
+                correlation_id=resolved_correlation,
+                origin_trace_id=bridge.span.context.trace_id,
+                created_at=resolved_at,
+                resolved_at=resolved_at,
+            )
 
         return intents

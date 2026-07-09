@@ -104,6 +104,9 @@ def _blocked_state() -> State:
         u=0.2,
         pending_proactive_id="corr-1",
         pending_proactive_since=_ago(2),
+        pending_proactive_origin_traceparent=(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        ),
         last_exchange_at=_ago(2),  # well inside w=15min
         declined_at=_ago(1),
         decline_count=5,  # deep in the growing backoff
@@ -192,6 +195,8 @@ def test_force_wake_clears_pending() -> None:
     assert after is not None
     assert after.pending_proactive_id is None
     assert after.pending_proactive_since is None
+    # §4.4: the async-correlation anchor is cleared in lockstep with pending_id.
+    assert after.pending_proactive_origin_traceparent is None
 
 
 def test_force_wake_clears_reject_backoff() -> None:
@@ -286,12 +291,17 @@ def test_satiate_clears_pending_and_action_pending() -> None:
     before = State(
         pending_proactive_id="corr-1",
         pending_proactive_since=_ago(1),
+        pending_proactive_origin_traceparent=(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        ),
         action_pending_since=_ago(1),
     )
     after, _ = satiate(before, NOW)
     assert after is not None
     assert after.pending_proactive_id is None
     assert after.pending_proactive_since is None
+    # §4.4: the async-correlation anchor is cleared in lockstep with pending_id.
+    assert after.pending_proactive_origin_traceparent is None
     assert after.action_pending_since is None
 
 

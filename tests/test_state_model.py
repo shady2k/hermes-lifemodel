@@ -157,6 +157,8 @@ def test_state_has_lifecycle_fields_with_defaults() -> None:
     assert s.decline_count == 0
     assert s.pending_proactive_id is None
     assert s.pending_proactive_since is None
+    # The async-correlation anchor (§4.4) defaults absent, in lockstep with pending_id.
+    assert s.pending_proactive_origin_traceparent is None
 
 
 def test_state_roundtrips_lifecycle_fields() -> None:
@@ -168,8 +170,21 @@ def test_state_roundtrips_lifecycle_fields() -> None:
         decline_count=3,
         pending_proactive_id="p-1",
         pending_proactive_since="2026-07-05T10:01:00+00:00",
+        pending_proactive_origin_traceparent=(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        ),
     )
     assert State.from_dict(s.to_dict()) == s
+
+
+def test_state_anchor_survives_missing_key_from_older_files() -> None:
+    # Additive/back-compatible (spec §9): an older runtime_state JSON without the
+    # anchor key loads cleanly with the field defaulting to ``None``.
+    data = State(pending_proactive_id="p-1").to_dict()
+    del data["pending_proactive_origin_traceparent"]
+    loaded = State.from_dict(data)
+    assert loaded.pending_proactive_origin_traceparent is None
+    assert loaded.pending_proactive_id == "p-1"
 
 
 def test_from_dict_ignores_unknown_legacy_keys() -> None:

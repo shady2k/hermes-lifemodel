@@ -80,6 +80,55 @@ def test_active_desire_launches_proactive_turn(tmp_path) -> None:
     assert upd.changes["energy"] < 1.0  # reserved
 
 
+def test_launch_carries_origin_traceparent_and_writes_state_anchor(tmp_path) -> None:
+    # §4.4: the launch carries the FULL W3C traceparent of THIS launch span, and the
+    # SAME value is committed atomically as the durable state anchor beside pending_id.
+    from lifemodel.ports.tracer import format_traceparent
+
+    state = State(u=2.0, energy=1.0, fatigue=0.0)
+    intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path))
+    launch = _launch(intents)
+    assert launch is not None
+    expected = format_traceparent(_TRACE)  # ctx.trace is the launch span
+    assert launch.origin_traceparent == expected
+    upd = _update(intents)
+    assert upd.changes["pending_proactive_origin_traceparent"] == expected
+
+
+def test_launch_submits_correlation_index_row(tmp_path) -> None:
+    # §4.4: a best-effort disposable index row (correlation_id → origin trace) is
+    # submitted at launch through ctx.trace_writer.
+    from lifemodel.ports.tracer import format_traceparent
+
+    submitted: list[dict] = []
+
+    class _CapturingSink:
+        def submit_event(self, **kw):
+            return True
+
+        def submit_span(self, **kw):
+            return True
+
+        def submit_correlation(self, **kw):
+            submitted.append(kw)
+            return True
+
+    ctx = TickContext(
+        state=State(u=2.0, energy=1.0, fatigue=0.0),
+        now=NOW,
+        bus=FileSignalBus(tmp_path),
+        objects=tuple(ACTIVE),
+        trace=_TRACE,
+        trace_writer=_CapturingSink(),
+    )
+    _cog().step(ctx)
+    assert len(submitted) == 1
+    assert submitted[0]["correlation_id"] == f"proactive-{NOW.isoformat()}"
+    assert submitted[0]["origin_trace_id"] == _TRACE.trace_id
+    assert submitted[0]["origin_traceparent"] == format_traceparent(_TRACE)
+    assert submitted[0]["kind"] == "proactive"
+
+
 def test_pending_turn_is_not_relaunched(tmp_path) -> None:
     state = State(u=2.0, pending_proactive_id="proactive-earlier")
     intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path))

@@ -53,10 +53,19 @@ class CheckpointState(Intent):
 @dataclass(frozen=True)
 class LaunchProactive(Intent):
     """Launch a proactive turn (the being's native Hermes turn) with this
-    desire-framed prompt. Consumed by the egress in Phase E."""
+    desire-framed prompt. Consumed by the egress in Phase E.
+
+    ``origin_traceparent`` is the MANDATORY async-correlation anchor (spec §4.4):
+    the full W3C ``traceparent`` (trace_id + span_id + flags) of the launch span,
+    so every downstream span of this one attempt — delivery, the async
+    ``post_llm`` outcome, the resolving tick — can ``child_of`` it and land under
+    ONE ``trace_id``. The type forbids launching without an origin trace (§3 law 1):
+    an untraceable async launch is structurally impossible.
+    """
 
     prompt: str
     correlation_id: str
+    origin_traceparent: str
     reserved_energy: float = 0.0
 
 

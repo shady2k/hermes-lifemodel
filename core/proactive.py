@@ -27,20 +27,22 @@ signal the debug HEALTH view reads.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping
 
 from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
 from ..domain.memory import TransitionOp
 from ..domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID, DesireState, IntentionState
-from ..log import EventLogger, SpanLogger
+from ..log import EventLogger
 from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
-from ..ports.tracer import start_span
+from ..ports.tracer import parse_traceparent
 from .backstop import allow_send
+from .correlate import open_correlated_span
 from .desire_view import read_live_contact_desire
 from .intention_view import read_live_contact_intention
-from .intents import Intent, TransitionRecord, UpdateState
+from .intents import Intent, LaunchProactive, TransitionRecord, UpdateState
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
 
@@ -81,11 +83,13 @@ def proactive_tick(
 
     if not allow_send(state.proactive_send_log, now):
         # Backstop held fire (fail-closed rate limit): a core decision to HOLD, not a
-        # delivery attempt. Log the reason as a suppression span, defer the desire,
-        # and return None (quiet — no egress outcome).
-        _emit_backstop_suppression(lm, tick=state.tick_count)
+        # delivery attempt. Log the reason as a suppression span UNDER THE LAUNCH'S
+        # ORIGIN TRACE (§4.4 — not a fresh root), defer the desire, and return None.
+        _emit_egress_suppression(
+            lm, SuppressionReason.BACKSTOP_RATE_LIMITED, launch=launch, tick=state.tick_count
+        )
         logger.info("proactive_backstop_blocked")
-        _rollback(lm, actor, launch.reserved_energy, defer=True)  # hold: active -> deferred
+        _rollback(lm, actor, launch, defer=True)  # hold: active -> deferred
         logger.info("proactive_tick", launches=len(report.launches), outcome=None)
         return None
 
@@ -103,12 +107,21 @@ def proactive_tick(
     outcome = egress.reach_out(target, full_prompt)
     if outcome is not ReachOutcome.DELIVERED:
         # The delivery boundary held/failed: a first-class suppression span naming the
-        # gate (egress_unavailable / egress_failed), not a bare INFO line — so the
-        # "why nothing went out" is in the one trace store (spec §5).
+        # gate (egress_unavailable / egress_failed) UNDER THE ORIGIN TRACE (§4.4), not
+        # a bare INFO line — so the "why nothing went out" is in the one trace store.
         _emit_egress_suppression(
-            lm, _EGRESS_SUPPRESSION[outcome], tick=state.tick_count, outcome=outcome.value
+            lm,
+            _EGRESS_SUPPRESSION[outcome],
+            launch=launch,
+            tick=state.tick_count,
+            outcome=outcome.value,
         )
-        _rollback(lm, actor, launch.reserved_energy, defer=False)  # keep active, retry
+        _rollback(lm, actor, launch, defer=False)  # keep active, retry
+    else:
+        # A delivered launch is a span UNDER THE ORIGIN TRACE too (§4.4 / §5 step 3),
+        # so the weave carries launch → delivery → async outcome → resolution under one
+        # trace_id — not just the "why NOT" edges.
+        _emit_delivery_span(lm, launch=launch, tick=state.tick_count)
 
     logger.info("proactive_tick", launches=len(report.launches), outcome=outcome.value)
     return outcome
@@ -121,49 +134,65 @@ _EGRESS_SUPPRESSION: dict[ReachOutcome, SuppressionReason] = {
 }
 
 
-def _emit_backstop_suppression(lm: LifeModel, *, tick: int) -> None:
-    """Log a backstop-held launch as a ``backstop_rate_limited`` suppression span."""
-    _emit_egress_suppression(lm, SuppressionReason.BACKSTOP_RATE_LIMITED, tick=tick)
-
-
 def _emit_egress_suppression(
-    lm: LifeModel, reason: SuppressionReason, *, tick: int, **extra: object
+    lm: LifeModel, reason: SuppressionReason, *, launch: LaunchProactive, tick: int, **extra: object
 ) -> None:
-    """Emit an OUT-OF-TICK ``proactive`` suppression span (spec §5).
+    """Emit an OUT-OF-TICK ``proactive`` suppression span UNDER THE ORIGIN TRACE (§4.4).
 
     The egress runs after ``coreloop.tick()`` returns, so there is no in-tick span to
-    bind to; mint a fresh root span on the graph's tracer, bind a
-    :class:`~lifemodel.log.SpanLogger` over the graph's SAME durable writer + ring
-    (so the record lands in the one trace store, not a second place), emit the
-    suppression, and persist the span row. Best-effort: a graph without a tracer (a
-    hand-built test ``LifeModel``) skips it. (Correlating this to the launch's ORIGIN
-    trace is the Phase-3 async bridge; here it stands as its own root.)"""
+    bind to — but the launch carries its ``origin_traceparent``, so instead of a
+    disconnected fresh root we CONTINUE the attempt's trace (one attempt = one
+    ``trace_id``). Bind a :class:`~lifemodel.log.SpanLogger` over the graph's SAME
+    durable writer + ring (the one trace store), emit the suppression, persist the
+    span row. Best-effort: a graph without a tracer (a hand-built test ``LifeModel``)
+    skips it."""
     tracer = lm.tracer
     if tracer is None:
         return
-    root = tracer.start_root()
-    span = start_span(root, component="proactive", tick=tick)
-    span.set(**extra)  # decision values (e.g. the egress outcome) onto the span
-    emit_suppression_span(
-        SpanLogger(span, writer=lm.trace_writer, ring=lm.event_ring),
-        reason=reason,
-        component="proactive",
-    )
-    lm.trace_writer.submit_span(
-        trace_id=root.trace_id,
-        span_id=root.span_id,
-        parent_span_id=root.parent_span_id,
+    now = lm.clock.now().isoformat()
+    bridge = open_correlated_span(
+        tracer=tracer,
+        writer=lm.trace_writer,
+        ring=lm.event_ring,
+        origin_traceparent=launch.origin_traceparent,
         component="proactive",
         tick=tick,
-        status=span.status,
-        attrs=dict(span.attrs) or None,
+        started_at=now,
     )
+    bridge.span.set(**extra)  # decision values (e.g. the egress outcome) onto the span
+    emit_suppression_span(bridge.logger, reason=reason, component="proactive")
+    bridge.persist(ended_at=now)
 
 
-def _rollback(lm: LifeModel, actor: StateActor, reserved_energy: float, *, defer: bool) -> None:
-    """Atomically undo a launch that did not deliver — clear pending + refund
-    energy, and (on a backstop block) hold BOTH the desire AND the intention
-    ``active → deferred`` in lockstep.
+def _emit_delivery_span(lm: LifeModel, *, launch: LaunchProactive, tick: int) -> None:
+    """Emit a DELIVERED ``proactive`` span under the launch's origin trace (§5 step 3)."""
+    tracer = lm.tracer
+    if tracer is None:
+        return
+    now = lm.clock.now().isoformat()
+    bridge = open_correlated_span(
+        tracer=tracer,
+        writer=lm.trace_writer,
+        ring=lm.event_ring,
+        origin_traceparent=launch.origin_traceparent,
+        component="proactive",
+        tick=tick,
+        started_at=now,
+    )
+    bridge.span.set(correlation_id=launch.correlation_id, outcome=ReachOutcome.DELIVERED.value)
+    bridge.logger.info(
+        "proactive_delivery",
+        correlation_id=launch.correlation_id,
+        outcome=ReachOutcome.DELIVERED.value,
+    )
+    bridge.span.end(status="ok", ended_at=now)
+    bridge.persist(ended_at=now)
+
+
+def _rollback(lm: LifeModel, actor: StateActor, launch: LaunchProactive, *, defer: bool) -> None:
+    """Atomically undo a launch that did not deliver — clear pending (+ its async
+    anchor, §4.4) + refund energy, and (on a backstop block) hold BOTH the desire AND
+    the intention ``active → deferred`` in lockstep.
 
     One atomic ``commit_tick`` via the state-actor, so State, the desire row and
     the intention row never split. Each ``active → deferred`` edge is only emitted
@@ -171,14 +200,17 @@ def _rollback(lm: LifeModel, actor: StateActor, reserved_energy: float, *, defer
     it, in which case holding is moot and would be an illegal transition out of a
     terminal state, so it is skipped (the pending-clear + refund still apply). A
     delivery-fail (``defer=False``) keeps both rows ``active`` to retry — no
-    transition, just the pending-clear + refund."""
+    transition, just the pending-clear + refund. The correlation anchor is cleared in
+    lockstep with ``pending_proactive_id`` (§4.4 clear-site), and the disposable index
+    correlation is stamped ``resolved_at`` so retention can reclaim the origin trace."""
     state = actor.state
     intents: list[Intent] = [
         UpdateState(
             {
                 "pending_proactive_id": None,
                 "pending_proactive_since": None,
-                "energy": state.energy + reserved_energy,
+                "pending_proactive_origin_traceparent": None,
+                "energy": state.energy + launch.reserved_energy,
             }
         )
     ]
@@ -210,3 +242,16 @@ def _rollback(lm: LifeModel, actor: StateActor, reserved_energy: float, *, defer
                 ),
             )
     actor.apply(intents)
+    # Retire the disposable index correlation (§4.4): this attempt is aborted (its
+    # state anchor was just cleared above), so stamp ``resolved_at`` — otherwise the
+    # unresolved index row would protect the origin trace from retention forever.
+    # Best-effort/fail-open like all trace writes.
+    with contextlib.suppress(ValueError):
+        origin_trace_id = parse_traceparent(launch.origin_traceparent).trace_id
+        resolved_at = lm.clock.now().isoformat()
+        lm.trace_writer.submit_correlation(
+            correlation_id=launch.correlation_id,
+            origin_trace_id=origin_trace_id,
+            created_at=resolved_at,
+            resolved_at=resolved_at,
+        )

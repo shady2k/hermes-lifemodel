@@ -97,6 +97,9 @@ def _live_pending_state(**over) -> State:
         u=1.5,
         pending_proactive_id=CORR,
         pending_proactive_since="2026-07-06T03:55:00+00:00",
+        pending_proactive_origin_traceparent=(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        ),
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     base.update(over)
@@ -254,6 +257,8 @@ def test_fulfill_starts_action_pending_and_clears_pending(tmp_path) -> None:
     assert "u" not in changes  # not satiated (send != contact)
     assert changes["last_contact_at"] == now.isoformat()
     assert changes["pending_proactive_id"] is None  # turn resolved
+    # §4.4: the async anchor is cleared in lockstep with pending_id at resolution.
+    assert changes["pending_proactive_origin_traceparent"] is None
 
 
 def test_readback_send_does_not_satiate_u(tmp_path) -> None:
@@ -283,6 +288,8 @@ def test_reject_records_backoff_and_clears_pending(tmp_path) -> None:
     assert changes["decline_count"] == 2
     assert changes["declined_at"] == now.isoformat()
     assert changes["pending_proactive_id"] is None
+    # §4.4: the async anchor is cleared in lockstep with pending_id at resolution.
+    assert changes["pending_proactive_origin_traceparent"] is None
 
 
 def test_defer_holds_desire_keeps_pending(tmp_path) -> None:

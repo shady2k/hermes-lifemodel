@@ -15,9 +15,11 @@ from typing import Protocol, runtime_checkable
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
+from ..events import EventRing
 from ..log import SpanBoundLogger
-from ..ports.tracer import TraceContext
+from ..ports.tracer import TraceContext, TracerPort
 from ..state.model import State
+from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .intents import Intent
 from .signal_bus import SignalBus
 
@@ -56,6 +58,15 @@ class TickContext:
     #: values onto ``logger.span`` so the span is self-explaining. ``None`` in a
     #: bare unit-test ``TickContext`` (no graph) — observability emission is skipped.
     logger: SpanBoundLogger | None = None
+    #: The async-bridge emit trio (spec §4.4, generic): the SAME tracer + durable
+    #: sink + freshness ring the CoreLoop fans in-tick logging onto, exposed so a
+    #: component can mint a span under a DIFFERENT (foreign) origin trace than this
+    #: tick's — e.g. aggregation emitting the resolution span of a proactive attempt
+    #: under its launch's ``origin_traceparent`` (raised from state), not this tick's
+    #: trace. ``None``/no-op in a bare unit-test context (no async weave to bridge).
+    tracer: TracerPort | None = None
+    trace_writer: TraceSink = NULL_TRACE_SINK
+    event_ring: EventRing | None = None
 
 
 @runtime_checkable

@@ -7,7 +7,6 @@ aggregation layer (inside ``coreloop.tick()``) consumes them on the next tick.
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +14,6 @@ from typing import Any
 
 import pytest
 
-import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import (
@@ -32,37 +30,23 @@ from lifemodel.core.taxonomy import (
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import Verdict
 from lifemodel.domain.objects import DesireState
-from lifemodel.events import EventSink
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
-from lifemodel.log import EventTee
 from lifemodel.ports.memory import MemoryPort
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 
 _T0 = datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
 
+#: A valid W3C traceparent standing in for a launch span's origin anchor — the
+#: async bridge (§4.4) re-binds the outcome under THIS trace_id.
+_ORIGIN_TP = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+_ORIGIN_TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
 
-class _RecordingLogger:
-    """A minimal :class:`~lifemodel.log.EventLogger` that records calls per level."""
 
-    def __init__(self) -> None:
-        self.debug_calls: list[tuple[str, dict[str, Any]]] = []
-        self.info_calls: list[tuple[str, dict[str, Any]]] = []
-
-    def debug(self, event: str, **fields: Any) -> None:
-        self.debug_calls.append((event, dict(fields)))
-
-    def info(self, event: str, **fields: Any) -> None:
-        self.info_calls.append((event, dict(fields)))
-
-    def warning(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-    def error(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-    def critical(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
+def _ring_events(lm: Any, event: str) -> list[dict[str, Any]]:
+    """Every ring record for *event* — the async outcome now fans onto the origin
+    trace's freshness ring (spec §4.4), self-stamped with its ``trace_id``."""
+    return [rec for rec in lm.event_ring.read() if rec.get("event") == event]
 
 
 def _seed_active_desire(store: MemoryPort) -> None:
@@ -70,12 +54,13 @@ def _seed_active_desire(store: MemoryPort) -> None:
     store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
 
 
-def _lm_with_pending(tmp_path: Path, corr: str = "p-1", *, logger: Any = None) -> Any:
-    lm = build_lifemodel(base_dir=tmp_path, logger=logger)
+def _lm_with_pending(tmp_path: Path, corr: str = "p-1", *, origin: str | None = _ORIGIN_TP) -> Any:
+    lm = build_lifemodel(base_dir=tmp_path)
     lm.state.commit(
         State(
             pending_proactive_id=corr,
             pending_proactive_since="2026-07-06T00:00:00+00:00",
+            pending_proactive_origin_traceparent=origin,
         )
     )
     _seed_active_desire(lm.state)
@@ -145,54 +130,76 @@ def test_post_llm_ignores_when_desire_not_active(tmp_path: Path) -> None:
     assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT] == []
 
 
-# --- B3 (lm-j2w): the resolved outcome, logged at INFO (always visible) -----
+# --- §4.4: the resolved outcome, WOVEN UNDER THE LAUNCH'S ORIGIN TRACE -------
 
 
-def test_post_llm_logs_delivered_outcome_at_info_on_real_text(tmp_path: Path) -> None:
-    logger = _RecordingLogger()
-    lm = _lm_with_pending(tmp_path, corr="p-delivered", logger=logger)
+def test_post_llm_weaves_delivered_outcome_under_origin_trace(tmp_path: Path) -> None:
+    # FULFILL (real text): the outcome lands on the origin trace's ring, self-stamped
+    # with the ORIGIN trace_id (§4.4) — one attempt, one trace_id, not a fresh root.
+    lm = _lm_with_pending(tmp_path, corr="p-delivered")
     make_post_llm_observer(lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
         assistant_response="Саш, привет, скучаю!",
     )
-    outcomes = [c for c in logger.info_calls if c[0] == "proactive_outcome"]
+    outcomes = _ring_events(lm, "proactive_outcome")
     assert len(outcomes) == 1
-    _, fields = outcomes[0]
-    assert fields["outcome"] == "delivered"
-    assert fields["correlation_id"] == "p-delivered"
+    assert outcomes[0]["outcome"] == "delivered"
+    assert outcomes[0]["correlation_id"] == "p-delivered"
+    assert outcomes[0]["trace_id"] == _ORIGIN_TRACE_ID  # under the launch's trace
 
 
-def test_post_llm_logs_silent_outcome_at_info_on_no_reply(tmp_path: Path) -> None:
-    logger = _RecordingLogger()
-    lm = _lm_with_pending(tmp_path, corr="p-silent", logger=logger)
+def test_post_llm_weaves_silent_outcome_and_act_gate_silent_suppression(tmp_path: Path) -> None:
+    # REJECT ([SILENT]): the outcome is "silent" AND the 4th suppression reason
+    # (ACT_GATE_SILENT) is emitted UNDER THE ORIGIN TRACE (phase-2 carryover, §4.4).
+    lm = _lm_with_pending(tmp_path, corr="p-silent")
     make_post_llm_observer(lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} ...",
         assistant_response="[SILENT]",
     )
-    outcomes = [c for c in logger.info_calls if c[0] == "proactive_outcome"]
+    outcomes = _ring_events(lm, "proactive_outcome")
     assert len(outcomes) == 1
-    _, fields = outcomes[0]
-    assert fields["outcome"] == "silent"
-    assert fields["correlation_id"] == "p-silent"
+    assert outcomes[0]["outcome"] == "silent"
+    assert outcomes[0]["trace_id"] == _ORIGIN_TRACE_ID
+    suppressions = [
+        rec for rec in _ring_events(lm, "suppression") if rec.get("reason") == "act_gate_silent"
+    ]
+    assert len(suppressions) == 1
+    assert suppressions[0]["trace_id"] == _ORIGIN_TRACE_ID  # suppression under origin too
 
 
-def test_post_llm_does_not_log_outcome_for_uncorrelated_turn(tmp_path: Path) -> None:
-    logger = _RecordingLogger()
-    lm = _lm_with_pending(tmp_path, logger=logger)
+def test_post_llm_does_not_emit_outcome_for_uncorrelated_turn(tmp_path: Path) -> None:
+    lm = _lm_with_pending(tmp_path)
     make_post_llm_observer(lm)(user_message="just a normal user message", assistant_response="hi")
-    assert [c for c in logger.info_calls if c[0] == "proactive_outcome"] == []
+    assert _ring_events(lm, "proactive_outcome") == []
 
 
-# --- proactive_verdict_detail — DEBUG discovery log (bead lm-otq) -----------
+def test_post_llm_orphan_async_outcome_when_origin_anchor_missing(tmp_path: Path) -> None:
+    # Miss policy (§4.4, load-bearing): a pending turn whose origin anchor is GONE
+    # emits an explicit ``orphan_async_outcome`` on its OWN trace — NEVER attaching the
+    # outcome to a fresh/foreign trace — while the verdict signal still publishes.
+    lm = _lm_with_pending(tmp_path, corr="p-orphan", origin=None)
+    make_post_llm_observer(lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} ...",
+        assistant_response="[SILENT]",
+    )
+    orphans = _ring_events(lm, "orphan_async_outcome")
+    assert len(orphans) == 1
+    assert orphans[0]["correlation_id"] == "p-orphan"
+    # The outcome is NOT attached to any (foreign) trace — no proactive_outcome at all.
+    assert _ring_events(lm, "proactive_outcome") == []
+    # Control flow is intact: the verdict still resolves the desire next tick.
+    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
+    assert len(verdicts) == 1
+    assert read_verdict(verdicts[0]) is Verdict.REJECT
 
 
-def test_post_llm_emits_verdict_detail_at_debug_with_extra_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-detail", logger=logger)
+# --- proactive_verdict_detail — durable under the origin trace (bead lm-otq) --
+
+
+def test_post_llm_emits_verdict_detail_under_origin_with_extra_fields(tmp_path: Path) -> None:
+    # The DEBUG discovery detail is now DURABLE in the trace store under the origin
+    # trace regardless of log level (§4.3, 5th-source collapse) — no ambient gating.
+    lm = _lm_with_pending(tmp_path, corr="p-detail")
 
     make_post_llm_observer(lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
@@ -201,40 +208,19 @@ def test_post_llm_emits_verdict_detail_at_debug_with_extra_fields(
         model="claude",
     )
 
-    events = [c for c in base.debug_calls if c[0] == "proactive_verdict_detail"]
+    events = _ring_events(lm, "proactive_verdict_detail")
     assert len(events) == 1
-    _, fields = events[0]
+    fields = events[0]
     assert fields["correlation_id"] == "p-detail"
     assert fields["verdict"] == "fulfill"
     assert fields["assistant_response"] == "Саш, привет, скучаю!"
     assert fields["extra_fields"]["reasoning"] == "because X"
     assert fields["extra_fields"]["model"] == "claude"
+    assert fields["trace_id"] == _ORIGIN_TRACE_ID  # under the launch's trace
 
 
-def test_post_llm_does_not_emit_verdict_detail_when_effective_level_is_info(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "info-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-info", logger=logger)
-
-    make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет, скучаю!",
-        reasoning="because X",
-    )
-
-    assert base.debug_calls == []  # gated — DEBUG never reaches the base logger/sink
-
-
-def test_post_llm_does_not_emit_verdict_detail_for_uncorrelated_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-uncorrelated", logger=logger)
+def test_post_llm_does_not_emit_verdict_detail_for_uncorrelated_turn(tmp_path: Path) -> None:
+    lm = _lm_with_pending(tmp_path, corr="p-uncorrelated")
 
     make_post_llm_observer(lm)(
         user_message="just a normal user message",  # not our impulse -> gate short-circuits
@@ -242,19 +228,14 @@ def test_post_llm_does_not_emit_verdict_detail_for_uncorrelated_turn(
         reasoning="because X",
     )
 
-    assert base.debug_calls == []
-    assert [c for c in base.info_calls if c[0] == "proactive_outcome"] == []
+    assert _ring_events(lm, "proactive_verdict_detail") == []
+    assert _ring_events(lm, "proactive_outcome") == []
 
 
-def test_post_llm_verdict_detail_does_not_change_signal_or_outcome_log(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Regression: adding the DEBUG discovery log must not disturb the existing
-    # verdict signal publish or the INFO proactive_outcome log.
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-regress", logger=logger)
+def test_post_llm_verdict_detail_does_not_change_signal_or_outcome(tmp_path: Path) -> None:
+    # Regression: the discovery detail must not disturb the verdict signal publish
+    # or the proactive_outcome record.
+    lm = _lm_with_pending(tmp_path, corr="p-regress")
 
     make_post_llm_observer(lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
@@ -267,23 +248,17 @@ def test_post_llm_verdict_detail_does_not_change_signal_or_outcome_log(
     assert read_verdict(verdicts[0]) is Verdict.FULFILL
     assert read_verdict_correlation(verdicts[0]) == "p-regress"
 
-    outcomes = [c for c in base.info_calls if c[0] == "proactive_outcome"]
+    outcomes = _ring_events(lm, "proactive_outcome")
     assert len(outcomes) == 1
-    _, fields = outcomes[0]
-    assert fields["outcome"] == "delivered"
-    assert fields["correlation_id"] == "p-regress"
+    assert outcomes[0]["outcome"] == "delivered"
+    assert outcomes[0]["correlation_id"] == "p-regress"
 
 
-# --- proactive_reasoning — DEBUG discovery log (bead lm-otq step 2) --------
+# --- proactive_reasoning — durable under the origin trace (bead lm-otq step 2) --
 
 
-def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-reason", logger=logger)
+def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(tmp_path: Path) -> None:
+    lm = _lm_with_pending(tmp_path, corr="p-reason")
 
     # Longer than the old 800-char truncation cap, but within the new 4000-char
     # generous cap — proves this event is untruncated relative to the old one.
@@ -311,11 +286,12 @@ def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(
         conversation_history=history,
     )
 
-    events = [c for c in base.debug_calls if c[0] == "proactive_reasoning"]
+    events = _ring_events(lm, "proactive_reasoning")
     assert len(events) == 1
-    _, fields = events[0]
+    fields = events[0]
     assert fields["correlation_id"] == "p-reason"
     assert fields["message_count"] == 3
+    assert fields["trace_id"] == _ORIGIN_TRACE_ID  # under the launch's trace
     messages = fields["messages"]
     assert len(messages) == 3
 
@@ -332,13 +308,8 @@ def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(
     assert tool_msg["reasoning"] == "first pass reasoning"
 
 
-def test_post_llm_proactive_reasoning_unavailable_when_history_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-nohistory", logger=logger)
+def test_post_llm_proactive_reasoning_unavailable_when_history_missing(tmp_path: Path) -> None:
+    lm = _lm_with_pending(tmp_path, corr="p-nohistory")
 
     # No conversation_history kwarg at all — must not raise.
     make_post_llm_observer(lm)(
@@ -346,19 +317,13 @@ def test_post_llm_proactive_reasoning_unavailable_when_history_missing(
         assistant_response="Саш, привет!",
     )
 
-    events = [c for c in base.debug_calls if c[0] == "proactive_reasoning"]
+    events = _ring_events(lm, "proactive_reasoning")
     assert len(events) == 1
-    _, fields = events[0]
-    assert fields["available"] is False
+    assert events[0]["available"] is False
 
 
-def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-badtype", logger=logger)
+def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(tmp_path: Path) -> None:
+    lm = _lm_with_pending(tmp_path, corr="p-badtype")
 
     make_post_llm_observer(lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
@@ -366,36 +331,13 @@ def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(
         conversation_history="not-a-list",
     )
 
-    events = [c for c in base.debug_calls if c[0] == "proactive_reasoning"]
+    events = _ring_events(lm, "proactive_reasoning")
     assert len(events) == 1
-    _, fields = events[0]
-    assert fields["available"] is False
+    assert events[0]["available"] is False
 
 
-def test_post_llm_does_not_emit_proactive_reasoning_when_effective_level_is_info(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "info-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-info2", logger=logger)
-
-    make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет!",
-        conversation_history=[{"role": "assistant", "reasoning": "should not log"}],
-    )
-
-    assert base.debug_calls == []  # gated — DEBUG never reaches the base logger/sink
-
-
-def test_post_llm_does_not_emit_proactive_reasoning_for_uncorrelated_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-uncorrelated2", logger=logger)
+def test_post_llm_does_not_emit_proactive_reasoning_for_uncorrelated_turn(tmp_path: Path) -> None:
+    lm = _lm_with_pending(tmp_path, corr="p-uncorrelated2")
 
     make_post_llm_observer(lm)(
         user_message="just a normal user message",  # not our impulse -> gate short-circuits
@@ -403,35 +345,7 @@ def test_post_llm_does_not_emit_proactive_reasoning_for_uncorrelated_turn(
         conversation_history=[{"role": "assistant", "reasoning": "irrelevant"}],
     )
 
-    assert [c for c in base.debug_calls if c[0] == "proactive_reasoning"] == []
-
-
-def test_post_llm_proactive_reasoning_does_not_change_signal_or_outcome_log(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Regression: adding proactive_reasoning must not disturb the existing
-    # verdict signal publish or the INFO proactive_outcome log.
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
-    lm = _lm_with_pending(tmp_path, corr="p-regress2", logger=logger)
-
-    make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} внутри тяга...",
-        assistant_response="Саш, привет, скучаю!",
-        conversation_history=[{"role": "assistant", "reasoning": "because X"}],
-    )
-
-    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
-    assert len(verdicts) == 1
-    assert read_verdict(verdicts[0]) is Verdict.FULFILL
-    assert read_verdict_correlation(verdicts[0]) == "p-regress2"
-
-    outcomes = [c for c in base.info_calls if c[0] == "proactive_outcome"]
-    assert len(outcomes) == 1
-    _, fields = outcomes[0]
-    assert fields["outcome"] == "delivered"
-    assert fields["correlation_id"] == "p-regress2"
+    assert _ring_events(lm, "proactive_reasoning") == []
 
 
 # --- make_inbound_observer — signal publishing (spec §7.1) ------------------

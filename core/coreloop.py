@@ -224,6 +224,12 @@ class CoreLoop:
                 objects=objects,
                 trace=child_ctx,
                 logger=logger,
+                # The async-bridge emit trio (spec §4.4): a component can weave an
+                # out-of-band span onto a FOREIGN origin trace (aggregation resolving
+                # a proactive attempt under its launch trace) through the SAME sinks.
+                tracer=self._tracer,
+                trace_writer=self._writer,
+                event_ring=self._ring,
             )
             try:
                 produced = component.step(ctx)
