@@ -14,12 +14,13 @@ source of truth is the structural logs / event sink, §5.6) can always answer
 "why did the being stay silent?".
 
 A span here is the LOGICAL correlation unit materialised as a structured event:
-it joins the span tree through the deciding component's already-bound child
-:class:`~lifemodel.ports.tracer.TraceContext`, and it is *self-contained* — the
-minimum attributes are explicit event fields, so the reason + correlation ids
-reach the sink even where structlog's contextvar decoration is unavailable (the
-degraded Hermes-host fallback). Best-effort OTel export of child/suppression
-spans is a separate, later concern (the current exporter ships only the root).
+it joins the span tree through the deciding component's already-bound
+:class:`~lifemodel.log.SpanBoundLogger` (over that component's child
+:class:`~lifemodel.ports.tracer.ActiveSpan`), and it is *self-explaining* — the
+``reason`` + decision values land on the span's attribute bag and the emitting
+logger self-stamps the correlation ids onto the durable record. Best-effort OTel
+export of child/suppression spans is a separate, later concern (the current
+exporter ships only the root).
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ from __future__ import annotations
 import enum
 from typing import Any
 
-from ..log import EventLogger
-from ..ports.tracer import TraceContext
+from ..log import SpanBoundLogger
+from ..ports.tracer import SpanStatus
 
 #: The canonical structured-event name for a suppression span (HLA §13 vocab),
 #: shared by emitters and the debug reader so a silent decision is queryable.
@@ -87,35 +88,33 @@ SUPPRESSION_MIN_FIELDS: frozenset[str] = frozenset(
 
 
 def emit_suppression_span(
+    logger: SpanBoundLogger,
     *,
-    logger: EventLogger,
     reason: SuppressionReason,
     component: str,
-    span: TraceContext,
-    tick: int,
+    status: SpanStatus = "suppressed",
     **extra: Any,
 ) -> None:
     """Emit a first-class suppression span — a "why NOT" decision becomes a record.
 
-    Call this from inside the deciding component (it is already running in its
-    child *span*, so the emitted event joins the span tree). The minimum contract
-    attributes are passed as EXPLICIT fields (not left to contextvar decoration),
-    so the event sink / ``/lifemodel debug`` sees ``reason`` + the W3C correlation
-    ids regardless of the logging backend. *extra* attrs may enrich a specific
-    gate's span (e.g. a threshold value, a rate-limit window) — they must not
-    shadow the minimum names.
+    Call this from inside the deciding component (its *logger* is already bound to
+    that component's child :class:`~lifemodel.ports.tracer.ActiveSpan`, so the
+    emitted event joins the span tree). It does three things, making the span
+    *self-explaining* rather than a bare event:
 
-    Structural note: *span* is a :class:`~lifemodel.ports.tracer.TraceContext`
-    (never ``None``) — a suppression span without an active span is impossible by
-    signature, matching the §5 invariant that a log/decision without a span cannot
-    exist.
+    1. drops ``reason`` + any *extra* decision values onto ``logger.span`` (the
+       ``trace_spans.attrs_json`` bag — spec §4.1);
+    2. closes the span with *status* (``"suppressed"`` for a gate that held fire,
+       ``"failed"`` for a component fault the CoreLoop converts here);
+    3. emits the canonical ``suppression`` event through *logger*, which self-stamps
+       the span's ``trace_id``/``span_id``/``tick`` — so the durable record carries
+       the whole :data:`SUPPRESSION_MIN_FIELDS` contract without the caller passing
+       correlation ids by hand.
+
+    Structural note: *logger* is a :class:`~lifemodel.log.SpanBoundLogger` — a
+    suppression without an active span is impossible by signature, matching the §5
+    invariant that a log/decision without a span cannot exist.
     """
-    logger.info(
-        EVENT_SUPPRESSION,
-        reason=reason.value,
-        component=component,
-        trace_id=span.trace_id,
-        span_id=span.span_id,
-        tick=tick,
-        **extra,
-    )
+    logger.span.set(reason=reason.value, **extra)
+    logger.span.end(status=status)
+    logger.info(EVENT_SUPPRESSION, reason=reason.value, component=component, **extra)

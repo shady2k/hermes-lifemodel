@@ -31,6 +31,7 @@ from ..core.desire_view import read_live_contact_desire
 from ..core.proactive import proactive_tick
 from ..core.taxonomy import exchange_signal, verdict_signal
 from ..domain.egress import ReachOutcome, Verdict
+from ..events import EventRing
 from ..ports.memory import MemoryPort
 from ..sim.quality import Actor, Label
 from ..state.model import State
@@ -115,6 +116,7 @@ class IntegrationHarness:
     base_dir: Path
     clock: FakeClock = field(default_factory=lambda: FakeClock(datetime(2026, 1, 1, tzinfo=UTC)))
     logger: RecordingLogger = field(default_factory=RecordingLogger)
+    event_ring: EventRing = field(default_factory=EventRing)
     egress: RecordingEgress = field(default_factory=RecordingEgress)
     target: dict[str, str | None] = field(
         default_factory=lambda: {"platform": "test", "chat_id": "1", "thread_id": None}
@@ -123,7 +125,12 @@ class IntegrationHarness:
     records: list[TickRecord] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self._lm = build_lifemodel(base_dir=self.base_dir, clock=self.clock, logger=self.logger)
+        self._lm = build_lifemodel(
+            base_dir=self.base_dir,
+            clock=self.clock,
+            logger=self.logger,
+            event_ring=self.event_ring,
+        )
         # Seed the start state (loaded lazily by the StateActor on the first tick).
         # The default is a rested start with last_tick_at set, so the FIRST clock
         # advance yields a real Δt (else minutes_between(None, now) = 0 and the drive
@@ -178,14 +185,18 @@ class IntegrationHarness:
                         correlation_id=pending,
                     )
                 )
-        log_before = len(self.logger.info_calls)
+        ring_before = len(self.event_ring.read())
         egress_before = len(self.egress.calls)
         # The real delivery path: pipeline → backstop → recording egress.
         outcome = proactive_tick(self._lm, self.egress, self.target, logger=self.logger)
-        new_info = self.logger.info_calls[log_before:]
+        # Suppression spans route through the SpanLogger onto the freshness ring
+        # (spec §4.2/§5), not the ad-hoc logger — read this step's slice back.
+        new_ring = self.event_ring.read()[ring_before:]
         new_egress = self.egress.calls[egress_before:]
         suppressions = tuple(
-            fld["reason"] for ev, fld in new_info if ev == "suppression" and "reason" in fld
+            rec["reason"]
+            for rec in new_ring
+            if rec.get("event") == "suppression" and "reason" in rec
         )
         desire = read_live_contact_desire(self._memory())
         final = self._lm.state.load()

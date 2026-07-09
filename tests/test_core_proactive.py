@@ -26,7 +26,7 @@ from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
-from lifemodel.events import EventSink
+from lifemodel.events import EventRing, EventSink
 from lifemodel.log import EventTee, get_logger
 from lifemodel.state.model import State
 
@@ -75,13 +75,28 @@ class FixedClock:
         return self._m
 
 
-def _lm(tmp_path, state: State, now: datetime, *, desire: DesireState | None = DesireState.ACTIVE):
-    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(now))
+def _lm(
+    tmp_path,
+    state: State,
+    now: datetime,
+    *,
+    desire: DesireState | None = DesireState.ACTIVE,
+    event_ring: EventRing | None = None,
+):
+    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(now), event_ring=event_ring)
     lm.state.commit(state)
     if desire is not None:
         # the contact desire is a typed row now (lm-27n.3), not a State flag
         lm.state.put(encode_contact_desire(build_contact_desire(state=desire, salience=state.u)))
     return lm
+
+
+def _supp_reasons(ring: EventRing) -> list[str]:
+    """The suppression reason codes recorded on the graph's freshness ring (spec §5).
+
+    Suppression spans route through the SpanLogger onto the durable writer + ring,
+    NOT the caller's ad-hoc logger — so a test reads them back here."""
+    return [r["reason"] for r in ring.read() if r.get("event") == "suppression"]
 
 
 def _active(**over) -> State:
@@ -115,10 +130,10 @@ def test_no_active_desire_does_not_reach_out(tmp_path) -> None:
 
 
 def test_backstop_block_defers_and_refunds(tmp_path) -> None:
-    logger = _RecordingLogger()
-    lm = _lm(tmp_path, _active(proactive_send_log=CAP_LOG), NOW)
+    ring = EventRing()
+    lm = _lm(tmp_path, _active(proactive_send_log=CAP_LOG), NOW, event_ring=ring)
     egress = FakeEgress()
-    out = proactive_tick(lm, egress, TARGET, logger=logger)
+    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
     final = lm.state.load()
     desire = read_live_contact_desire(lm.state)
     assert out is None  # T5: a backstop-held launch returns None, not a 'busy' outcome
@@ -126,24 +141,22 @@ def test_backstop_block_defers_and_refunds(tmp_path) -> None:
     assert desire is not None and desire.state == "deferred"  # held, not sent
     assert final.energy >= 0.99  # reservation refunded
     # the hold is a logged suppression span (backstop_rate_limited), not a silent busy
-    suppressions = [f for event, f in logger.info_calls if event == "suppression"]
-    assert suppressions and suppressions[-1]["reason"] == "backstop_rate_limited"
+    assert _supp_reasons(ring)[-1] == "backstop_rate_limited"
 
 
 def test_no_launch_returns_none_and_logs_a_suppression_reason(tmp_path) -> None:
     # T5 acceptance: a quiet tick (no launch) returns None — NOT a false 'busy'
     # egress outcome — and its reason is a logged suppression span. Here the drive
-    # sits below threshold, so aggregation (running in-tick with the graph's logger)
-    # emits a below_threshold suppression; proactive_tick then returns None.
-    logger = _RecordingLogger()
-    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), logger=logger)
+    # sits below threshold, so aggregation (running in-tick under its span-bound
+    # logger) emits a below_threshold suppression; proactive_tick then returns None.
+    ring = EventRing()
+    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), event_ring=ring)
     lm.state.commit(State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
     egress = FakeEgress()
-    out = proactive_tick(lm, egress, TARGET, logger=logger)
+    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
     assert out is None  # quiet — no egress outcome
     assert egress.calls == []
-    suppressions = [f for event, f in logger.info_calls if event == "suppression"]
-    assert suppressions and suppressions[-1]["reason"] == "below_threshold"
+    assert _supp_reasons(ring)[-1] == "below_threshold"
 
 
 def test_failed_delivery_rolls_pending_active_and_refunds(tmp_path) -> None:
@@ -154,6 +167,21 @@ def test_failed_delivery_rolls_pending_active_and_refunds(tmp_path) -> None:
     assert final.pending_proactive_id is None  # rolled back
     assert desire is not None and desire.state == "active"  # kept to retry
     assert final.energy >= 0.99  # refunded — no turn ran
+
+
+def test_egress_unavailable_emits_egress_unavailable_suppression(tmp_path) -> None:
+    # A non-DELIVERED egress outcome is a first-class suppression span naming the gate.
+    ring = EventRing()
+    lm = _lm(tmp_path, _active(), NOW, event_ring=ring)
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t"))
+    assert _supp_reasons(ring)[-1] == "egress_unavailable"
+
+
+def test_egress_failed_emits_egress_failed_suppression(tmp_path) -> None:
+    ring = EventRing()
+    lm = _lm(tmp_path, _active(), NOW, event_ring=ring)
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.FAILED), TARGET, logger=get_logger("t"))
+    assert _supp_reasons(ring)[-1] == "egress_failed"
 
 
 def test_delivered_launch_keeps_the_cost(tmp_path) -> None:

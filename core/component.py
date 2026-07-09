@@ -15,7 +15,7 @@ from typing import Protocol, runtime_checkable
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
-from ..log import EventLogger
+from ..log import SpanBoundLogger
 from ..ports.tracer import TraceContext
 from ..state.model import State
 from .intents import Intent
@@ -30,30 +30,32 @@ class TickContext:
     once, before any component runs, so every component this tick sees the same
     consistent view (HLA §4.1). Both default to empty so the many existing
     construction sites keep compiling; no component reads them yet (lm-27n.2
-    installs the snapshot; aggregation consumes it in .3). Deliberately
-    extensible: the ``trace`` field (lm-27n.11) slots in additively here.
+    installs the snapshot; aggregation consumes it in .3).
     """
 
     state: State
     now: datetime
     bus: SignalBus
+    #: THE component's active execution span's W3C ids (spec §5) — set by the
+    #: CoreLoop to the CHILD span it minted for this component (parented on the
+    #: tick's root), so a creation site stamps the born object's provenance with
+    #: it. NON-OPTIONAL: tracing is mandatory (§4.1) — a tick without a span is
+    #: structurally impossible, so every construction site MUST supply one (a bare
+    #: unit test mints a ``FakeTracer().start_root()``). The mutable
+    #: :class:`~lifemodel.ports.tracer.ActiveSpan` a component drops decision
+    #: values onto is reached via :attr:`logger` (``ctx.logger.span``).
+    trace: TraceContext
     signals: tuple[Signal, ...] = ()
     #: The being's live contact-pressure summary as of ``now`` (start of tick).
     pressure: PressureIndex = PressureIndex()
     #: A bounded snapshot of the being's ``state="active"`` memory records.
     objects: tuple[MemoryRecord, ...] = ()
-    #: THE component's active execution span (spec §5) — set by the CoreLoop to the
-    #: CHILD span it minted for this component (parented on the tick's root), so a
-    #: creation site stamps the born object's provenance with it and the component's
-    #: own logs bind to it. Tracing is mandatory in the live tick (the tracer is a
-    #: required CoreLoop dependency), so the CoreLoop always supplies a span; the
-    #: ``None`` default is only for direct unit-test construction of a ``TickContext``.
-    trace: TraceContext | None = None
-    #: The graph's shared :class:`EventLogger`, set by the CoreLoop so a component
-    #: can emit observability (e.g. a suppression span, spec §5) through the SAME
-    #: collaborator the rest of the graph uses. ``None`` in a bare unit-test
-    #: ``TickContext`` (no graph) — observability emission is then skipped.
-    logger: EventLogger | None = None
+    #: THE component's span-bound logger (spec §4.1), set by the CoreLoop to a
+    #: :class:`~lifemodel.log.SpanLogger` over this component's child span. A
+    #: component logs through it (self-stamping trace/span/tick) and drops decision
+    #: values onto ``logger.span`` so the span is self-explaining. ``None`` in a
+    #: bare unit-test ``TickContext`` (no graph) — observability emission is skipped.
+    logger: SpanBoundLogger | None = None
 
 
 @runtime_checkable

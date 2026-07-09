@@ -12,9 +12,14 @@ from lifemodel.core.taxonomy import (
     contact_pressure_value,
 )
 from lifemodel.domain.signal import Signal
+from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
 
 ALPHA = 1.0 / 240.0
+
+# ctx.trace is non-optional (spec §4.1); this drive writes no objects, so a literal
+# span's ids suffice for the unit fixture.
+_TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 
 def _drive() -> SolitudeDrive:
@@ -22,7 +27,9 @@ def _drive() -> SolitudeDrive:
 
 
 def _ctx(state: State, now: datetime, signals=(), *, tmp_path) -> TickContext:
-    return TickContext(state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals))
+    return TickContext(
+        state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals), trace=_TRACE
+    )
 
 
 def _presence(dt: float, qualities: tuple[float, ...], *, origin_id: str = "p") -> Signal:

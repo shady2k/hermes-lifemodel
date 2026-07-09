@@ -120,19 +120,6 @@ def test_fake_tracer_child_keeps_trace_consumes_span() -> None:
     assert child.span_id == "0" * 15 + "2"  # next span in the sequence
 
 
-def test_creation_provenance_none_trace_omits_trace_fields() -> None:
-    # Untraced (no tracer): the object still carries lineage, but NO W3C trace fields,
-    # so ids/timing stay behaviour-identical to before .11.
-    prov = creation_provenance(None, created_by="c", component="aggregation", reason="birth")
-    assert prov.created_by == "c"
-    assert prov.component == "aggregation"
-    assert prov.reason == "birth"
-    assert prov.trace_id is None
-    assert prov.creation_span_id is None
-    assert prov.parent_span_id is None
-    assert prov.trace_flags is None
-
-
 def test_creation_provenance_stamps_the_tick_trace() -> None:
     trace = FakeTracer().start_root(upstream_traceparent=UPSTREAM_TRACEPARENT)
     prov = creation_provenance(

@@ -23,13 +23,15 @@ from datetime import datetime
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
-from ..log import EventLogger, bound_log_context
+from ..events import EventRing
+from ..log import SpanLogger
 from ..ports.clock import ClockPort
 from ..ports.memory import MemoryPort
 from ..ports.pressure import PressureSensorPort
 from ..ports.trace_export import TraceExportPort
-from ..ports.tracer import TraceContext, TracerPort
+from ..ports.tracer import ActiveSpan, TraceContext, TracerPort, start_span
 from ..state.model import State
+from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .component import TickContext
 from .intake import IntakeLimits, apply_intake
 from .intents import (
@@ -43,6 +45,7 @@ from .intents import (
 from .registry import ComponentRegistry
 from .signal_bus import SignalBus
 from .state_actor import StateActor
+from .suppression import SuppressionReason, emit_suppression_span
 from .taxonomy import lane_of
 
 #: How many records the start-of-tick snapshot pulls *per live state*. A per-tick
@@ -56,24 +59,6 @@ OBJECTS_SNAPSHOT_LIMIT = 256
 #: (``{active, deferred, pending, parked}``) so parked thoughts and pending
 #: intentions — both non-terminal, previously invisible — appear in the snapshot.
 _DEFAULT_LIVE_STATES: frozenset[str] = frozenset({"active", "deferred"})
-
-
-def _span_log_fields(span: TraceContext, tick: int) -> dict[str, object]:
-    """The fields bound onto every log line for one span (spec §5).
-
-    The active span's W3C correlation ids + the tick number. Every log line this
-    tick is bound to a span — the tick's root span for tick-level bookkeeping, and
-    each component's child span for that component's events — so logs JOIN durable
-    provenance on ``trace_id`` and "which component did what / why silent" is
-    answered from the span tree. There is no untraced branch: the tracer is a
-    required dependency, so a log without an active span is structurally impossible.
-    """
-    return {
-        "trace_id": span.trace_id,
-        "span_id": span.span_id,
-        "parent_span_id": span.parent_span_id,
-        "tick": tick,
-    }
 
 
 @dataclass(frozen=True)
@@ -96,7 +81,8 @@ class CoreLoop:
         state_actor: StateActor,
         bus: SignalBus,
         clock: ClockPort,
-        logger: EventLogger | None = None,
+        trace_writer: TraceSink | None = None,
+        event_ring: EventRing | None = None,
         breaker_threshold: int = 3,
         intake_limits: IntakeLimits | None = None,
         pressure_sensor: PressureSensorPort | None = None,
@@ -109,7 +95,13 @@ class CoreLoop:
         self._state_actor = state_actor
         self._bus = bus
         self._clock = clock
-        self._log = logger
+        # The tick's durable + freshness sinks (spec §4.2): every component gets a
+        # SpanLogger over these, so all tick-path logging is span-bound. Off the
+        # live being (a bare test / CLI tick with no BeingAdapter to acquire the
+        # writer) both default to a no-op durable sink + a throwaway ring — the
+        # pipeline stays uniform, it just persists nothing.
+        self._writer: TraceSink = trace_writer if trace_writer is not None else NULL_TRACE_SINK
+        self._ring: EventRing = event_ring if event_ring is not None else EventRing()
         self._tracer = tracer
         self._trace_exporter = trace_exporter
         self._breaker_threshold = breaker_threshold
@@ -120,6 +112,29 @@ class CoreLoop:
         self._failures: dict[str, int] = {}
         self._broken: set[str] = set()
 
+    def _span_logger(self, span: ActiveSpan) -> SpanLogger:
+        """A :class:`SpanLogger` bound to *span* over this loop's writer + ring."""
+        return SpanLogger(span, writer=self._writer, ring=self._ring)
+
+    def _persist_span(self, span: ActiveSpan, *, ended_at: str) -> None:
+        """Upsert one finished span row (spec §4.3) — the durable span tree.
+
+        Fail-open through the writer (a full queue drops it); the attrs bag carries
+        the decision values components stamped, so the span is self-explaining.
+        """
+        ctx = span.context
+        self._writer.submit_span(
+            trace_id=ctx.trace_id,
+            span_id=ctx.span_id,
+            parent_span_id=ctx.parent_span_id,
+            component=span.component,
+            tick=span.tick,
+            started_at=span.started_at,
+            ended_at=ended_at,
+            status=span.status,
+            attrs=dict(span.attrs) or None,
+        )
+
     def tick(self) -> TickReport:
         now = self._clock.now()
         state = self._state_actor.state
@@ -127,21 +142,21 @@ class CoreLoop:
         # Tracing is MANDATORY (spec §5): the tracer is a required dependency, so
         # every tick has a root span and a log without an active span is structurally
         # impossible — there is no untraced branch. Components run in CHILD spans of
-        # this root (minted per component in ``_run_tick``) and read theirs via
-        # ``ctx.trace``, never the tracer itself (the tracer is an injected
-        # capability; the active span is per-tick state, not ambient).
+        # this root (minted per component in ``_run_tick``); each gets a SpanLogger
+        # bound to its span that SELF-stamps trace/span/tick (no ambient contextvar
+        # bind to leak across ticks).
         root = self._tracer.start_root()
         tick_no = state.tick_count + 1
-        # Bind the root span onto every tick-level log line this tick, reset at tick
-        # end (no stale bind leaks across ticks). Per-component logs rebind to their
-        # own child span inside ``_run_tick``. Wrapped in log.py so the CoreLoop never
-        # imports structlog directly.
-        with bound_log_context(**_span_log_fields(root, tick_no)):
-            return self._run_tick(now=now, state=state, root=root, tick_no=tick_no)
+        return self._run_tick(now=now, state=state, root=root, tick_no=tick_no)
 
     def _run_tick(
         self, *, now: datetime, state: State, root: TraceContext, tick_no: int
     ) -> TickReport:
+        started = now.isoformat()
+        # The tick's ROOT span + its logger: tick-level bookkeeping (snapshot/intake
+        # failures, trace export) binds here; each component rebinds to its own child.
+        root_span = start_span(root, tick=tick_no, started_at=started)
+        root_logger = self._span_logger(root_span)
         # Start-of-tick snapshot: read once, before any component runs, so every
         # component this tick sees one consistent view (HLA §4.1). Pure reads —
         # they never change tick output; no component consumes them yet (.3).
@@ -169,15 +184,12 @@ class CoreLoop:
                     found.extend(self._memory.find(state=live_state, limit=OBJECTS_SNAPSHOT_LIMIT))
                 objects = tuple(found)
             except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
-                if self._log is not None:
-                    self._log.info("objects_snapshot_failed", error=repr(exc))
+                root_logger.info("objects_snapshot_failed", error=repr(exc))
         intake = apply_intake(
             self._bus.consume_unprocessed(), limits=self._intake_limits, lane_of=lane_of
         )
-        if self._log is not None and (
-            intake.shed_control or intake.shed_sensor or intake.coalesced_sensor
-        ):
-            self._log.info(
+        if intake.shed_control or intake.shed_sensor or intake.coalesced_sensor:
+            root_logger.info(
                 "signals_shed",
                 shed_control=intake.shed_control,
                 shed_sensor=intake.shed_sensor,
@@ -195,11 +207,14 @@ class CoreLoop:
                 continue
             # Each component runs in its OWN child span of the tick root (spec §4.2):
             # the span tree makes "which component did what / why did it stay silent"
-            # observable. ``ctx.trace`` carries THIS span, so a creation site stamps the
-            # component's span (not the root), and the component's own logs — plus a
-            # component-failure record — bind to it. Rebinding nests correctly: the
-            # root bind is restored on exit, so later components see the root again.
-            span = self._tracer.child_of(root)
+            # observable. ``ctx.trace`` carries the child's W3C ids (so a creation site
+            # stamps the component's span, not the root); ``ctx.logger`` is a SpanLogger
+            # bound to that span, self-stamping the component's logs — plus its decision
+            # attrs and a failure record — onto it. Every span is persisted after the
+            # step (ok / suppressed / failed) so the durable span tree is complete.
+            child_ctx = self._tracer.child_of(root)
+            span = start_span(child_ctx, component=component.id, tick=tick_no, started_at=started)
+            logger = self._span_logger(span)
             ctx = TickContext(
                 state=state,
                 now=now,
@@ -207,27 +222,28 @@ class CoreLoop:
                 signals=tuple(available),
                 pressure=pressure,
                 objects=objects,
-                trace=span,
-                logger=self._log,
+                trace=child_ctx,
+                logger=logger,
             )
-            with bound_log_context(**_span_log_fields(span, tick_no)):
-                try:
-                    produced = component.step(ctx)
-                except Exception as exc:  # isolation: the heart never dies
-                    self._record_failure(component.id, exc)
-                    failed.append(component.id)
-                    continue
-                self._failures[component.id] = 0
-                for intent in produced:
-                    if isinstance(intent, EmitSignal):
-                        available.append(
-                            intent.signal
-                        )  # transient — visible to later components this tick
-                    elif isinstance(intent, LaunchProactive):
-                        launches.append(intent)
-                    else:
-                        intents.append(intent)
-                ran.append(component.id)
+            try:
+                produced = component.step(ctx)
+            except Exception as exc:  # isolation: the heart never dies
+                self._record_failure(component.id, exc, logger)
+                self._persist_span(span, ended_at=started)
+                failed.append(component.id)
+                continue
+            self._failures[component.id] = 0
+            for intent in produced:
+                if isinstance(intent, EmitSignal):
+                    available.append(
+                        intent.signal
+                    )  # transient — visible to later components this tick
+                elif isinstance(intent, LaunchProactive):
+                    launches.append(intent)
+                else:
+                    intents.append(intent)
+            ran.append(component.id)
+            self._persist_span(span, ended_at=started)
 
         intents.append(
             UpdateState({"tick_count": state.tick_count + 1, "last_tick_at": now.isoformat()})
@@ -252,26 +268,33 @@ class CoreLoop:
         # (fail-soft, like the snapshot read). Noop default → behaviour-neutral. The
         # root span is always present (tracing is mandatory), so the exporter always
         # has a root span to ship.
-        self._export_tick(report, root)
+        self._export_tick(report, root, root_logger)
+        # Persist the root span row LAST — the tick tree's parent (spec §4.3).
+        self._persist_span(root_span, ended_at=started)
         return report
 
-    def _export_tick(self, report: TickReport, trace: TraceContext | None) -> None:
+    def _export_tick(self, report: TickReport, trace: TraceContext, logger: SpanLogger) -> None:
         if self._trace_exporter is None:
             return
         try:
             self._trace_exporter.export_tick(report, trace)
         except Exception as exc:  # noqa: BLE001 - best-effort; never break the tick
-            if self._log is not None:
-                self._log.info("trace_export_failed", error=repr(exc))
+            logger.info("trace_export_failed", error=repr(exc))
 
-    def _record_failure(self, component_id: str, exc: Exception) -> None:
+    def _record_failure(self, component_id: str, exc: Exception, logger: SpanLogger) -> None:
         count = self._failures.get(component_id, 0) + 1
         self._failures[component_id] = count
-        if self._log is not None:
-            self._log.info(
-                "component_failed", component=component_id, error=repr(exc), consecutive=count
-            )
+        # A component fault suppresses the tick's outcome — record it as a proper
+        # suppression span (spec §5): reason COMPONENT_FAILED, the span closed
+        # ``failed`` with the error + consecutive count on its attrs bag.
+        emit_suppression_span(
+            logger,
+            reason=SuppressionReason.COMPONENT_FAILED,
+            component=component_id,
+            status="failed",
+            error=repr(exc),
+            consecutive=count,
+        )
         if count >= self._breaker_threshold and component_id not in self._broken:
             self._broken.add(component_id)
-            if self._log is not None:
-                self._log.info("circuit_breaker_open", component=component_id, after=count)
+            logger.warning("circuit_breaker_open", component=component_id, after=count)

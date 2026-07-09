@@ -28,15 +28,23 @@ from lifemodel.core.taxonomy import (
 )
 from lifemodel.domain.egress import Verdict
 from lifemodel.domain.objects import DesireSpring
+from lifemodel.ports.tracer import TraceContext
 from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
 from lifemodel.testing import (
+    FakeActiveSpan,
+    FakeSpanLogger,
+    FakeTracer,
     contact_desire_objects,
     contact_desire_record,
     contact_intention_record,
 )
 
 PARAMS = GateParams(theta_u=1.0, w=15.0, r0=30.0, k=2.0, r_max=1440.0)
+
+# ctx.trace is non-optional (spec §4.1) — a literal span's ids for the fixtures that
+# do not assert on the born object's trace.
+_TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 # a live active-desire snapshot (what the old ``desire_status="active"`` meant)
 ACTIVE = contact_desire_objects("active")
@@ -56,6 +64,7 @@ def _ctx(state: State, now: datetime, signals=(), *, objects=(), tmp_path) -> Ti
         bus=FileSignalBus(tmp_path),
         signals=tuple(signals),
         objects=tuple(objects),
+        trace=_TRACE,
     )
 
 
@@ -637,19 +646,13 @@ def test_drive_only_urge_springs_a_drive_desire(tmp_path) -> None:
 # ``repeat_pure_longing``.
 
 
-class _RecLogger:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict]] = []  # type: ignore[type-arg]
-
-    def info(self, event, **fields):  # type: ignore[no-untyped-def]
-        self.calls.append((event, dict(fields)))
-
-
 def _run_with_logger(state, now, signals, *, tmp_path):  # type: ignore[no-untyped-def]
-    from lifemodel.testing import FakeTracer
-
-    logger = _RecLogger()
+    # The live tick hands aggregation a span-bound logger over its child span; the
+    # FakeSpanLogger records the emitted events (with the span's ids stamped) so we
+    # can read back the suppression reason (spec §4.1/§5).
     trace = FakeTracer().start_root()
+    span = FakeActiveSpan(trace, component="aggregation", tick=state.tick_count + 1)
+    logger = FakeSpanLogger(span)
     _agg().step(
         TickContext(
             state=state,
@@ -661,13 +664,13 @@ def _run_with_logger(state, now, signals, *, tmp_path):  # type: ignore[no-untyp
             logger=logger,
         )
     )
-    return logger.calls
+    return logger.events
 
 
-def _supp_reason(calls):  # type: ignore[no-untyped-def]
-    for event, fields in calls:
-        if event == "suppression":
-            return fields["reason"]
+def _supp_reason(events):  # type: ignore[no-untyped-def]
+    for record in events:
+        if record["event"] == "suppression":
+            return record["reason"]
     return None
 
 
@@ -778,17 +781,3 @@ def test_born_desire_carries_the_tick_trace(tmp_path) -> None:
     assert prov.trace_id == trace.trace_id  # logs and durable provenance JOIN on this
     assert prov.creation_span_id == trace.span_id
     assert prov.component == "aggregation"
-
-
-def test_untraced_born_desire_has_no_trace_fields(tmp_path) -> None:
-    # No tracer wired -> the desire still carries lineage, but NO trace fields
-    # (ids/timing behaviour-identical to before .11).
-    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
-    c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    draft = _created_desire(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
-    assert draft is not None
-    prov = _decode_desire_provenance(draft)
-    assert prov is not None
-    assert prov.component == "aggregation"
-    assert prov.trace_id is None

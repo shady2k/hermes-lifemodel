@@ -23,7 +23,7 @@ from ..ports.tracer import TraceContext
 
 
 def creation_provenance(
-    trace: TraceContext | None,
+    trace: TraceContext,
     *,
     created_by: str,
     component: str,
@@ -34,23 +34,13 @@ def creation_provenance(
 ) -> Provenance:
     """Build the :class:`Provenance` stamped on a NEW episode's object.
 
-    On the live tick *trace* is always present (spec §5: tracing is mandatory — the
-    tracer is a required CoreLoop dependency, and each component runs in a child span
-    passed in as ``ctx.trace``); the component's span is recorded as the object's
-    creation context (``span_id`` → ``creation_span_id``; never "the object's live
-    span"). The ``None`` branch is retained only as a defensive fallback for direct
-    unit-test construction of a ``TickContext`` without a span — it omits the W3C
-    trace fields while keeping the lineage, so a bare test fixture still builds.
+    *trace* is NON-OPTIONAL (spec §5: tracing is mandatory — the tracer is a
+    required CoreLoop dependency, and each component runs in a child span passed in
+    as the now non-optional ``ctx.trace``); the component's span is recorded as the
+    object's creation context (``span_id`` → ``creation_span_id``; never "the
+    object's live span"). The former ``None`` fallback is retired — an untraced
+    creation is structurally impossible, not papered over here.
     """
-    if trace is None:
-        return Provenance(
-            created_by=created_by,
-            component=component,
-            reason=reason,
-            turn_id=turn_id,
-            source_object_ids=source_object_ids,
-            source_signal_ids=source_signal_ids,
-        )
     return Provenance(
         created_by=created_by,
         component=component,

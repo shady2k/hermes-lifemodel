@@ -492,16 +492,55 @@ class TraceRecorder:
         return []
 
 
-class ContextRecordingLogger:
-    """Snapshots the bound structlog contextvars at each ``.info`` call."""
+class _CapturingSink:
+    """A :class:`~lifemodel.state.trace_store.TraceSink` that records every submit.
+
+    The tick fans SpanLoggers onto this, so a test reads back the durable events
+    (``submit_event``) and span rows (``submit_span``) — the span tree the CoreLoop
+    now persists — without standing up ``observability.sqlite``.
+    """
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict]] = []  # type: ignore[type-arg]
+        self.events: list[dict] = []  # type: ignore[type-arg]
+        self.spans: list[dict] = []  # type: ignore[type-arg]
 
-    def info(self, event, **fields):  # type: ignore[no-untyped-def]
-        import structlog
+    def submit_event(self, *, record_id, trace_id, span_id, tick, event, ts, fields=None):  # type: ignore[no-untyped-def]
+        self.events.append(
+            {
+                "event": event,
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "tick": tick,
+                "fields": dict(fields) if fields else {},
+            }
+        )
+        return True
 
-        self.calls.append((event, dict(structlog.contextvars.get_contextvars())))
+    def submit_span(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        trace_id,
+        span_id,
+        parent_span_id=None,
+        component=None,
+        tick=None,
+        started_at=None,
+        ended_at=None,
+        status=None,
+        attrs=None,
+    ):
+        self.spans.append(
+            {
+                "trace_id": trace_id,
+                "span_id": span_id,
+                "parent_span_id": parent_span_id,
+                "component": component,
+                "tick": tick,
+                "status": status,
+                "attrs": dict(attrs) if attrs else {},
+            }
+        )
+        return True
 
 
 def _clock() -> FixedClock:
@@ -594,60 +633,61 @@ def test_each_tick_gets_a_fresh_trace(tmp_path) -> None:
     assert first != second  # a new execution unit per tick
 
 
-def test_tick_binds_trace_on_logs_and_resets_after(tmp_path) -> None:
-    import structlog
-
-    from lifemodel.testing import FakeTracer
-
+def test_component_failure_is_a_suppression_span_under_the_child_span(tmp_path) -> None:
+    # spec §4.1/§5: a component fault is a first-class SUPPRESSION span (reason
+    # ``component_failed``), self-stamped with the FAILING component's child span
+    # ids (not the tick root) so the span tree records WHICH component faulted. A
+    # log without an active span never appears — the SpanLogger stamps it.
     reg = ComponentRegistry()
     reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
-    logger = ContextRecordingLogger()
+    sink = _CapturingSink()
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
         bus=FileSignalBus(tmp_path),
         clock=_clock(),
-        logger=logger,
+        trace_writer=sink,
         tracer=FakeTracer(),
     )
-    structlog.contextvars.clear_contextvars()  # clean slate
-    loop.tick()  # Broken raises -> "component_failed" is logged WITHIN the bound context
+    loop.tick()  # Broken raises -> component_failed suppression under the child span
 
-    events = {event: ctx for event, ctx in logger.calls}
-    assert "component_failed" in events
-    bound = events["component_failed"]
-    assert bound["trace_id"] == FakeTracer().start_root().trace_id
-    assert bound["tick"] == 1  # the tick number is bound too
-    assert "span_id" in bound
+    mirror = FakeTracer()  # mirror the loop's deterministic id sequence
+    root = mirror.start_root()  # trace#1 / span#1
+    child = mirror.child_of(root)  # span#2 — the component's child
 
-    # After the tick, the contextvars are reset — a log outside carries no trace_id.
-    assert "trace_id" not in structlog.contextvars.get_contextvars()
+    supp = next(e for e in sink.events if e["event"] == "suppression")
+    assert supp["fields"]["reason"] == "component_failed"
+    assert supp["fields"]["component"] == "broken"
+    assert supp["fields"]["consecutive"] == 1
+    assert supp["trace_id"] == root.trace_id
+    assert supp["span_id"] == child.span_id  # bound to the failing child span
+    assert supp["span_id"] != root.span_id  # not the tick root
+    assert supp["tick"] == 1
 
 
-def test_component_failure_log_binds_to_the_component_child_span(tmp_path) -> None:
-    # The "component_failed" log binds to the FAILING component's child span — not the
-    # tick root — so the span tree records WHICH component faulted. The child span_id
-    # is distinct from the root's (FakeTracer: root span#1, component child span#2),
-    # and parented on it. A log without an active span never appears.
-    import structlog
-
+def test_component_failure_span_row_is_failed_and_parented_on_root(tmp_path) -> None:
+    # The persisted span ROW for the fault closes ``failed`` and is parented on the
+    # tick root — the durable span tree makes "which component faulted, under which
+    # tick" answerable from ``trace_spans`` alone.
     reg = ComponentRegistry()
     reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
-    logger = ContextRecordingLogger()
-    loop = CoreLoop(
+    sink = _CapturingSink()
+    CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
         bus=FileSignalBus(tmp_path),
         clock=_clock(),
-        logger=logger,
+        trace_writer=sink,
         tracer=FakeTracer(),
-    )
-    structlog.contextvars.clear_contextvars()  # clean slate
-    loop.tick()  # Broken raises -> "component_failed" logged WITHIN the child-span bind
+    ).tick()
 
-    events = {event: ctx for event, ctx in logger.calls}
-    bound = events["component_failed"]
-    root_span_id = FakeTracer().start_root().span_id  # span#1
-    assert bound["span_id"] != root_span_id  # the component's child span, not the root
-    assert bound["parent_span_id"] == root_span_id  # parented on the tick root
-    assert bound["tick"] == 1
+    mirror = FakeTracer()
+    root = mirror.start_root()  # span#1
+    child = mirror.child_of(root)  # span#2
+
+    child_row = next(s for s in sink.spans if s["span_id"] == child.span_id)
+    assert child_row["status"] == "failed"  # the component raised
+    assert child_row["parent_span_id"] == root.span_id  # parented on the tick root
+    assert child_row["component"] == "broken"
+    assert child_row["attrs"]["reason"] == "component_failed"
+    assert child_row["tick"] == 1

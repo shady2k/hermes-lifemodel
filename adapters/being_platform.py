@@ -32,7 +32,14 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from ..composition import build_lifemodel
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
+from ..events import EventRing
 from ..log import EventLogger, get_logger
+from ..state.trace_store import (
+    TraceWriter,
+    acquire_trace_writer,
+    observability_db_path,
+    release_trace_writer,
+)
 from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
 
@@ -61,6 +68,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         self._loop: SupervisedLoop | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # The durable trace writer (spec §4.2) + in-memory freshness ring, acquired
+        # in :meth:`connect` and threaded into every per-tick graph so the live tick
+        # actually persists ``observability.sqlite``. ``None`` until connected.
+        self._trace_writer: TraceWriter | None = None
+        self._event_ring = EventRing()
 
     def _tick(self) -> None:
         """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
@@ -68,7 +80,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
         # None → server-local, so a timezone quirk never drops a tick (HLA §11).
         lm = build_lifemodel(
-            base_dir=self._base_dir, logger=self._log, display_tz=resolve_owner_tz()
+            base_dir=self._base_dir,
+            logger=self._log,
+            display_tz=resolve_owner_tz(),
+            trace_writer=self._trace_writer,
+            event_ring=self._event_ring,
         )
         proactive_tick(lm, self._egress, self._target, logger=self._log)
 
@@ -94,6 +110,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._shutting_down = False
+        # Acquire the singleton durable trace writer (spec §4.2) so the live tick's
+        # ``observability.sqlite`` is created + flushed. Idempotent + reconnect-safe:
+        # guarded so a reconnect that skipped disconnect never double-refcounts.
+        if self._trace_writer is None:
+            self._trace_writer = acquire_trace_writer(observability_db_path(self._base_dir))
         self._loop = SupervisedLoop(
             tick=self._tick, interval_sec=self._interval, on_death=self._on_loop_death
         )
@@ -111,6 +132,10 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
             self._loop_task = None
+        # Release the trace writer (flush + stop on the last release, §4.2).
+        if self._trace_writer is not None:
+            release_trace_writer(observability_db_path(self._base_dir))
+            self._trace_writer = None
         self._mark_disconnected()  # keep status accurate on a clean stop
         self._log.info("being_disconnected")
 

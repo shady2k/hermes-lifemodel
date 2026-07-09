@@ -12,8 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from lifemodel.adapters.tracer import MutableActiveSpan, start_span
-from lifemodel.ports.tracer import ActiveSpan, TraceContext
+from lifemodel.ports.tracer import ActiveSpan, MutableActiveSpan, TraceContext, start_span
 from lifemodel.testing import FakeActiveSpan
 
 _CTX = TraceContext(trace_id="a" * 32, span_id="b" * 16, parent_span_id="c" * 16)

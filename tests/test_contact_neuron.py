@@ -7,7 +7,11 @@ from lifemodel.core.component import TickContext
 from lifemodel.core.contact_neuron import PresenceNeuron
 from lifemodel.core.intents import EmitSignal, UpdateState
 from lifemodel.core.taxonomy import KIND_CONTACT_PRESENCE, exchange_signal, read_contact_presence
+from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
+
+# ctx.trace is non-optional (spec §4.1); the sensor writes no objects.
+_TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 
 def _sensor() -> PresenceNeuron:
@@ -15,7 +19,9 @@ def _sensor() -> PresenceNeuron:
 
 
 def _ctx(state: State, now: datetime, signals=(), *, tmp_path) -> TickContext:
-    return TickContext(state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals))
+    return TickContext(
+        state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals), trace=_TRACE
+    )
 
 
 def test_emits_contact_presence_reading_with_dt(tmp_path) -> None:

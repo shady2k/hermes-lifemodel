@@ -9,8 +9,11 @@ from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
 from lifemodel.core.wake_packet import RECENT_THOUGHTS_HEADER, build_wake_packet
 from lifemodel.domain.memory import MemoryRecord
 from lifemodel.domain.objects import default_registry
+from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
 from lifemodel.testing import (
+    FakeActiveSpan,
+    FakeSpanLogger,
     FakeTracer,
     contact_desire_objects,
 )
@@ -22,6 +25,9 @@ MSK = timezone(timedelta(hours=3), "MSK")
 
 # a live active-desire snapshot (what the old ``desire_status="active"`` meant)
 ACTIVE = contact_desire_objects("active")
+
+# ctx.trace is non-optional (spec §4.1) — a literal span's ids for behaviour fixtures.
+_TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 
 def _intention_put(intents):
@@ -38,7 +44,12 @@ def _cog(display_tz: tzinfo | None = None) -> CognitionLauncher:
 
 def _ctx(state: State, *, objects=(), tmp_path, now: datetime = NOW) -> TickContext:
     return TickContext(
-        state=state, now=now, bus=FileSignalBus(tmp_path), signals=(), objects=tuple(objects)
+        state=state,
+        now=now,
+        bus=FileSignalBus(tmp_path),
+        signals=(),
+        objects=tuple(objects),
+        trace=_TRACE,
     )
 
 
@@ -323,18 +334,6 @@ def test_new_episode_after_resolution_gets_a_fresh_trace(tmp_path) -> None:
     assert _intention_provenance(put.op.draft).trace_id == trace.trace_id
 
 
-def test_untraced_intention_carries_lineage_without_trace_fields(tmp_path) -> None:
-    # No tracer wired (trace defaults None): the intention still carries lineage, but
-    # NO W3C trace fields — behaviour-neutral for ids/timing.
-    state = State(u=2.0, energy=1.0, fatigue=0.0)
-    put = _intention_put(_cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path)))
-    assert put is not None
-    prov = _intention_provenance(put.op.draft)
-    assert prov is not None
-    assert prov.component == "cognition"
-    assert prov.trace_id is None
-
-
 # --- lm-27n.10: the ONE new causal stamp — the Intention→Desire edge ---
 
 
@@ -409,17 +408,11 @@ def test_intention_retry_preserves_the_source_edge_unchanged(tmp_path) -> None:
 # launcher's gate; aggregation already recorded it) — emit nothing.
 
 
-class _RecLogger:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict]] = []  # type: ignore[type-arg]
-
-    def info(self, event, **fields):  # type: ignore[no-untyped-def]
-        self.calls.append((event, dict(fields)))
-
-
 def _logged_ctx(state: State, *, objects, tmp_path):  # type: ignore[no-untyped-def]
-    logger = _RecLogger()
+    # The live tick hands the launcher a span-bound logger over its child span; the
+    # FakeSpanLogger records the emitted events so the suppression reason reads back.
     trace = FakeTracer().start_root()
+    logger = FakeSpanLogger(FakeActiveSpan(trace, component="cognition", tick=state.tick_count + 1))
     return (
         TickContext(
             state=state,
@@ -435,9 +428,9 @@ def _logged_ctx(state: State, *, objects, tmp_path):  # type: ignore[no-untyped-
 
 
 def _supp_reason(logger):  # type: ignore[no-untyped-def]
-    for event, fields in logger.calls:
-        if event == "suppression":
-            return fields["reason"]
+    for record in logger.events:
+        if record["event"] == "suppression":
+            return record["reason"]
     return None
 
 

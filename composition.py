@@ -70,6 +70,7 @@ from .core.signal_bus import SignalBus
 from .core.solitude_drive import SolitudeDrive
 from .core.state_actor import StateActor
 from .domain.objects import default_registry
+from .events import EventRing
 from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
@@ -81,6 +82,7 @@ from .ports.tracer import TracerPort
 from .sim.wake import GateParams
 from .state.port import StatePort
 from .state.sqlite_store import SQLiteRuntimeStore
+from .state.trace_store import NULL_TRACE_SINK, TraceSink
 
 CONTACT_ALPHA = 1.0 / 240.0
 CONTACT_BETA = 1.0
@@ -130,6 +132,12 @@ class LifeModel:
     #: backstop in :func:`proactive_tick`) can mint a span for a suppression.
     #: Always set by :func:`build_lifemodel`; ``None`` only for a hand-built graph.
     tracer: TracerPort | None = None
+    #: The durable trace sink + in-memory freshness ring (spec §4.2) the CoreLoop
+    #: fans SpanLoggers onto — exposed so an OUT-OF-TICK span (the egress backstop
+    #: suppression in :func:`proactive_tick`) records through the SAME sinks as the
+    #: in-tick pipeline. ``NULL_TRACE_SINK`` / a throwaway ring off the live being.
+    trace_writer: TraceSink = NULL_TRACE_SINK
+    event_ring: EventRing = field(default_factory=EventRing)
 
 
 def build_lifemodel(
@@ -145,6 +153,8 @@ def build_lifemodel(
     registry: ComponentRegistry | None = None,
     tracer: TracerPort | None = None,
     trace_exporter: TraceExportPort | None = None,
+    trace_writer: TraceSink | None = None,
+    event_ring: EventRing | None = None,
     display_tz: tzinfo | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
@@ -199,6 +209,13 @@ def build_lifemodel(
     # so in the Hermes venv (no OTel) this is behaviour-neutral. The CoreLoop ships
     # each finished tick's root span to it best-effort, after the commit.
     resolved_trace_exporter: TraceExportPort = trace_exporter or make_trace_exporter()
+    # The durable trace sink + freshness ring (spec §4.2). The live BeingAdapter
+    # injects an acquired ``TraceWriter`` (writing ``observability.sqlite``); off
+    # the being both default to no-op/throwaway. The SAME instances are wired into
+    # the CoreLoop AND exposed on the returned LifeModel, so an out-of-tick span
+    # (the egress backstop) records through the same sinks as the in-tick pipeline.
+    resolved_writer: TraceSink = trace_writer if trace_writer is not None else NULL_TRACE_SINK
+    resolved_ring: EventRing = event_ring if event_ring is not None else EventRing()
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
 
@@ -271,7 +288,8 @@ def build_lifemodel(
         state_actor=resolved_state_actor,
         bus=resolved_bus,
         clock=resolved_clock,
-        logger=logger,
+        trace_writer=resolved_writer,
+        event_ring=resolved_ring,
         pressure_sensor=resolved_pressure,
         memory=resolved_memory,
         # The registry-derived live (non-terminal) state-set drives the snapshot,
@@ -294,4 +312,6 @@ def build_lifemodel(
         coreloop=resolved_coreloop,
         logger=logger,
         tracer=resolved_tracer,
+        trace_writer=resolved_writer,
+        event_ring=resolved_ring,
     )

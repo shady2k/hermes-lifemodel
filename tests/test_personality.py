@@ -7,9 +7,13 @@ from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import Intent, UpdateState
 from lifemodel.core.personality import Personality
+from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
 
 PEAK = 13.0
+
+# ctx.trace is non-optional (spec §4.1); the personality writes no objects.
+_TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 
 def _p() -> Personality:
@@ -23,7 +27,7 @@ def _p() -> Personality:
 
 
 def _ctx(state: State, now: datetime, *, tmp_path) -> TickContext:
-    return TickContext(state=state, now=now, bus=FileSignalBus(tmp_path), signals=())
+    return TickContext(state=state, now=now, bus=FileSignalBus(tmp_path), signals=(), trace=_TRACE)
 
 
 def _changes(intents: Sequence[Intent]) -> dict:

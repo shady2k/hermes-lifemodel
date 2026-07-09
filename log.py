@@ -15,8 +15,7 @@ described in HLA §13 land in task 0.3.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -86,6 +85,28 @@ class EventLogger(Protocol):
     def warning(self, event: str, **fields: Any) -> Any: ...
     def error(self, event: str, **fields: Any) -> Any: ...
     def critical(self, event: str, **fields: Any) -> Any: ...
+
+
+class SpanBoundLogger(Protocol):
+    """The ONLY logger surface a tick component receives (spec §4.1).
+
+    A span-bound :class:`EventLogger` that also exposes its :attr:`span` — the
+    live :class:`~lifemodel.ports.tracer.ActiveSpan` the component drops decision
+    values onto (``span.set(u=…, effective_pressure=…)``) so the persisted span is
+    *self-explaining*, not just a bag of ``reason`` codes. The concrete
+    :class:`SpanLogger` and the test :class:`~lifemodel.testing.fakes.FakeSpanLogger`
+    both satisfy it, so :class:`~lifemodel.core.component.TickContext` depends on
+    this seam rather than a concrete class. A "bare" logger cannot appear in the
+    tick path — §1.1 (a log without a span) is inexpressible by type.
+    """
+
+    @property
+    def span(self) -> ActiveSpan: ...
+    def debug(self, event: str, **fields: Any) -> None: ...
+    def info(self, event: str, **fields: Any) -> None: ...
+    def warning(self, event: str, **fields: Any) -> None: ...
+    def error(self, event: str, **fields: Any) -> None: ...
+    def critical(self, event: str, **fields: Any) -> None: ...
 
 
 class EventTee:
@@ -346,32 +367,3 @@ def get_logger(name: str | None = None, **initial_values: Any) -> EventLogger:
     if _HAVE_STRUCTLOG:
         return cast(EventLogger, structlog.get_logger(name, **initial_values))
     return _StdlibEventLogger(name, **initial_values)
-
-
-@contextmanager
-def bound_log_context(**fields: Any) -> Iterator[None]:
-    """Bind *fields* onto every log line emitted inside the ``with`` block, then reset.
-
-    The CoreLoop wraps every tick (and each component's child span) in this (spec §5)
-    so every ``.info()`` auto-carries its span's ``{trace_id, span_id,
-    parent_span_id, tick}`` and RESETS on block exit — no stale bind leaks across
-    ticks or components. Wrapped here so the CoreLoop never imports structlog directly.
-
-    The caller always supplies the active span's fields (tracing is mandatory — the
-    tracer is a required CoreLoop dependency), so there is no untraced branch here:
-    a log without an active span is structurally impossible at the call site, not
-    papered over by an empty-bind no-op. With structlog present this uses the
-    contextvars API (bind on enter, reset on exit even under an exception). Without
-    structlog (the Hermes-host fallback) there are no contextvars, so the bind is a
-    no-op — the trace CONTEXT is still threaded explicitly via ``TracerPort``/
-    ``TickContext.trace`` and suppression spans carry their ids as explicit fields;
-    only the per-line structlog decoration is absent in that degraded host.
-    """
-    if not _HAVE_STRUCTLOG:
-        yield
-        return
-    tokens = structlog.contextvars.bind_contextvars(**fields)
-    try:
-        yield
-    finally:
-        structlog.contextvars.reset_contextvars(**tokens)

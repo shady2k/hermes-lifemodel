@@ -40,7 +40,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 #: The trace DB's filename, a sibling of ``lifemodel.sqlite`` in the state dir.
 _DB_FILENAME: Final = "observability.sqlite"
@@ -670,6 +670,93 @@ class TraceWriter:
 def _max_event_record_id(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT MAX(record_id) FROM trace_events").fetchone()
     return int(row[0]) if row is not None and row[0] is not None else 0
+
+
+# --------------------------------------------------------------------------- #
+# The tick-path durable sink seam (spec §4.2)
+# --------------------------------------------------------------------------- #
+
+
+class TraceSink(Protocol):
+    """The durable-write surface the tick path (CoreLoop / SpanLogger) depends on.
+
+    :class:`TraceWriter` is the real, async implementation; :data:`NULL_TRACE_SINK`
+    is the no-op used off the live being (a bare unit test / a CLI path with no
+    :class:`~lifemodel.adapters.being_platform.BeingAdapter` to
+    :func:`acquire_trace_writer`). Both ``submit_*`` return ``True`` on a
+    successful enqueue and ``False`` when the record was dropped (fail-open) —
+    the durable-first signal :class:`~lifemodel.log.SpanLogger` gates its
+    projections on.
+    """
+
+    def submit_event(
+        self,
+        *,
+        record_id: int,
+        trace_id: str,
+        span_id: str | None,
+        tick: int | None,
+        event: str,
+        ts: str,
+        fields: Mapping[str, Any] | None = None,
+    ) -> bool: ...
+
+    def submit_span(
+        self,
+        *,
+        trace_id: str,
+        span_id: str,
+        parent_span_id: str | None = None,
+        component: str | None = None,
+        tick: int | None = None,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+        status: str | None = None,
+        attrs: Mapping[str, Any] | None = None,
+    ) -> bool: ...
+
+
+class _NullTraceWriter:
+    """A :class:`TraceSink` that accepts and discards — the off-being default.
+
+    Returns ``True`` (a trivially "successful" enqueue) so a
+    :class:`~lifemodel.log.SpanLogger` built over it still projects onto its ring
+    + human tail, without a durable store wired. The live being always injects a
+    real :class:`TraceWriter`; this only backs bare test / CLI ticks where no
+    ``observability.sqlite`` exists to persist to.
+    """
+
+    def submit_event(
+        self,
+        *,
+        record_id: int,
+        trace_id: str,
+        span_id: str | None,
+        tick: int | None,
+        event: str,
+        ts: str,
+        fields: Mapping[str, Any] | None = None,
+    ) -> bool:
+        return True
+
+    def submit_span(
+        self,
+        *,
+        trace_id: str,
+        span_id: str,
+        parent_span_id: str | None = None,
+        component: str | None = None,
+        tick: int | None = None,
+        started_at: str | None = None,
+        ended_at: str | None = None,
+        status: str | None = None,
+        attrs: Mapping[str, Any] | None = None,
+    ) -> bool:
+        return True
+
+
+#: The process-wide no-op sink used when no durable trace writer is wired.
+NULL_TRACE_SINK: Final[TraceSink] = _NullTraceWriter()
 
 
 # --------------------------------------------------------------------------- #

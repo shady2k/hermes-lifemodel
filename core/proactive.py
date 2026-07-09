@@ -33,9 +33,10 @@ from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
 from ..domain.memory import TransitionOp
 from ..domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID, DesireState, IntentionState
-from ..log import EventLogger
+from ..log import EventLogger, SpanLogger
 from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
+from ..ports.tracer import start_span
 from .backstop import allow_send
 from .desire_view import read_live_contact_desire
 from .intention_view import read_live_contact_intention
@@ -82,7 +83,7 @@ def proactive_tick(
         # Backstop held fire (fail-closed rate limit): a core decision to HOLD, not a
         # delivery attempt. Log the reason as a suppression span, defer the desire,
         # and return None (quiet — no egress outcome).
-        _emit_backstop_suppression(lm, logger=logger, tick=state.tick_count)
+        _emit_backstop_suppression(lm, tick=state.tick_count)
         logger.info("proactive_backstop_blocked")
         _rollback(lm, actor, launch.reserved_energy, defer=True)  # hold: active -> deferred
         logger.info("proactive_tick", launches=len(report.launches), outcome=None)
@@ -101,32 +102,61 @@ def proactive_tick(
     logger.debug("proactive_prompt", correlation_id=launch.correlation_id, prompt=full_prompt)
     outcome = egress.reach_out(target, full_prompt)
     if outcome is not ReachOutcome.DELIVERED:
-        logger.info("proactive_launch_failed", outcome=outcome.value)
+        # The delivery boundary held/failed: a first-class suppression span naming the
+        # gate (egress_unavailable / egress_failed), not a bare INFO line — so the
+        # "why nothing went out" is in the one trace store (spec §5).
+        _emit_egress_suppression(
+            lm, _EGRESS_SUPPRESSION[outcome], tick=state.tick_count, outcome=outcome.value
+        )
         _rollback(lm, actor, launch.reserved_energy, defer=False)  # keep active, retry
 
     logger.info("proactive_tick", launches=len(report.launches), outcome=outcome.value)
     return outcome
 
 
-def _emit_backstop_suppression(lm: LifeModel, *, logger: EventLogger, tick: int) -> None:
-    """Log a backstop-held launch as a ``backstop_rate_limited`` suppression span.
+#: The non-DELIVERED egress boundary outcomes → their suppression reason (spec §5).
+_EGRESS_SUPPRESSION: dict[ReachOutcome, SuppressionReason] = {
+    ReachOutcome.UNAVAILABLE: SuppressionReason.EGRESS_UNAVAILABLE,
+    ReachOutcome.FAILED: SuppressionReason.EGRESS_FAILED,
+}
 
-    The egress runs out-of-tick (after ``coreloop.tick()`` returns), so there is no
-    in-tick span to bind to; mint a fresh root span on the graph's tracer so the
-    suppression still carries the §5 minimum (``reason``/``component``/``trace_id``/
-    ``span_id``/``tick``). Best-effort: a graph without a tracer (a hand-built
-    test ``LifeModel``) skips the span — the ``proactive_backstop_blocked`` log line
-    still records the hold."""
+
+def _emit_backstop_suppression(lm: LifeModel, *, tick: int) -> None:
+    """Log a backstop-held launch as a ``backstop_rate_limited`` suppression span."""
+    _emit_egress_suppression(lm, SuppressionReason.BACKSTOP_RATE_LIMITED, tick=tick)
+
+
+def _emit_egress_suppression(
+    lm: LifeModel, reason: SuppressionReason, *, tick: int, **extra: object
+) -> None:
+    """Emit an OUT-OF-TICK ``proactive`` suppression span (spec §5).
+
+    The egress runs after ``coreloop.tick()`` returns, so there is no in-tick span to
+    bind to; mint a fresh root span on the graph's tracer, bind a
+    :class:`~lifemodel.log.SpanLogger` over the graph's SAME durable writer + ring
+    (so the record lands in the one trace store, not a second place), emit the
+    suppression, and persist the span row. Best-effort: a graph without a tracer (a
+    hand-built test ``LifeModel``) skips it. (Correlating this to the launch's ORIGIN
+    trace is the Phase-3 async bridge; here it stands as its own root.)"""
     tracer = lm.tracer
     if tracer is None:
         return
-    span = tracer.start_root()
+    root = tracer.start_root()
+    span = start_span(root, component="proactive", tick=tick)
+    span.set(**extra)  # decision values (e.g. the egress outcome) onto the span
     emit_suppression_span(
-        logger=logger,
-        reason=SuppressionReason.BACKSTOP_RATE_LIMITED,
+        SpanLogger(span, writer=lm.trace_writer, ring=lm.event_ring),
+        reason=reason,
         component="proactive",
-        span=span,
+    )
+    lm.trace_writer.submit_span(
+        trace_id=root.trace_id,
+        span_id=root.span_id,
+        parent_span_id=root.parent_span_id,
+        component="proactive",
         tick=tick,
+        status=span.status,
+        attrs=dict(span.attrs) or None,
     )
 
 

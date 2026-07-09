@@ -5,8 +5,9 @@ must not reach for a global tracer or mint ids inline, or its execution-correlat
 logic becomes untestable and non-deterministic. The **capability** is a
 :class:`TracerPort` (injected once at the composition root); the **active context**
 is a per-tick :class:`TraceContext` value threaded through
-:class:`~lifemodel.core.component.TickContext` — never an ambient contextvar (those
-are for *log* decoration only, see :func:`lifemodel.log.bound_log_context`).
+:class:`~lifemodel.core.component.TickContext` — never an ambient contextvar. A
+component's :class:`~lifemodel.log.SpanLogger` self-stamps the span's ids onto every
+record, so no ambient bind is needed.
 
 Trace ids follow the **W3C Trace Context data model** (not the OpenTelemetry SDK;
 stdlib only) — the very model :class:`~lifemodel.domain.objects.Provenance` already
@@ -18,7 +19,7 @@ correlation id. The traceparent codec is REUSED from
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from ..domain.objects.provenance import (
@@ -184,3 +185,61 @@ def parse_traceparent(value: str) -> TraceContext:
     """
     trace_id, span_id, flags = _parse_provenance_traceparent(value)
     return TraceContext(trace_id=trace_id, span_id=span_id, parent_span_id=None, trace_flags=flags)
+
+
+@dataclass
+class MutableActiveSpan:
+    """The live :class:`ActiveSpan` — a mutable handle (spec §4.1).
+
+    A component receives one of these, stamps decision values onto it with
+    :meth:`set`, and closes it with :meth:`end`. It carries the immutable W3C ids
+    in :attr:`context` (never mutated — the frozen :class:`TraceContext`) alongside
+    the attribute bag, ``status`` and timing that settle as the component runs. The
+    trace store reads these fields to persist one ``trace_spans`` row (spec §4.3).
+
+    Lives beside the :class:`ActiveSpan` protocol (not in ``adapters``) so the
+    Hermes-free ``core`` scheduler can mint spans without importing the adapter
+    layer; the id-minting :class:`~lifemodel.adapters.tracer.StdlibTracer` stays an
+    adapter, this pure value handle does not.
+    """
+
+    context: TraceContext
+    component: str | None = None
+    tick: int | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    status: SpanStatus = "ok"
+    #: The decision-value bag. Private so the public :attr:`attrs` view is
+    #: read-only (mutation goes through :meth:`set`, the traced door).
+    _attrs: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        return self._attrs
+
+    def set(self, **attrs: Any) -> MutableActiveSpan:
+        self._attrs.update(attrs)
+        return self
+
+    def end(self, *, status: SpanStatus = "ok", ended_at: str | None = None) -> MutableActiveSpan:
+        self.status = status
+        if ended_at is not None:
+            self.ended_at = ended_at
+        return self
+
+
+def start_span(
+    context: TraceContext,
+    *,
+    component: str | None = None,
+    tick: int | None = None,
+    started_at: str | None = None,
+) -> MutableActiveSpan:
+    """Open a fresh :class:`MutableActiveSpan` over *context* (spec §4.1).
+
+    A thin, allocation-only factory: the caller (the CoreLoop) supplies the child
+    :class:`TraceContext` it minted for the component plus the ``started_at`` it
+    stamped from its clock. Kept separate from the tracer's id-minting so opening a
+    span never draws randomness or touches a clock here.
+    """
+    return MutableActiveSpan(context=context, component=component, tick=tick, started_at=started_at)

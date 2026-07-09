@@ -330,30 +330,29 @@ class ContactAggregation:
                     )
                 )
 
-        # Observability (spec §5): a quiet tick — no desire born, nothing resolved —
-        # emits a suppression span naming the gate that held fire, so silence is a
+        # Observability (spec §5): drop this tick's decision values onto the span so
+        # it is SELF-EXPLAINING (u / effective pressure / wake outcome / what the
+        # desire row did), and on a QUIET tick — no desire born, nothing resolved —
+        # emit a suppression span naming the gate that held fire, so silence is a
         # logged decision, not the absence of a record. (A creation or resolution is
         # NOT silent; a dedup'd URGE with a live desire is "already reaching", not a
-        # suppression.) Only when a logger+span are wired (the live tick); bare
-        # unit-test contexts skip it.
-        if (
-            not create_desire
-            and transition_to is None
-            and ctx.logger is not None
-            and ctx.trace is not None
-        ):
-            reason = (
-                SuppressionReason.REPEAT_PURE_LONGING
-                if pure_longing_repeat_hold
-                else _WAKE_SUPPRESSION.get(outcome)
+        # suppression.) Only when a span-bound logger is wired (the live tick); a
+        # bare unit-test context skips it.
+        if ctx.logger is not None:
+            ctx.logger.span.set(
+                u=u_now,
+                effective_pressure=effective,
+                wake_outcome=outcome.name,
+                created=create_desire,
+                transition_to=str(transition_to) if transition_to is not None else None,
             )
-            if reason is not None:
-                emit_suppression_span(
-                    logger=ctx.logger,
-                    reason=reason,
-                    component=self.id,
-                    span=ctx.trace,
-                    tick=state.tick_count + 1,
+            if not create_desire and transition_to is None:
+                reason = (
+                    SuppressionReason.REPEAT_PURE_LONGING
+                    if pure_longing_repeat_hold
+                    else _WAKE_SUPPRESSION.get(outcome)
                 )
+                if reason is not None:
+                    emit_suppression_span(ctx.logger, reason=reason, component=self.id)
 
         return intents

@@ -94,6 +94,8 @@ class CognitionLauncher:
         estimate = cost_real(self._fast_cost + self._send_cost, state.fatigue, alpha=self._alpha)
         reserved = reserve(state.energy, estimate)
         if reserved is None:
+            if ctx.logger is not None:
+                ctx.logger.span.set(available_energy=state.energy, required_energy=estimate)
             self._emit_suppression(ctx, SuppressionReason.ENERGY_UNAFFORDABLE)
             return []
         energy_after, _reservation = reserved
@@ -143,6 +145,15 @@ class CognitionLauncher:
             source_drive=desire.source_drive,
             provenance=provenance,
         )
+        # Self-explaining span (spec §4.1): a clean launch records the energy it
+        # reserved and the desire salience that cleared the gate, so the span says
+        # WHY it woke without cross-referencing state.
+        if ctx.logger is not None:
+            ctx.logger.span.set(
+                reserved_energy=estimate,
+                energy_after=energy_after,
+                salience=desire.salience,
+            )
         return [
             PutRecord(op=PutOp(draft=encode_contact_intention(intention))),
             LaunchProactive(
@@ -158,14 +169,8 @@ class CognitionLauncher:
         ]
 
     def _emit_suppression(self, ctx: TickContext, reason: SuppressionReason) -> None:
-        """Log a HOLD as a suppression span (spec §5) — only when a logger + span are
-        wired (the live tick); a bare unit-test ``TickContext`` skips it."""
-        if ctx.logger is None or ctx.trace is None:
+        """Log a HOLD as a suppression span (spec §5) — only when a span-bound logger
+        is wired (the live tick); a bare unit-test ``TickContext`` skips it."""
+        if ctx.logger is None:
             return
-        emit_suppression_span(
-            logger=ctx.logger,
-            reason=reason,
-            component=self.id,
-            span=ctx.trace,
-            tick=ctx.state.tick_count + 1,
-        )
+        emit_suppression_span(ctx.logger, reason=reason, component=self.id)
