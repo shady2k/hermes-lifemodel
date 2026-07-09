@@ -37,9 +37,10 @@ def test_silence_to_threshold_to_a_delivered_message(tmp_path) -> None:
     assert launch.outcome is ReachOutcome.DELIVERED
     assert launch.launched
     assert launch.delivered_impulse
-    # the [SILENT] cure (T6): the wake-packet names the longing as a sufficient reason
-    assert "тоска" in launch.delivered_impulse.lower()
-    assert "повод" in launch.delivered_impulse.lower()
+    # the [SILENT] cure (T6): the wake-packet is the owner-approved felt impulse —
+    # it names the longing (the feeling) and its cause as a sufficient reason.
+    assert "miss him" in launch.delivered_impulse.lower()
+    assert "reason enough" in launch.delivered_impulse.lower()
     u_at_launch = launch.u
 
     # scripted act-gate: the being actually sent a message → FULFILL read-back
