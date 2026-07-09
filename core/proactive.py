@@ -34,7 +34,6 @@ from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
 from ..domain.memory import TransitionOp
 from ..domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID, DesireState, IntentionState
-from ..log import EventLogger
 from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
 from ..ports.tracer import parse_traceparent
@@ -51,20 +50,22 @@ def proactive_tick(
     lm: LifeModel,
     egress: ProactiveEgressPort,
     target: Mapping[str, str | None],
-    *,
-    logger: EventLogger,
 ) -> ReachOutcome | None:
     """Run one proactive tick: pipeline → backstop → deliver. Never raises past
     the injected collaborators. Assumes a fresh ``LifeModel`` per call (the loop
     builds one each tick), so the rollback reconciliation commit is safe.
 
+    Every "why" is a span under the launch's ORIGIN TRACE (§4.4), never a bare
+    log line: the core stayed quiet → its suppression span was logged in-tick by
+    aggregation/CognitionLauncher; the backstop held → a ``BACKSTOP_RATE_LIMITED``
+    suppression span here; the egress held/failed → an ``EGRESS_*`` suppression
+    span; a delivery → a ``proactive_delivery`` span carrying the exact prompt.
+
     Returns a :class:`ReachOutcome` ONLY for a real delivery attempt (delivered /
-    failed / unavailable — the egress boundary, spec §9). A QUIET tick returns
-    ``None``: either no launch was produced (the core stayed quiet — its reason is
-    already a suppression span logged in-tick by aggregation/CognitionLauncher) or
-    the backstop held the launch (logged here as a ``backstop_rate_limited``
-    suppression span). ``DELIVERED`` means the turn was queued — whether the being
-    actually spoke is the async ``proactive_outcome`` read-back, not this return."""
+    failed / unavailable — the egress boundary, spec §9). A QUIET tick (no launch,
+    or the backstop held) returns ``None``. ``DELIVERED`` means the turn was queued
+    — whether the being actually spoke is the async ``proactive_outcome`` read-back,
+    not this return."""
     assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
     assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
     report = lm.coreloop.tick()  # pipeline runs + state committed by the state-actor
@@ -73,7 +74,6 @@ def proactive_tick(
     # delivery outcome: aggregation/CognitionLauncher already logged the reason as a
     # suppression span during the tick (spec §5). No egress outcome to report.
     if not report.launches:
-        logger.info("proactive_tick", launches=0, outcome=None)
         return None
 
     launch = report.launches[0]
@@ -88,9 +88,7 @@ def proactive_tick(
         _emit_egress_suppression(
             lm, SuppressionReason.BACKSTOP_RATE_LIMITED, launch=launch, tick=state.tick_count
         )
-        logger.info("proactive_backstop_blocked")
         _rollback(lm, actor, launch, defer=True)  # hold: active -> deferred
-        logger.info("proactive_tick", launches=len(report.launches), outcome=None)
         return None
 
     # The prompt already opens with the self-attribution line (build_wake_packet),
@@ -98,32 +96,27 @@ def proactive_tick(
     # is prepended here; a machine label would only re-invite the meta-analysis the
     # phenomenological self-state is meant to cure ([SILENT] regression).
     full_prompt = launch.prompt
-    # The owner's core observability ask (lm-j2w B3): "I want to know what
-    # we handed the agent." DEBUG-only (a no-op unless the owner has set
-    # loglevel=debug) and carries the COMPLETE, untruncated text — byte-
-    # identical to what egress.reach_out is about to receive — plus the
-    # correlation_id shared with the outcome verdict logged in hooks.py.
-    logger.debug("proactive_prompt", correlation_id=launch.correlation_id, prompt=full_prompt)
     outcome = egress.reach_out(target, full_prompt)
     if outcome is not ReachOutcome.DELIVERED:
         # The delivery boundary held/failed: a first-class suppression span naming the
         # gate (egress_unavailable / egress_failed) UNDER THE ORIGIN TRACE (§4.4), not
         # a bare INFO line — so the "why nothing went out" is in the one trace store.
+        # The exact prompt we handed the egress rides the span (5th-source collapse).
         _emit_egress_suppression(
             lm,
             _EGRESS_SUPPRESSION[outcome],
             launch=launch,
             tick=state.tick_count,
+            prompt=full_prompt,
             outcome=outcome.value,
         )
         _rollback(lm, actor, launch, defer=False)  # keep active, retry
     else:
         # A delivered launch is a span UNDER THE ORIGIN TRACE too (§4.4 / §5 step 3),
         # so the weave carries launch → delivery → async outcome → resolution under one
-        # trace_id — not just the "why NOT" edges.
-        _emit_delivery_span(lm, launch=launch, tick=state.tick_count)
+        # trace_id — not just the "why NOT" edges. The exact prompt rides the span.
+        _emit_delivery_span(lm, launch=launch, tick=state.tick_count, prompt=full_prompt)
 
-    logger.info("proactive_tick", launches=len(report.launches), outcome=outcome.value)
     return outcome
 
 
@@ -164,8 +157,13 @@ def _emit_egress_suppression(
     bridge.persist(ended_at=now)
 
 
-def _emit_delivery_span(lm: LifeModel, *, launch: LaunchProactive, tick: int) -> None:
-    """Emit a DELIVERED ``proactive`` span under the launch's origin trace (§5 step 3)."""
+def _emit_delivery_span(lm: LifeModel, *, launch: LaunchProactive, tick: int, prompt: str) -> None:
+    """Emit a DELIVERED ``proactive`` span under the launch's origin trace (§5 step 3).
+
+    The exact *prompt* handed to the egress rides the span as an attr AND a
+    ``proactive_prompt`` DEBUG event, so "what we handed the agent" (the owner's
+    core observability ask) is durable under the attempt's ``trace_id`` — the
+    5th-source collapse (§4.3), not a hindsight/DEBUG-log side channel."""
     tracer = lm.tracer
     if tracer is None:
         return
@@ -179,7 +177,10 @@ def _emit_delivery_span(lm: LifeModel, *, launch: LaunchProactive, tick: int) ->
         tick=tick,
         started_at=now,
     )
-    bridge.span.set(correlation_id=launch.correlation_id, outcome=ReachOutcome.DELIVERED.value)
+    bridge.span.set(
+        correlation_id=launch.correlation_id, outcome=ReachOutcome.DELIVERED.value, prompt=prompt
+    )
+    bridge.logger.debug("proactive_prompt", correlation_id=launch.correlation_id, prompt=prompt)
     bridge.logger.info(
         "proactive_delivery",
         correlation_id=launch.correlation_id,

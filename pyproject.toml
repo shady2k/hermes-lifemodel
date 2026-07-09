@@ -5,9 +5,9 @@ description = "Personality-and-decision layer plugin on top of the Hermes agent 
 requires-python = ">=3.11,<3.12"
 # Runtime deps are deliberately empty: the plugin is loaded inside Hermes' own
 # interpreter (from ~/.hermes/plugins/), not pip-installed into Hermes' venv, so
-# anything Hermes already provides is not vendored here. structlog in particular
-# is only an *optional* logging backend — log.py falls back to a stdlib shim
-# when it is absent — so it is a dev/test dep (below), not a runtime dependency.
+# anything Hermes already provides is not vendored here. Runtime logging is
+# stdlib-only (spec §v1.2 / lm-edu): SpanLogger + logging.getLogger, no
+# structlog/loguru anywhere — not even as a dev dep.
 dependencies = []
 
 # Flat root-layout: this repo directory IS the `lifemodel` package (no
@@ -25,9 +25,6 @@ dev = [
     "mypy",
     "ruff",
     "pre-commit",
-    # Optional runtime backend, required by the tests so log.py's structlog
-    # path (and structlog.testing.capture_logs) is still exercised off-host.
-    "structlog",
 ]
 
 [tool.ruff]

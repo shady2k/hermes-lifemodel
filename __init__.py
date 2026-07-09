@@ -13,7 +13,6 @@ No engine/neurons yet — those land in later tasks (see docs/roadmap.md §0).
 from __future__ import annotations
 
 import logging
-import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -22,9 +21,9 @@ from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
 from .debug import render_dump_for_dir
-from .events import EVENTS_FILENAME, EventRing, EventSink
+from .events import EventRing
 from .hooks import make_inbound_observer, make_post_llm_observer
-from .log import EventTee, configure, current_level, get_logger, parse_log_level
+from .log import apply_log_level, parse_log_level
 from .paths import state_dir
 from .state.trace_store import acquire_trace_writer, observability_db_path
 from .state_commands import (
@@ -37,8 +36,14 @@ from .state_commands import (
     think_for_dir,
     why_for_dir,
 )
+from .trace_view import trace_for_dir
 
 __version__ = "0.0.0"
+
+#: Registration/lifecycle/boundary events with no ambient span go through the
+#: native stdlib logger (spec §4.5 allowlist); Hermes routes ``lifemodel.*`` into
+#: ``agent.log``. Tick-path events go through SpanLogger, never this.
+_LOG = logging.getLogger("lifemodel")
 
 
 class _Subcommand(NamedTuple):
@@ -61,6 +66,10 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
     "why": _Subcommand(
         "why [desire|intention|write|<kind>:<id>] — trace the causal chain behind a "
         "desire/intention (read-only)."
+    ),
+    "trace": _Subcommand(
+        "trace [<trace_id> | last [N]] — render a durable execution trace "
+        "(tick → components → decisions → launch → async outcome), read-only."
     ),
     "help": _Subcommand("List these subcommands."),
     "nudge": _Subcommand(
@@ -150,33 +159,19 @@ def register(ctx: Any) -> None:
     sdir = state_dir(home)
 
     # Boot at the persisted log level (lm-j2w B2) — defaults to 'info' when no
-    # config.json exists yet (a fresh being), same default log.configure()
-    # itself uses. Must run before get_logger() below so the structlog
-    # pipeline (when present) is configured at the right level from the very
-    # first event this registration emits, not just from the next owner
-    # `/lifemodel loglevel` call. Skipped when the persisted level already
-    # matches the current effective level: log.configure() unconditionally
-    # rebuilds the WHOLE structlog processor chain (not just the level), so
-    # calling it on every register() would blow away any processors a host
-    # (or a test's structlog.testing.capture_logs()) had layered on top —
-    # true idempotence at the call site, not just at the level-int.
-    # read_log_level() is itself safe-by-construction (falls back to the
-    # default on a missing/malformed config or an invalid persisted name), so
-    # parse_log_level() should never raise here. This try/except is pure
-    # defense in depth: NO failure while resolving the boot level may ever
-    # abort register() and take the plugin down — degrade to logging.INFO
-    # instead (matches log.configure()'s own default) and keep booting.
+    # config.json exists yet (a fresh being). read_log_level() is itself
+    # safe-by-construction (falls back to the default on a missing/malformed
+    # config or an invalid persisted name), so parse_log_level() should never
+    # raise here; this try/except is pure defense in depth — NO failure while
+    # resolving the boot level may ever abort register() and take the plugin
+    # down (degrade to logging.INFO and keep booting). apply_log_level() only
+    # setLevel()s the ``lifemodel`` logger (Hermes owns handler setup), so it is
+    # idempotent and safe to call unconditionally on every register().
     try:
         desired_level = parse_log_level(read_log_level(sdir))
     except Exception:
         desired_level = logging.INFO
-    if desired_level != current_level():
-        configure(desired_level)
-
-    # Tee structured events into a bounded on-disk sink so the debug command can
-    # query them (HLA §12/§13) instead of scraping operator logs.
-    sink = EventSink(sdir / EVENTS_FILENAME)
-    logger = EventTee(get_logger("lifemodel"), sink)
+    apply_log_level(desired_level)
 
     def lifemodel_command(raw_args: str = "") -> str:
         """`/lifemodel` — 'status' (default), 'debug', 'help', or a mutating
@@ -200,14 +195,15 @@ def register(ctx: Any) -> None:
         dispatch: dict[str, Callable[[], str]] = {
             "debug": lambda: render_dump_for_dir(sdir),
             "why": lambda: why_for_dir(sdir, rest),
+            "trace": lambda: trace_for_dir(sdir, rest),
             "help": lambda: _command_list() + "\n",
-            "nudge": lambda: nudge_for_dir(sdir, rest, logger=logger),
-            "force-wake": lambda: force_wake_for_dir(sdir, logger=logger),
-            "satiate": lambda: satiate_for_dir(sdir, logger=logger),
-            "reset": lambda: reset_for_dir(sdir, logger=logger),
-            "set": lambda: set_field_for_dir(sdir, rest, logger=logger),
-            "relationship": lambda: set_relationship_prefs_for_dir(sdir, rest, logger=logger),
-            "think": lambda: think_for_dir(sdir, rest, logger=logger),
+            "nudge": lambda: nudge_for_dir(sdir, rest),
+            "force-wake": lambda: force_wake_for_dir(sdir),
+            "satiate": lambda: satiate_for_dir(sdir),
+            "reset": lambda: reset_for_dir(sdir),
+            "set": lambda: set_field_for_dir(sdir, rest),
+            "relationship": lambda: set_relationship_prefs_for_dir(sdir, rest),
+            "think": lambda: think_for_dir(sdir, rest),
             "loglevel": lambda: set_log_level_for_dir(sdir, rest),
         }
         handler = dispatch.get(sub)
@@ -218,11 +214,11 @@ def register(ctx: Any) -> None:
                 # typing a command must NEVER see "unknown command" for a
                 # handler bug (lm-zhh) — log it (with traceback) and surface
                 # the real reason, one readable owner-facing block.
-                logger.info(
-                    "lifemodel_command_failed",
-                    subcommand=sub,
-                    error=f"{type(exc).__name__}: {exc}",
-                    traceback=traceback.format_exc(),
+                _LOG.info(
+                    "lifemodel_command_failed subcommand=%s error=%s",
+                    sub,
+                    f"{type(exc).__name__}: {exc}",
+                    exc_info=True,
                 )
                 return f"lifemodel: команда не выполнена — {exc}\n"
 
@@ -241,12 +237,11 @@ def register(ctx: Any) -> None:
         args_hint=" | ".join(_SUBCOMMANDS),
     )
 
-    logger.info(
-        "plugin_registered",
-        plugin="lifemodel",
-        version=__version__,
-        profile=profile,
-        state_dir=str(sdir),
+    _LOG.info(
+        "plugin_registered plugin=lifemodel version=%s profile=%s state_dir=%s",
+        __version__,
+        profile,
+        str(sdir),
     )
 
     # --- Verdict feedback wiring (Task 5, spec §5/§7) -------------------------
@@ -268,14 +263,13 @@ def register(ctx: Any) -> None:
         # cycle, so the hook can always write regardless of loop state.
         verdict_lm = build_lifemodel(
             base_dir=sdir,
-            logger=logger,
             trace_writer=acquire_trace_writer(observability_db_path(sdir)),
             event_ring=EventRing(),
         )
         ctx.register_hook("post_llm_call", make_post_llm_observer(verdict_lm))
-        logger.info("post_llm_observer_registered")
+        _LOG.info("post_llm_observer_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-        logger.info("post_llm_observer_registration_skipped", error=f"{type(exc).__name__}: {exc}")
+        _LOG.info("post_llm_observer_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")
 
     # --- Inbound observation wiring (Task 6, spec §4/§6) ----------------------
     # RC1: the being is currently deaf to inbound user messages. On a genuine
@@ -290,11 +284,11 @@ def register(ctx: Any) -> None:
     # pre_gateway_dispatch in VALID_HOOKS, or any wiring hiccup, must not break
     # load.
     try:
-        inbound_lm = build_lifemodel(base_dir=sdir, logger=logger)
+        inbound_lm = build_lifemodel(base_dir=sdir)
         ctx.register_hook("pre_gateway_dispatch", make_inbound_observer(inbound_lm))
-        logger.info("inbound_observer_registered")
+        _LOG.info("inbound_observer_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-        logger.info("inbound_observer_registration_skipped", error=f"{type(exc).__name__}: {exc}")
+        _LOG.info("inbound_observer_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")
 
     # --- Proactive brain wiring (the being as a gateway platform) -------------
     # The autonomic brain is hosted as a gateway-supervised platform adapter: its
@@ -306,7 +300,7 @@ def register(ctx: Any) -> None:
     try:
         from .adapters.being_platform import register_being_platform
 
-        register_being_platform(ctx, base_dir=sdir, target=resolve_home_origin(), logger=logger)
-        logger.info("being_platform_registered")
+        register_being_platform(ctx, base_dir=sdir, target=resolve_home_origin())
+        _LOG.info("being_platform_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-        logger.info("being_platform_registration_skipped", error=f"{type(exc).__name__}: {exc}")
+        _LOG.info("being_platform_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")

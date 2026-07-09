@@ -7,25 +7,33 @@ and ``ctx`` is a duck-typed recorder. No real Hermes package is imported.
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-import structlog
-from structlog.testing import capture_logs
 
 import lifemodel
 import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.config import write_log_level
-from lifemodel.events import EVENTS_FILENAME
 from lifemodel.state.errors import StateSchemaError
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+
+@pytest.fixture(autouse=True)
+def _restore_lifemodel_log_level() -> Iterator[None]:
+    """Save/restore the ``lifemodel`` logger level so a register()/loglevel test
+    that mutates it (via ``setLevel``) never leaks into later tests."""
+    logger = logging.getLogger("lifemodel")
+    saved = logger.level
+    try:
+        yield
+    finally:
+        logger.setLevel(saved)
 
 
 class FakeCtx:
@@ -79,20 +87,21 @@ def test_register_adds_lifemodel_command(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 
 def test_register_emits_plugin_registered_event(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
     ctx = FakeCtx()
 
-    with capture_logs() as logs:
+    with caplog.at_level(logging.INFO, logger="lifemodel"):
         lifemodel.register(ctx)
 
-    events = [e for e in logs if e.get("event") == "plugin_registered"]
-    assert len(events) == 1
-    event = events[0]
-    assert event["profile"] == "test-being"
-    assert event["state_dir"] == str(tmp_path / "workspace" / "lifemodel")
-    assert event["version"] == lifemodel.__version__
+    lines = [r.getMessage() for r in caplog.records if r.name == "lifemodel"]
+    registered = [line for line in lines if line.startswith("plugin_registered")]
+    assert len(registered) == 1
+    line = registered[0]
+    assert "profile=test-being" in line
+    assert f"state_dir={tmp_path / 'workspace' / 'lifemodel'}" in line
+    assert f"version={lifemodel.__version__}" in line
 
 
 def test_register_does_not_import_real_hermes(
@@ -311,7 +320,7 @@ def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
 
 
 def test_register_lifemodel_command_catches_handler_exception_and_returns_error_string(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """lm-zhh: when a subcommand handler RAISES (e.g. StateSchemaError, the
     confirmed incident mechanism -- '/lifemodel set ...' loaded state, hit a
@@ -331,7 +340,7 @@ def test_register_lifemodel_command_catches_handler_exception_and_returns_error_
 
     monkeypatch.setattr(lifemodel, "set_field_for_dir", _boom)
 
-    with capture_logs() as logs:
+    with caplog.at_level(logging.INFO, logger="lifemodel"):
         out = handler("set u 1")
 
     # Owner-facing text: readable, prefixed as a lifemodel error, carries the
@@ -339,9 +348,14 @@ def test_register_lifemodel_command_catches_handler_exception_and_returns_error_
     assert "команда не выполнена" in out
     assert "schema_version=99 is newer than this build supports" in out
     # The failure is also recorded, not only shown to the owner.
-    failures = [e for e in logs if e.get("event") == "lifemodel_command_failed"]
+    failures = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "lifemodel" and r.getMessage().startswith("lifemodel_command_failed")
+    ]
     assert len(failures) == 1
-    assert "schema_version=99" in failures[0]["error"]
+    assert "subcommand=set" in failures[0]
+    assert "schema_version=99" in failures[0]
 
 
 def test_register_lifemodel_command_success_path_unchanged(
@@ -360,26 +374,6 @@ def test_register_lifemodel_command_success_path_unchanged(
     assert "**help**" in handler("help")
 
 
-def test_register_tees_plugin_registered_into_events_sink(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
-
-    lifemodel.register(FakeCtx())
-
-    # The structured event landed in the queryable sink, not only the logs.
-    events_file = tmp_path / "workspace" / "lifemodel" / EVENTS_FILENAME
-    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
-    assert any(r["event"] == "plugin_registered" for r in records)
-
-
-def test_uses_the_configured_structlog_pipeline() -> None:
-    # Sanity: structlog is the backend in the plugin's own test environment,
-    # so get_logger yields a real structlog logger (not the fallback shim).
-    assert structlog is not None
-    assert lifemodel.get_logger("lifemodel.probe") is not None
-
-
 # --- loglevel (lm-j2w B2): persisted log level + `/lifemodel loglevel` -------
 
 
@@ -389,22 +383,23 @@ def test_register_boots_at_the_persisted_log_level(
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
     sdir = tmp_path / "workspace" / "lifemodel"
     write_log_level(sdir, "warning")
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    logging.getLogger("lifemodel").setLevel(logging.INFO)
 
     lifemodel.register(FakeCtx())
 
-    assert lm_logging._effective_level == logging.WARNING
+    # register() applied the persisted level via setLevel on the lifemodel logger.
+    assert logging.getLogger("lifemodel").level == logging.WARNING
 
 
 def test_register_boots_at_info_when_no_config_is_persisted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    logging.getLogger("lifemodel").setLevel(logging.DEBUG)
 
     lifemodel.register(FakeCtx())
 
-    assert lm_logging._effective_level == logging.INFO
+    assert logging.getLogger("lifemodel").level == logging.INFO
 
 
 def test_loglevel_in_subcommands_registry() -> None:
@@ -429,10 +424,7 @@ def test_register_lifemodel_loglevel_sets_and_persists_and_applies(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
-    # Guard against leaking the real (non-monkeypatched) log.configure() call
-    # this test triggers into later tests: monkeypatch reverts _effective_level
-    # to its pre-test value on teardown regardless of what happens in between.
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    logging.getLogger("lifemodel").setLevel(logging.INFO)
     ctx = FakeCtx()
     lifemodel.register(ctx)
     handler = ctx.commands["lifemodel"]["handler"]
@@ -444,7 +436,8 @@ def test_register_lifemodel_loglevel_sets_and_persists_and_applies(
     from lifemodel.config import read_log_level
 
     assert read_log_level(sdir) == "debug"
-    assert lm_logging._effective_level == logging.DEBUG
+    # The change is applied at runtime: setLevel on the lifemodel logger.
+    assert logging.getLogger("lifemodel").level == logging.DEBUG
 
 
 def test_register_does_not_raise_on_invalid_persisted_log_level(
@@ -459,11 +452,12 @@ def test_register_does_not_raise_on_invalid_persisted_log_level(
     from lifemodel.config import write_config
 
     write_config(sdir, {"log_level": "warn"})
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
+    logging.getLogger("lifemodel").setLevel(logging.DEBUG)
 
     lifemodel.register(FakeCtx())  # must not raise
 
-    assert lm_logging._effective_level == logging.INFO
+    # Degraded to the default level rather than raising out of registration.
+    assert logging.getLogger("lifemodel").level == logging.INFO
 
 
 def test_register_lifemodel_loglevel_invalid_arg_returns_usage_error(

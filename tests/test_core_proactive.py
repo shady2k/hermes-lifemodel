@@ -10,11 +10,8 @@ no Hermes.
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime
-from typing import Any
 
-import lifemodel.log as lm_logging
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import (
     build_contact_desire,
@@ -26,33 +23,8 @@ from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
-from lifemodel.events import EventRing, EventSink
-from lifemodel.log import EventTee, get_logger
+from lifemodel.events import EventRing
 from lifemodel.state.model import State
-
-
-class _RecordingLogger:
-    """A minimal :class:`~lifemodel.log.EventLogger` that records calls per level."""
-
-    def __init__(self) -> None:
-        self.debug_calls: list[tuple[str, dict[str, Any]]] = []
-        self.info_calls: list[tuple[str, dict[str, Any]]] = []
-
-    def debug(self, event: str, **fields: Any) -> None:
-        self.debug_calls.append((event, dict(fields)))
-
-    def info(self, event: str, **fields: Any) -> None:
-        self.info_calls.append((event, dict(fields)))
-
-    def warning(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-    def error(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-    def critical(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
 
 TARGET = {"platform": "telegram", "chat_id": "1", "thread_id": None}
 
@@ -112,7 +84,7 @@ CAP_LOG = ["2026-07-06T11:00:00+00:00", "2026-07-06T10:00:00+00:00", "2026-07-06
 def test_active_desire_launches_native_turn(tmp_path) -> None:
     lm = _lm(tmp_path, _active(), NOW)
     egress = FakeEgress()
-    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    out = proactive_tick(lm, egress, TARGET)
     assert out is ReachOutcome.DELIVERED
     assert len(egress.calls) == 1
     _, impulse = egress.calls[0]
@@ -124,7 +96,7 @@ def test_no_active_desire_does_not_reach_out(tmp_path) -> None:
     idle = State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
     lm = _lm(tmp_path, idle, NOW, desire=None)  # no live desire row
     egress = FakeEgress()
-    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    out = proactive_tick(lm, egress, TARGET)
     assert out is None  # T5: a quiet tick returns None, not a false 'busy' outcome
     assert egress.calls == []
 
@@ -133,7 +105,7 @@ def test_backstop_block_defers_and_refunds(tmp_path) -> None:
     ring = EventRing()
     lm = _lm(tmp_path, _active(proactive_send_log=CAP_LOG), NOW, event_ring=ring)
     egress = FakeEgress()
-    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    out = proactive_tick(lm, egress, TARGET)
     final = lm.state.load()
     desire = read_live_contact_desire(lm.state)
     assert out is None  # T5: a backstop-held launch returns None, not a 'busy' outcome
@@ -153,7 +125,7 @@ def test_no_launch_returns_none_and_logs_a_suppression_reason(tmp_path) -> None:
     lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), event_ring=ring)
     lm.state.commit(State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
     egress = FakeEgress()
-    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    out = proactive_tick(lm, egress, TARGET)
     assert out is None  # quiet — no egress outcome
     assert egress.calls == []
     assert _supp_reasons(ring)[-1] == "below_threshold"
@@ -161,7 +133,7 @@ def test_no_launch_returns_none_and_logs_a_suppression_reason(tmp_path) -> None:
 
 def test_failed_delivery_rolls_pending_active_and_refunds(tmp_path) -> None:
     lm = _lm(tmp_path, _active(), NOW)
-    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET)
     final = lm.state.load()
     desire = read_live_contact_desire(lm.state)
     assert final.pending_proactive_id is None  # rolled back
@@ -173,20 +145,20 @@ def test_egress_unavailable_emits_egress_unavailable_suppression(tmp_path) -> No
     # A non-DELIVERED egress outcome is a first-class suppression span naming the gate.
     ring = EventRing()
     lm = _lm(tmp_path, _active(), NOW, event_ring=ring)
-    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET)
     assert _supp_reasons(ring)[-1] == "egress_unavailable"
 
 
 def test_egress_failed_emits_egress_failed_suppression(tmp_path) -> None:
     ring = EventRing()
     lm = _lm(tmp_path, _active(), NOW, event_ring=ring)
-    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.FAILED), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.FAILED), TARGET)
     assert _supp_reasons(ring)[-1] == "egress_failed"
 
 
 def test_delivered_launch_keeps_the_cost(tmp_path) -> None:
     lm = _lm(tmp_path, _active(), NOW)
-    proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(), TARGET)
     assert lm.state.load().energy < 1.0  # the turn ran -> energy spent, not refunded
 
 
@@ -197,7 +169,7 @@ def test_delivered_launch_leaves_intention_active_in_flight(tmp_path) -> None:
     # A delivered launch crystallized the decision record; it stays ``active`` (the
     # verdict resolves it next tick), mirroring the desire.
     lm = _lm(tmp_path, _active(), NOW)
-    proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(), TARGET)
     intention = read_live_contact_intention(lm.state)
     assert intention is not None and intention.state == "active"
 
@@ -207,7 +179,7 @@ def test_backstop_block_defers_intention_with_desire(tmp_path) -> None:
     # atomically with the pending-clear + energy refund.
     lm = _lm(tmp_path, _active(proactive_send_log=CAP_LOG), NOW)
     egress = FakeEgress()
-    proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    proactive_tick(lm, egress, TARGET)
     final = lm.state.load()
     assert egress.calls == []  # backstop blocked the send
     assert read_live_contact_desire(lm.state).state == "deferred"
@@ -220,7 +192,7 @@ def test_failed_delivery_keeps_intention_active_to_retry(tmp_path) -> None:
     # A delivery failure keeps BOTH rows active to retry; only pending clears + the
     # reservation refunds — no transition, no split-brain.
     lm = _lm(tmp_path, _active(), NOW)
-    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(outcome=ReachOutcome.UNAVAILABLE), TARGET)
     final = lm.state.load()
     assert read_live_contact_desire(lm.state).state == "active"
     assert read_live_contact_intention(lm.state).state == "active"  # kept to retry
@@ -230,42 +202,48 @@ def test_failed_delivery_keeps_intention_active_to_retry(tmp_path) -> None:
 
 def test_does_not_stamp_egress_service_alive_at(tmp_path) -> None:
     lm = _lm(tmp_path, State(last_tick_at="2026-07-06T11:59:00+00:00"), NOW, desire=None)
-    proactive_tick(lm, FakeEgress(), TARGET, logger=get_logger("t"))
+    proactive_tick(lm, FakeEgress(), TARGET)
     # liveness is NOT a separate stamp anymore; last_tick_at (dt clock) carries it
     assert getattr(lm.state.load(), "egress_service_alive_at", None) is None
     assert lm.state.load().last_tick_at == NOW.isoformat()  # coreloop stamped the tick
 
 
-# --- B3 (lm-j2w): the FULL assembled prompt, logged at DEBUG only ------------
+# --- B3 (lm-j2w): the FULL assembled prompt, durable under the origin trace --
 
 
-def test_proactive_prompt_logged_at_debug_with_full_untruncated_text(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.DEBUG)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "debug-events.jsonl"))
+def _prompt_events(ring: EventRing) -> list[dict]:
+    return [r for r in ring.read() if r.get("event") == "proactive_prompt"]
 
-    lm = _lm(tmp_path, _active(), NOW)
+
+def test_proactive_prompt_recorded_with_full_untruncated_text(tmp_path) -> None:
+    # The exact prompt handed to the egress rides the delivery span under the
+    # launch's origin trace (spec §4.3, 5th-source collapse) — a durable
+    # ``proactive_prompt`` DEBUG record on the freshness ring, not a level-gated
+    # side channel. DEBUG detail is ALWAYS durable now (sqlite is the complete
+    # trace), so this is captured regardless of the human logger's level.
+    ring = EventRing()
+    lm = _lm(tmp_path, _active(), NOW, event_ring=ring)
     egress = FakeEgress()
-    proactive_tick(lm, egress, TARGET, logger=logger)
+    proactive_tick(lm, egress, TARGET)
 
     assert len(egress.calls) == 1
     _, delivered_impulse = egress.calls[0]  # the exact text handed to egress
 
-    prompt_events = [c for c in base.debug_calls if c[0] == "proactive_prompt"]
+    prompt_events = _prompt_events(ring)
     assert len(prompt_events) == 1
-    _, fields = prompt_events[0]
+    fields = prompt_events[0]
     # Complete, untruncated — byte-identical to what was actually delivered.
     assert fields["prompt"] == delivered_impulse
     assert fields["prompt"].startswith(IMPULSE_LABEL_PREFIX)
     assert fields["correlation_id"]
 
 
-def test_proactive_prompt_not_emitted_when_effective_level_is_info(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
-    base = _RecordingLogger()
-    logger = EventTee(base, EventSink(tmp_path / "info-events.jsonl"))
+def test_proactive_prompt_not_recorded_when_nothing_is_delivered(tmp_path) -> None:
+    # A quiet tick (drive below threshold, no launch) hands the egress nothing,
+    # so there is no prompt to record — the delivery span never opens.
+    ring = EventRing()
+    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), event_ring=ring)
+    lm.state.commit(State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
+    proactive_tick(lm, FakeEgress(), TARGET)
 
-    lm = _lm(tmp_path, _active(), NOW)
-    proactive_tick(lm, FakeEgress(), TARGET, logger=logger)
-
-    assert base.debug_calls == []  # gated — DEBUG never reaches the base logger/sink
+    assert _prompt_events(ring) == []

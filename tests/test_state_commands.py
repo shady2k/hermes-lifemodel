@@ -52,7 +52,6 @@ from lifemodel.core.thought_view import (
 )
 from lifemodel.core.timeutil import minutes_between
 from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
-from lifemodel.log import get_logger
 from lifemodel.sim.wake import LaneState, evaluate_wake
 from lifemodel.state.errors import StateCorruptError
 from lifemodel.state.model import State
@@ -418,7 +417,7 @@ def _store(tmp_path) -> SQLiteRuntimeStore:
 
 def test_nudge_for_dir_persists_through_the_real_store(tmp_path) -> None:
     _store(tmp_path).commit(State(u=1.0))
-    message = nudge_for_dir(tmp_path, "2", logger=get_logger("t"))
+    message = nudge_for_dir(tmp_path, "2")
     assert "u: 1.00 -> 3.00" in message
     assert _store(tmp_path).load().u == 3.0
 
@@ -428,7 +427,7 @@ def test_force_wake_for_dir_persists_through_the_real_store(tmp_path) -> None:
     store.commit(_blocked_state())
     # a stuck live desire is terminalized so the next tick births a fresh one
     store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0)))
-    message = force_wake_for_dir(tmp_path, logger=get_logger("t"))
+    message = force_wake_for_dir(tmp_path)
     assert "gates satisfied" in message
     persisted = _store(tmp_path).load()
     assert read_live_contact_desire(_store(tmp_path)) is None  # stuck desire dropped
@@ -439,7 +438,7 @@ def test_satiate_for_dir_persists_through_the_real_store(tmp_path) -> None:
     store = _store(tmp_path)
     store.commit(State(u=5.0))
     store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0)))
-    satiate_for_dir(tmp_path, logger=get_logger("t"))
+    satiate_for_dir(tmp_path)
     persisted = _store(tmp_path).load()
     assert persisted.u == 0.0
     assert read_live_contact_desire(_store(tmp_path)) is None  # desire terminalized (satisfied)
@@ -448,7 +447,7 @@ def test_satiate_for_dir_persists_through_the_real_store(tmp_path) -> None:
 
 def test_reset_for_dir_persists_through_the_real_store(tmp_path) -> None:
     _store(tmp_path).commit(State(tick_count=7, u=3.0))
-    reset_for_dir(tmp_path, logger=get_logger("t"))
+    reset_for_dir(tmp_path)
     assert _store(tmp_path).load() == State()
 
 
@@ -466,7 +465,7 @@ def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> 
     with pytest.raises(StateCorruptError):
         store.load()  # sanity: really unreadable beforehand
 
-    message = reset_for_dir(tmp_path, logger=get_logger("t"))
+    message = reset_for_dir(tmp_path)
 
     assert "previous state unreadable" in message
     assert store.load() == State()  # reset still landed cleanly
@@ -499,7 +498,7 @@ def test_reset_for_dir_purges_every_memory_record(tmp_path) -> None:
     )
     assert _store(tmp_path).find() != []  # sanity: seeded
 
-    message = reset_for_dir(tmp_path, logger=get_logger("t"))
+    message = reset_for_dir(tmp_path)
 
     assert _store(tmp_path).find() == []  # every memory_records row gone
     assert _store(tmp_path).load() == State()
@@ -509,21 +508,21 @@ def test_reset_for_dir_purges_every_memory_record(tmp_path) -> None:
 def test_reset_for_dir_on_empty_store_reports_zero_cleared_without_crashing(
     tmp_path,
 ) -> None:
-    message = reset_for_dir(tmp_path, logger=get_logger("t"))
+    message = reset_for_dir(tmp_path)
     assert "cleared 0 memory records" in message
     assert _store(tmp_path).load() == State()
 
 
 def test_set_field_for_dir_persists_through_the_real_store(tmp_path) -> None:
     _store(tmp_path).commit(State(u=0.0))
-    set_field_for_dir(tmp_path, "u 9.0", logger=get_logger("t"))
+    set_field_for_dir(tmp_path, "u 9.0")
     assert _store(tmp_path).load().u == 9.0
 
 
 def test_set_field_for_dir_rejects_without_writing(tmp_path) -> None:
     original = State(u=1.0)
     _store(tmp_path).commit(original)
-    message = set_field_for_dir(tmp_path, "tick_count 5", logger=get_logger("t"))
+    message = set_field_for_dir(tmp_path, "tick_count 5")
     assert "not writable" in message
     assert _store(tmp_path).load() == original  # untouched
 
@@ -531,9 +530,7 @@ def test_set_field_for_dir_rejects_without_writing(tmp_path) -> None:
 def test_set_field_for_dir_rejects_naive_timestamp_without_writing(tmp_path) -> None:
     original = State(u=1.0)
     _store(tmp_path).commit(original)
-    message = set_field_for_dir(
-        tmp_path, "last_exchange_at 2026-01-01T00:00:00", logger=get_logger("t")
-    )
+    message = set_field_for_dir(tmp_path, "last_exchange_at 2026-01-01T00:00:00")
     assert "error" in message
     assert _store(tmp_path).load() == original  # untouched — round-trip validation caught it
 
@@ -548,7 +545,7 @@ def test_force_wake_wakes_on_the_next_real_tick(tmp_path) -> None:
     confirm the desire actually wakes."""
     _store(tmp_path).commit(_blocked_state())
 
-    message = force_wake_for_dir(tmp_path, logger=get_logger("t"))
+    message = force_wake_for_dir(tmp_path)
     assert "gates satisfied" in message
 
     lm = build_lifemodel(base_dir=tmp_path)  # fresh graph, real wall clock, next "tick"
@@ -599,7 +596,7 @@ def test_set_relationship_prefs_empty_shows_usage() -> None:
 def test_set_relationship_prefs_for_dir_round_trips_and_gates(tmp_path) -> None:
     store = _store(tmp_path)
     store.commit(State(u=5.0))
-    message = set_relationship_prefs_for_dir(tmp_path, "bad-hours=2,3", logger=get_logger("t"))
+    message = set_relationship_prefs_for_dir(tmp_path, "bad-hours=2,3")
     assert "(mutating)" in message
     # the row is readable through the SAME store the adapter loop uses
     rel = read_owner_relationship(_store(tmp_path))
@@ -615,8 +612,8 @@ def test_set_relationship_prefs_for_dir_patches_not_replaces(tmp_path) -> None:
     # A second, unrelated update must PATCH — not clear a previously-set boundary.
     store = _store(tmp_path)
     store.commit(State(u=5.0))
-    set_relationship_prefs_for_dir(tmp_path, "bad-hours=2,3", logger=get_logger("t"))
-    set_relationship_prefs_for_dir(tmp_path, "cadence=2h", logger=get_logger("t"))
+    set_relationship_prefs_for_dir(tmp_path, "bad-hours=2,3")
+    set_relationship_prefs_for_dir(tmp_path, "cadence=2h")
     rel = read_owner_relationship(_store(tmp_path))
     assert rel is not None
     assert rel.bad_hours == (2, 3)  # the earlier boundary SURVIVES the cadence update
@@ -627,7 +624,7 @@ def test_set_relationship_prefs_for_dir_patches_not_replaces(tmp_path) -> None:
 def test_set_relationship_prefs_for_dir_leaves_vitals_untouched(tmp_path) -> None:
     store = _store(tmp_path)
     store.commit(State(u=5.0, decline_count=3))
-    set_relationship_prefs_for_dir(tmp_path, "cadence=2h", logger=get_logger("t"))
+    set_relationship_prefs_for_dir(tmp_path, "cadence=2h")
     persisted = _store(tmp_path).load()
     assert persisted.u == 5.0  # relationship set does not touch the being's vitals
     assert persisted.decline_count == 3
@@ -637,14 +634,14 @@ def test_set_relationship_prefs_for_dir_leaves_vitals_untouched(tmp_path) -> Non
 
 
 def test_think_for_dir_rejects_empty_content(tmp_path) -> None:
-    message = think_for_dir(tmp_path, "   ", logger=get_logger("t"))
+    message = think_for_dir(tmp_path, "   ")
     assert "usage:" in message
     assert read_live_thoughts(_store(tmp_path)) == ()  # nothing persisted
 
 
 def test_think_for_dir_persists_a_live_active_thought(tmp_path) -> None:
     _store(tmp_path).commit(State(u=5.0, decline_count=3))
-    message = think_for_dir(tmp_path, "did the owner ever hear back", logger=get_logger("t"))
+    message = think_for_dir(tmp_path, "did the owner ever hear back")
     assert "(mutating)" in message
     thoughts = read_live_thoughts(_store(tmp_path))
     assert len(thoughts) == 1
@@ -657,26 +654,24 @@ def test_think_for_dir_persists_a_live_active_thought(tmp_path) -> None:
 
 
 def test_think_for_dir_is_idempotent_on_identical_content(tmp_path) -> None:
-    think_for_dir(tmp_path, "one and the same", logger=get_logger("t"))
-    think_for_dir(tmp_path, "one and the same", logger=get_logger("t"))
+    think_for_dir(tmp_path, "one and the same")
+    think_for_dir(tmp_path, "one and the same")
     assert len(read_live_thoughts(_store(tmp_path))) == 1  # deterministic id -> one row
 
 
 def test_transition_thought_to_terminal_removes_it_from_live(tmp_path) -> None:
-    think_for_dir(tmp_path, "let this one go", logger=get_logger("t"))
+    think_for_dir(tmp_path, "let this one go")
     tid = seed_thought_id("let this one go")
-    message = transition_thought_for_dir(
-        tmp_path, tid, ThoughtState.RESOLVED, logger=get_logger("t")
-    )
+    message = transition_thought_for_dir(tmp_path, tid, ThoughtState.RESOLVED)
     assert "(mutating)" in message
     assert read_live_thoughts(_store(tmp_path)) == ()  # resolved -> gone from the live set
     assert read_thought(_store(tmp_path), tid) is None  # and no longer a live thought
 
 
 def test_transition_thought_park_keeps_it_live(tmp_path) -> None:
-    think_for_dir(tmp_path, "hold this thought", logger=get_logger("t"))
+    think_for_dir(tmp_path, "hold this thought")
     tid = seed_thought_id("hold this thought")
-    transition_thought_for_dir(tmp_path, tid, ThoughtState.PARKED, logger=get_logger("t"))
+    transition_thought_for_dir(tmp_path, tid, ThoughtState.PARKED)
     live = read_live_thoughts(_store(tmp_path))
     assert [t.id for t in live] == [tid]  # parked is still live
     assert live[0].state == ThoughtState.PARKED.value
@@ -685,18 +680,16 @@ def test_transition_thought_park_keeps_it_live(tmp_path) -> None:
 def test_transition_thought_rejects_illegal_edge(tmp_path) -> None:
     # "archived" is not a thought state at all -> the registry rejects the edge,
     # nothing is written.
-    think_for_dir(tmp_path, "stays active", logger=get_logger("t"))
+    think_for_dir(tmp_path, "stays active")
     tid = seed_thought_id("stays active")
-    message = transition_thought_for_dir(tmp_path, tid, "archived", logger=get_logger("t"))
+    message = transition_thought_for_dir(tmp_path, tid, "archived")
     assert "error" in message.lower()
     assert read_live_thoughts(_store(tmp_path))[0].state == ThoughtState.ACTIVE.value  # unchanged
 
 
 def test_transition_thought_absent_is_rejected(tmp_path) -> None:
     _store(tmp_path).commit(State())
-    message = transition_thought_for_dir(
-        tmp_path, "thought:nope", "resolved", logger=get_logger("t")
-    )
+    message = transition_thought_for_dir(tmp_path, "thought:nope", "resolved")
     assert "no thought" in message
 
 
@@ -705,7 +698,7 @@ def test_seeded_thought_persists_but_does_not_render_in_a_launch(tmp_path) -> No
     # committer and is snapshot-visible next tick. T6: cognition no longer renders
     # thoughts into the proactive prompt (the thought machinery moved to Phase 6 in
     # T7), so the seeded thought stays in the store but does NOT reach the prompt.
-    think_for_dir(tmp_path, "did the owner hear back about the flat", logger=get_logger("t"))
+    think_for_dir(tmp_path, "did the owner hear back about the flat")
     lm = build_lifemodel(base_dir=tmp_path, clock=_FixedClock(NOW))
     # a live active desire + an affordable, past-silence, un-inhibited state so
     # cognition launches this tick

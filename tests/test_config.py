@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-import lifemodel.log as lm_logging
 from lifemodel.config import (
     CONFIG_FILENAME,
     read_config,
@@ -24,6 +24,19 @@ from lifemodel.config import (
     write_log_level,
 )
 from lifemodel.log import LOG_LEVEL_NAMES
+
+
+@pytest.fixture(autouse=True)
+def _restore_lifemodel_log_level() -> Iterator[None]:
+    """Save/restore the ``lifemodel`` logger level so a ``loglevel`` handler test
+    that applies a level (via ``setLevel``) never leaks into later tests."""
+    logger = logging.getLogger("lifemodel")
+    saved = logger.level
+    try:
+        yield
+    finally:
+        logger.setLevel(saved)
+
 
 # --- read_config / write_config ----------------------------------------------
 
@@ -147,12 +160,9 @@ def test_set_log_level_for_dir_no_arg_defaults_to_info_with_no_config(
 
 
 def test_set_log_level_for_dir_valid_arg_persists_and_echoes_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    # Guard against leaking the real (non-monkeypatched) log.configure() call
-    # this triggers into later tests: monkeypatch reverts _effective_level to
-    # its pre-test value on teardown regardless of what happens in between.
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    logging.getLogger("lifemodel").setLevel(logging.INFO)
     message = set_log_level_for_dir(tmp_path, "debug")
     assert read_log_level(tmp_path) == "debug"
     assert "info" in message  # old
@@ -161,11 +171,12 @@ def test_set_log_level_for_dir_valid_arg_persists_and_echoes_change(
 
 
 def test_set_log_level_for_dir_valid_arg_applies_at_runtime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(lm_logging, "_effective_level", logging.INFO)
+    logging.getLogger("lifemodel").setLevel(logging.INFO)
     set_log_level_for_dir(tmp_path, "debug")
-    assert lm_logging._effective_level == logging.DEBUG
+    # Applied at runtime via setLevel on the lifemodel logger.
+    assert logging.getLogger("lifemodel").level == logging.DEBUG
 
 
 def test_set_log_level_for_dir_invalid_arg_returns_usage_listing_valid_names(

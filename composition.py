@@ -71,7 +71,6 @@ from .core.solitude_drive import SolitudeDrive
 from .core.state_actor import StateActor
 from .domain.objects import default_registry
 from .events import EventRing
-from .log import EventLogger
 from .ports.clock import ClockPort
 from .ports.delivery import DeliveryPort
 from .ports.memory import MemoryPort
@@ -121,12 +120,6 @@ class LifeModel:
     registry: ComponentRegistry = field(default_factory=ComponentRegistry)
     state_actor: StateActor | None = None
     coreloop: CoreLoop | None = None
-    #: The logger this graph was built with (bead lm-j2w B3), so hooks/observers
-    #: that only receive ``lm`` — not a separately threaded ``logger`` param —
-    #: can still log through the SAME collaborator the rest of the graph uses,
-    #: rather than constructing a fresh ad-hoc one. ``None`` when the caller
-    #: (e.g. a bare test ``build_lifemodel(base_dir=...)``) never passed one.
-    logger: EventLogger | None = None
     #: The execution tracer (lm-27n.11) the graph was built with — the SAME one
     #: wired into the CoreLoop. Exposed so out-of-tick paths (e.g. the egress
     #: backstop in :func:`proactive_tick`) can mint a span for a suppression.
@@ -149,7 +142,6 @@ def build_lifemodel(
     delivery: DeliveryPort | None = None,
     aggregator: Aggregator | None = None,
     neurons: Sequence[Neuron] | None = None,
-    logger: EventLogger | None = None,
     registry: ComponentRegistry | None = None,
     tracer: TracerPort | None = None,
     trace_exporter: TraceExportPort | None = None,
@@ -178,9 +170,7 @@ def build_lifemodel(
     server-local then UTC.
     """
     resolved_clock: ClockPort = clock or SystemClock()
-    resolved_state: StatePort = state or SQLiteRuntimeStore(
-        base_dir, clock=resolved_clock, logger=logger
-    )
+    resolved_state: StatePort = state or SQLiteRuntimeStore(base_dir, clock=resolved_clock)
     # The one live adapter (SQLiteRuntimeStore) implements StatePort + MemoryPort
     # + PressureSensorPort + TickCommitPort, so a tick's commit spans vitals and
     # entities in one transaction (HLA §4.1). Default the memory/pressure/commit
@@ -197,8 +187,8 @@ def build_lifemodel(
     resolved_committer: TickCommitPort | None = (
         resolved_state if isinstance(resolved_state, TickCommitPort) else None
     )
-    resolved_bus: SignalBus = bus or FileSignalBus(base_dir, logger=logger)
-    resolved_delivery: DeliveryPort = delivery or NoopDelivery(logger=logger)
+    resolved_bus: SignalBus = bus or FileSignalBus(base_dir)
+    resolved_delivery: DeliveryPort = delivery or NoopDelivery()
     # The execution tracer (lm-27n.11): the DEFAULT mints real W3C ids stdlib-only;
     # a test injects a deterministic FakeTracer. The CoreLoop mints ONE root trace per
     # tick from it and threads it through TickContext so creation sites stamp the born
@@ -282,7 +272,7 @@ def build_lifemodel(
             display_tz=display_tz,
         )
         resolved_registry.register(launcher, ComponentManifest(id=launcher.id, type="launcher"))
-    resolved_state_actor = StateActor(resolved_state, committer=resolved_committer, logger=logger)
+    resolved_state_actor = StateActor(resolved_state, committer=resolved_committer)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,
         state_actor=resolved_state_actor,
@@ -310,7 +300,6 @@ def build_lifemodel(
         registry=resolved_registry,
         state_actor=resolved_state_actor,
         coreloop=resolved_coreloop,
-        logger=logger,
         tracer=resolved_tracer,
         trace_writer=resolved_writer,
         event_ring=resolved_ring,

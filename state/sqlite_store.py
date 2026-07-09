@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import shutil
 import sqlite3
 from collections.abc import Callable, Sequence
@@ -96,7 +97,6 @@ from ..domain.memory import (
     parse_expires_at_epoch_ms,
     stamp_iso_utc,
 )
-from ..log import EventLogger, get_logger
 from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
 from .errors import StateCorruptError, StateSchemaError, StateSerializationError
@@ -104,6 +104,8 @@ from .model import SCHEMA_VERSION, State
 
 _DB_FILENAME = "lifemodel.sqlite"
 _BUSY_TIMEOUT_MS = 5_000
+
+_LOG = logging.getLogger("lifemodel.state.sqlite")
 _WAL_AUTOCHECKPOINT_PAGES = 1_000
 
 _SELECT_COLUMNS = (
@@ -135,13 +137,10 @@ class SQLiteRuntimeStore:
     """A :class:`StatePort` + :class:`MemoryPort` + :class:`PressureSensorPort` over one
     SQLite file (HLA §4.1/D7)."""
 
-    def __init__(
-        self, base_dir: Path, *, clock: ClockPort, logger: EventLogger | None = None
-    ) -> None:
+    def __init__(self, base_dir: Path, *, clock: ClockPort) -> None:
         self._base_dir = base_dir
         self._path = base_dir / _DB_FILENAME
         self._clock = clock
-        self._log = logger or get_logger("lifemodel.state.sqlite")
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._strict_supported = self._detect_strict_support()
         self._ensure_ready()
@@ -192,8 +191,10 @@ class SQLiteRuntimeStore:
                 try:
                     src.unlink()
                 except OSError as exc:
-                    self._log.info("sqlite_quarantine_unlink_failed", path=str(src), error=str(exc))
-        self._log.info("sqlite_quarantined", path=str(self._path), epoch_ms=stamp)
+                    _LOG.info(
+                        "sqlite_quarantine_unlink_failed path=%s error=%s", str(src), str(exc)
+                    )
+        _LOG.info("sqlite_quarantined path=%s epoch_ms=%s", str(self._path), stamp)
 
     def _ensure_wal_mode(self) -> None:
         with suppress(sqlite3.Error), closing(sqlite3.connect(str(self._path))) as conn:
@@ -543,10 +544,10 @@ class SQLiteRuntimeStore:
             # never trusts a NEWER version — only forward-loads OLDER ones;
             # NON-additive migrations remain Phase 7.
             loaded = dataclasses.replace(State.from_dict(data), schema_version=SCHEMA_VERSION)
-            self._log.info(
-                "state_schema_forward_compat_upgrade",
-                on_disk_version=version,
-                build_version=SCHEMA_VERSION,
+            _LOG.info(
+                "state_schema_forward_compat_upgrade on_disk_version=%s build_version=%s",
+                version,
+                SCHEMA_VERSION,
             )
             return loaded
 
@@ -579,7 +580,7 @@ class SQLiteRuntimeStore:
         now = self._clock.now()
         with closing(self._connect()) as conn, conn:
             self._commit_state_on(conn, state, now)
-        self._log.info("state_commit", schema_version=state.schema_version)
+        _LOG.info("state_commit schema_version=%s", state.schema_version)
 
     def _ensure_state_serializable(self, state: State) -> None:
         """Fail-closed guard (mirrors ``JsonStateStore.commit``): reject a
@@ -691,7 +692,7 @@ class SQLiteRuntimeStore:
         finally:
             conn.close()
         if state is not None:
-            self._log.info("state_commit", schema_version=state.schema_version)
+            _LOG.info("state_commit schema_version=%s", state.schema_version)
 
     def reset(self) -> State:
         """Factory-wipe the ``runtime_state`` row to a fresh ``State()``.
@@ -726,7 +727,7 @@ class SQLiteRuntimeStore:
         with closing(self._connect()) as conn, conn:
             (count,) = conn.execute("SELECT COUNT(*) FROM memory_records").fetchone()
             conn.execute("DELETE FROM memory_records")
-        self._log.info("memory_records_purged", count=count)
+        _LOG.info("memory_records_purged count=%s", count)
         return int(count)
 
     # ---- PressureSensorPort ---------------------------------------------------
@@ -750,7 +751,7 @@ class SQLiteRuntimeStore:
             # a transient condition, so it still surfaces.
             if _is_schema_error(exc):
                 raise
-            self._log.info("pressure_read_failed_soft", error=str(exc))
+            _LOG.info("pressure_read_failed_soft error=%s", str(exc))
             return PressureIndex()
 
         count = row[0] if row is not None else 0

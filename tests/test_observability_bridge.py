@@ -29,7 +29,7 @@ from lifemodel.ports.tracer import parse_traceparent
 from lifemodel.state.model import State
 from lifemodel.state.trace_store import TraceWriter, observability_db_path
 from lifemodel.testing.fakes import FakeClock, FakeTracer
-from lifemodel.testing.harness import RecordingEgress, RecordingLogger
+from lifemodel.testing.harness import RecordingEgress
 
 _T0 = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
 
@@ -61,11 +61,10 @@ def test_one_proactive_attempt_is_one_trace_id(tmp_path: Path) -> None:
         )
         _seed_launch_ready(lm)
         egress = RecordingEgress(ReachOutcome.DELIVERED)
-        logger = RecordingLogger()
 
         # --- tick N: the launch (cognition mints origin trace T, delivery under T) ---
         clock.advance(timedelta(minutes=1))
-        outcome = proactive_tick(lm, egress, {"chat_id": "1"}, logger=logger)
+        outcome = proactive_tick(lm, egress, {"chat_id": "1"})
         assert outcome is ReachOutcome.DELIVERED
         after_launch = lm.state.load()
         assert after_launch.pending_proactive_id is not None
@@ -90,7 +89,7 @@ def test_one_proactive_attempt_is_one_trace_id(tmp_path: Path) -> None:
                 correlation_id=correlation_id,
             )
         )
-        proactive_tick(lm, egress, {"chat_id": "1"}, logger=logger)
+        proactive_tick(lm, egress, {"chat_id": "1"})
 
         assert writer.flush(timeout=5.0)
         conn = sqlite3.connect(str(db_path))

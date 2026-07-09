@@ -13,7 +13,9 @@ Hermes.
 
 from __future__ import annotations
 
-from ..log import EventLogger, get_logger
+import logging
+
+_LOG = logging.getLogger("lifemodel.delivery")
 
 
 class NoopDelivery:
@@ -24,9 +26,6 @@ class NoopDelivery:
     skeleton stays observable.
     """
 
-    def __init__(self, *, logger: EventLogger | None = None) -> None:
-        self._log = logger or get_logger("lifemodel.delivery")
-
     def send(self, channel: str, text: str) -> None:
         """Drop the message; record that it would have been sent (text-only)."""
-        self._log.info("delivery_noop", channel=channel, text_len=len(text))
+        _LOG.info("delivery_noop channel=%s text_len=%s", channel, len(text))

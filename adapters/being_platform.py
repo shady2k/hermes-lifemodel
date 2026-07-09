@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,6 @@ from ..composition import build_lifemodel
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..events import EventRing
-from ..log import EventLogger, get_logger
 from ..state.trace_store import (
     TraceWriter,
     acquire_trace_writer,
@@ -46,6 +46,8 @@ from .reachin import ReachInEgress, default_runner_accessor
 PLATFORM_NAME = "lifemodel"
 LOOP_INTERVAL_SEC = 60.0
 
+_LOG = logging.getLogger("lifemodel.being")
+
 
 class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (gateway untyped)
     """Hosts the being's autonomic brain as a supervised gateway loop."""
@@ -56,15 +58,13 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         *,
         base_dir: Path,
         target: dict[str, str | None] | None,
-        logger: EventLogger | None = None,
         interval_sec: float = LOOP_INTERVAL_SEC,
     ) -> None:
         super().__init__(config, Platform(PLATFORM_NAME))
         self._base_dir = base_dir
         self._target: dict[str, str | None] = target or {}
-        self._log = logger or get_logger("lifemodel.being")
         self._interval = interval_sec
-        self._egress = ReachInEgress(runner_accessor=default_runner_accessor, logger=self._log)
+        self._egress = ReachInEgress(runner_accessor=default_runner_accessor)
         self._loop: SupervisedLoop | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -81,18 +81,17 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # None → server-local, so a timezone quirk never drops a tick (HLA §11).
         lm = build_lifemodel(
             base_dir=self._base_dir,
-            logger=self._log,
             display_tz=resolve_owner_tz(),
             trace_writer=self._trace_writer,
             event_ring=self._event_ring,
         )
-        proactive_tick(lm, self._egress, self._target, logger=self._log)
+        proactive_tick(lm, self._egress, self._target)
 
     def _on_loop_death(self, exc: BaseException | None) -> None:
         """Convert an unexpected loop death into a gateway-visible fatal error."""
         if self._shutting_down:
             return
-        self._log.info("being_loop_died", error=repr(exc))
+        _LOG.info("being_loop_died error=%r", exc)
         self._set_fatal_error("brain_loop_exited", f"proactive loop died: {exc!r}", retryable=True)
         # always on the gateway loop in practice; suppress if somehow off-loop.
         # Track the notify task so a failure to notify (which would strand the
@@ -106,7 +105,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             return
         exc = task.exception()
         if exc is not None:
-            self._log.info("being_notify_fatal_failed", error=repr(exc))
+            _LOG.info("being_notify_fatal_failed error=%r", exc)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._shutting_down = False
@@ -120,7 +119,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         )
         self._loop_task = asyncio.create_task(self._loop.run())
         self._mark_connected()
-        self._log.info("being_connected", is_reconnect=is_reconnect, interval=self._interval)
+        _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
         return True
 
     async def disconnect(self) -> None:
@@ -137,7 +136,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             release_trace_writer(observability_db_path(self._base_dir))
             self._trace_writer = None
         self._mark_disconnected()  # keep status accurate on a clean stop
-        self._log.info("being_disconnected")
+        _LOG.info("being_disconnected")
 
     async def send(
         self, chat_id: str, content: str, reply_to: Any = None, metadata: Any = None
@@ -157,14 +156,12 @@ def register_being_platform(
     *,
     base_dir: Path,
     target: dict[str, str | None] | None,
-    logger: EventLogger | None = None,
 ) -> None:
     """Register the being as a gateway platform (call from ``register(ctx)``)."""
-    log = logger or get_logger("lifemodel.being")
     ctx.register_platform(
         PLATFORM_NAME,
         label="Life Model",
-        adapter_factory=lambda cfg: BeingAdapter(cfg, base_dir=base_dir, target=target, logger=log),
+        adapter_factory=lambda cfg: BeingAdapter(cfg, base_dir=base_dir, target=target),
         check_fn=lambda: True,
         emoji="🫀",
     )

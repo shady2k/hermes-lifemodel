@@ -78,7 +78,6 @@ from .domain.objects import (
     ThoughtState,
     default_registry,
 )
-from .log import EventLogger
 from .ports.memory import MemoryPort
 from .ports.tick_commit import TickCommitPort
 from .ports.tracer import parse_traceparent
@@ -465,7 +464,6 @@ def _apply(
     base_dir: Path,
     compute: Callable[[State, datetime], tuple[State | None, str]],
     *,
-    logger: EventLogger | None = None,
     desire_mutations: Callable[[composition.LifeModel], list[MemoryMutation]] | None = None,
 ) -> str:
     """Load -> compute a candidate -> re-validate -> commit (or reject).
@@ -473,7 +471,7 @@ def _apply(
     ``desire_mutations`` optionally computes desire-row mutations to commit
     atomically alongside the ``State`` candidate (one ``commit_tick``), so the
     row and the vitals never split."""
-    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    lm = composition.build_lifemodel(base_dir=base_dir)
     before = lm.state.load()
     now = lm.clock.now()
     candidate, message = compute(before, now)
@@ -522,32 +520,30 @@ def _mark_pending_correlation_resolved(base_dir: Path, before: State, now: datet
         )
 
 
-def nudge_for_dir(base_dir: Path, raw_amount: str, *, logger: EventLogger | None = None) -> str:
-    return _apply(base_dir, lambda before, now: nudge(before, now, raw_amount), logger=logger)
+def nudge_for_dir(base_dir: Path, raw_amount: str) -> str:
+    return _apply(base_dir, lambda before, now: nudge(before, now, raw_amount))
 
 
-def force_wake_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
+def force_wake_for_dir(base_dir: Path) -> str:
     # Terminalize any stuck desire so the NEXT real tick births a fresh one via
     # the (now-satisfied) gates — the gate-proving path force-wake exists for.
     return _apply(
         base_dir,
         force_wake,
-        logger=logger,
         desire_mutations=lambda lm: _terminalize_live_desire(lm, str(DesireState.DROPPED)),
     )
 
 
-def satiate_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
+def satiate_for_dir(base_dir: Path) -> str:
     # A simulated fulfilled contact terminalizes the live desire (satisfied).
     return _apply(
         base_dir,
         satiate,
-        logger=logger,
         desire_mutations=lambda lm: _terminalize_live_desire(lm, str(DesireState.SATISFIED)),
     )
 
 
-def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
+def reset_for_dir(base_dir: Path) -> str:
     """Factory wipe via :meth:`~lifemodel.state.port.StatePort.reset` directly —
     NOT through :func:`_apply`'s load-mutate-commit flow, because a reset must
     still work when the previously-persisted state is unreadable (corrupt, or
@@ -560,7 +556,7 @@ def reset_for_dir(base_dir: Path, *, logger: EventLogger | None = None) -> str:
     a reset being genuinely starts "as if newly born" with no rumination spiral
     left behind. See :func:`_purge_all_memory` for the best-effort seam.
     """
-    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    lm = composition.build_lifemodel(base_dir=base_dir)
     now = lm.clock.now()
     try:
         before: State | None = lm.state.load()
@@ -607,13 +603,11 @@ def _purge_all_memory(lm: composition.LifeModel) -> int:
     return result if isinstance(result, int) else 0
 
 
-def set_field_for_dir(base_dir: Path, raw_args: str, *, logger: EventLogger | None = None) -> str:
-    return _apply(base_dir, lambda before, now: set_field(before, now, raw_args), logger=logger)
+def set_field_for_dir(base_dir: Path, raw_args: str) -> str:
+    return _apply(base_dir, lambda before, now: set_field(before, now, raw_args))
 
 
-def set_relationship_prefs_for_dir(
-    base_dir: Path, raw_args: str, *, logger: EventLogger | None = None
-) -> str:
+def set_relationship_prefs_for_dir(base_dir: Path, raw_args: str) -> str:
     """Parse owner prefs and commit the owner-relationship row through the bus.
 
     The relationship is a typed ``kind='relationship'`` record, not a ``State``
@@ -624,7 +618,7 @@ def set_relationship_prefs_for_dir(
     split. A ``StatePort`` fake without ``TickCommitPort`` cannot persist the row;
     that degrades to a no-op commit (the live ``SQLiteRuntimeStore`` always
     implements it)."""
-    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    lm = composition.build_lifemodel(base_dir=base_dir)
     # Read the existing owner relationship so the parsed keys PATCH it (an unrelated
     # update must not clear a previously-set boundary). Absent → build fresh.
     existing = read_owner_relationship(lm.state) if isinstance(lm.state, MemoryPort) else None
@@ -659,7 +653,7 @@ _SEED_PROVENANCE = Provenance(
 )
 
 
-def think_for_dir(base_dir: Path, content: str, *, logger: EventLogger | None = None) -> str:
+def think_for_dir(base_dir: Path, content: str) -> str:
     """Seed one typed ``kind='thought'`` row (active) through the intent bus.
 
     The debug/owner path that creates a thought so persist+render+snapshot are
@@ -670,7 +664,7 @@ def think_for_dir(base_dir: Path, content: str, *, logger: EventLogger | None = 
     content = content.strip()
     if not content:
         return "usage: /lifemodel think <content>\n"
-    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    lm = composition.build_lifemodel(base_dir=base_dir)
     thought = build_thought(
         id=seed_thought_id(content),
         content=content,
@@ -697,8 +691,6 @@ def transition_thought_for_dir(
     base_dir: Path,
     thought_id: str,
     to_state: ThoughtState | str,
-    *,
-    logger: EventLogger | None = None,
 ) -> str:
     """Move a live thought through a guarded, registry-legal edge (park/resolve/
     drop/...), committed atomically through the bus.
@@ -709,7 +701,7 @@ def transition_thought_for_dir(
     an illegal edge with a clear message — never a raw write. Nothing DRIVES these
     transitions yet (the engine is .7)."""
     to = str(to_state)
-    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    lm = composition.build_lifemodel(base_dir=base_dir)
     memory = lm.state if isinstance(lm.state, MemoryPort) else None
     if memory is None:  # pragma: no cover - the live store is always a MemoryPort
         return "error: this store cannot read thought records\n"
@@ -768,14 +760,14 @@ def render_why(node: WhyNode) -> str:
     return "\n".join(lines) + "\n"
 
 
-def why_for_dir(base_dir: Path, raw_args: str, *, logger: EventLogger | None = None) -> str:
+def why_for_dir(base_dir: Path, raw_args: str) -> str:
     """Answer ``/lifemodel why [desire|intention|write|<kind>:<id>]`` — read-only.
 
     ``why`` / ``why write`` / ``why intention`` walk the contact intention chain ("why
     did I decide to write?"); ``why desire`` walks the contact desire chain; a bare
     ``<kind>:<id>`` walks that precise object. A target with no live/recent row renders
     a clear "no current outreach" (or "no such object") message — never a crash."""
-    lm = composition.build_lifemodel(base_dir=base_dir, logger=logger)
+    lm = composition.build_lifemodel(base_dir=base_dir)
     memory = lm.state if isinstance(lm.state, MemoryPort) else None
     if memory is None:  # pragma: no cover - the live store is always a MemoryPort
         return "error: this store cannot read memory records\n"

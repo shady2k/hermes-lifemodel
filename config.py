@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .log import LOG_LEVEL_NAMES, configure, parse_log_level
+from .log import LOG_LEVEL_NAMES, apply_log_level, parse_log_level
 
 #: The config file's name, sitting next to ``lifemodel.sqlite`` in the
 #: per-profile ``base_dir``.
@@ -35,7 +35,7 @@ _LOG_LEVEL_KEY = "log_level"
 
 #: The log level a being boots at when nothing has been persisted yet —
 #: matches :func:`lifemodel.log.configure`'s own default.
-DEFAULT_LOG_LEVEL = "info"
+DEFAULT_LOG_LEVEL = "info"  # matches the lifemodel logger's effective level at import
 
 
 def read_config(base_dir: Path) -> dict[str, Any]:
@@ -67,8 +67,8 @@ def write_config(base_dir: Path, config: dict[str, Any]) -> None:
     — on POSIX (and modern Windows) ``replace`` is atomic, so a reader never
     observes a partially-written file, and a crash mid-write leaves the old
     config (or nothing) intact, never a corrupt one. Creates *base_dir* if it
-    doesn't exist yet (mirrors :class:`lifemodel.events.EventSink`, which does
-    the same for its sibling file in the same directory).
+    doesn't exist yet, so a fresh being can persist a preference before its
+    state store has written anything to the same directory.
     """
     base_dir.mkdir(parents=True, exist_ok=True)
     path = base_dir / CONFIG_FILENAME
@@ -123,8 +123,9 @@ def set_log_level_for_dir(base_dir: Path, raw_args: str) -> str:
     vs. bare status elsewhere in this plugin). With an argument: validate
     against the 5 standard names, and on success persist it
     (:func:`write_log_level`) AND apply it at runtime
-    (:func:`lifemodel.log.configure`) so the change takes effect immediately
-    — not just on the next restart. An invalid name returns a readable usage
+    (:func:`lifemodel.log.apply_log_level` → ``setLevel`` on the ``lifemodel``
+    logger) so the change takes effect immediately — not just on the next
+    restart. An invalid name returns a readable usage
     message listing the valid names rather than raising (the command
     dispatch boundary in ``__init__.py`` already catches exceptions, but a
     clean usage message reads far better than the generic error wrapper for
@@ -143,5 +144,5 @@ def set_log_level_for_dir(base_dir: Path, raw_args: str) -> str:
             f"error: 'loglevel' invalid level {requested!r}. Valid levels: {valid}\n"
             f"usage: /lifemodel loglevel [{usage}]\n"
         )
-    configure(parse_log_level(new_level))
+    apply_log_level(parse_log_level(new_level))
     return f"lifemodel loglevel: {current} -> {new_level}\n"

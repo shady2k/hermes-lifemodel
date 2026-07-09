@@ -20,7 +20,6 @@ from dataclasses import fields, replace
 from typing import Any
 
 from ..domain.memory import MemoryMutation
-from ..log import EventLogger
 from ..ports.tick_commit import TickCommitPort
 from ..state.model import State
 from ..state.port import StatePort
@@ -51,7 +50,6 @@ class StateActor:
         *,
         committer: TickCommitPort | None = None,
         state: State | None = None,
-        logger: EventLogger | None = None,
     ) -> None:
         self._store = store
         if committer is not None:
@@ -64,8 +62,6 @@ class StateActor:
             )
         self._provided_state = state
         self._state: State | None = None
-        self._log = logger
-        self._checkpoint_id = 0
 
     @property
     def state(self) -> State:
@@ -100,11 +96,4 @@ class StateActor:
         new_state = replace(self.state, **patch) if patch else self.state
         self._committer.commit_tick(new_state if patch else None, mutations)
         self._state = new_state
-        self._checkpoint_id += 1
-        if self._log is not None:
-            self._log.info(
-                "state_checkpoint",
-                checkpoint_id=self._checkpoint_id,
-                fields=sorted(patch),
-            )
         return new_state

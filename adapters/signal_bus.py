@@ -30,31 +30,32 @@ concern; Phase 1 keeps it simple. Stdlib + our domain/logging only; no Hermes.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from ..core.signal_bus import SignalBus
 from ..domain.signal import Signal
-from ..log import EventLogger, get_logger
 
 _LOG_FILENAME = "signals.log"
 _CONSUMED_FILENAME = "signals.consumed"
+
+_LOG = logging.getLogger("lifemodel.signal_bus")
 
 
 class FileSignalBus(SignalBus):
     """A durable append-only :class:`SignalBus` over two files in *base_dir*."""
 
-    def __init__(self, base_dir: Path, *, logger: EventLogger | None = None) -> None:
+    def __init__(self, base_dir: Path) -> None:
         self._base_dir = base_dir
         self._log_path = base_dir / _LOG_FILENAME
         self._consumed_path = base_dir / _CONSUMED_FILENAME
-        self._log = logger or get_logger("lifemodel.signal_bus")
 
     def publish(self, signal: Signal) -> None:
         """Append *signal* to the durable log (``flush`` + ``fsync``)."""
         line = json.dumps(signal.to_dict(), ensure_ascii=False, allow_nan=False)
         self._append_line(self._log_path, line)
-        self._log.info("signal_published", origin_id=signal.origin_id, kind=signal.kind)
+        _LOG.info("signal_published origin_id=%s kind=%s", signal.origin_id, signal.kind)
 
     def consume_unprocessed(self) -> list[Signal]:
         """Return not-yet-consumed signals, deduped by origin id, and mark them.
@@ -67,7 +68,7 @@ class FileSignalBus(SignalBus):
         fresh = self._unprocessed()
         if fresh:
             self._append_lines(self._consumed_path, [s.origin_id for s in fresh])
-        self._log.info("signals_consumed", count=len(fresh))
+        _LOG.info("signals_consumed count=%s", len(fresh))
         return fresh
 
     def peek_unprocessed(self) -> list[Signal]:

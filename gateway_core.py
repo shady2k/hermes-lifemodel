@@ -14,11 +14,13 @@ The being's autonomic loop is hosted as a supervised platform adapter
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from .domain.egress import ReachOutcome
-from .log import EventLogger, get_logger
+
+_LOG = logging.getLogger("lifemodel.reachin")
 
 MakeEvent = Callable[[str, Any, int | None], Any]
 Schedule = Callable[[Any, Any], None]
@@ -78,15 +80,13 @@ def inject_proactive_turn(
     message_id: int | None = None,
     make_event: MakeEvent = _default_make_event,
     schedule: Schedule = _default_schedule,
-    logger: EventLogger | None = None,
 ) -> ReachOutcome:
     """Run a native ``internal=True`` turn on *target* lane. Fail-closed."""
-    log = logger or get_logger("lifemodel.reachin")
     if not reachin_available(runner):
-        log.info("reachin_unavailable", reason="runner_incomplete")
+        _LOG.info("reachin_unavailable reason=%s", "runner_incomplete")
         return ReachOutcome.UNAVAILABLE
     if not getattr(runner, "_running", False) or getattr(runner, "_draining", False):
-        log.info("reachin_unavailable", reason="not_running_or_draining")
+        _LOG.info("reachin_unavailable reason=%s", "not_running_or_draining")
         return ReachOutcome.UNAVAILABLE
     try:
         # Resolve the lane. Prefer the session_store origin via session_key (the
@@ -111,11 +111,11 @@ def inject_proactive_turn(
         }
         source = runner._build_process_event_source(evt)
         if source is None or not getattr(source, "chat_id", None):
-            log.info("reachin_unavailable", reason="unknown_lane")
+            _LOG.info("reachin_unavailable reason=%s", "unknown_lane")
             return ReachOutcome.UNAVAILABLE
         adapter = _select_adapter(runner, source)
         if adapter is None:
-            log.info("reachin_unavailable", reason="no_adapter")
+            _LOG.info("reachin_unavailable reason=%s", "no_adapter")
             return ReachOutcome.UNAVAILABLE
         event = make_event(prompt, source, message_id)  # message_id None (spec constraint)
         # Internal impulse turns must not show a visible "typing…" indicator on the
@@ -130,8 +130,8 @@ def inject_proactive_turn(
             with contextlib.suppress(Exception):
                 adapter.pause_typing_for_chat(source.chat_id)
         schedule(adapter.handle_message(event), runner._gateway_loop)
-        log.info("reachin_injected", chat_id=getattr(source, "chat_id", None))
+        _LOG.info("reachin_injected chat_id=%s", getattr(source, "chat_id", None))
         return ReachOutcome.DELIVERED
     except Exception as exc:  # noqa: BLE001 - fail-closed, never crash the gateway
-        log.info("reachin_failed", error=f"{type(exc).__name__}: {exc}")
+        _LOG.info("reachin_failed error=%s", f"{type(exc).__name__}: {exc}")
         return ReachOutcome.FAILED

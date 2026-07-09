@@ -15,4 +15,3 @@ repos:
       - id: mypy
         args: [--strict]
         files: ^src/
-        additional_dependencies: [structlog]

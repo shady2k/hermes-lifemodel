@@ -9,13 +9,13 @@ lm-fib.6.2 — the ``StatePort`` cutover (``runtime_state``, the v2 migration).
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from structlog.testing import capture_logs
 
 import lifemodel.state.sqlite_store as sqlite_store_module
 from lifemodel.domain.memory import (
@@ -68,13 +68,17 @@ def test_recovery_quarantines_garbage_trio_and_bootstraps_fresh(tmp_path: Path) 
     assert record.payload == {"note": "hi"}
 
 
-def test_recovery_logs_quarantine_incident(tmp_path: Path) -> None:
+def test_recovery_logs_quarantine_incident(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     _db_path(tmp_path).write_bytes(b"garbage")
-    with capture_logs() as logs:
+    with caplog.at_level(logging.INFO, logger="lifemodel.state.sqlite"):
         SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
-    events = [e for e in logs if e.get("event") == "sqlite_quarantined"]
+    events = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("sqlite_quarantined")
+    ]
     assert len(events) == 1
-    assert events[0]["path"] == str(_db_path(tmp_path))
+    assert f"path={_db_path(tmp_path)}" in events[0]
 
 
 def test_valid_store_reopens_without_quarantine(tmp_path: Path) -> None:
@@ -751,7 +755,9 @@ def test_commit_tick_applies_mutations_in_list_order(tmp_path: Path) -> None:
     assert record.state == "archived"
 
 
-def test_commit_tick_state_only_matches_old_commit(tmp_path: Path) -> None:
+def test_commit_tick_state_only_matches_old_commit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     # Behavior-neutral: a state-only commit_tick is byte-identical to commit —
     # same row, same revision bump, same state_commit log.
     clock = FakeClock(BASE_TIME)
@@ -760,21 +766,24 @@ def test_commit_tick_state_only_matches_old_commit(tmp_path: Path) -> None:
 
     store_a.commit(State(u=1.0))
     store_a.commit(State(u=2.0))
-    with capture_logs() as logs_b:
+    with caplog.at_level(logging.INFO, logger="lifemodel.state.sqlite"):
         store_b.commit_tick(State(u=1.0), [])
         store_b.commit_tick(State(u=2.0), [])
 
     assert store_a.load() == store_b.load()
     assert _runtime_state_revision(tmp_path / "a") == _runtime_state_revision(tmp_path / "b") == 1
-    assert [e for e in logs_b if e.get("event") == "state_commit"]  # same log emitted
+    # same log emitted
+    assert any(r.getMessage().startswith("state_commit") for r in caplog.records)
 
 
-def test_commit_tick_mutation_only_does_not_log_state_commit(tmp_path: Path) -> None:
+def test_commit_tick_mutation_only_does_not_log_state_commit(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     clock = FakeClock(BASE_TIME)
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    with capture_logs() as logs:
+    with caplog.at_level(logging.INFO, logger="lifemodel.state.sqlite"):
         store.commit_tick(None, [PutOp(_draft(id="m", state="active"))])
-    assert [e for e in logs if e.get("event") == "state_commit"] == []
+    assert not any(r.getMessage().startswith("state_commit") for r in caplog.records)
 
 
 def test_commit_tick_rejects_nan_state_before_writing_mutations(tmp_path: Path) -> None:

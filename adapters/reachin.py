@@ -18,7 +18,6 @@ from typing import Any
 
 from ..domain.egress import ReachOutcome
 from ..gateway_core import inject_proactive_turn, reachin_available
-from ..log import EventLogger, get_logger
 
 RunnerAccessor = Callable[[], Any | None]
 InjectFn = Callable[..., ReachOutcome]
@@ -43,14 +42,12 @@ class ReachInEgress:
         *,
         runner_accessor: RunnerAccessor,
         inject: InjectFn = inject_proactive_turn,
-        logger: EventLogger | None = None,
     ) -> None:
         self._runner_accessor = runner_accessor
         self._inject = inject
-        self._log = logger or get_logger("lifemodel.reachin")
 
     def reach_out(self, target: Mapping[str, str | None], impulse: str) -> ReachOutcome:
         runner = self._runner_accessor()
         if not reachin_available(runner):
             return ReachOutcome.UNAVAILABLE
-        return self._inject(runner, target, impulse, message_id=None, logger=self._log)
+        return self._inject(runner, target, impulse, message_id=None)

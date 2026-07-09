@@ -22,7 +22,6 @@ from .fakes import (
 from .harness import (
     IntegrationHarness,
     RecordingEgress,
-    RecordingLogger,
     Step,
     TickRecord,
 )
@@ -42,7 +41,6 @@ __all__ = [
     "FakeTracer",
     "IntegrationHarness",
     "RecordingEgress",
-    "RecordingLogger",
     "Step",
     "TickRecord",
     "contact_desire_objects",

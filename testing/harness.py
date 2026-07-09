@@ -24,7 +24,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 from ..composition import build_lifemodel
 from ..core.desire_view import read_live_contact_desire
@@ -79,30 +78,6 @@ class RecordingEgress:
         return self.outcome
 
 
-class RecordingLogger:
-    """A minimal :class:`EventLogger` that records info events (to capture the
-    suppression spans the real components emit) and debug events."""
-
-    def __init__(self) -> None:
-        self.info_calls: list[tuple[str, dict[str, Any]]] = []
-        self.debug_calls: list[tuple[str, dict[str, Any]]] = []
-
-    def debug(self, event: str, **fields: Any) -> None:
-        self.debug_calls.append((event, dict(fields)))
-
-    def info(self, event: str, **fields: Any) -> None:
-        self.info_calls.append((event, dict(fields)))
-
-    def warning(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-    def error(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-    def critical(self, event: str, **fields: Any) -> None:  # pragma: no cover - unused here
-        pass
-
-
 @dataclass
 class IntegrationHarness:
     """Drive the real being spine through fake ports over a tmp dir.
@@ -115,7 +90,6 @@ class IntegrationHarness:
 
     base_dir: Path
     clock: FakeClock = field(default_factory=lambda: FakeClock(datetime(2026, 1, 1, tzinfo=UTC)))
-    logger: RecordingLogger = field(default_factory=RecordingLogger)
     event_ring: EventRing = field(default_factory=EventRing)
     egress: RecordingEgress = field(default_factory=RecordingEgress)
     target: dict[str, str | None] = field(
@@ -128,7 +102,6 @@ class IntegrationHarness:
         self._lm = build_lifemodel(
             base_dir=self.base_dir,
             clock=self.clock,
-            logger=self.logger,
             event_ring=self.event_ring,
         )
         # Seed the start state (loaded lazily by the StateActor on the first tick).
@@ -188,7 +161,7 @@ class IntegrationHarness:
         ring_before = len(self.event_ring.read())
         egress_before = len(self.egress.calls)
         # The real delivery path: pipeline → backstop → recording egress.
-        outcome = proactive_tick(self._lm, self.egress, self.target, logger=self.logger)
+        outcome = proactive_tick(self._lm, self.egress, self.target)
         # Suppression spans route through the SpanLogger onto the freshness ring
         # (spec §4.2/§5), not the ad-hoc logger — read this step's slice back.
         new_ring = self.event_ring.read()[ring_before:]

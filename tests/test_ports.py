@@ -8,7 +8,10 @@ Imports no Hermes.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+
+import pytest
 
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.adapters.delivery import NoopDelivery
@@ -90,13 +93,11 @@ def test_clock_adapter_returns_aware_utc() -> None:
     assert now.utcoffset() == datetime.now(UTC).utcoffset()
 
 
-def test_noop_delivery_drops_the_send_but_logs_it() -> None:
-    from structlog.testing import capture_logs
-
-    with capture_logs() as logs:
+def test_noop_delivery_drops_the_send_but_logs_it(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO, logger="lifemodel.delivery"):
         NoopDelivery().send("author", "hello there")
 
-    events = [e for e in logs if e.get("event") == "delivery_noop"]
+    events = [r.getMessage() for r in caplog.records if r.getMessage().startswith("delivery_noop")]
     assert len(events) == 1
-    assert events[0]["channel"] == "author"
-    assert events[0]["text_len"] == len("hello there")
+    assert "channel=author" in events[0]
+    assert f"text_len={len('hello there')}" in events[0]
