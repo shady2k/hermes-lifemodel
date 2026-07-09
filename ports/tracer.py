@@ -17,8 +17,9 @@ correlation id. The traceparent codec is REUSED from
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from ..domain.objects.provenance import (
     Provenance,
@@ -49,6 +50,74 @@ class TraceContext:
     span_id: str
     parent_span_id: str | None = None
     trace_flags: str = _DEFAULT_TRACE_FLAGS
+
+
+#: The closed set of terminal span outcomes recorded in ``trace_spans.status``
+#: (spec §4.3). ``ok`` = ran and produced its effect; ``suppressed`` = a
+#: deliberate no-act with a closed-enum reason; ``failed`` = raised.
+SpanStatus = Literal["ok", "suppressed", "failed"]
+
+
+@runtime_checkable
+class ActiveSpan(Protocol):
+    """A MUTABLE, in-flight span handle — the decision-values carrier (spec §4.1).
+
+    Deliberately SEPARATE from the frozen :class:`TraceContext` (which stays a
+    pure W3C-id carrier): a component receives an ``ActiveSpan``, drops the
+    values that explain its decision onto it with :meth:`set` (``u``,
+    ``effective_pressure``, gate outcomes, …), and closes it with :meth:`end`.
+    The trace store serializes the accumulated :attr:`attrs` into
+    ``trace_spans.attrs_json`` so a span is *self-explaining* — the gap §1.3
+    named. The handle wraps a :class:`TraceContext` (its immutable ids) plus the
+    mutable ``attrs``/``status``/timing that only settle as the component runs.
+
+    Structural: :class:`~lifemodel.adapters.tracer.MutableActiveSpan` is the live
+    implementation and :class:`~lifemodel.testing.fakes.FakeActiveSpan` the test
+    double, so callers depend on this seam, not a concrete class.
+    """
+
+    @property
+    def context(self) -> TraceContext:
+        """The immutable W3C ids (trace/span/parent/flags) this span runs under."""
+        ...
+
+    @property
+    def component(self) -> str | None:
+        """The scheduling component that owns this span (``None`` for a bare root)."""
+        ...
+
+    @property
+    def tick(self) -> int | None:
+        """The tick number this span belongs to (``None`` outside a tick)."""
+        ...
+
+    @property
+    def status(self) -> SpanStatus:
+        """The current terminal outcome — ``ok`` until :meth:`end` sets otherwise."""
+        ...
+
+    @property
+    def started_at(self) -> str | None:
+        """ISO-8601 UTC start instant, or ``None`` if unstamped."""
+        ...
+
+    @property
+    def ended_at(self) -> str | None:
+        """ISO-8601 UTC end instant, set by :meth:`end` (``None`` while in-flight)."""
+        ...
+
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        """The read-only view of decision values accumulated via :meth:`set`."""
+        ...
+
+    def set(self, **attrs: Any) -> ActiveSpan:
+        """Merge *attrs* into this span's attribute bag; returns ``self`` to chain."""
+        ...
+
+    def end(self, *, status: SpanStatus = "ok", ended_at: str | None = None) -> ActiveSpan:
+        """Close the span with a terminal *status* (+ optional *ended_at*); chains."""
+        ...
 
 
 @runtime_checkable

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from .desires import contact_desire_objects, contact_desire_record
 from .fakes import (
+    FakeActiveSpan,
     FakeClock,
     FakeDelivery,
     FakeMemoryStore,
     FakePressureSensor,
     FakeSignalBus,
+    FakeSpanLogger,
     FakeStateStore,
     FakeTracer,
 )
@@ -29,11 +31,13 @@ from .relationships import owner_relationship_objects, owner_relationship_record
 from .thoughts import thought_objects, thought_record
 
 __all__ = [
+    "FakeActiveSpan",
     "FakeClock",
     "FakeDelivery",
     "FakeMemoryStore",
     "FakePressureSensor",
     "FakeSignalBus",
+    "FakeSpanLogger",
     "FakeStateStore",
     "FakeTracer",
     "IntegrationHarness",

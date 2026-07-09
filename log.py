@@ -15,11 +15,16 @@ described in HLA §13 land in task 0.3.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any, Protocol, cast
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from .events import EventSink
+from .state.trace_store import next_record_id
+
+if TYPE_CHECKING:
+    from .ports.tracer import ActiveSpan
 
 try:
     import structlog
@@ -148,6 +153,140 @@ class _StdlibEventLogger:
             return
         method = getattr(self._log, log_level_name(level))
         method("%s %s", event, {**self._initial, **fields})
+
+    def debug(self, event: str, **fields: Any) -> None:
+        self._emit(logging.DEBUG, event, fields)
+
+    def info(self, event: str, **fields: Any) -> None:
+        self._emit(logging.INFO, event, fields)
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self._emit(logging.WARNING, event, fields)
+
+    def error(self, event: str, **fields: Any) -> None:
+        self._emit(logging.ERROR, event, fields)
+
+    def critical(self, event: str, **fields: Any) -> None:
+        self._emit(logging.CRITICAL, event, fields)
+
+
+class _TraceEventWriter(Protocol):
+    """The slice of :class:`~lifemodel.state.trace_store.TraceWriter` SpanLogger needs.
+
+    Non-blocking, fail-open: returns ``True`` when the record was enqueued (the
+    durable write will happen on the writer thread) and ``False`` when the queue
+    was full and the record was dropped — the signal SpanLogger uses to enforce
+    durable-first (§4.2).
+    """
+
+    def submit_event(
+        self,
+        *,
+        record_id: int,
+        trace_id: str,
+        span_id: str | None,
+        tick: int | None,
+        event: str,
+        ts: str,
+        fields: Mapping[str, Any] | None = None,
+    ) -> bool: ...
+
+
+class _EventRingLike(Protocol):
+    """The append surface of :class:`~lifemodel.events.EventRing` SpanLogger projects onto."""
+
+    def append(self, record: Mapping[str, Any]) -> None: ...
+
+
+#: The human live-tail logger — native stdlib ``logging`` routed by Hermes to
+#: ``agent.log`` (spec §4.2/§v1.2). We only ever ``getLogger`` it; never
+#: ``basicConfig`` or (de)register handlers — setup is Hermes' job.
+_HUMAN_LOGGER = logging.getLogger("lifemodel")
+
+
+class SpanLogger:
+    """A span-bound :class:`EventLogger` — the "no-log-without-span" main lock (§4.1).
+
+    Every ``.info``/``.debug``/… SELF-stamps the active span's
+    ``{trace_id, span_id, tick}`` (a component cannot forget to, nor reach a
+    "bare" logger — §1.1 becomes inexpressible), then fans one record out to
+    three projections of the SAME stream:
+
+    1. the durable :class:`~lifemodel.state.trace_store.TraceWriter` (async — the
+       queryable source of truth);
+    2. the in-memory :class:`~lifemodel.events.EventRing` (freshness / read-your-writes);
+    3. the human tail via stdlib ``logging.getLogger("lifemodel")`` → ``agent.log``.
+
+    **Durable-first ordering (spec §4.2, codex fix #2).** The durable enqueue is
+    attempted FIRST; the ring + human projections happen ONLY if it succeeded, so
+    ``agent.log ⊆ sqlite`` even under overload. On a full queue the writer bumps
+    its ``dropped_count`` and this logger writes NO projections — it never
+    fabricates a line the durable store is missing.
+
+    Added ALONGSIDE the legacy structlog pipeline (Phase 1); retiring
+    ``EventTee``/``configure``/structlog is Phase 4. Level gating is delegated:
+    the durable + ring projections capture EVERY level (sqlite is the complete
+    trace, DEBUG detail included), while the human ``logging`` call self-filters
+    on the stdlib logger's own level.
+    """
+
+    def __init__(
+        self,
+        span: ActiveSpan,
+        *,
+        writer: _TraceEventWriter,
+        ring: _EventRingLike,
+        now: Callable[[], datetime] | None = None,
+        human_logger: logging.Logger | None = None,
+    ) -> None:
+        self._span = span
+        self._writer = writer
+        self._ring = ring
+        self._now = now or (lambda: datetime.now(UTC))
+        self._human = human_logger or _HUMAN_LOGGER
+
+    @property
+    def span(self) -> ActiveSpan:
+        """The active span this logger is bound to (for ``.set``/``.end`` at the site)."""
+        return self._span
+
+    def _emit(self, level: int, event: str, fields: dict[str, Any]) -> None:
+        ctx = self._span.context
+        tick = self._span.tick
+        record_id = next_record_id()
+        ts = self._now().isoformat()
+        enqueued = self._writer.submit_event(
+            record_id=record_id,
+            trace_id=ctx.trace_id,
+            span_id=ctx.span_id,
+            tick=tick,
+            event=event,
+            ts=ts,
+            fields=fields,
+        )
+        if not enqueued:
+            return  # dropped on a full queue — write NO projections (durable-first)
+        # Stamped ids are authoritative: they go last so a stray field cannot clobber them.
+        self._ring.append(
+            {
+                "event": event,
+                **fields,
+                "record_id": record_id,
+                "trace_id": ctx.trace_id,
+                "span_id": ctx.span_id,
+                "tick": tick,
+                "ts": ts,
+            }
+        )
+        self._human.log(
+            level,
+            "%s trace_id=%s span_id=%s tick=%s %s",
+            event,
+            ctx.trace_id,
+            ctx.span_id,
+            tick,
+            fields,
+        )
 
     def debug(self, event: str, **fields: Any) -> None:
         self._emit(logging.DEBUG, event, fields)

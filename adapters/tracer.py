@@ -11,8 +11,12 @@ the durable provenance codec), so there is exactly one W3C implementation.
 from __future__ import annotations
 
 import secrets
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
 
 from ..ports.tracer import (
+    SpanStatus,
     TraceContext,
 )
 from ..ports.tracer import (
@@ -78,3 +82,57 @@ class StdlibTracer:
 
     def parse_traceparent(self, value: str) -> TraceContext:
         return _parse_traceparent(value)
+
+
+@dataclass
+class MutableActiveSpan:
+    """The live :class:`~lifemodel.ports.tracer.ActiveSpan` — a mutable handle.
+
+    A component receives one of these, stamps decision values onto it with
+    :meth:`set`, and closes it with :meth:`end`. It carries the immutable W3C
+    ids in :attr:`context` (never mutated — the frozen
+    :class:`~lifemodel.ports.tracer.TraceContext`) alongside the attribute bag,
+    ``status`` and timing that settle as the component runs. The trace store
+    reads these fields to persist one ``trace_spans`` row (spec §4.3).
+    """
+
+    context: TraceContext
+    component: str | None = None
+    tick: int | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    status: SpanStatus = "ok"
+    #: The decision-value bag. Private so the public :attr:`attrs` view is
+    #: read-only (mutation goes through :meth:`set`, the traced door).
+    _attrs: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        return self._attrs
+
+    def set(self, **attrs: Any) -> MutableActiveSpan:
+        self._attrs.update(attrs)
+        return self
+
+    def end(self, *, status: SpanStatus = "ok", ended_at: str | None = None) -> MutableActiveSpan:
+        self.status = status
+        if ended_at is not None:
+            self.ended_at = ended_at
+        return self
+
+
+def start_span(
+    context: TraceContext,
+    *,
+    component: str | None = None,
+    tick: int | None = None,
+    started_at: str | None = None,
+) -> MutableActiveSpan:
+    """Open a fresh :class:`MutableActiveSpan` over *context* (spec §4.1).
+
+    A thin, allocation-only factory: the caller (the CoreLoop, later phases)
+    supplies the child :class:`TraceContext` it minted for the component plus
+    the ``started_at`` it stamped from its clock. Kept separate from the tracer's
+    id-minting so opening a span never draws randomness or touches a clock here.
+    """
+    return MutableActiveSpan(context=context, component=component, tick=tick, started_at=started_at)

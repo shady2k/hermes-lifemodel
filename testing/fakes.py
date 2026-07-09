@@ -23,9 +23,9 @@ database. Purely additive — nothing in the live tick uses them yet.
 from __future__ import annotations
 
 import copy
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import assert_never
+from typing import Any, assert_never
 
 from ..core.signal_bus import SignalBus
 from ..domain.memory import (
@@ -50,6 +50,8 @@ from ..domain.signal import Signal
 from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
 from ..ports.tracer import (
+    ActiveSpan,
+    SpanStatus,
     TraceContext,
 )
 from ..ports.tracer import (
@@ -139,6 +141,90 @@ class FakeTracer:
 
     def parse_traceparent(self, value: str) -> TraceContext:
         return _parse_traceparent(value)
+
+
+class FakeActiveSpan:
+    """A deterministic, inspectable :class:`~lifemodel.ports.tracer.ActiveSpan`.
+
+    A plain mutable handle for tests: construct it over a
+    :class:`~lifemodel.ports.tracer.TraceContext`, then assert on the ``attrs`` a
+    component :meth:`set` and the ``status`` it :meth:`end`ed with. Mirrors the
+    live :class:`~lifemodel.adapters.tracer.MutableActiveSpan` without importing
+    the adapter layer, and satisfies the ``ActiveSpan`` protocol structurally.
+    """
+
+    def __init__(
+        self,
+        context: TraceContext,
+        *,
+        component: str | None = None,
+        tick: int | None = None,
+        started_at: str | None = None,
+    ) -> None:
+        self.context = context
+        self.component = component
+        self.tick = tick
+        self.started_at = started_at
+        self.ended_at: str | None = None
+        self.status: SpanStatus = "ok"
+        #: A test-only flag recording that :meth:`end` was called.
+        self.ended = False
+        self._attrs: dict[str, Any] = {}
+
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        return self._attrs
+
+    def set(self, **attrs: Any) -> FakeActiveSpan:
+        self._attrs.update(attrs)
+        return self
+
+    def end(self, *, status: SpanStatus = "ok", ended_at: str | None = None) -> FakeActiveSpan:
+        self.status = status
+        self.ended = True
+        if ended_at is not None:
+            self.ended_at = ended_at
+        return self
+
+
+class FakeSpanLogger:
+    """A recording :class:`~lifemodel.log.SpanLogger` for tests.
+
+    Each level call records a ``{"level", "event", **fields}`` dict — with the
+    bound span's ``trace_id``/``span_id``/``tick`` stamped in exactly as the real
+    :class:`~lifemodel.log.SpanLogger` would — so a test can assert both the
+    events emitted and that the span's ids were carried, without standing up a
+    real trace store or ring. With no span it still records, leaving the ids off
+    (a bare unit-test logger).
+    """
+
+    def __init__(self, span: ActiveSpan | None = None) -> None:
+        self.span = span
+        self.events: list[dict[str, Any]] = []
+
+    def _record(self, level: str, event: str, fields: dict[str, Any]) -> None:
+        record: dict[str, Any] = {"level": level, "event": event, **fields}
+        if self.span is not None:
+            ctx = self.span.context
+            record["trace_id"] = ctx.trace_id
+            record["span_id"] = ctx.span_id
+            record["tick"] = self.span.tick
+        self.events.append(record)
+
+    def debug(self, event: str, **fields: Any) -> None:
+        self._record("debug", event, fields)
+
+    def info(self, event: str, **fields: Any) -> None:
+        self._record("info", event, fields)
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self._record("warning", event, fields)
+
+    def error(self, event: str, **fields: Any) -> None:
+        self._record("error", event, fields)
+
+    def critical(self, event: str, **fields: Any) -> None:
+        self._record("critical", event, fields)
 
 
 class FakeDelivery:
