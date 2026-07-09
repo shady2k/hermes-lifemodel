@@ -87,3 +87,4 @@
 {"id":"int-bc49ebc030f252e2709964719894c10c","kind":"field_change","created_at":"2026-07-09T18:57:22.622413Z","actor":"shady","issue_id":"lm-edu.4","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-9ade54ae6c4f4352c410e2969c183702","kind":"field_change","created_at":"2026-07-09T20:38:50.607788Z","actor":"shady","issue_id":"lm-edu.4","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-7810ecd6896aebc7f9113033e632c47a","kind":"field_change","created_at":"2026-07-09T20:46:01.416064Z","actor":"shady","issue_id":"lm-5ac","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-83360f4a754850333cd642f3d9a10c70","kind":"field_change","created_at":"2026-07-09T20:52:44.716329Z","actor":"shady","issue_id":"lm-edu","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
