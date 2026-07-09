@@ -76,3 +76,5 @@
 {"id":"int-3b087eff63a0e1c8b49ad4dbab5a0590","kind":"field_change","created_at":"2026-07-09T08:10:34.196653Z","actor":"shady","issue_id":"lm-25t","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-5c6ce2e0753f727a6db75d8c2aa76705","kind":"field_change","created_at":"2026-07-09T08:16:31.829259Z","actor":"shady","issue_id":"lm-uzn","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-b91281a444fbd26388b4aa7a4d9dc9ad","kind":"field_change","created_at":"2026-07-09T08:24:42.204105Z","actor":"shady","issue_id":"lm-25t","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-6059e238b69fa791a8aa3e45d3a7e8d3","kind":"field_change","created_at":"2026-07-09T09:10:40.668027Z","actor":"shady","issue_id":"lm-uzn","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-a591a8b041aeeb71bc3ea0adde560cdb","kind":"field_change","created_at":"2026-07-09T11:30:22.816135Z","actor":"shady","issue_id":"lm-czo","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
