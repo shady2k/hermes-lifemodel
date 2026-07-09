@@ -26,6 +26,7 @@ from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
+from lifemodel.testing import FakeTracer
 
 
 def _report() -> TickReport:
@@ -156,6 +157,7 @@ def test_coreloop_swallows_a_failing_exporter(tmp_path) -> None:
         bus=FileSignalBus(tmp_path),
         clock=_FixedClock(),
         trace_exporter=_ExplodingExporter(),
+        tracer=FakeTracer(),
     )
     report = loop.tick()  # must NOT raise — the exporter failure is swallowed
     assert isinstance(report, TickReport)

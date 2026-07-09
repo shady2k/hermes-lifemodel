@@ -672,14 +672,12 @@ def test_transition_thought_absent_is_rejected(tmp_path) -> None:
     assert "no thought" in message
 
 
-def test_seeded_thought_reaches_the_snapshot_and_renders_in_a_launch(tmp_path) -> None:
-    # End-to-end: a thought seeded through the bus reaches the next tick's
-    # start-of-tick snapshot and cognition renders it into the proactive prompt.
+def test_seeded_thought_persists_but_does_not_render_in_a_launch(tmp_path) -> None:
+    # End-to-end: a thought seeded via /lifemodel think persists through the atomic
+    # committer and is snapshot-visible next tick. T6: cognition no longer renders
+    # thoughts into the proactive prompt (the thought machinery moved to Phase 6 in
+    # T7), so the seeded thought stays in the store but does NOT reach the prompt.
     think_for_dir(tmp_path, "did the owner hear back about the flat", logger=get_logger("t"))
-    # Fixed clock in a non-hold jitter bucket (lm-8o3's launch jitter holds when
-    # sha256(f"proactive-{now.isoformat()}").digest()[0] % 5 == 0; NOW hashes to
-    # bucket 3, not 0) so the tick deterministically launches every run instead
-    # of ~20% flaking on a real wall clock.
     lm = build_lifemodel(base_dir=tmp_path, clock=_FixedClock(NOW))
     # a live active desire + an affordable, past-silence, un-inhibited state so
     # cognition launches this tick
@@ -697,7 +695,13 @@ def test_seeded_thought_reaches_the_snapshot_and_renders_in_a_launch(tmp_path) -
     )
     report = lm.coreloop.tick()
     assert report.launches, "cognition should launch for a live active desire"
-    assert "did the owner hear back about the flat" in report.launches[0].prompt
+    # the seeded thought persisted (snapshot-visible next tick)
+    seeded = lm.state.find(kind="thought")
+    assert any(
+        "did the owner hear back about the flat" in r.payload.get("content", "") for r in seeded
+    )
+    # T6: ...but it is NOT rendered into the launch prompt
+    assert "did the owner hear back about the flat" not in report.launches[0].prompt
 
 
 # --- lm-27n.10: /lifemodel why — the read-only causal-chain reader ----------

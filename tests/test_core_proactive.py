@@ -109,19 +109,41 @@ def test_no_active_desire_does_not_reach_out(tmp_path) -> None:
     idle = State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
     lm = _lm(tmp_path, idle, NOW, desire=None)  # no live desire row
     egress = FakeEgress()
-    proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    out = proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    assert out is None  # T5: a quiet tick returns None, not a false 'busy' outcome
     assert egress.calls == []
 
 
 def test_backstop_block_defers_and_refunds(tmp_path) -> None:
+    logger = _RecordingLogger()
     lm = _lm(tmp_path, _active(proactive_send_log=CAP_LOG), NOW)
     egress = FakeEgress()
-    proactive_tick(lm, egress, TARGET, logger=get_logger("t"))
+    out = proactive_tick(lm, egress, TARGET, logger=logger)
     final = lm.state.load()
     desire = read_live_contact_desire(lm.state)
+    assert out is None  # T5: a backstop-held launch returns None, not a 'busy' outcome
     assert egress.calls == []  # backstop blocked the send
     assert desire is not None and desire.state == "deferred"  # held, not sent
     assert final.energy >= 0.99  # reservation refunded
+    # the hold is a logged suppression span (backstop_rate_limited), not a silent busy
+    suppressions = [f for event, f in logger.info_calls if event == "suppression"]
+    assert suppressions and suppressions[-1]["reason"] == "backstop_rate_limited"
+
+
+def test_no_launch_returns_none_and_logs_a_suppression_reason(tmp_path) -> None:
+    # T5 acceptance: a quiet tick (no launch) returns None — NOT a false 'busy'
+    # egress outcome — and its reason is a logged suppression span. Here the drive
+    # sits below threshold, so aggregation (running in-tick with the graph's logger)
+    # emits a below_threshold suppression; proactive_tick then returns None.
+    logger = _RecordingLogger()
+    lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), logger=logger)
+    lm.state.commit(State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
+    egress = FakeEgress()
+    out = proactive_tick(lm, egress, TARGET, logger=logger)
+    assert out is None  # quiet — no egress outcome
+    assert egress.calls == []
+    suppressions = [f for event, f in logger.info_calls if event == "suppression"]
+    assert suppressions and suppressions[-1]["reason"] == "below_threshold"
 
 
 def test_failed_delivery_rolls_pending_active_and_refunds(tmp_path) -> None:

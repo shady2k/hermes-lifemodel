@@ -58,19 +58,20 @@ OBJECTS_SNAPSHOT_LIMIT = 256
 _DEFAULT_LIVE_STATES: frozenset[str] = frozenset({"active", "deferred"})
 
 
-def _tick_log_fields(trace: TraceContext | None, tick: int) -> dict[str, object]:
-    """The fields bound onto every log line for one tick (lm-27n.11).
+def _span_log_fields(span: TraceContext, tick: int) -> dict[str, object]:
+    """The fields bound onto every log line for one span (spec §5).
 
-    Untraced (no tracer wired → ``trace is None``) → empty, so the bind is a no-op and
-    the tick's logs are byte-identical to before .11. Traced → the W3C correlation ids
-    + the tick number, so logs and durable provenance JOIN on ``trace_id``.
+    The active span's W3C correlation ids + the tick number. Every log line this
+    tick is bound to a span — the tick's root span for tick-level bookkeeping, and
+    each component's child span for that component's events — so logs JOIN durable
+    provenance on ``trace_id`` and "which component did what / why silent" is
+    answered from the span tree. There is no untraced branch: the tracer is a
+    required dependency, so a log without an active span is structurally impossible.
     """
-    if trace is None:
-        return {}
     return {
-        "trace_id": trace.trace_id,
-        "span_id": trace.span_id,
-        "parent_span_id": trace.parent_span_id,
+        "trace_id": span.trace_id,
+        "span_id": span.span_id,
+        "parent_span_id": span.parent_span_id,
         "tick": tick,
     }
 
@@ -101,7 +102,7 @@ class CoreLoop:
         pressure_sensor: PressureSensorPort | None = None,
         memory: MemoryPort | None = None,
         live_states: frozenset[str] | None = None,
-        tracer: TracerPort | None = None,
+        tracer: TracerPort,
         trace_exporter: TraceExportPort | None = None,
     ) -> None:
         self._registry = registry
@@ -122,18 +123,25 @@ class CoreLoop:
     def tick(self) -> TickReport:
         now = self._clock.now()
         state = self._state_actor.state
-        # Mint THE tick's root trace (continue-or-mint; a cron tick has no upstream).
-        # ONE root span per tick — components read it via ``TickContext.trace``, never
-        # the tracer itself (the tracer is an injected capability; the active trace is
-        # per-tick state, not ambient). No tracer wired → ``None`` → behaviour-neutral.
-        trace = self._tracer.start_root() if self._tracer is not None else None
-        # Bind the trace onto every log line emitted THIS tick, reset at tick end (no
-        # stale bind leaking across ticks). Wrapped in log.py so the CoreLoop never
-        # imports structlog; empty fields (untraced) makes it a no-op.
-        with bound_log_context(**_tick_log_fields(trace, state.tick_count + 1)):
-            return self._run_tick(now=now, state=state, trace=trace)
+        # Mint THE tick's root span (continue-or-mint; a cron tick has no upstream).
+        # Tracing is MANDATORY (spec §5): the tracer is a required dependency, so
+        # every tick has a root span and a log without an active span is structurally
+        # impossible — there is no untraced branch. Components run in CHILD spans of
+        # this root (minted per component in ``_run_tick``) and read theirs via
+        # ``ctx.trace``, never the tracer itself (the tracer is an injected
+        # capability; the active span is per-tick state, not ambient).
+        root = self._tracer.start_root()
+        tick_no = state.tick_count + 1
+        # Bind the root span onto every tick-level log line this tick, reset at tick
+        # end (no stale bind leaks across ticks). Per-component logs rebind to their
+        # own child span inside ``_run_tick``. Wrapped in log.py so the CoreLoop never
+        # imports structlog directly.
+        with bound_log_context(**_span_log_fields(root, tick_no)):
+            return self._run_tick(now=now, state=state, root=root, tick_no=tick_no)
 
-    def _run_tick(self, *, now: datetime, state: State, trace: TraceContext | None) -> TickReport:
+    def _run_tick(
+        self, *, now: datetime, state: State, root: TraceContext, tick_no: int
+    ) -> TickReport:
         # Start-of-tick snapshot: read once, before any component runs, so every
         # component this tick sees one consistent view (HLA §4.1). Pure reads —
         # they never change tick output; no component consumes them yet (.3).
@@ -185,6 +193,13 @@ class CoreLoop:
         for component in self._registry.enabled():
             if component.id in self._broken:
                 continue
+            # Each component runs in its OWN child span of the tick root (spec §4.2):
+            # the span tree makes "which component did what / why did it stay silent"
+            # observable. ``ctx.trace`` carries THIS span, so a creation site stamps the
+            # component's span (not the root), and the component's own logs — plus a
+            # component-failure record — bind to it. Rebinding nests correctly: the
+            # root bind is restored on exit, so later components see the root again.
+            span = self._tracer.child_of(root)
             ctx = TickContext(
                 state=state,
                 now=now,
@@ -192,25 +207,27 @@ class CoreLoop:
                 signals=tuple(available),
                 pressure=pressure,
                 objects=objects,
-                trace=trace,
+                trace=span,
+                logger=self._log,
             )
-            try:
-                produced = component.step(ctx)
-            except Exception as exc:  # isolation: the heart never dies
-                self._record_failure(component.id, exc)
-                failed.append(component.id)
-                continue
-            self._failures[component.id] = 0
-            for intent in produced:
-                if isinstance(intent, EmitSignal):
-                    available.append(
-                        intent.signal
-                    )  # transient — visible to later components this tick
-                elif isinstance(intent, LaunchProactive):
-                    launches.append(intent)
-                else:
-                    intents.append(intent)
-            ran.append(component.id)
+            with bound_log_context(**_span_log_fields(span, tick_no)):
+                try:
+                    produced = component.step(ctx)
+                except Exception as exc:  # isolation: the heart never dies
+                    self._record_failure(component.id, exc)
+                    failed.append(component.id)
+                    continue
+                self._failures[component.id] = 0
+                for intent in produced:
+                    if isinstance(intent, EmitSignal):
+                        available.append(
+                            intent.signal
+                        )  # transient — visible to later components this tick
+                    elif isinstance(intent, LaunchProactive):
+                        launches.append(intent)
+                    else:
+                        intents.append(intent)
+                ran.append(component.id)
 
         intents.append(
             UpdateState({"tick_count": state.tick_count + 1, "last_tick_at": now.isoformat()})
@@ -232,8 +249,10 @@ class CoreLoop:
         )
         # Ship the finished tick to the (optional) trace backend AFTER the commit —
         # BEST-EFFORT: an exporter that raises must never affect the tick outcome
-        # (fail-soft, like the snapshot read). Noop default → behaviour-neutral.
-        self._export_tick(report, trace)
+        # (fail-soft, like the snapshot read). Noop default → behaviour-neutral. The
+        # root span is always present (tracing is mandatory), so the exporter always
+        # has a root span to ship.
+        self._export_tick(report, root)
         return report
 
     def _export_tick(self, report: TickReport, trace: TraceContext | None) -> None:

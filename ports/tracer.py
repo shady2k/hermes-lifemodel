@@ -72,8 +72,11 @@ class TracerPort(Protocol):
 
     def child_of(self, parent: TraceContext) -> TraceContext:
         """A child span within *parent*'s trace (same ``trace_id``, new ``span_id``,
-        ``parent_span_id = parent.span_id``). Unused by the .11 tick (one root span
-        per tick); the seam for later per-component spans."""
+        ``parent_span_id = parent.span_id``). The CoreLoop mints one per component,
+        parented on the tick's root span, so every component runs in its own span
+        (spec §4.2/§5) — the span tree that makes "which component did what / why
+        silent" observable. ``ctx.trace`` carries the child; the root stays the
+        creation parent for tick-level bookkeeping."""
         ...
 
     def format_traceparent(self, ctx: TraceContext) -> str:

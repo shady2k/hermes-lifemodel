@@ -213,17 +213,22 @@ def get_logger(name: str | None = None, **initial_values: Any) -> EventLogger:
 def bound_log_context(**fields: Any) -> Iterator[None]:
     """Bind *fields* onto every log line emitted inside the ``with`` block, then reset.
 
-    The CoreLoop wraps a whole tick in this (lm-27n.11) so every ``.info()`` that tick
-    auto-carries ``{trace_id, span_id, parent_span_id, tick}`` and it RESETS at tick
-    end — no stale bind leaks across ticks. Wrapped here so the CoreLoop never imports
-    structlog directly.
+    The CoreLoop wraps every tick (and each component's child span) in this (spec §5)
+    so every ``.info()`` auto-carries its span's ``{trace_id, span_id,
+    parent_span_id, tick}`` and RESETS on block exit — no stale bind leaks across
+    ticks or components. Wrapped here so the CoreLoop never imports structlog directly.
 
-    With structlog present it uses the contextvars API (bind on enter, reset on exit
-    even under an exception). Without structlog (the Hermes-host fallback) there are no
-    contextvars, so it is a no-op — nothing to bind, nothing to leak. Empty *fields*
-    (an untraced tick) short-circuits to the no-op, keeping that path byte-identical.
+    The caller always supplies the active span's fields (tracing is mandatory — the
+    tracer is a required CoreLoop dependency), so there is no untraced branch here:
+    a log without an active span is structurally impossible at the call site, not
+    papered over by an empty-bind no-op. With structlog present this uses the
+    contextvars API (bind on enter, reset on exit even under an exception). Without
+    structlog (the Hermes-host fallback) there are no contextvars, so the bind is a
+    no-op — the trace CONTEXT is still threaded explicitly via ``TracerPort``/
+    ``TickContext.trace`` and suppression spans carry their ids as explicit fields;
+    only the per-line structlog decoration is absent in that degraded host.
     """
-    if not _HAVE_STRUCTLOG or not fields:
+    if not _HAVE_STRUCTLOG:
         yield
         return
     tokens = structlog.contextvars.bind_contextvars(**fields)

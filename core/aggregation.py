@@ -1,63 +1,60 @@
-"""ContactAggregation — the AGGREGATION layer for the contact desire (spec §7, §12).
+"""ContactAggregation — the AGGREGATION layer for the contact desire (spec §3/§7).
 
 Stateless: every tick it reads the live contact desire from the start-of-tick
-records snapshot (``ctx.objects``, via :func:`live_contact_desire`) plus the
-neuron's transient ``contact`` value and the durable ``exchange``/``verdict``/
-``in_flight`` inputs, applies them in the order exchange → verdict → wake
-(threaded through locals, like ``core/decision.py``'s functions), and emits at
-most ONE desire-row mutation (a :class:`PutRecord` to birth an ``active`` desire,
-or a :class:`TransitionRecord` to advance a live one) plus the residual-field
-:class:`UpdateState`.
+records snapshot (``ctx.objects``, via :func:`live_contact_desire`) plus the drive's
+transient ``contact_pressure`` value (the FRESH ``u``) and the durable
+``exchange``/``verdict``/``in_flight`` inputs, applies them in the order
+exchange → verdict → wake (threaded through locals, like ``core/decision.py``'s
+functions), and emits at most ONE desire-row mutation (a :class:`PutRecord` to
+birth an ``active`` desire, or a :class:`TransitionRecord` to advance a live one)
+plus the residual-field :class:`UpdateState`.
 
-The desire *lifecycle* is a first-class typed row now, not a ``State`` flag
-(lm-27n.3): ``urge → PutRecord(active)``; ``FULFILL → active→satisfied``;
-``REJECT → active→dropped``; ``DEFER → active→deferred``; a real ``exchange``
-terminalizes the live desire (``→satisfied``) and **dominates a same-tick
-verdict**. ``satisfied``/``dropped``/``expired`` are terminal — aggregation never
-transitions out of them (it only ever births a fresh ``active`` desire, an upsert
-on the singleton id). This layer keeps ALL its gates (effective pressure, silence
-window, decline backoff, ActionPending grace/decay, in-flight, the ``evaluate_wake``
-gate); the residual policy scalars (``decline_count``, ``action_pending_since``,
-``pending_proactive_id``, ``proactive_send_log`` …) stay on ``State``.
+The desire *lifecycle* is a first-class typed row (lm-27n.3): ``urge →
+PutRecord(active)``; ``FULFILL → active→satisfied``; ``REJECT → active→dropped``;
+``DEFER → active→deferred``; a real ``exchange`` terminalizes the live desire
+(``→satisfied``) and **dominates a same-tick verdict**. ``satisfied``/``dropped``/
+``expired`` are terminal — aggregation never transitions out of them (it only ever
+births a fresh ``active`` desire, an upsert on the singleton id). This layer keeps
+its safety gates (effective pressure / ActionPending inhibition, silence window,
+decline backoff, in-flight, the certified ``evaluate_wake`` threshold) and the
+atomic desire/intention interlock.
 
-The neuron owns ``u`` on rise and exchange-satiation; this layer never writes
-``u`` (send ≠ contact: FULFILL starts an ActionPending inhibition window but does
-not satiate the drive). Only a real exchange clears ActionPending (the neuron
-satiates ``u`` separately). Aggregation is the SOLE contact-desire writer — it folds
-BOTH springs into the singleton (lm-27n.9): bottom-up drive AND the top-down
-``thought_contact_proposal`` that ``ThoughtCrystallization`` emits (in-tick, just
-upstream). ``spring`` = drive / thought / mixed accordingly. So the start-of-tick
-snapshot plus its single decision remain a sufficient in-tick dedup guard even with
-two springs.
+**T3 re-cut (spec §3/§8):** drive-only. The baroque gates that did NOT survive the
+rebuild are gone — appropriateness is the async act-gate's job (Hermes turn), not
+aggregation's, so the receptivity appraisal is cut entirely; the top-down
+thought-proposal spring is cut entirely (``spring`` is always ``DRIVE``; thoughts
+return in a later phase). The pure-longing anti-repeat CONCERN is kept but shed of
+its machinery: a second drive-only bid while one is unanswered HOLDS. ``u`` comes
+from the drive's same-tick ``contact_pressure`` signal (``UpdateState`` is only
+visible after commit); this layer never writes ``u`` (send ≠ contact). And a quiet
+tick is no longer the absence of a record: on a non-wake it emits a suppression
+span (spec §5) naming the gate that held fire.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ..domain.egress import Verdict
 from ..domain.memory import PutOp, TransitionOp
 from ..domain.objects import DesireSpring, DesireState, IntentionState
-from ..sim.aggregation import Verdict
-from ..sim.wake import GateParams, LaneState, evaluate_wake
+from ..sim.wake import GateParams, LaneState, WakeOutcome, evaluate_wake
 from .backstop import record_send
 from .component import TickContext
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
 from .intention_view import live_contact_intention
-from .intents import EmitSignal, Intent, PutRecord, TransitionRecord, UpdateState
+from .intents import Intent, PutRecord, TransitionRecord, UpdateState
 from .invalidation import is_verdict_stale
 from .pressure import effective_pressure, inhibition_at
-from .receptivity import appraise_receptivity
-from .relationship_view import DEFAULT_RELATIONSHIP, live_owner_relationship
+from .suppression import SuppressionReason, emit_suppression_span
 from .taxonomy import (
     KIND_EXCHANGE,
     KIND_VERDICT,
-    contact_value,
+    contact_pressure_value,
     is_in_flight,
     read_exchange,
-    read_thought_contact_proposal,
     read_verdict,
     read_verdict_correlation,
-    thought_contact_created_signal,
 )
 from .timeutil import minutes_between
 from .trace import creation_provenance
@@ -77,9 +74,18 @@ _INTENTION_TARGET: dict[str, str] = {
     DesireState.DEFERRED.value: IntentionState.DEFERRED.value,
 }
 
+#: Maps a non-URGE wake outcome to its suppression reason (spec §5). An URGE maps to
+#: nothing — it wakes (or is held by the anti-repeat gate, handled separately).
+_WAKE_SUPPRESSION: dict[WakeOutcome, SuppressionReason] = {
+    WakeOutcome.BELOW_THRESHOLD: SuppressionReason.BELOW_THRESHOLD,
+    WakeOutcome.IN_FLIGHT: SuppressionReason.IN_FLIGHT,
+    WakeOutcome.SILENCE_WINDOW: SuppressionReason.SILENCE_WINDOW,
+    WakeOutcome.DECLINE_BACKOFF: SuppressionReason.DECLINE_BACKOFF,
+}
+
 
 class ContactAggregation:
-    """Owns the contact-desire lifecycle (one desire per lane)."""
+    """Owns the contact-desire lifecycle (one desire per lane). Drive-only (T3)."""
 
     def __init__(
         self,
@@ -107,7 +113,10 @@ class ContactAggregation:
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
         now = ctx.now
-        u_now = contact_value(ctx.signals, default=state.u)
+        # The drive's FRESH u from its transient contact_pressure signal (T3): the
+        # drive's UpdateState is only visible AFTER commit, so aggregation reads the
+        # same-tick u here, falling back to the start-of-tick ctx.state.u baseline.
+        u_now = contact_pressure_value(ctx.signals, default=state.u)
 
         # The live desire from the start-of-tick snapshot (active/deferred), and
         # its logical state threaded through the reducer — the old ``agg.status``.
@@ -160,7 +169,7 @@ class ContactAggregation:
             declined_at = None
             decline_count = 0
             action_pending_since = None
-            unanswered_outbound_count = 0  # a genuine reply resets the longing bid (Task 7)
+            unanswered_outbound_count = 0  # a genuine reply resets the longing bid
             if desire_state in (DesireState.ACTIVE, DesireState.DEFERRED):
                 transition_to = DesireState.SATISFIED  # exchange terminalizes the live desire
             desire_state = _NONE
@@ -190,10 +199,10 @@ class ContactAggregation:
                     action_pending_since = now.isoformat()  # send -> inhibition starts
                     last_contact_at = now.isoformat()
                     send_log = record_send(send_log, now)  # backstop counter (spec §14)
-                    # Pure-longing outreach counter (Task 7, lm-8o3.1): a FULFILLED
-                    # drive-only send (no crystallized-thought backing) is a repeat
-                    # longing bid -> bump. THOUGHT/MIXED carries a genuine new reason
-                    # (a source thought) -> not a repeat, does not bump.
+                    # Pure-longing outreach counter: a FULFILLED drive-only send (the
+                    # only kind now, T3) is a repeat longing bid -> bump. A legacy
+                    # THOUGHT/MIXED-sprung desire (persisted from before the cut) is a
+                    # materially-new reason -> not a repeat, does not bump.
                     if live is not None and live.spring == DesireSpring.DRIVE:
                         unanswered_outbound_count += 1
                     pending_id = None
@@ -227,18 +236,6 @@ class ContactAggregation:
             ),
         )
 
-        # Receptivity appraisal (lm-27n.5): the NEW owner-appropriateness gate,
-        # DISJOINT from the wake gates below (it never re-derives silence / backoff /
-        # inhibition / in-flight — those stay in ``evaluate_wake`` + the effective
-        # pressure math above). A hard veto (explicit boundary — quiet hours,
-        # cadence min, no-contact) SUPPRESSES the birth; soft norms scale the
-        # effective pressure so a borderline urge that would have woken is held.
-        # With no relationship row (or the permissive DEFAULT) this returns
-        # allowed=True / multiplier=1.0 → behaviour-identical to .4.
-        relationship = live_owner_relationship(ctx.objects) or DEFAULT_RELATIONSHIP
-        appraisal = appraise_receptivity(relationship, state, now)
-        gated_effective = effective * appraisal.pressure_multiplier
-
         exch_min = -minutes_between(last_exchange_at, now) if last_exchange_at is not None else None
         decl_min = -minutes_between(declined_at, now) if declined_at is not None else None
         lane = LaneState(
@@ -247,48 +244,23 @@ class ContactAggregation:
             declined_at=decl_min,
             decline_count=decline_count,
         )
-        outcome = evaluate_wake(u=gated_effective, now=0.0, state=lane, params=self._params)
+        outcome = evaluate_wake(u=effective, now=0.0, state=lane, params=self._params)
         drive_urge = outcome.is_urge
 
-        # Top-down spring (lm-27n.9): a crystallized-thought proposal from the
-        # in-tick signal (ThoughtCrystallization ran just before this component).
-        # It BYPASSES the drive threshold — contact from a genuine reason, not
-        # accumulated pressure — but STILL respects every appropriateness gate:
-        # in-flight / silence window / decline backoff (re-evaluated by forcing the
-        # threshold pass while keeping the real lane state), the receptivity hard
-        # veto (``appraisal.allowed`` below — AUTHORITATIVE here), and the singleton
-        # dedup (``desire_state == _NONE``). Energy is inherited downstream (cognition
-        # will not launch a turn it cannot afford), exactly as the bottom-up path.
-        proposal = read_thought_contact_proposal(ctx.signals)
-        top_down_admissible = (
-            proposal is not None
-            and evaluate_wake(
-                u=max(gated_effective, self._theta), now=0.0, state=lane, params=self._params
-            ).is_urge
-        )
+        # Anti-repeat HOLD (T3, simplified — concern kept, machinery shed): a SECOND
+        # pure-longing bid while one is unanswered (unanswered_outbound_count >= 1)
+        # must HOLD — don't drum a second reach into the void. Aggregation is
+        # drive-only now, so a held urge is always a pure-longing repeat (there is no
+        # top-down override). A genuine exchange THIS tick reset the counter above
+        # (same-tick visible), so a same-tick exchange+re-urge does not self-deadlock.
+        pure_longing_repeat_hold = unanswered_outbound_count >= 1 and drive_urge
 
-        # A wake-eligible urge (bottom-up drive OR top-down proposal) births a desire
-        # only when none is live, nothing resolved one this tick (dedup / anti-drum),
-        # AND the appraisal admits it (no explicit-boundary hard veto). With no
-        # proposal and the permissive default this is behaviour-identical to .5.
-        # Task 8 HOLD gate (lm-8o3.1): with an unanswered pure-longing send still
-        # out (``unanswered_outbound_count >= 1``, Task 7), a SECOND pure-longing
-        # bid (``drive_urge and not top_down_admissible`` — no materially-new
-        # reason backing it) must HOLD rather than birth another desire. A
-        # top-down-admissible proposal still overrides — it IS a materially-new
-        # reason. Uses the tick-local ``unanswered_outbound_count`` (not
-        # ``state.unanswered_outbound_count`` directly) so a genuine exchange
-        # THIS SAME tick (which resets it to 0 above, §1) already lifts the hold
-        # — the reset is the escape hatch and must be visible same-tick, or a
-        # same-tick exchange+re-urge could spuriously self-deadlock.
-        pure_longing_repeat_hold = (
-            unanswered_outbound_count >= 1 and drive_urge and not top_down_admissible
-        )
+        # A wake-eligible urge births a desire only when none is live and nothing
+        # resolved one this tick (dedup / anti-drum).
         if (
-            (drive_urge or top_down_admissible)
+            drive_urge
             and desire_state == _NONE
             and transition_to is None
-            and appraisal.allowed
             and not pure_longing_repeat_hold
         ):
             create_desire = True
@@ -308,60 +280,23 @@ class ContactAggregation:
         intents: list[Intent] = [UpdateState(changes)]
 
         if create_desire:
-            # Fold the two springs into the singleton (lm-27n.9). Bottom-up only →
-            # ``spring=DRIVE``, salience = the gated effective pressure that cleared
-            # the wake bar (behaviour-identical to .5). Top-down proposal only →
-            # ``spring=THOUGHT``, salience from the proposal score, carrying
-            # ``source_thought_ids`` (the concrete reason — the [SILENT] fix). Both
-            # in one tick → ``spring=MIXED`` (still carrying the source thought).
-            source_thought_ids: tuple[str, ...]
-            if top_down_admissible and proposal is not None:
-                spring = DesireSpring.MIXED if drive_urge else DesireSpring.THOUGHT
-                salience = max(gated_effective, proposal.score) if drive_urge else proposal.score
-                source_thought_ids = (proposal.thought_id,)
-                risk_if_ignored = proposal.other_regarding
-            else:
-                spring = DesireSpring.DRIVE
-                salience = gated_effective
-                source_thought_ids = ()
-                risk_if_ignored = 0.0
-            # Creation provenance (lm-27n.11): a contact-desire birth ONLY happens when
-            # no live desire exists (create-if-none, guarded by ``desire_state == _NONE``
-            # → ``live is None`` here), so a birth is ALWAYS a NEW episode → stamp a
-            # fresh trace. The ``live is not None`` branch is the uniform preserve-if-live
-            # guard (defensive/documentary — unreachable in the create path today).
-            provenance = (
-                live.provenance
-                if live is not None
-                else creation_provenance(
-                    ctx.trace,
-                    created_by=self.id,
-                    component="aggregation",
-                    reason=f"contact desire ({spring})",
-                )
+            # Drive-only (T3): spring is always DRIVE, salience is the effective
+            # pressure that cleared the wake bar. A birth only happens when no live
+            # desire exists, so it is always a NEW episode → stamp a fresh trace.
+            provenance = creation_provenance(
+                ctx.trace,
+                created_by=self.id,
+                component="aggregation",
+                reason="contact desire (drive)",
             )
             desire = build_contact_desire(
                 state=DesireState.ACTIVE,
-                salience=salience,
+                salience=effective,
                 source_drive=u_now,
-                spring=spring,
-                source_thought_ids=source_thought_ids,
-                risk_if_ignored=risk_if_ignored,
+                spring=DesireSpring.DRIVE,
                 provenance=provenance,
             )
             intents.append(PutRecord(op=PutOp(draft=encode_contact_desire(desire))))
-            # Tell ThoughtAttention (same tick, downstream) the source thought's reason
-            # ACTUALLY became a desire, so it resolves that thought. Only on genuine
-            # creation — a proposal aggregation suppressed leaves its thought live
-            # (lm-27n.9; codex): the reason is not silently spent by timing.
-            for thought_id in source_thought_ids:
-                intents.append(
-                    EmitSignal(
-                        signal=thought_contact_created_signal(
-                            origin_id=self.id, thought_id=thought_id, timestamp=now.isoformat()
-                        )
-                    )
-                )
         elif transition_to is not None and live is not None:
             intents.append(
                 TransitionRecord(
@@ -394,4 +329,31 @@ class ContactAggregation:
                         )
                     )
                 )
+
+        # Observability (spec §5): a quiet tick — no desire born, nothing resolved —
+        # emits a suppression span naming the gate that held fire, so silence is a
+        # logged decision, not the absence of a record. (A creation or resolution is
+        # NOT silent; a dedup'd URGE with a live desire is "already reaching", not a
+        # suppression.) Only when a logger+span are wired (the live tick); bare
+        # unit-test contexts skip it.
+        if (
+            not create_desire
+            and transition_to is None
+            and ctx.logger is not None
+            and ctx.trace is not None
+        ):
+            reason = (
+                SuppressionReason.REPEAT_PURE_LONGING
+                if pure_longing_repeat_hold
+                else _WAKE_SUPPRESSION.get(outcome)
+            )
+            if reason is not None:
+                emit_suppression_span(
+                    logger=ctx.logger,
+                    reason=reason,
+                    component=self.id,
+                    span=ctx.trace,
+                    tick=state.tick_count + 1,
+                )
+
         return intents

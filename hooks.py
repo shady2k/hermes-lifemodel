@@ -30,9 +30,9 @@ from .core.desire_view import read_live_contact_desire
 from .core.output_lint import lint_proactive
 from .core.taxonomy import exchange_signal, verdict_signal
 from .core.wake_packet import IMPULSE_LABEL_PREFIX
+from .domain.egress import Verdict
 from .domain.objects import DesireState
 from .ports.memory import MemoryPort
-from .sim.aggregation import Verdict
 
 #: The exact silence markers Hermes' own gateway treats as intentional silence.
 _NO_REPLY_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})

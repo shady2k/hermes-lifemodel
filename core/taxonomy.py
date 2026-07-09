@@ -15,21 +15,33 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from ..domain.egress import Verdict
 from ..domain.signal import Signal
-from ..sim.aggregation import Verdict
 from ..sim.quality import Actor, Label
 
 KIND_CONTACT = "contact"
 KIND_EXCHANGE = "exchange"
 KIND_VERDICT = "verdict"
 KIND_IN_FLIGHT = "in_flight"
-#: The transient top-down desire spring (lm-27n.9): ThoughtCrystallization emits it
-#: mid-tick when a deliberated thought clears the Rubicon gate. It is a *proposal*
-#: (not a command) — ContactAggregation, the SOLE desire writer, folds it into the
-#: singleton contact desire, and ThoughtAttention resolves the source thought on
-#: seeing it. Never persisted: EmitSignal threads it in-tick to later components
-#: (crystallization runs BEFORE aggregation + attention), never to the durable bus.
+#: The transient top-down desire spring (lm-27n.9): a deliberated thought that
+#: cleared the Rubicon gate proposed to spring the contact desire — a *proposal*
+#: (not a command) that ContactAggregation, the SOLE desire writer, would fold into
+#: the singleton contact desire. T7 cut the thought machinery that emitted/consumed
+#: this (aggregation is drive-only; thoughts return in Phase 6), so it is now
+#: dead-in-prod — the kind + helpers stay because ``test_taxonomy`` pins the
+#: contract for the Phase 6 return. Never persisted: an in-tick ``EmitSignal``.
 KIND_THOUGHT_CONTACT_PROPOSAL = "thought_contact_proposal"
+#: The INSTANTANEOUS contact-channel reading (T2 split, spec §3): PresenceNeuron — a
+#: stateless receptor — emits it carrying the elapsed silence ``dt`` + this tick's
+#: exchange qualities. SolitudeDrive consumes it to integrate the drive. Raw and
+#: unintegrated: the sensor measures, the center integrates. Never persisted.
+KIND_CONTACT_PRESENCE = "contact_presence"
+#: The transient drive-OUTPUT kind (T2 split, spec §3): SolitudeDrive emits it
+#: carrying the FRESH ``u``; ContactAggregation reads it for the same-tick value
+#: (``UpdateState`` is only visible AFTER commit, so aggregation must read u from
+#: this transient signal, not ``ctx.state.u``). Created in T2; ContactAggregation
+#: migrates from the legacy ``contact`` kind onto this one in T3.
+KIND_CONTACT_PRESSURE = "contact_pressure"
 
 Lane = Literal["control", "sensor"]
 
@@ -62,6 +74,24 @@ def contact_signal(*, origin_id: str, value: float, delta: float, timestamp: str
     return Signal(
         origin_id=origin_id,
         kind=KIND_CONTACT,
+        payload={"value": float(value), "delta": float(delta)},
+        timestamp=timestamp,
+    )
+
+
+def contact_pressure_signal(
+    *, origin_id: str, value: float, delta: float, timestamp: str | None
+) -> Signal:
+    """Build the transient drive-OUTPUT signal carrying the FRESH ``u`` (spec §3).
+
+    SolitudeDrive emits this each tick so :class:`~lifemodel.core.aggregation.ContactAggregation`
+    reads the same-tick ``u`` (its ``UpdateState`` is only visible after commit).
+    Mirrors :func:`contact_signal`'s shape (the legacy drive-output kind, kept for
+    the not-yet-removed thought machinery that still reads it).
+    """
+    return Signal(
+        origin_id=origin_id,
+        kind=KIND_CONTACT_PRESSURE,
         payload={"value": float(value), "delta": float(delta)},
         timestamp=timestamp,
     )
@@ -143,6 +173,76 @@ def contact_value(signals: Iterable[Signal], *, default: float) -> float:
     return value
 
 
+def contact_pressure_value(signals: Iterable[Signal], *, default: float) -> float:
+    """The most recent fresh-``u`` from the drive's ``contact_pressure`` signal, or ``default``.
+
+    The same-tick seam (spec §4): aggregation reads the drive's JUST-emitted ``u``
+    here, not the start-of-tick ``ctx.state.u`` (which only updates after commit).
+    """
+    value = default
+    for s in signals:
+        if s.kind == KIND_CONTACT_PRESSURE:
+            raw = s.payload.get("value", default)
+            value = float(raw) if isinstance(raw, int | float) else default
+    return value
+
+
+@dataclass(frozen=True)
+class ContactPresenceReading:
+    """The instantaneous contact-channel reading :class:`PresenceNeuron` emits (§3).
+
+    Raw and unintegrated: elapsed silence ``dt`` (minutes) plus the ordered
+    exchange qualities this tick. :class:`SolitudeDrive` consumes it to run the
+    certified drive (``rise(dt)`` then per-quality ``satiate``). The sensor holds no
+    state — this is a pure measurement of the channel right now, handed to the
+    integrator so sensing and accumulation stay separate (osmoreceptor vs thirst).
+    """
+
+    dt: float
+    qualities: tuple[float, ...]
+
+
+def contact_presence_signal(
+    *,
+    origin_id: str,
+    dt: float,
+    qualities: Iterable[float],
+    timestamp: str | None,
+) -> Signal:
+    """Build the transient contact-presence reading (PresenceNeuron's raw output)."""
+    return Signal(
+        origin_id=origin_id,
+        kind=KIND_CONTACT_PRESENCE,
+        payload={"dt": float(dt), "qualities": [float(q) for q in qualities]},
+        timestamp=timestamp,
+    )
+
+
+def read_contact_presence(signals: Iterable[Signal]) -> ContactPresenceReading | None:
+    """The latest well-formed contact-presence reading in the batch, or ``None``.
+
+    Mirrors :func:`contact_value`: a later component (:class:`SolitudeDrive`) reads
+    the freshest reading an earlier one (PresenceNeuron) emitted this tick. A
+    malformed payload (a non-numeric ``dt`` or a ``qualities`` entry) is skipped — a
+    corrupt in-tick signal degrades to "no reading" (the drive neither rises nor
+    satiates), never a crash.
+    """
+    latest: ContactPresenceReading | None = None
+    for s in signals:
+        if s.kind != KIND_CONTACT_PRESENCE:
+            continue
+        raw_dt = s.payload.get("dt")
+        raw_qualities = s.payload.get("qualities")
+        if not isinstance(raw_dt, int | float) or not isinstance(raw_qualities, list):
+            continue
+        try:
+            qualities = tuple(_as_float(q) for q in raw_qualities)
+        except (TypeError, ValueError):
+            continue
+        latest = ContactPresenceReading(dt=float(raw_dt), qualities=qualities)
+    return latest
+
+
 @dataclass(frozen=True)
 class ThoughtContactProposal:
     """A crystallized thought's *proposal* to spring the contact desire (lm-27n.9).
@@ -217,11 +317,11 @@ def read_thought_contact_proposal(signals: Iterable[Signal]) -> ThoughtContactPr
     return latest
 
 
-#: Emitted by aggregation ONLY when it actually creates a top-down/mixed contact
-#: desire FROM a proposal (lm-27n.9) — so ThoughtAttention resolves the source
-#: thought on genuine CREATION, never on a mere proposal aggregation then suppressed
-#: (via silence window / backoff / in-flight). A suppressed reason stays live and is
-#: handled by normal decay/parking ("not nagged" without silently dropping it).
+#: Emitted ONLY when a top-down/mixed contact desire was actually created FROM a
+#: proposal (lm-27n.9), so the source thought resolved on genuine CREATION (never on
+#: a proposal aggregation then suppressed). T7 cut the thought machinery that
+#: emitted/consumed this (aggregation is drive-only; thoughts return in Phase 6), so
+#: it is now dead-in-prod — kept because ``test_taxonomy`` pins the contract.
 KIND_THOUGHT_CONTACT_CREATED = "thought_contact_created"
 
 

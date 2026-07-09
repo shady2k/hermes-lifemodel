@@ -30,12 +30,12 @@ from lifemodel.core.taxonomy import (
     read_verdict_correlation,
 )
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
+from lifemodel.domain.egress import Verdict
 from lifemodel.domain.objects import DesireState
 from lifemodel.events import EventSink
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
 from lifemodel.log import EventTee
 from lifemodel.ports.memory import MemoryPort
-from lifemodel.sim.aggregation import Verdict
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 

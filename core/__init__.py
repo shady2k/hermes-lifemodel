@@ -16,9 +16,9 @@ from .aggregation import ContactAggregation
 from .aggregator import Aggregator, SilentAggregator
 from .backstop import allow_send, record_send
 from .circadian import circadian
-from .cognition import Cognition
+from .cognition import CognitionLauncher
 from .component import Component, TickContext
-from .contact_neuron import ContactNeuron
+from .contact_neuron import PresenceNeuron
 from .coreloop import CoreLoop, TickReport
 from .energy import Reservation, can_afford, cost_real, reserve, settle
 from .intake import IntakeLimits, IntakeResult, apply_intake
@@ -37,14 +37,27 @@ from .registry import (
     UnknownComponent,
 )
 from .signal_bus import SignalBus
+from .solitude_drive import SolitudeDrive
 from .state_actor import StateActor, UnknownStateField
+from .suppression import (
+    EVENT_SUPPRESSION,
+    SUPPRESSION_MIN_FIELDS,
+    SuppressionReason,
+    emit_suppression_span,
+)
 from .taxonomy import (
     CONTROL_KINDS,
     KIND_CONTACT,
+    KIND_CONTACT_PRESENCE,
+    KIND_CONTACT_PRESSURE,
     KIND_EXCHANGE,
     KIND_IN_FLIGHT,
     KIND_VERDICT,
+    ContactPresenceReading,
     Lane,
+    contact_presence_signal,
+    contact_pressure_signal,
+    contact_pressure_value,
     contact_signal,
     contact_value,
     exchange_signal,
@@ -52,6 +65,7 @@ from .taxonomy import (
     is_in_flight,
     is_kind,
     lane_of,
+    read_contact_presence,
     read_exchange,
     read_verdict,
     read_verdict_correlation,
@@ -68,23 +82,31 @@ __all__ = [
     "can_afford",
     "circadian",
     "Component",
-    "Cognition",
+    "CognitionLauncher",
     "DEFAULT_MECHANICAL_PATTERNS",
     "cost_real",
     "ComponentManifest",
     "ContactAggregation",
-    "ContactNeuron",
+    "ContactPresenceReading",
+    "PresenceNeuron",
+    "SolitudeDrive",
     "ComponentRegistry",
     "CONTROL_KINDS",
     "CoreLoop",
     "DuplicateComponent",
     "EmitSignal",
+    "EVENT_SUPPRESSION",
+    "emit_suppression_span",
+    "SUPPRESSION_MIN_FIELDS",
+    "SuppressionReason",
     "IntakeLimits",
     "IntakeResult",
     "is_verdict_stale",
     "Intent",
     "LaunchProactive",
     "KIND_CONTACT",
+    "KIND_CONTACT_PRESENCE",
+    "KIND_CONTACT_PRESSURE",
     "lint_proactive",
     "LintResult",
     "KIND_EXCHANGE",
@@ -114,12 +136,16 @@ __all__ = [
     "inhibition_at",
     "contact_signal",
     "contact_value",
+    "contact_presence_signal",
+    "contact_pressure_signal",
+    "contact_pressure_value",
     "exchange_signal",
     "in_flight_signal",
     "is_in_flight",
     "is_kind",
     "lane_of",
     "minutes_between",
+    "read_contact_presence",
     "read_exchange",
     "read_verdict",
     "read_verdict_correlation",

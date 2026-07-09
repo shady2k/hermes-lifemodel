@@ -19,7 +19,7 @@ from lifemodel.adapters.delivery import NoopDelivery
 from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.composition import LifeModel, build_lifemodel
 from lifemodel.core.aggregator import SilentAggregator
-from lifemodel.core.contact_neuron import ContactNeuron
+from lifemodel.core.contact_neuron import PresenceNeuron
 from lifemodel.core.coreloop import CoreLoop
 from lifemodel.core.desire_view import (
     build_contact_desire,
@@ -28,6 +28,7 @@ from lifemodel.core.desire_view import (
 )
 from lifemodel.core.neuron import Neuron
 from lifemodel.core.registry import ComponentRegistry
+from lifemodel.core.solitude_drive import SolitudeDrive
 from lifemodel.core.state_actor import StateActor
 from lifemodel.core.taxonomy import exchange_signal
 from lifemodel.domain.objects import DesireState
@@ -166,16 +167,17 @@ def test_default_registry_contains_contact_neuron(tmp_path: Path) -> None:
 
 
 def test_coreloop_tick_bookkeeps_and_runs_contact(tmp_path: Path) -> None:
-    # Contact neuron + aggregation run (last_tick_at=None → dt=0, no signals → no satiate).
-    # Tick still checkpoints the bookkeeping bump — proves the wired seam works.
+    # PresenceNeuron + SolitudeDrive + aggregation run (last_tick_at=None → dt=0,
+    # no signals → no satiate). Tick still checkpoints the bookkeeping bump.
     lm = build_lifemodel(base_dir=tmp_path)
     report = lm.coreloop.tick()
     assert "contact" in report.ran
+    assert "solitude-drive" in report.ran
     assert "contact-aggregation" in report.ran
     assert lm.state.load().tick_count == 1
 
 
-# --- Phase B1: ContactNeuron wiring ---
+# --- Phase B1: contact sensor/drive wiring (T2 split) ---
 
 
 class _FixedClock:
@@ -186,11 +188,15 @@ class _FixedClock:
         return self._m
 
 
-def test_contact_neuron_is_registered_enabled(tmp_path: Path) -> None:
+def test_presence_and_solitude_drive_are_registered_enabled(tmp_path: Path) -> None:
+    # T2 split: the instantaneous sensor (PresenceNeuron, "contact" slot) + the
+    # AUTONOMIC u-integrator (SolitudeDrive) replace the old monolithic ContactNeuron.
     lm = build_lifemodel(base_dir=tmp_path)
     ids = [c.id for c in lm.registry.enabled()]
-    assert "contact" in ids
-    assert any(isinstance(c, ContactNeuron) for c in lm.registry.enabled())
+    assert "contact" in ids  # PresenceNeuron keeps the historical sensor slot id
+    assert "solitude-drive" in ids
+    assert any(isinstance(c, PresenceNeuron) for c in lm.registry.enabled())
+    assert any(isinstance(c, SolitudeDrive) for c in lm.registry.enabled())
 
 
 def test_pipeline_tick_rises_u_and_persists(tmp_path: Path) -> None:
@@ -221,7 +227,10 @@ def test_aggregation_registered_after_neuron(tmp_path: Path) -> None:
 
     lm = build_lifemodel(base_dir=tmp_path)
     ids = [c.id for c in lm.registry.enabled()]
-    assert ids.index("contact") < ids.index("contact-aggregation")
+    # The T2 spine prefix: sensor (PresenceNeuron) -> integrator (SolitudeDrive) ->
+    # aggregation, so aggregation reads the drive's fresh-u contact signal same-tick.
+    assert ids.index("contact") < ids.index("solitude-drive")
+    assert ids.index("solitude-drive") < ids.index("contact-aggregation")
     assert any(isinstance(c, ContactAggregation) for c in lm.registry.enabled())
 
 
@@ -316,81 +325,36 @@ def test_pipeline_tick_recovers_energy_and_decays_fatigue(tmp_path: Path) -> Non
 
 
 def test_cognition_registered_after_aggregation(tmp_path: Path) -> None:
-    from lifemodel.core.cognition import Cognition
+    from lifemodel.core.cognition import CognitionLauncher
 
     lm = build_lifemodel(base_dir=tmp_path)
     ids = [c.id for c in lm.registry.enabled()]
-    assert ids.index("contact-aggregation") < ids.index("cognition")
-    assert any(isinstance(c, Cognition) for c in lm.registry.enabled())
+    assert ids.index("contact-aggregation") < ids.index("cognition-launcher")
+    assert any(isinstance(c, CognitionLauncher) for c in lm.registry.enabled())
 
 
-# --- lm-27n.9: ThoughtCrystallization proposes BEFORE aggregation + attention ---
-
-
-def test_thought_crystallization_registered_before_aggregation_and_attention(
-    tmp_path: Path,
-) -> None:
-    from lifemodel.core.thought_crystallization import ThoughtCrystallization
-
-    lm = build_lifemodel(base_dir=tmp_path)
-    ids = [c.id for c in lm.registry.enabled()]
-    # The pure proposer runs AFTER the neuron and BEFORE the two writers so its
-    # in-tick EmitSignal reaches aggregation (desire writer) + attention (thought
-    # writer) the SAME tick — the reordered pipeline's contract.
-    assert ids.index("contact") < ids.index("thought-crystallization")
-    assert ids.index("thought-crystallization") < ids.index("contact-aggregation")
-    assert ids.index("thought-crystallization") < ids.index("thought-attention")
-    assert any(isinstance(c, ThoughtCrystallization) for c in lm.registry.enabled())
+# --- T7: the single-spine tick order (thought machinery removed → Phase 6) ---
 
 
 def test_full_pipeline_order_is_asserted(tmp_path: Path) -> None:
-    # The whole reordered spine (lm-27n.9): personality -> neuron ->
-    # thought-crystallization -> contact-aggregation -> thought-attention ->
-    # thought-generation -> cognition.
+    # T7 removed ThoughtCrystallization / ThoughtAttention / ThoughtGeneration from
+    # the tick (idle/chaining thoughts return in Phase 6). The spine is now exactly
+    # the five links: personality -> presence -> solitude-drive -> contact-aggregation
+    # -> cognition-launcher. ContactAggregation is the SOLE birth point of a durable
+    # desire in the tick.
     lm = build_lifemodel(base_dir=tmp_path)
     ids = [c.id for c in lm.registry.enabled()]
     spine = [
         "personality",
         "contact",
-        "thought-crystallization",
+        "solitude-drive",
         "contact-aggregation",
-        "thought-attention",
-        "thought-generation",
-        "cognition",
+        "cognition-launcher",
     ]
     positions = [ids.index(cid) for cid in spine]
     assert positions == sorted(positions), ids
-
-
-# --- lm-27n.7: the ThoughtAttention brake sits between aggregation and cognition ---
-
-
-def test_thought_attention_registered_between_aggregation_and_cognition(tmp_path: Path) -> None:
-    from lifemodel.core.thought_attention import ThoughtAttention
-
-    lm = build_lifemodel(base_dir=tmp_path)
-    ids = [c.id for c in lm.registry.enabled()]
-    # The 0-LLM brake reads the settled snapshot (after aggregation) and feeds the
-    # attended set to cognition (before it) — the enabled() order is the contract.
-    assert ids.index("contact-aggregation") < ids.index("thought-attention")
-    assert ids.index("thought-attention") < ids.index("cognition")
-    assert any(isinstance(c, ThoughtAttention) for c in lm.registry.enabled())
-
-
-# --- lm-27n.8: ThoughtGeneration sits between the attention brake and cognition ---
-
-
-def test_thought_generation_registered_between_attention_and_cognition(tmp_path: Path) -> None:
-    from lifemodel.core.thought_generation import ThoughtGeneration
-
-    lm = build_lifemodel(base_dir=tmp_path)
-    ids = [c.id for c in lm.registry.enabled()]
-    # The 0-LLM generative stream reads the settled snapshot (after the .7 brake so
-    # it can chain the just-attended thought) and runs before cognition (a generated
-    # thought is visible only NEXT tick, so it can never launch a turn it created).
-    assert ids.index("thought-attention") < ids.index("thought-generation")
-    assert ids.index("thought-generation") < ids.index("cognition")
-    assert any(isinstance(c, ThoughtGeneration) for c in lm.registry.enabled())
+    # no thought component remains in the tick
+    assert not any("thought" in cid for cid in ids), ids
 
 
 # --- lm-27n.4: the Intention decision record, end-to-end through the store ---

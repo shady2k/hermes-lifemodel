@@ -6,10 +6,16 @@ from lifemodel.ports.proactive import ProactiveEgressPort as DirectPort
 
 
 def test_reach_outcome_ok_only_for_delivered() -> None:
+    # T5: ReachOutcome is ONLY the delivery boundary — {delivered, failed,
+    # unavailable}. A quiet tick (no launch / backstop-held) produces NO outcome.
     assert ReachOutcome.DELIVERED.ok is True
-    assert ReachOutcome.SKIPPED_BUSY.ok is False
     assert ReachOutcome.UNAVAILABLE.ok is False
     assert ReachOutcome.FAILED.ok is False
+    assert {o for o in ReachOutcome} == {
+        ReachOutcome.DELIVERED,
+        ReachOutcome.UNAVAILABLE,
+        ReachOutcome.FAILED,
+    }
 
 
 def test_port_is_runtime_checkable_and_reexported() -> None:

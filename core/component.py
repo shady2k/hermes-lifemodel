@@ -15,6 +15,7 @@ from typing import Protocol, runtime_checkable
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
+from ..log import EventLogger
 from ..ports.tracer import TraceContext
 from ..state.model import State
 from .intents import Intent
@@ -41,11 +42,18 @@ class TickContext:
     pressure: PressureIndex = PressureIndex()
     #: A bounded snapshot of the being's ``state="active"`` memory records.
     objects: tuple[MemoryRecord, ...] = ()
-    #: THE tick's active execution trace (lm-27n.11) — set by the CoreLoop when a
-    #: tracer is wired, so a creation site stamps the born object's provenance with
-    #: it. ``None`` on an untraced tick (no tracer): stamping omits the trace fields,
-    #: keeping ids/timing behaviour-identical.
+    #: THE component's active execution span (spec §5) — set by the CoreLoop to the
+    #: CHILD span it minted for this component (parented on the tick's root), so a
+    #: creation site stamps the born object's provenance with it and the component's
+    #: own logs bind to it. Tracing is mandatory in the live tick (the tracer is a
+    #: required CoreLoop dependency), so the CoreLoop always supplies a span; the
+    #: ``None`` default is only for direct unit-test construction of a ``TickContext``.
     trace: TraceContext | None = None
+    #: The graph's shared :class:`EventLogger`, set by the CoreLoop so a component
+    #: can emit observability (e.g. a suppression span, spec §5) through the SAME
+    #: collaborator the rest of the graph uses. ``None`` in a bare unit-test
+    #: ``TickContext`` (no graph) — observability emission is then skipped.
+    logger: EventLogger | None = None
 
 
 @runtime_checkable
