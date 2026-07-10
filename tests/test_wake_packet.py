@@ -35,13 +35,25 @@ INITIATING_FRAME = (
     "carry, not a thread left open — I'm coming to them anew because I want to, not "
     "merely answering their last message."
 )
+# The consequence-transparency line (lm-md6.3): appended AFTER the </internal_impulse>
+# close tag, OUTSIDE the felt block. Consequence-ONLY — it discloses this turn's
+# delivery semantics (text written now reaches the user, and how to send nothing) and
+# says nothing about whether to reach out, so it can't re-trigger the [SILENT]
+# suppression regression. Spelled independently here so this test PINS the exact bytes
+# the model reads; the marker matches hooks._NO_REPLY_MARKERS (single source of truth).
+DELIVERY_CONSEQUENCE = (
+    "Delivery consequence: text you write now is delivered to the user.\n"
+    "Reply exactly [SILENT] for no message to be sent."
+)
 
 
 def _wrapped(facts: str, *, body_suffix: str = "") -> str:
-    """The exact bytes build_wake_packet must emit for these facts (no thoughts)."""
+    """The exact bytes build_wake_packet must emit for these facts (no thoughts): the
+    felt <internal_impulse> block, then the consequence-transparency line appended
+    AFTER the close tag, OUTSIDE the block (lm-md6.3)."""
     return (
         f"{OPEN_TAG}\n{SELF_ATTR}\n\n{facts}\n\n{APPROVED_BODY}\n\n"
-        f"{INITIATING_FRAME}{body_suffix}\n{CLOSE_TAG}"
+        f"{INITIATING_FRAME}{body_suffix}\n{CLOSE_TAG}\n{DELIVERY_CONSEQUENCE}"
     )
 
 
@@ -72,12 +84,15 @@ def _build(**kw) -> ProactivePrompt:
 def test_packet_is_the_verbatim_owner_approved_impulse() -> None:
     p = _build(value=2.0, correlation_id="corr-1", last_exchange_at=LAST)
     assert isinstance(p, ProactivePrompt)
-    # Wrapped in the tag: opens with the tag + self-attribution line, closes with the
-    # feeling body + initiating frame + close tag — all byte-exact; temporal facts
-    # between (dedicated test).
+    # Wrapped in the tag: opens with the tag + self-attribution line; the felt block
+    # closes with the feeling body + initiating frame + close tag, then the
+    # consequence-transparency line (lm-md6.3) trails OUTSIDE the tag — all byte-exact;
+    # temporal facts between (dedicated test).
     assert p.prompt.startswith(f"{OPEN_TAG}\n{SELF_ATTR}\n\n")
     assert APPROVED_BODY in p.prompt
-    assert p.prompt.endswith(f"\n\n{APPROVED_BODY}\n\n{INITIATING_FRAME}\n{CLOSE_TAG}")
+    assert p.prompt.endswith(
+        f"\n\n{APPROVED_BODY}\n\n{INITIATING_FRAME}\n{CLOSE_TAG}\n{DELIVERY_CONSEQUENCE}"
+    )
     assert p.correlation_id == "corr-1"
     # projection_id is retained as an audit stamp of the woken drive's band even
     # though the impulse text is now fixed (observability parity).
@@ -85,15 +100,17 @@ def test_packet_is_the_verbatim_owner_approved_impulse() -> None:
 
 
 def test_packet_is_wrapped_in_the_internal_impulse_tag() -> None:
-    # The structural anti-inversion frame: the ENTIRE model-facing impulse is one
+    # The structural anti-inversion frame: the FELT impulse is one
     # <internal_impulse>…</internal_impulse> block — open tag on its own first line,
-    # close tag on its own last line, exactly one of each.
+    # close tag on its own line, exactly one of each. Since lm-md6.3 the
+    # consequence-transparency line trails the close tag, so the close tag is no longer
+    # the very last line (see test_decline_instruction_sits_after_the_felt_block).
     p = _build(last_exchange_at=LAST).prompt
     lines = p.splitlines()
     assert lines[0] == OPEN_TAG
-    assert lines[-1] == CLOSE_TAG
     assert p.count(OPEN_TAG) == 1
     assert p.count(CLOSE_TAG) == 1
+    assert CLOSE_TAG in lines  # on its own line, just not the last one
 
 
 def test_packet_opens_with_the_tag_marker_hooks_match_on() -> None:
@@ -133,26 +150,29 @@ def test_packet_carries_the_initiating_frame_after_the_feeling() -> None:
 
 
 def test_packet_carries_no_machine_label_or_brand_tag() -> None:
-    # The old bracketed machine label (a "[lifemodel …]" tag) is gone. The only
-    # markup is the <internal_impulse> frame — no brand tag, no bracketed machine
-    # label ([lifemodel …], [SILENT]).
+    # The old bracketed machine label (a "[lifemodel …]" tag) is gone. The FELT block's
+    # only markup is the <internal_impulse> frame — no brand tag, no bracketed machine
+    # label. The sole bracketed token in the whole prompt is the [SILENT] decline marker
+    # in the consequence line OUTSIDE the block (lm-md6.3).
     p = _build(value=3.4, last_exchange_at=LAST).prompt
     assert "lifemodel" not in p.lower()
-    assert "[" not in p and "]" not in p  # no bracketed machine label at all
+    felt = p.partition(CLOSE_TAG)[0]
+    assert "[" not in felt and "]" not in felt  # no bracketed label inside the felt block
 
 
 def test_packet_names_no_mechanism_and_gives_no_procedure() -> None:
-    # The cure: state the WHY (feeling + cause) and the raw facts, never the HOW,
-    # and never name the mechanism — that framing is what taught the being to
-    # discount its own feeling.
-    p = _build(value=2.0, last_exchange_at=LAST).prompt
-    lowered = p.lower()
+    # The cure: the FELT block states the WHY (feeling + cause) and the raw facts, never
+    # the HOW, and never names the mechanism — that framing is what taught the being to
+    # discount its own feeling. (The consequence-transparency line, lm-md6.3, sits
+    # OUTSIDE the block and is guarded by its own consequence-only test.)
+    felt = _build(value=2.0, last_exchange_at=LAST).prompt.partition(CLOSE_TAG)[0]
+    lowered = felt.lower()
     for mechanism in ("bug", "timer", "synthetic", "threshold", "pressure"):
         assert mechanism not in lowered
-    assert "[silent]" not in lowered  # no silence-as-default instruction
+    assert "[silent]" not in lowered  # no silence-as-default INSIDE the felt block
     # "impulse" is now the owner-chosen STRUCTURAL frame — but only there: the
     # human-readable CONTENT still never editorialises the nudge as "an impulse".
-    content = p.replace(OPEN_TAG, "").replace(CLOSE_TAG, "")
+    content = felt.replace(OPEN_TAG, "")
     assert "impulse" not in content.lower()
     # no imperative/procedural instruction or "checking-in" filler (the English
     # analogue of the removed guards): the impulse is felt self-state, not a directive.
@@ -293,10 +313,11 @@ def test_thoughts_render_a_recent_thoughts_block_content_only_no_id() -> None:
     ]
     p = _build(last_exchange_at=LAST, thoughts=thoughts)
     # the open tag still opens; the feeling body is intact; the block is appended
-    # after it but INSIDE the tag (the close tag is still the very last line)
+    # after it but INSIDE the tag. Since lm-md6.3 the consequence-transparency line
+    # trails the close tag, so IT — not the close tag — is the prompt's last line.
     assert p.prompt.startswith(IMPULSE_LABEL_PREFIX)
     assert APPROVED_BODY in p.prompt
-    assert p.prompt.splitlines()[-1] == CLOSE_TAG
+    assert p.prompt.endswith(DELIVERY_CONSEQUENCE)
     assert p.prompt.index(APPROVED_BODY) < p.prompt.index(RECENT_THOUGHTS_HEADER)
     assert p.prompt.index(RECENT_THOUGHTS_HEADER) < p.prompt.rindex(CLOSE_TAG)
     assert RECENT_THOUGHTS_HEADER in p.prompt
@@ -317,3 +338,68 @@ def test_thoughts_block_is_bounded() -> None:
     p = _build(last_exchange_at=LAST, thoughts=thoughts)
     rendered = sum(1 for line in p.prompt.splitlines() if line.startswith("— "))
     assert rendered == THOUGHTS_RENDER_LIMIT  # top-N only, order preserved from the caller
+
+
+# --- lm-md6.3: the consequence-transparency (silent-decline) affordance --------
+#
+# The proactive turn is the act-gate: any prose the being writes is DELIVERED to the
+# owner, and only a bare silence marker is classified as "stay silent". With no neutral
+# way to decline, a being that correctly decides NOT to reach out writes its private
+# third-person deliberation ("I feel the pull but won't write") as prose — and that
+# leaks TO the owner. The fix adds a consequence-ONLY line AFTER the felt block: it
+# discloses delivery semantics and the decline marker, never whether to reach out
+# (that would re-trigger the [SILENT] suppression regression, lm-8p4/lm-32b).
+
+
+def test_packet_carries_the_silent_decline_instruction() -> None:
+    # REGRESSION GUARD (owner-mandated, the most important test): the built packet MUST
+    # always carry the decline instruction, so a proactive turn can NEVER again lack a
+    # neutral way to send nothing. If a future edit silently drops it, this fails.
+    p = _build(last_exchange_at=LAST).prompt
+    assert DELIVERY_CONSEQUENCE in p
+    assert "[SILENT]" in p
+
+
+def test_decline_instruction_sits_after_the_felt_block() -> None:
+    # Placement: the instruction lives OUTSIDE the felt block — it follows the
+    # </internal_impulse> close tag and is the last thing in the prompt. The felt block
+    # itself stays byte-identical to the phenomenological impulse (nothing about
+    # declining leaks inside it — mechanism-talk there caused BOTH the regression and
+    # the perspective inversion).
+    p = _build(last_exchange_at=LAST).prompt
+    felt, close, after = p.partition(CLOSE_TAG)
+    assert close == CLOSE_TAG
+    assert DELIVERY_CONSEQUENCE not in felt  # no decline talk inside the felt block
+    assert after == f"\n{DELIVERY_CONSEQUENCE}"  # directly follows the close tag, and is last
+    assert p.endswith(DELIVERY_CONSEQUENCE)
+    # the felt block is exactly the phenomenological impulse it was before lm-md6.3
+    facts = render_temporal_facts(NOW, LAST, MSK)
+    assert felt == f"{OPEN_TAG}\n{SELF_ATTR}\n\n{facts}\n\n{APPROVED_BODY}\n\n{INITIATING_FRAME}\n"
+
+
+def test_decline_instruction_is_consequence_only_no_suppression_bias() -> None:
+    # Consequence-only guard: the added line must never carry suppression-bias language.
+    # The old guidance bundled [SILENT] with a bias ("if it's filler → be silent",
+    # "don't invent a reason") that taught the being to distrust its own longing and go
+    # mute (the [SILENT] regression). This pins the new line to delivery semantics only.
+    p = _build(last_exchange_at=LAST).prompt
+    _, _, consequence = p.partition(CLOSE_TAG)
+    lowered = consequence.lower()
+    for biased in ("filler", "invent", "should", "not worth", "waste"):
+        assert biased not in lowered
+    # it MUST name the recipient — the leak was private deliberation ABOUT the owner
+    # delivered TO the owner; "silence is an option" alone would not prevent that.
+    assert "the user" in consequence
+
+
+def test_decline_marker_is_single_source_of_truth_with_the_classifier() -> None:
+    # Marker consistency (single source of truth): the marker the packet INSTRUCTS is
+    # the exact constant the act-gate classifier maps to REJECT. If they ever drifted,
+    # an instructed decline would silently leak to the owner as delivered text. The
+    # instruction is BUILT from DECLINE_MARKER, and the classifier's set contains it.
+    from lifemodel.core.wake_packet import DECLINE_MARKER
+    from lifemodel.hooks import _NO_REPLY_MARKERS
+
+    assert DECLINE_MARKER == "[SILENT]"
+    assert DECLINE_MARKER in _NO_REPLY_MARKERS
+    assert DECLINE_MARKER in _build(last_exchange_at=LAST).prompt

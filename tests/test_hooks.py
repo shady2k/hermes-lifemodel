@@ -90,6 +90,18 @@ def test_is_no_reply_rejects_prose_mentioning_a_marker() -> None:
     assert _is_no_reply("Hi! How are you?") is False
 
 
+def test_decline_marker_is_a_member_of_no_reply_markers() -> None:
+    # Single source of truth (lm-md6.3): the marker the wake-packet INSTRUCTS the being
+    # to reply with to decline must be one the classifier maps to REJECT. The packet's
+    # DECLINE_MARKER is spliced INTO _NO_REPLY_MARKERS, and _is_no_reply must reject
+    # exactly it — otherwise an instructed decline leaks to the owner as delivered text.
+    from lifemodel.core.wake_packet import DECLINE_MARKER
+    from lifemodel.hooks import _NO_REPLY_MARKERS
+
+    assert DECLINE_MARKER in _NO_REPLY_MARKERS
+    assert _is_no_reply(DECLINE_MARKER) is True
+
+
 # --- make_post_llm_observer — signal publishing (spec §7.1) ------------------
 
 
