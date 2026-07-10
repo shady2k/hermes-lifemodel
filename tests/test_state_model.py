@@ -82,7 +82,14 @@ def test_declined_at_accepts_valid_iso_forms() -> None:
 
 
 @pytest.mark.parametrize(
-    "field", ["last_contact_at", "last_exchange_at", "declined_at", "pending_proactive_since"]
+    "field",
+    [
+        "last_contact_at",
+        "last_exchange_at",
+        "silence_anchor_at",
+        "declined_at",
+        "pending_proactive_since",
+    ],
 )
 def test_iso_fields_reject_timezone_naive_values(field: str) -> None:
     # FINDING 2: a tz-naive value parses fine via fromisoformat but the tick
@@ -243,3 +250,13 @@ def test_unanswered_outbound_count_defaults_zero_and_roundtrips() -> None:
 def test_unanswered_outbound_count_rejects_non_int() -> None:
     with pytest.raises(StateCorruptError):
         State.from_dict({"unanswered_outbound_count": "x"})
+
+
+def test_silence_anchor_at_defaults_none_and_roundtrips() -> None:
+    # lm-md6.1: the decoupled silence-window anchor. Additive (missing key → None, so
+    # older runtime_state files load clean, no schema bump) and round-trips as an aware
+    # ISO instant.
+    assert State().silence_anchor_at is None
+    assert State.from_dict({}).silence_anchor_at is None
+    s = State(silence_anchor_at="2026-07-06T11:40:00+00:00")
+    assert State.from_dict(s.to_dict()).silence_anchor_at == "2026-07-06T11:40:00+00:00"

@@ -12,9 +12,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from lifemodel.adapters.clock import SystemClock
 from lifemodel.core.desire_view import read_live_contact_desire
+from lifemodel.core.wake_packet import build_wake_packet
 from lifemodel.domain.egress import ReachOutcome, Verdict
 from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+from lifemodel.state_commands import force_wake_for_dir
 from lifemodel.testing import IntegrationHarness, Step
 from lifemodel.testing.fakes import FakeClock
 
@@ -135,6 +139,35 @@ def test_silence_window_suppresses_a_wake_right_after_an_exchange(tmp_path) -> N
     rec = h.run([Step(advance=timedelta(minutes=10))])[-1]  # 10 min < 15 min window
     assert rec.outcome is None and not rec.launched
     assert rec.suppressions == ("silence_window",)
+
+
+def test_force_wake_keeps_the_real_last_exchange_in_the_wake_packet(tmp_path) -> None:
+    # THE lm-md6.1 acceptance, end-to-end through the REAL store + command wiring the
+    # live being uses (force_wake_for_dir over SQLiteRuntimeStore). The real last
+    # exchange is seeded at a FIXED absolute instant far in the past so the render is
+    # deterministic under the real wall clock. force_wake used to overwrite it with a
+    # ~20-min-ago backdate; now it moves only the decoupled silence anchor, so the
+    # wake packet the model reads still carries the genuine last-exchange time.
+    real_last = "2020-01-01T00:00:00+00:00"  # a genuine, long-ago exchange
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    store.commit(State(u=0.2, last_exchange_at=real_last))
+
+    message = force_wake_for_dir(tmp_path)
+    assert "gates satisfied" in message
+
+    persisted = SQLiteRuntimeStore(tmp_path, clock=SystemClock()).load()
+    assert persisted.last_exchange_at == real_last  # immune: the real record survives
+    assert persisted.silence_anchor_at is not None  # the gate was satisfied via the anchor
+
+    packet = build_wake_packet(
+        value=persisted.u,
+        theta=1.0,
+        correlation_id="c",
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        last_exchange_at=persisted.last_exchange_at,
+        tz=UTC,
+    )
+    assert "The last time we exchanged messages was 2020-01-01 00:00 UTC." in packet.prompt
 
 
 def test_decline_backoff_suppresses_a_wake_right_after_a_rejection(tmp_path) -> None:

@@ -179,10 +179,21 @@ def _action_pending(
     return inh, "decaying", None
 
 
+def _silence_anchor(state: State) -> str | None:
+    """The timestamp the silence-window gate measures from (lm-md6.1): an admin
+    override (:attr:`~lifemodel.state.model.State.silence_anchor_at`) if set, else
+    the real :attr:`~lifemodel.state.model.State.last_exchange_at` — mirroring the
+    live gate in ``core/aggregation.py`` so the debug readings never disagree with it."""
+    if state.silence_anchor_at is not None:
+        return state.silence_anchor_at
+    return state.last_exchange_at
+
+
 def _silence_remaining(state: State, now: datetime, w: float) -> float | None:
-    if state.last_exchange_at is None:
+    anchor = _silence_anchor(state)
+    if anchor is None:
         return None
-    left = w - minutes_between(state.last_exchange_at, now)
+    left = w - minutes_between(anchor, now)
     return left if left > 0 else None
 
 
@@ -242,11 +253,11 @@ def compute_readings(
     inhibition, phase, grace_left = _action_pending(state, now, cfg)
     effective = effective_pressure(u, inhibition)
 
-    exch_min = (
-        -minutes_between(state.last_exchange_at, now)
-        if state.last_exchange_at is not None
-        else None
-    )
+    # The would-wake reading measures the silence window from the gate's anchor
+    # (admin override or the real last exchange), matching core/aggregation.py so the
+    # dump's would_wake never contradicts the live gate (lm-md6.1).
+    silence_anchor = _silence_anchor(state)
+    exch_min = -minutes_between(silence_anchor, now) if silence_anchor is not None else None
     decl_min = -minutes_between(state.declined_at, now) if state.declined_at is not None else None
     lane = LaneState(
         last_exchange_at=exch_min,

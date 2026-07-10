@@ -166,6 +166,59 @@ def test_silence_window_suppresses_wake(tmp_path) -> None:
     assert _desire_intent(intents) is None
 
 
+def test_silence_anchor_overrides_last_exchange_for_the_gate(tmp_path) -> None:
+    # lm-md6.1 (force_wake's mechanism): a REAL exchange 2 min ago would normally
+    # suppress (inside w=15), but the decoupled silence_anchor_at backdated 20 min past
+    # the window opens the gate — WITHOUT touching the immune last_exchange_at, which
+    # the wake packet reads. Proven through the real aggregation gate.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        last_exchange_at="2026-07-06T03:58:00+00:00",  # 2 min ago — would suppress
+        silence_anchor_at="2026-07-06T03:40:00+00:00",  # 20 min ago — clears the window
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _created_active(intents)  # the anchor opened the gate → a desire is born
+    # the immune exchange record is passed through untouched (never re-anchored here)
+    assert _changes(intents)["last_exchange_at"] == "2026-07-06T03:58:00+00:00"
+
+
+def test_silence_anchor_now_suppresses_wake_despite_an_old_exchange(tmp_path) -> None:
+    # lm-md6.1 (satiate's mechanism): silence_anchor_at=now opens the window and
+    # suppresses a wake even though the real last exchange is 20 min old (past w) — and
+    # the old exchange record is left intact for the model to read.
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        last_exchange_at="2026-07-06T03:40:00+00:00",  # 20 min ago — would wake
+        silence_anchor_at="2026-07-06T04:00:00+00:00",  # now — inside the window
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # anchor holds the wake
+    assert _changes(intents)["last_exchange_at"] == "2026-07-06T03:40:00+00:00"  # untouched
+
+
+def test_exchange_clears_the_silence_anchor(tmp_path) -> None:
+    # A genuine exchange re-anchors the silence gate on itself: it stamps
+    # last_exchange_at=now AND clears any admin silence override, so the window measures
+    # from the real exchange again (lm-md6.1).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(
+        u=3.0,
+        silence_anchor_at="2026-07-06T03:40:00+00:00",  # a stale admin override
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
+    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
+    assert changes["last_exchange_at"] == now.isoformat()
+    assert changes["silence_anchor_at"] is None  # override cleared by the real exchange
+
+
 def test_in_flight_suppresses_wake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")

@@ -132,6 +132,11 @@ class ContactAggregation:
 
         # working copies of the residual policy fields (threaded like decision.py)
         last_exchange_at = state.last_exchange_at
+        # The silence-window gate's anchor, DECOUPLED from the exchange record
+        # (lm-md6.1): an admin override (force_wake backdates it, satiate sets it to
+        # now) or ``None`` to fall back to the real last_exchange_at below. A genuine
+        # exchange this tick clears it so the gate re-tracks the fresh exchange.
+        silence_anchor_at = state.silence_anchor_at
         declined_at = state.declined_at
         decline_count = state.decline_count
         last_contact_at = state.last_contact_at
@@ -176,6 +181,7 @@ class ContactAggregation:
         )
         if had_exchange:
             last_exchange_at = now.isoformat()
+            silence_anchor_at = None  # a real exchange re-anchors the gate on itself
             declined_at = None
             decline_count = 0
             action_pending_since = None
@@ -254,7 +260,11 @@ class ContactAggregation:
             ),
         )
 
-        exch_min = -minutes_between(last_exchange_at, now) if last_exchange_at is not None else None
+        # The silence-window gate measures from the anchor: an admin override if set,
+        # else the real last exchange (lm-md6.1). ``last_exchange_at`` still feeds the
+        # verdict-staleness check above and the wake-packet fact — untouched here.
+        silence_anchor = silence_anchor_at if silence_anchor_at is not None else last_exchange_at
+        exch_min = -minutes_between(silence_anchor, now) if silence_anchor is not None else None
         decl_min = -minutes_between(declined_at, now) if declined_at is not None else None
         lane = LaneState(
             last_exchange_at=exch_min,
@@ -286,6 +296,7 @@ class ContactAggregation:
         changes: dict[str, object] = {
             "duration_over_theta": duration,
             "last_exchange_at": last_exchange_at,
+            "silence_anchor_at": silence_anchor_at,
             "declined_at": declined_at,
             "decline_count": decline_count,
             "last_contact_at": last_contact_at,
