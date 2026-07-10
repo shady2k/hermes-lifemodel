@@ -52,6 +52,7 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "adapters/signal_bus.py",
         "state/sqlite_store.py",
         "state/trace_store.py",
+        "state/metrics_store.py",
     }
 )
 
