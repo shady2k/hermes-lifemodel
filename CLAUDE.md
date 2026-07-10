@@ -87,6 +87,20 @@ hermes gateway status
 
 ⚠️ `make deploy` targets the **owner's live being** (`~/.hermes`). For integration tests use an **isolated `HERMES_HOME`**, never the live being.
 
+## Operating the Live Being (`/lifemodel` admin commands)
+
+Proactive contact fires only when the drive `u` organically crosses `θ` — that can take **hours**. To make the being reach out **now** (e.g. to verify a wake-packet / prompt change live without waiting), the owner types this **in their DM chat with the being** — NOT from a shell:
+
+```
+/lifemodel force-wake
+```
+
+`force-wake` (see `state_commands.py:force_wake`) sets `u = θ + margin`, backdates `last_exchange_at` past the silence window, and clears decline-backoff / action-pending / the send backstop. It does **not** run a tick itself — the **next** brain tick's aggregation pass wakes cognition and the being reaches out. It echoes the satisfied gates so you can confirm.
+
+- **Must be sent from the chat**, not a shell/python one-liner: the command runs inside the gateway process that holds the singleton state. An out-of-band mutation races the live tick and desyncs the in-memory singleton.
+- **It won't defeat itself:** `hooks._is_control_command` excludes any `/…` message from the exchange signal, so sending the command does not count as contact and does not satiate the `u` it just raised.
+- Sibling subcommands: `nudge [N]` (`u += N`, default +1.0), `satiate` (simulate a fulfilled contact — resets the drive), `reset` (factory wipe), `set <field> <value>`. `/lifemodel help` lists them all (mutating ones marked `[mutating]`).
+
 ## Architecture Overview
 
 Docs live under `docs/` — product [`business-requirements.md`](docs/business-requirements.md), architecture [`hla.md`](docs/hla.md), delivery [`roadmap.md`](docs/roadmap.md) (phases = bd epics). Hexagonal layout: `core/` (Hermes-free layered engine: AUTONOMIC → AGGREGATION → COGNITION), `domain/`, `ports/`, `adapters/` (the only Hermes boundary; `being_platform.py` hosts the being as a supervised platform adapter), `state/`.
