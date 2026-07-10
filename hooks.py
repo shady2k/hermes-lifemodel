@@ -29,14 +29,18 @@ from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import exchange_signal, verdict_signal
-from .core.wake_packet import IMPULSE_LABEL_PREFIX
+from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import Verdict
 from .domain.objects import DesireState
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 
 #: The exact silence markers Hermes' own gateway treats as intentional silence.
-_NO_REPLY_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})
+#: :data:`~lifemodel.core.wake_packet.DECLINE_MARKER` — the one marker the wake-packet
+#: actually INSTRUCTS the being to reply with to decline (lm-md6.3) — is spliced in from
+#: that single source of truth, so the affordance we advertise can never drift out of
+#: the set we classify as REJECT (a drift would silently deliver an intended decline).
+_NO_REPLY_MARKERS = frozenset({"NO_REPLY", "NO REPLY", DECLINE_MARKER, "SILENT"})
 
 
 def _is_no_reply(text: str) -> bool:

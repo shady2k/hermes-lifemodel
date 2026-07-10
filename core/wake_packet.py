@@ -10,6 +10,14 @@ the other is, their name, and the language to answer in are the being's to draw
 from its own context (the live conversation + memory), never baked into this
 standard, English impulse.
 
+After the felt block — deliberately OUTSIDE it — the packet appends one
+consequence-transparency line (lm-md6.3): a consequence-ONLY disclosure that text
+written now is delivered to the user, plus the marker reply that sends nothing. It
+gives the being a NEUTRAL way to decline, so a turn it decides NOT to send no longer
+leaks its private "I won't write" deliberation to the owner. Because it discloses
+substrate affordance and never comments on whether the longing is valid/enough, it
+stays clear of the [SILENT] suppression regression the felt block itself guards against.
+
 The temporal facts are two bare timestamps — ``now`` and ``last_exchange_at`` —
 rendered in the OWNER's local timezone (resolved from Hermes at the boundary and
 threaded in; the core stays Hermes-free) with an explicit zone label, so the being
@@ -64,9 +72,35 @@ from .projection import project_contact
 #: ``IMPULSE_LABEL_PREFIX`` for the hooks import — the value is now the open tag.
 IMPULSE_LABEL_PREFIX = "<internal_impulse>"
 
-#: The matching close tag; build_wake_packet emits it on its own final line so the
-#: whole model-facing impulse is wrapped ``<internal_impulse>…</internal_impulse>``.
+#: The matching close tag; build_wake_packet emits it on its own line so the whole
+#: FELT impulse is wrapped ``<internal_impulse>…</internal_impulse>``. It is no longer
+#: the packet's final line — the consequence-transparency line follows it (see
+#: :data:`_DELIVERY_CONSEQUENCE`).
 _IMPULSE_CLOSE_TAG = "</internal_impulse>"
+
+#: The one silence marker the wake-packet INSTRUCTS the being to reply with in order to
+#: DECLINE — to stay silent and have nothing sent. It MUST be a member of
+#: ``lifemodel.hooks._NO_REPLY_MARKERS`` (the set the async act-gate classifier maps to
+#: REJECT); ``hooks`` builds that set FROM this constant, so the marker we advertise and
+#: the marker we classify can never drift, and a test pins the membership. Written once,
+#: here, so "[SILENT]" is never hardcoded in two places (lm-md6.3).
+DECLINE_MARKER = "[SILENT]"
+
+#: The CONSEQUENCE-TRANSPARENCY line, appended AFTER the close tag — OUTSIDE the felt
+#: ``<internal_impulse>`` block, which stays purely phenomenological. It discloses ONLY
+#: this turn's delivery semantics: that text written now is delivered to the user, and
+#: how to decline (reply the marker). It says NOTHING about whether to reach out — no
+#: "if it's filler", no "don't invent a reason", no "you should" — so it is substrate
+#: affordance, not drive interpretation, and cannot re-trigger the [SILENT] suppression
+#: regression (lm-8p4/lm-32b) that behavioural bias caused. It MUST name the recipient
+#: ("the user"): the bug it fixes is the being's private third-person deliberation
+#: ABOUT the owner ("I feel the pull but won't write") being DELIVERED TO the owner —
+#: with no neutral way to decline it wrote prose instead of the marker, and the
+#: classifier delivered it. Built from :data:`DECLINE_MARKER` (single source of truth).
+_DELIVERY_CONSEQUENCE = (
+    "Delivery consequence: text you write now is delivered to the user.\n"
+    f"Reply exactly {DECLINE_MARKER} for no message to be sent."
+)
 
 #: The first-person self-attribution line, INSIDE the tag. Says the feeling is the
 #: being's own and, explicitly, "not a message from the user" — the word ``user``
@@ -236,6 +270,14 @@ def build_wake_packet(
     (:data:`IMPULSE_LABEL_PREFIX`), so the being's own hooks self-exclude it
     (``startswith(IMPULSE_LABEL_PREFIX)``).
 
+    AFTER the close tag — OUTSIDE the felt block — comes the consequence-transparency
+    line (:data:`_DELIVERY_CONSEQUENCE`, lm-md6.3): a consequence-ONLY disclosure that
+    text written now is delivered to the user, plus the :data:`DECLINE_MARKER` reply
+    that sends nothing. It gives the being a NEUTRAL way to decline, so a turn it
+    decides NOT to send no longer leaks its private "I won't write" prose to the owner.
+    It sits OUTSIDE the felt block on purpose: it discloses substrate affordance, never
+    whether the longing is valid/enough, so it cannot re-trigger the [SILENT] regression.
+
     *value*/*theta* do NOT shape the text (the self-state is fixed): they feed
     :func:`project_contact` solely to stamp ``projection_id`` — an audit reference
     to the woken drive's band, kept for observability parity.
@@ -259,9 +301,12 @@ def build_wake_packet(
     inner = f"{_SELF_ATTRIBUTION}\n\n{temporal_facts}\n\n{_IMPULSE_BODY}\n\n{_INITIATING_FRAME}"
     if thoughts:
         inner = f"{inner}\n\n{render_thoughts_block(thoughts)}"
-    # Wrap the ENTIRE model-facing impulse: open tag on its own line, the content,
-    # then the close tag on its own final line.
-    prompt = f"{IMPULSE_LABEL_PREFIX}\n{inner}\n{_IMPULSE_CLOSE_TAG}"
+    # Wrap the FELT impulse: open tag on its own line, the content, then the close tag
+    # on its own line. AFTER the close tag — OUTSIDE the felt block — comes the
+    # consequence-transparency line (lm-md6.3): a consequence-ONLY disclosure of this
+    # turn's delivery semantics and the decline marker, so the being has a NEUTRAL way
+    # to stay silent instead of leaking its private "I won't write" prose to the owner.
+    prompt = f"{IMPULSE_LABEL_PREFIX}\n{inner}\n{_IMPULSE_CLOSE_TAG}\n{_DELIVERY_CONSEQUENCE}"
     return ProactivePrompt(
         prompt=prompt, projection_id=projection_id, correlation_id=correlation_id
     )
