@@ -383,7 +383,9 @@ class ContactAggregation:
                     else _WAKE_SUPPRESSION.get(outcome)
                 )
                 if reason is not None:
-                    emit_suppression_span(ctx.logger, reason=reason, component=self.id)
+                    emit_suppression_span(
+                        ctx.logger, reason=reason, component=self.id, metrics=ctx.metrics
+                    )
 
         # Async-bridge resolution span (spec §4.4 / §5 step 6): when this tick
         # consumes the verdict that resolves an in-flight proactive attempt, weave the

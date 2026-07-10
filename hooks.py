@@ -281,7 +281,10 @@ def _emit_async_outcome(
         # [SILENT] — a CONSCIOUS verdict, logged as a suppression under the origin
         # trace. ``emit_suppression_span`` sets ``reason`` + ends the span "suppressed".
         emit_suppression_span(
-            bridge.logger, reason=SuppressionReason.ACT_GATE_SILENT, component="hooks"
+            bridge.logger,
+            reason=SuppressionReason.ACT_GATE_SILENT,
+            component="hooks",
+            metrics=lm.metrics,
         )
     else:
         bridge.span.end(status="ok", ended_at=now)

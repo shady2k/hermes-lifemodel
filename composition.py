@@ -64,6 +64,7 @@ from .core.cognition import CognitionLauncher
 from .core.component import layer_for_type
 from .core.contact_neuron import PresenceNeuron
 from .core.coreloop import CoreLoop
+from .core.metrics import MetricRegistry, get_metric_registry
 from .core.neuron import Neuron
 from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
@@ -132,6 +133,12 @@ class LifeModel:
     #: in-tick pipeline. ``NULL_TRACE_SINK`` / a throwaway ring off the live being.
     trace_writer: TraceSink = NULL_TRACE_SINK
     event_ring: EventRing = field(default_factory=EventRing)
+    #: The shared metric registry (telemetry-core §4.1/§4.2) — the SAME
+    #: singleton-per-base_dir instance the CoreLoop emits into. Exposed so an
+    #: OUT-OF-TICK suppression (the proactive/egress backstop) is counted into
+    #: ``lifemodel_suppressions_total`` through the same choke-point. ``None`` only
+    #: for a hand-built graph that passed no registry.
+    metrics: MetricRegistry | None = None
 
 
 def _component_manifest(
@@ -169,6 +176,7 @@ def build_lifemodel(
     trace_exporter: TraceExportPort | None = None,
     trace_writer: TraceSink | None = None,
     event_ring: EventRing | None = None,
+    metrics: MetricRegistry | None = None,
     display_tz: tzinfo | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
@@ -230,6 +238,12 @@ def build_lifemodel(
     resolved_ring: EventRing = event_ring if event_ring is not None else EventRing()
     resolved_aggregator: Aggregator = aggregator or SilentAggregator()
     resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
+    # The shared metric registry (telemetry-core §4.1): the singleton-per-base_dir
+    # instance so tick, hooks, and ``/lifemodel stats`` (all in the one gateway
+    # process) read ONE registry. A test injects its own to inspect emitted metrics.
+    resolved_metrics: MetricRegistry = (
+        metrics if metrics is not None else get_metric_registry(base_dir)
+    )
 
     resolved_registry: ComponentRegistry = registry if registry is not None else ComponentRegistry()
     try:
@@ -318,6 +332,7 @@ def build_lifemodel(
         live_states=default_registry().live_states(),
         tracer=resolved_tracer,
         trace_exporter=resolved_trace_exporter,
+        metrics=resolved_metrics,
     )
 
     return LifeModel(
@@ -333,4 +348,5 @@ def build_lifemodel(
         tracer=resolved_tracer,
         trace_writer=resolved_writer,
         event_ring=resolved_ring,
+        metrics=resolved_metrics,
     )

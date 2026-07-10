@@ -26,10 +26,14 @@ exporter ships only the root).
 from __future__ import annotations
 
 import enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..log import SpanBoundLogger
 from ..ports.tracer import SpanStatus
+from .tick_metrics import SUPPRESSIONS_TOTAL
+
+if TYPE_CHECKING:
+    from .metrics import MetricRegistry
 
 #: The canonical structured-event name for a suppression span (HLA §13 vocab),
 #: shared by emitters and the debug reader so a silent decision is queryable.
@@ -93,6 +97,7 @@ def emit_suppression_span(
     reason: SuppressionReason,
     component: str,
     status: SpanStatus = "suppressed",
+    metrics: MetricRegistry | None = None,
     **extra: Any,
 ) -> None:
     """Emit a first-class suppression span — a "why NOT" decision becomes a record.
@@ -114,7 +119,20 @@ def emit_suppression_span(
     Structural note: *logger* is a :class:`~lifemodel.log.SpanBoundLogger` — a
     suppression without an active span is impossible by signature, matching the §5
     invariant that a log/decision without a span cannot exist.
+
+    **Choke-point metric (telemetry-core §4.2, bead lm-fib.7.4).** This is the ONE
+    birthplace of every suppression span — in-tick (a component gate, a component
+    fault) and out-of-tick (the proactive/egress backstop, the async act-gate
+    verdict). When a *metrics* registry is supplied, bump
+    ``lifemodel_suppressions_total{component,reason}`` HERE so the count can never
+    diverge from the trace. Emission is fail-open (the registry never raises), so a
+    suppression is recorded whether or not metrics are wired; *metrics* is ``None``
+    in a bare unit test and off a hand-built graph.
     """
     logger.span.set(reason=reason.value, **extra)
     logger.span.end(status=status)
     logger.info(EVENT_SUPPRESSION, reason=reason.value, component=component, **extra)
+    if metrics is not None:
+        # Fail-open: an undeclared metric / label is a no-op + emit-error bump, never
+        # an exception onto the tick or egress path (§7).
+        metrics.inc(SUPPRESSIONS_TOTAL, component=component, reason=reason.value)

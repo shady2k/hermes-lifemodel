@@ -193,4 +193,4 @@ class CognitionLauncher:
         is wired (the live tick); a bare unit-test ``TickContext`` skips it."""
         if ctx.logger is None:
             return
-        emit_suppression_span(ctx.logger, reason=reason, component=self.id)
+        emit_suppression_span(ctx.logger, reason=reason, component=self.id, metrics=ctx.metrics)

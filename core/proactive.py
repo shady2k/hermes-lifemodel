@@ -153,7 +153,9 @@ def _emit_egress_suppression(
         started_at=now,
     )
     bridge.span.set(**extra)  # decision values (e.g. the egress outcome) onto the span
-    emit_suppression_span(bridge.logger, reason=reason, component="proactive")
+    # Choke-point count (§4.2): this OUT-OF-TICK egress suppression lands in
+    # ``lifemodel_suppressions_total`` through the same door as in-tick ones.
+    emit_suppression_span(bridge.logger, reason=reason, component="proactive", metrics=lm.metrics)
     bridge.persist(ended_at=now)
 
 

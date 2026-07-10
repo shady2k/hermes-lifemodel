@@ -22,6 +22,7 @@ from ..ports.tracer import TraceContext, TracerPort
 from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .intents import Intent
+from .metrics import MetricRegistry
 from .signal_bus import SignalBus
 
 
@@ -119,6 +120,12 @@ class TickContext:
     tracer: TracerPort | None = None
     trace_writer: TraceSink = NULL_TRACE_SINK
     event_ring: EventRing | None = None
+    #: The shared metric registry (telemetry-core §4.2), set by the CoreLoop so a
+    #: component gate can emit its suppression through the choke-point
+    #: (:func:`~lifemodel.core.suppression.emit_suppression_span`) and be counted
+    #: into ``lifemodel_suppressions_total``. ``None`` in a bare unit-test context
+    #: (no harness) — the choke-point then simply records no metric.
+    metrics: MetricRegistry | None = None
 
 
 @runtime_checkable

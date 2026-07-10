@@ -35,7 +35,7 @@ from ..ports.tracer import ActiveSpan, TraceContext, TracerPort, start_span
 from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .component import TickContext
-from .intake import IntakeLimits, apply_intake
+from .intake import IntakeLimits, IntakeResult, apply_intake
 from .intents import (
     EmitSignal,
     Intent,
@@ -44,11 +44,31 @@ from .intents import (
     TransitionRecord,
     UpdateState,
 )
-from .registry import ComponentRegistry
+from .metrics import MetricRegistry
+from .registry import ComponentRegistry, UnknownComponent
 from .signal_bus import SignalBus
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
 from .taxonomy import lane_of
+from .tick_metrics import (
+    COMPONENT_DURATION,
+    COMPONENT_RUNS,
+    INTAKE_COALESCED,
+    INTAKE_KEPT,
+    INTAKE_SHED_CONTROL,
+    INTAKE_SHED_SENSOR,
+    LAYER_ACCEPTS_SIGNALS,
+    RUN_FAILED,
+    RUN_OK,
+    RUN_SUPPRESSED,
+    SIGNALS_INTAKE,
+    TICK_DURATION,
+    TICK_LAG,
+    TRACE_WRITER_DROPPED,
+    TRACE_WRITER_WRITE_ERRORS,
+    register_universal_metrics,
+)
+from .timeutil import minutes_between
 
 #: How many records the start-of-tick snapshot pulls *per live state*. A per-tick
 #: scan is fine at current scale (lm-fib.6.5 tracks scaling); the cap keeps it
@@ -93,6 +113,7 @@ class CoreLoop:
         tracer: TracerPort,
         trace_exporter: TraceExportPort | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        metrics: MetricRegistry | None = None,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
@@ -119,6 +140,14 @@ class CoreLoop:
         self._live_states = live_states if live_states is not None else _DEFAULT_LIVE_STATES
         self._failures: dict[str, int] = {}
         self._broken: set[str] = set()
+        # The shared source of CURRENT metric state (telemetry-core §4.1/§4.2): the
+        # composition root injects the singleton-per-base_dir registry so tick, hooks
+        # and ``/lifemodel stats`` all read one registry; a bare test/CLI loop with no
+        # graph falls back to a private registry so instrumentation never crashes for
+        # want of one. The universal specs are declared fail-fast here (idempotent —
+        # a fresh graph is built every tick), then emitted fail-open on the hot path.
+        self._metrics = metrics if metrics is not None else MetricRegistry()
+        register_universal_metrics(self._metrics)
 
     def _span_logger(self, span: ActiveSpan) -> SpanLogger:
         """A :class:`SpanLogger` bound to *span* over this loop's writer + ring."""
@@ -219,6 +248,10 @@ class CoreLoop:
                 shed_sensor=intake.shed_sensor,
                 coalesced_sensor=intake.coalesced_sensor,
             )
+        # Universal metrics (telemetry-core §4.2): the intake buckets and the per-layer
+        # accepts-signals gauge. Emission is fail-open (the registry never raises).
+        self._emit_intake(intake)
+        self._emit_accepts_signals()
         available: list[Signal] = list(intake.kept)
 
         intents: list[Intent] = []
@@ -239,6 +272,7 @@ class CoreLoop:
             child_ctx = self._tracer.child_of(root)
             span = start_span(child_ctx, component=component.id, tick=tick_no, started_at=started)
             logger = self._span_logger(span)
+            layer = self._component_layer(component.id)
             ctx = TickContext(
                 state=state,
                 now=now,
@@ -248,6 +282,10 @@ class CoreLoop:
                 objects=objects,
                 trace=child_ctx,
                 logger=logger,
+                # The shared metric registry (telemetry-core §4.2): a component gate
+                # emits its suppression through the choke-point with this, so an
+                # in-tick gate's suppression is counted like any other.
+                metrics=self._metrics,
                 # The async-bridge emit trio (spec §4.4): a component can weave an
                 # out-of-band span onto a FOREIGN origin trace (aggregation resolving
                 # a proactive attempt under its launch trace) through the SAME sinks.
@@ -255,13 +293,20 @@ class CoreLoop:
                 trace_writer=self._writer,
                 event_ring=self._ring,
             )
+            # Real per-component latency (telemetry-core §4.2, needs the span-timing
+            # fix, §5): measured off the MONOTONIC source so it never jumps on a
+            # system-clock step and a test can prove dt > 0 deterministically.
+            component_started_mono = self._monotonic()
             try:
                 produced = component.step(ctx)
             except Exception as exc:  # isolation: the heart never dies
+                component_dt = self._monotonic() - component_started_mono
                 self._record_failure(component.id, exc, logger)
                 self._persist_span(span, ended_at=self._span_ended_at(now, started_mono))
+                self._emit_component_run(component.id, layer, RUN_FAILED, component_dt)
                 failed.append(component.id)
                 continue
+            component_dt = self._monotonic() - component_started_mono
             self._failures[component.id] = 0
             for intent in produced:
                 if isinstance(intent, EmitSignal):
@@ -274,6 +319,10 @@ class CoreLoop:
                     intents.append(intent)
             ran.append(component.id)
             self._persist_span(span, ended_at=self._span_ended_at(now, started_mono))
+            # Status derivation (§4.2): the exception path is RUN_FAILED above; here a
+            # gate that closed its span "suppressed" is RUN_SUPPRESSED, else RUN_OK.
+            status = RUN_SUPPRESSED if span.status == "suppressed" else RUN_OK
+            self._emit_component_run(component.id, layer, status, component_dt)
 
         intents.append(
             UpdateState({"tick_count": state.tick_count + 1, "last_tick_at": now.isoformat()})
@@ -303,6 +352,10 @@ class CoreLoop:
         # ``ended_at`` snapshots elapsed at the very end of the tick, so the root
         # encloses every child span.
         self._persist_span(root_span, ended_at=self._span_ended_at(now, started_mono))
+        # Tick-level universal metrics LAST, so the duration encloses the whole tick
+        # (telemetry-core §4.2). ``state`` is the start-of-tick snapshot: its
+        # ``last_tick_at`` is the PREVIOUS tick's stamp, so the lag is genuine.
+        self._emit_tick_summary(state=state, now=now, started_mono=started_mono)
         return report
 
     def _export_tick(self, report: TickReport, trace: TraceContext, logger: SpanLogger) -> None:
@@ -318,15 +371,70 @@ class CoreLoop:
         self._failures[component_id] = count
         # A component fault suppresses the tick's outcome — record it as a proper
         # suppression span (spec §5): reason COMPONENT_FAILED, the span closed
-        # ``failed`` with the error + consecutive count on its attrs bag.
+        # ``failed`` with the error + consecutive count on its attrs bag. The
+        # choke-point counts it into ``lifemodel_suppressions_total`` (§4.2).
         emit_suppression_span(
             logger,
             reason=SuppressionReason.COMPONENT_FAILED,
             component=component_id,
             status="failed",
+            metrics=self._metrics,
             error=repr(exc),
             consecutive=count,
         )
         if count >= self._breaker_threshold and component_id not in self._broken:
             self._broken.add(component_id)
             logger.warning("circuit_breaker_open", component=component_id, after=count)
+
+    # ---- universal-metric emission (telemetry-core §4.2) ---------------- #
+
+    def _component_layer(self, component_id: str) -> str:
+        """The low-cardinality ``layer`` label for *component_id* (``"other"`` if
+        somehow unregistered — register() guarantees a non-``None`` layer)."""
+        try:
+            manifest = self._registry.manifest(component_id)
+        except UnknownComponent:
+            return "other"
+        return manifest.layer.value if manifest.layer is not None else "other"
+
+    def _emit_component_run(self, component_id: str, layer: str, status: str, dt: float) -> None:
+        """Count one component run by derived status + record its real duration."""
+        self._metrics.inc(COMPONENT_RUNS, component=component_id, layer=layer, outcome=status)
+        self._metrics.observe(COMPONENT_DURATION, dt, component=component_id, layer=layer)
+
+    def _emit_intake(self, intake: IntakeResult) -> None:
+        """Count this tick's intake buckets (§4.2). The lane is folded into the
+        ``outcome`` value (the closed label set has no ``lane`` key)."""
+        self._metrics.inc(SIGNALS_INTAKE, len(intake.kept), outcome=INTAKE_KEPT)
+        self._metrics.inc(SIGNALS_INTAKE, intake.shed_control, outcome=INTAKE_SHED_CONTROL)
+        self._metrics.inc(SIGNALS_INTAKE, intake.shed_sensor, outcome=INTAKE_SHED_SENSOR)
+        self._metrics.inc(SIGNALS_INTAKE, intake.coalesced_sensor, outcome=INTAKE_COALESCED)
+
+    def _emit_accepts_signals(self) -> None:
+        """Set the per-layer accepts-signals gauge from the MANIFEST (§4.2 — registry
+        knowledge, not a component's; the harness emits it, never ``ctx.observe``).
+
+        A layer's gauge is 1 if ANY registered component in it consumes signals."""
+        by_layer: dict[str, bool] = {}
+        for manifest in self._registry.manifests():
+            layer = manifest.layer.value if manifest.layer is not None else "other"
+            by_layer[layer] = by_layer.get(layer, False) or manifest.accepts_signals
+        for layer, accepts in by_layer.items():
+            self._metrics.set(LAYER_ACCEPTS_SIGNALS, 1.0 if accepts else 0.0, layer=layer)
+
+    def _emit_tick_summary(self, *, state: State, now: datetime, started_mono: float) -> None:
+        """Emit the tick-level metrics: duration, lag, and the writer snapshot (§4.2)."""
+        self._metrics.observe(TICK_DURATION, self._monotonic() - started_mono)
+        # ``last_tick_at`` is the PREVIOUS tick's stamp; minutes_between is the
+        # defensive parser (None / unparseable / naive → 0.0), converted to seconds.
+        self._metrics.set(TICK_LAG, minutes_between(state.last_tick_at, now) * 60.0)
+        # Writer drop/error counters are ABSOLUTE process-local values — SNAPSHOT them
+        # as a gauge (§4.2 codex #7), never ``inc()`` (that would double-count). The
+        # injected sink is the same instance the live being acquired; a bare
+        # NULL_TRACE_SINK has no counters and is simply skipped.
+        dropped = getattr(self._writer, "dropped_count", None)
+        errors = getattr(self._writer, "write_errors", None)
+        if dropped is not None:
+            self._metrics.set(TRACE_WRITER_DROPPED, float(dropped))
+        if errors is not None:
+            self._metrics.set(TRACE_WRITER_WRITE_ERRORS, float(errors))
