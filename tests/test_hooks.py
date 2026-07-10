@@ -90,16 +90,49 @@ def test_is_no_reply_rejects_prose_mentioning_a_marker() -> None:
     assert _is_no_reply("Hi! How are you?") is False
 
 
-def test_decline_marker_is_a_member_of_no_reply_markers() -> None:
+def test_decline_marker_is_a_member_of_substring_declines() -> None:
     # Single source of truth (lm-md6.3): the marker the wake-packet INSTRUCTS the being
     # to reply with to decline must be one the classifier maps to REJECT. The packet's
-    # DECLINE_MARKER is spliced INTO _NO_REPLY_MARKERS, and _is_no_reply must reject
-    # exactly it — otherwise an instructed decline leaks to the owner as delivered text.
+    # DECLINE_MARKER is spliced INTO _SUBSTRING_DECLINE_MARKERS (the fail-closed set the
+    # classifier substring-matches, lm-md6.5), and _is_no_reply must reject exactly it —
+    # otherwise an instructed decline leaks to the owner as delivered text.
     from lifemodel.core.wake_packet import DECLINE_MARKER
-    from lifemodel.hooks import _NO_REPLY_MARKERS
+    from lifemodel.hooks import _SUBSTRING_DECLINE_MARKERS
 
-    assert DECLINE_MARKER in _NO_REPLY_MARKERS
+    assert DECLINE_MARKER in _SUBSTRING_DECLINE_MARKERS
     assert _is_no_reply(DECLINE_MARKER) is True
+
+
+def test_is_no_reply_failclosed_on_bracketed_marker_wrapped_in_prose() -> None:
+    # The lm-md6.5 fix (KEY): the being decides to stay silent but writes deliberation
+    # prose around the bracketed sentinel. Because [SILENT] is matched as a SUBSTRING
+    # (fail-closed), the whole turn is a decline and is NOT delivered — its private
+    # "I won't write" reasoning no longer leaks to the owner.
+    assert _is_no_reply("Not going to nudge them right now. [SILENT]") is True
+    # Case-insensitive: a lowercased bracketed sentinel buried in prose still rejects.
+    assert _is_no_reply("I think I will hold back for now. [silent]") is True
+    # Marker first, prose after — position does not matter for a substring match.
+    assert _is_no_reply("[SILENT] — staying quiet this time.") is True
+
+
+def test_is_no_reply_does_not_substring_match_bare_words() -> None:
+    # FALSE-POSITIVE GUARD (mandatory, lm-md6.5): the bare words are matched ONLY as a
+    # whole (normalised) response, never as a substring. A genuine message that merely
+    # CONTAINS the word "silent" or the phrase "no reply" must be DELIVERED (not a
+    # decline) — otherwise real prose would be misclassified as silence and dropped.
+    assert _is_no_reply("we sat in silent comfort tonight") is False
+    assert _is_no_reply("No reply is needed here, I just wanted to say hi.") is False
+    assert _is_no_reply("It was a silent, easy kind of evening.") is False
+
+
+def test_is_no_reply_bare_marker_whole_response_still_rejects() -> None:
+    # The exact whole-response path is unchanged (lm-md6.5 keeps it): a bare marker that
+    # IS the entire (normalised) response still maps to REJECT, including the bracketed
+    # sentinel on its own.
+    assert _is_no_reply("[SILENT]") is True
+    assert _is_no_reply("SILENT") is True
+    assert _is_no_reply("NO_REPLY") is True
+    assert _is_no_reply("no reply") is True
 
 
 # --- make_post_llm_observer — signal publishing (spec §7.1) ------------------
@@ -125,6 +158,34 @@ def test_post_llm_publishes_reject_on_silent(tmp_path: Path) -> None:
     obs(user_message=f"{IMPULSE_LABEL_PREFIX} ...", assistant_response="[SILENT]")
     verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
     assert read_verdict(verdicts[0]) is Verdict.REJECT
+
+
+def test_post_llm_rejects_prose_wrapped_silent_marker(tmp_path: Path) -> None:
+    # The lm-md6.5 fix END-TO-END: the being decided to stay silent but wrapped the
+    # bracketed sentinel in deliberation prose. Fail-closed substring matching maps the
+    # whole turn to REJECT, so its private "I won't write" reasoning is NOT delivered.
+    lm = _lm_with_pending(tmp_path)
+    obs = make_post_llm_observer(lm)
+    obs(
+        user_message=f"{IMPULSE_LABEL_PREFIX} ...",
+        assistant_response="Not going to nudge them right now. [SILENT]",
+    )
+    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
+    assert read_verdict(verdicts[0]) is Verdict.REJECT
+
+
+def test_post_llm_delivers_message_mentioning_silent_word(tmp_path: Path) -> None:
+    # FALSE-POSITIVE GUARD END-TO-END (lm-md6.5): a genuine proactive message that
+    # merely contains the bare word "silent" is FULFILLED (delivered) — bare words are
+    # never substring-matched, so real prose is not misclassified as silence and dropped.
+    lm = _lm_with_pending(tmp_path)
+    obs = make_post_llm_observer(lm)
+    obs(
+        user_message=f"{IMPULSE_LABEL_PREFIX} ...",
+        assistant_response="Hey — it's been a silent kind of evening, I miss you.",
+    )
+    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
+    assert read_verdict(verdicts[0]) is Verdict.FULFILL
 
 
 def test_post_llm_ignores_uncorrelated_turn(tmp_path: Path) -> None:

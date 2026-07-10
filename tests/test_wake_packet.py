@@ -40,7 +40,7 @@ INITIATING_FRAME = (
 # delivery semantics (text written now reaches the user, and how to send nothing) and
 # says nothing about whether to reach out, so it can't re-trigger the [SILENT]
 # suppression regression. Spelled independently here so this test PINS the exact bytes
-# the model reads; the marker matches hooks._NO_REPLY_MARKERS (single source of truth).
+# the model reads; the marker matches hooks._SUBSTRING_DECLINE_MARKERS (single source of truth).
 DELIVERY_CONSEQUENCE = (
     "Delivery consequence: text you write now is delivered to the user.\n"
     "Reply exactly [SILENT] for no message to be sent."
@@ -398,8 +398,8 @@ def test_decline_marker_is_single_source_of_truth_with_the_classifier() -> None:
     # an instructed decline would silently leak to the owner as delivered text. The
     # instruction is BUILT from DECLINE_MARKER, and the classifier's set contains it.
     from lifemodel.core.wake_packet import DECLINE_MARKER
-    from lifemodel.hooks import _NO_REPLY_MARKERS
+    from lifemodel.hooks import _SUBSTRING_DECLINE_MARKERS
 
     assert DECLINE_MARKER == "[SILENT]"
-    assert DECLINE_MARKER in _NO_REPLY_MARKERS
+    assert DECLINE_MARKER in _SUBSTRING_DECLINE_MARKERS
     assert DECLINE_MARKER in _build(last_exchange_at=LAST).prompt
