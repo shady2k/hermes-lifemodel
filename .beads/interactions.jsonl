@@ -103,3 +103,4 @@
 {"id":"int-6883f39e40253fb427c6dbd2440910a8","kind":"field_change","created_at":"2026-07-10T12:53:57.407216Z","actor":"shady","issue_id":"lm-md6.5","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-6c2be8e36b3b1a9e9e2fe287efdd6858","kind":"field_change","created_at":"2026-07-10T13:03:55.635511Z","actor":"shady","issue_id":"lm-md6.5","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-baa53a4a7c94412d3a3deb1ee03f4c6c","kind":"field_change","created_at":"2026-07-10T13:25:15.609667Z","actor":"shady","issue_id":"lm-md6","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-82bace5a86c43e7d8f44914368d275e2","kind":"field_change","created_at":"2026-07-10T13:28:41.902252Z","actor":"shady","issue_id":"lm-jh6","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
