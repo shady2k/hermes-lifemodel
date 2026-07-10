@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 
 import pytest
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext, layer_for_type
 from lifemodel.core.coreloop import CoreLoop, TickReport
 from lifemodel.core.intents import EmitSignal, Intent, LaunchProactive, UpdateState
@@ -107,14 +106,12 @@ class ContactEmitter:
 def _loop(
     registry: ComponentRegistry,
     store: RecordingStore,
-    bus: FileSignalBus,
     *,
     breaker_threshold: int = 3,
 ) -> CoreLoop:
     return CoreLoop(
         registry=registry,
         state_actor=StateActor(store),
-        bus=bus,
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         breaker_threshold=breaker_threshold,
         tracer=FakeTracer(),
@@ -130,7 +127,7 @@ def test_healthy_component_intents_reach_state_and_tick_bumps(tmp_path) -> None:
         ),
     )
     store = RecordingStore()
-    loop = _loop(reg, store, FileSignalBus(tmp_path))
+    loop = _loop(reg, store)
     report = loop.tick()
     assert isinstance(report, TickReport)
     assert store.commits[-1].u == 0.42
@@ -139,22 +136,50 @@ def test_healthy_component_intents_reach_state_and_tick_bumps(tmp_path) -> None:
     assert report.ran == ("healthy",)
 
 
-def test_emit_signal_is_transient_not_durable(tmp_path) -> None:
-    # EmitSignal threads to later components in-tick; it is NOT written to the bus.
+class OneShotEmitter:
+    """Emits a single contact signal on its FIRST frame only."""
+
+    id = "emitter"
+
+    def __init__(self) -> None:
+        self.emitted = False
+
+    def step(self, ctx: TickContext) -> Sequence[Intent]:
+        if self.emitted:
+            return []
+        self.emitted = True
+        return [
+            EmitSignal(contact_signal(origin_id="c-tick", value=1.0, delta=0.0, timestamp=None))
+        ]
+
+
+def test_emit_signal_is_transient_not_durable() -> None:
+    # EmitSignal threads to later components in-frame; the SignalFrame dies at end of
+    # frame, so a signal emitted once does NOT reappear next frame (spec §2/§3 — no
+    # durable log, no cursor).
     reg = ComponentRegistry()
+    seen = SeenRecorder()
     reg.register(
-        ContactEmitter(),
+        OneShotEmitter(),
         ComponentManifest(
             id="emitter", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
         ),
     )
-    bus = FileSignalBus(tmp_path)
-    loop = _loop(reg, RecordingStore(), bus)
+    reg.register(
+        seen,
+        ComponentManifest(
+            id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
+        ),
+    )
+    loop = _loop(reg, RecordingStore())
     loop.tick()
-    assert bus.peek_unprocessed() == []  # transient — nothing persisted
+    assert "c-tick" in seen.seen  # visible to a later component THIS frame
+    seen.seen = []
+    loop.tick()
+    assert "c-tick" not in seen.seen  # gone next frame — nothing persisted
 
 
-def test_later_component_sees_earlier_components_emitted_signal(tmp_path) -> None:
+def test_later_component_sees_earlier_components_emitted_signal() -> None:
     reg = ComponentRegistry()
     seen = SeenRecorder()
     reg.register(
@@ -169,12 +194,15 @@ def test_later_component_sees_earlier_components_emitted_signal(tmp_path) -> Non
             id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
         ),
     )
-    loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path))
+    loop = _loop(reg, RecordingStore())
     loop.tick()
     assert "c-tick" in seen.seen  # aggregation saw the neuron's transient contact signal
 
 
-def test_durable_inbound_signal_is_consumed_once_and_threaded(tmp_path) -> None:
+def test_initial_signal_seeds_the_frame_and_dies_with_it() -> None:
+    # A frame is SEEDED with its trigger's initial_signals (spec §3); they are visible
+    # this frame, then the ephemeral SignalFrame dies — a later frame with no seed sees
+    # nothing (no durable log, no cursor, no replay after restart).
     reg = ComponentRegistry()
     seen = SeenRecorder()
     reg.register(
@@ -183,16 +211,17 @@ def test_durable_inbound_signal_is_consumed_once_and_threaded(tmp_path) -> None:
             id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
         ),
     )
-    bus = FileSignalBus(tmp_path)
-    bus.publish(
-        Signal(origin_id="ext-1", kind="exchange", payload={"actor": "user", "label": "two_way"})
+    loop = _loop(reg, RecordingStore())
+    seed = Signal(
+        origin_id="ext-1",
+        kind="contact_observed",
+        payload={"actor": "user", "label": "two_way"},
     )
-    loop = _loop(reg, RecordingStore(), bus)
-    loop.tick()
-    assert seen.seen == ["ext-1"]  # inbound external input threaded in
+    loop.tick([seed])
+    assert seen.seen == ["ext-1"]  # inbound external input threaded in this frame
     seen.seen = []
-    loop.tick()
-    assert seen.seen == []  # consumed once — not re-served next tick
+    loop.tick()  # a fresh frame, no seed
+    assert seen.seen == []  # the ephemeral signal did not survive the frame
 
 
 def test_failing_component_is_isolated_and_others_still_run(tmp_path) -> None:
@@ -211,7 +240,7 @@ def test_failing_component_is_isolated_and_others_still_run(tmp_path) -> None:
         ),
     )
     store = RecordingStore()
-    loop = _loop(reg, store, FileSignalBus(tmp_path))
+    loop = _loop(reg, store)
     report = loop.tick()  # must not raise
     assert healthy.calls == 1
     assert store.commits[-1].u == 0.42  # tick still checkpointed
@@ -228,7 +257,7 @@ def test_repeated_failures_open_breaker_and_skip_component(tmp_path) -> None:
             id="broken", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
         ),
     )
-    loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path), breaker_threshold=3)
+    loop = _loop(reg, RecordingStore(), breaker_threshold=3)
     for _ in range(3):
         loop.tick()
     assert broken.calls == 3  # tripped after the 3rd failure
@@ -240,48 +269,10 @@ def test_repeated_failures_open_breaker_and_skip_component(tmp_path) -> None:
 def test_tick_count_increments_each_tick(tmp_path) -> None:
     reg = ComponentRegistry()
     store = RecordingStore()
-    loop = _loop(reg, store, FileSignalBus(tmp_path))
+    loop = _loop(reg, store)
     loop.tick()
     loop.tick()
     assert store.commits[-1].tick_count == 2
-
-
-def test_coreloop_bounds_a_flood_and_survives(tmp_path) -> None:
-    # publish a flood of exchange signals to the bus; one tick must complete,
-    # bounded, without raising, and the aggregation-facing ctx must be capped.
-    from lifemodel.core.intake import IntakeLimits
-
-    reg = ComponentRegistry()
-    seen = SeenRecorder()
-    reg.register(
-        seen,
-        ComponentManifest(
-            id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
-        ),
-    )
-    bus = FileSignalBus(tmp_path)
-    for i in range(1000):
-        bus.publish(
-            Signal(
-                origin_id=f"e{i}", kind="exchange", payload={"actor": "user", "label": "two_way"}
-            )
-        )
-    loop = CoreLoop(
-        registry=reg,
-        state_actor=StateActor(RecordingStore()),
-        bus=bus,
-        clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
-        intake_limits=IntakeLimits(max_control=256, max_sensor=64),
-        tracer=FakeTracer(),
-    )
-    report = loop.tick()  # must not raise
-    assert report.committed
-    assert len(seen.seen) <= 256 + 64  # aggregation saw a bounded batch
-
-
-def test_coreloop_default_intake_limits_present(tmp_path) -> None:
-    loop = _loop(ComponentRegistry(), RecordingStore(), FileSignalBus(tmp_path))
-    loop.tick()  # smoke: default IntakeLimits, no flood, still ticks
 
 
 class Launcher:
@@ -305,7 +296,7 @@ def test_launch_proactive_is_surfaced_in_report(tmp_path) -> None:
             id="launcher", type="cognition", layer=layer_for_type("cognition"), metric_surface=()
         ),
     )
-    loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path))
+    loop = _loop(reg, RecordingStore())
     report = loop.tick()
     assert len(report.launches) == 1
     assert report.launches[0].correlation_id == "c-1"
@@ -313,7 +304,7 @@ def test_launch_proactive_is_surfaced_in_report(tmp_path) -> None:
 
 
 def test_no_launch_means_empty_tuple(tmp_path) -> None:
-    loop = _loop(ComponentRegistry(), RecordingStore(), FileSignalBus(tmp_path))
+    loop = _loop(ComponentRegistry(), RecordingStore())
     assert loop.tick().launches == ()
 
 
@@ -370,7 +361,6 @@ def test_tick_context_snapshot_populated_once_and_shared(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         pressure_sensor=mem,
         memory=mem,
@@ -403,7 +393,6 @@ def test_snapshot_includes_deferred_not_only_active(tmp_path) -> None:
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         memory=mem,
         tracer=FakeTracer(),
@@ -436,7 +425,6 @@ def test_snapshot_includes_parked_thought_and_pending_intention(tmp_path) -> Non
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=clock,
         memory=mem,
         live_states=default_registry().live_states(),
@@ -464,7 +452,6 @@ def test_default_snapshot_stays_active_and_deferred_only(tmp_path) -> None:
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=clock,
         memory=mem,
         tracer=FakeTracer(),
@@ -485,7 +472,6 @@ def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         memory=counting,  # type: ignore[arg-type]
         tracer=FakeTracer(),
@@ -512,7 +498,6 @@ def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
     CoreLoop(
         registry=reg_with,
         state_actor=StateActor(store_with),
-        bus=FileSignalBus(tmp_path / "with"),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         pressure_sensor=mem,
         memory=mem,
@@ -527,7 +512,7 @@ def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
         ),
     )
     store_without = RecordingStore()
-    _loop(reg_without, store_without, FileSignalBus(tmp_path / "without")).tick()
+    _loop(reg_without, store_without).tick()
 
     assert store_with.commits[-1] == store_without.commits[-1]
 
@@ -541,7 +526,7 @@ def test_tick_context_snapshot_defaults_empty_without_ports(tmp_path) -> None:
             id="only", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
         ),
     )
-    _loop(reg, RecordingStore(), FileSignalBus(tmp_path)).tick()
+    _loop(reg, RecordingStore()).tick()
     assert rec.pressure == PressureIndex()
     assert rec.objects == ()
 
@@ -569,7 +554,6 @@ def test_objects_snapshot_read_is_fail_soft(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(store),
-        bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         memory=RaisingMemory(),  # type: ignore[arg-type]
         tracer=FakeTracer(),
@@ -667,7 +651,6 @@ def test_component_runs_in_a_child_span_of_the_tick_root(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=_clock(),
         tracer=FakeTracer(),
     )
@@ -707,7 +690,6 @@ def test_every_component_gets_a_distinct_child_span(tmp_path) -> None:
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=_clock(),
         tracer=FakeTracer(),
     ).tick()
@@ -727,7 +709,6 @@ def test_coreloop_requires_a_tracer_untraced_tick_is_impossible(tmp_path) -> Non
         CoreLoop(  # type: ignore[call-arg]
             registry=ComponentRegistry(),
             state_actor=StateActor(RecordingStore()),
-            bus=FileSignalBus(tmp_path),
             clock=_clock(),
         )
 
@@ -746,7 +727,6 @@ def test_each_tick_gets_a_fresh_trace(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=_clock(),
         tracer=FakeTracer(),
     )
@@ -773,7 +753,6 @@ def test_component_failure_is_a_suppression_span_under_the_child_span(tmp_path) 
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=_clock(),
         trace_writer=sink,
         tracer=FakeTracer(),
@@ -876,7 +855,6 @@ def test_every_persisted_span_closes_after_it_started(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=_clock(),
         trace_writer=sink,
         tracer=FakeTracer(),
@@ -908,7 +886,6 @@ def test_component_failure_span_row_is_failed_and_parented_on_root(tmp_path) -> 
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=_clock(),
         trace_writer=sink,
         tracer=FakeTracer(),

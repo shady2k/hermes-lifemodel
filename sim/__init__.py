@@ -5,7 +5,7 @@ This package is the certified core of bead ``lm-x43`` — the drive-component
 (:mod:`lifemodel.sim.wake`), and the exchange-quality classifier
 (:mod:`lifemodel.sim.quality`). The LIVE components import these directly
 (``SolitudeDrive`` uses ``Drive``; ``ContactAggregation`` uses ``evaluate_wake``;
-``PresenceNeuron`` uses ``quality_of``), so the math the being runs IS the
+``ContactSensor`` uses ``quality_of``), so the math the being runs IS the
 certified math. Nothing here imports Hermes; it runs and is tested in plain Python.
 
 T8 (spec §6) removed the OLD parallel tick model that lived here

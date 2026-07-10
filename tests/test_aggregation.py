@@ -16,17 +16,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.aggregation import ContactAggregation
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import Intent, PutRecord, TransitionRecord, UpdateState
 from lifemodel.core.taxonomy import (
+    contact_observed_signal,
     contact_pressure_signal,
-    exchange_signal,
     in_flight_signal,
-    verdict_signal,
+    proactive_outcome_signal,
 )
-from lifemodel.domain.egress import Verdict
+from lifemodel.domain.egress import ProactiveOutcome
 from lifemodel.domain.objects import DesireSpring
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.sim.wake import GateParams
@@ -61,7 +60,6 @@ def _ctx(state: State, now: datetime, signals=(), *, objects=(), tmp_path) -> Ti
     return TickContext(
         state=state,
         now=now,
-        bus=FileSignalBus(tmp_path),
         signals=tuple(signals),
         objects=tuple(objects),
         trace=_TRACE,
@@ -148,7 +146,7 @@ def test_deferred_desire_cleared_by_exchange(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=DEFERRED, tmp_path=tmp_path))
     assert _transition(intents) == ("deferred", "satisfied")
 
@@ -213,7 +211,7 @@ def test_exchange_clears_the_silence_anchor(tmp_path) -> None:
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
     assert changes["last_exchange_at"] == now.isoformat()
     assert changes["silence_anchor_at"] is None  # override cleared by the real exchange
@@ -267,7 +265,7 @@ def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
     changes = _changes(intents)
     assert _transition(intents) == ("active", "satisfied")  # exchange terminalizes the desire
@@ -280,7 +278,7 @@ def test_exchange_this_tick_suppresses_wake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # fresh exchange -> SILENCE_WINDOW, no wake
 
@@ -289,7 +287,7 @@ def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    own = exchange_signal(
+    own = contact_observed_signal(
         origin_id="e1", actor="proactive_internal", label="two_way", timestamp=None
     )
     intents = _agg().step(_ctx(state, now, [c, own], objects=ACTIVE, tmp_path=tmp_path))
@@ -302,7 +300,9 @@ def test_fulfill_starts_action_pending_and_clears_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(duration_over_theta=99.0)
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
     changes = _changes(intents)
     assert _transition(intents) == ("active", "satisfied")
@@ -322,7 +322,9 @@ def test_readback_send_does_not_satiate_u(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
     changes = _changes(intents)
     assert "u" not in changes  # the send left the drive deficit untouched
@@ -334,7 +336,9 @@ def test_reject_records_backoff_and_clears_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(decline_count=1)
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SILENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
     changes = _changes(intents)
     assert _transition(intents) == ("active", "dropped")
@@ -345,14 +349,23 @@ def test_reject_records_backoff_and_clears_pending(tmp_path) -> None:
     assert changes["pending_proactive_origin_traceparent"] is None
 
 
-def test_defer_holds_desire_keeps_pending(tmp_path) -> None:
+def test_stale_outcome_drops_desire_and_clears_pending_without_backoff(tmp_path) -> None:
+    # STALE/FAILED: the attempt ended with nothing to reinforce (spec §5/§6) — the
+    # desire is dropped and pending cleared, but no decline backoff and no
+    # ActionPending window (no send happened).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.DEFER, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.STALE, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
-    assert _transition(intents) == ("active", "deferred")
-    assert "u" not in _changes(intents)
+    changes = _changes(intents)
+    assert _transition(intents) == ("active", "dropped")
+    assert changes["pending_proactive_id"] is None  # turn resolved
+    assert changes["action_pending_since"] is None  # no send → no inhibition window
+    assert changes["decline_count"] == 0  # STALE is not a decline
+    assert "u" not in changes  # not satiated
 
 
 def test_exchange_clears_action_pending(tmp_path) -> None:
@@ -364,7 +377,7 @@ def test_exchange_clears_action_pending(tmp_path) -> None:
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_pressure_signal(origin_id="c1", value=1.0, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
     assert _changes(intents)["action_pending_since"] is None  # contact resolved the pull
     assert _transition(intents) == ("active", "satisfied")
@@ -374,7 +387,9 @@ def test_reject_does_not_set_action_pending(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SILENT, timestamp=None, correlation_id=CORR
+    )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["action_pending_since"] is None  # REJECT never inhibits
     assert changes["decline_count"] == 1  # existing backoff bookkeeping intact
@@ -384,7 +399,9 @@ def test_reject_then_backoff_blocks_immediate_rewake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(u=5.0)
     c = contact_pressure_signal(origin_id="c1", value=5.0, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SILENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
     assert _transition(intents) == ("active", "dropped")  # rejected...
     assert not _created_active(intents)  # ...and backoff vetoes a same-tick re-wake
@@ -394,8 +411,11 @@ def test_stale_verdict_wrong_correlation_is_dropped(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(
-        origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id="proactive-OTHER"
+    v = proactive_outcome_signal(
+        origin_id="v1",
+        outcome=ProactiveOutcome.SENT,
+        timestamp=None,
+        correlation_id="proactive-OTHER",
     )
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # verdict dropped -> desire untouched (dedup)
@@ -407,8 +427,10 @@ def test_exchange_dominates_same_tick_verdict(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, ex, v], objects=ACTIVE, tmp_path=tmp_path))
     changes = _changes(intents)
     assert _transition(intents) == ("active", "satisfied")  # exchange terminalized it
@@ -467,7 +489,9 @@ def test_fulfill_records_a_send(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     log = changes["proactive_send_log"]
     assert log[-1] == now.isoformat()  # this send recorded
@@ -486,7 +510,9 @@ def test_reject_does_not_record_a_send(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(proactive_send_log=["2026-07-06T02:00:00+00:00"])
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SILENT, timestamp=None, correlation_id=CORR
+    )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["proactive_send_log"] == ["2026-07-06T02:00:00+00:00"]  # unchanged
 
@@ -506,7 +532,9 @@ def test_fulfill_pure_longing_increments_unanswered_outbound_count(tmp_path) -> 
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state(unanswered_outbound_count=2)
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["unanswered_outbound_count"] == 3  # bumped by this longing FULFILL
 
@@ -518,7 +546,9 @@ def test_fulfill_top_down_send_does_not_increment_unanswered_outbound_count(tmp_
     state = _live_pending_state(unanswered_outbound_count=2)
     objects = contact_desire_objects("active", spring=DesireSpring.THOUGHT)
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=objects, tmp_path=tmp_path)))
     assert changes["unanswered_outbound_count"] == 2  # unchanged — top-down, not longing
 
@@ -532,7 +562,9 @@ def test_fulfill_mixed_spring_send_does_not_increment_unanswered_outbound_count(
         "active", spring=DesireSpring.MIXED, source_thought_ids=("t-serve",)
     )
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=objects, tmp_path=tmp_path)))
     assert changes["unanswered_outbound_count"] == 2  # unchanged — thought-backed, not longing
 
@@ -545,7 +577,7 @@ def test_exchange_resets_unanswered_outbound_count(tmp_path) -> None:
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path)))
     assert changes["unanswered_outbound_count"] == 0  # a genuine reply resets the longing bid
 
@@ -607,7 +639,9 @@ def test_fulfill_completes_intention_and_satisfies_desire_atomically(tmp_path) -
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=_live_pair(), tmp_path=tmp_path))
     # both transitions in ONE batch — the pair resolves together
     assert _kind_transition(intents, "desire") == ("active", "satisfied")
@@ -618,7 +652,9 @@ def test_reject_drops_both_intention_and_desire_atomically(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.REJECT, timestamp=None, correlation_id=CORR)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SILENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, v], objects=_live_pair(), tmp_path=tmp_path))
     assert _kind_transition(intents, "desire") == ("active", "dropped")
     assert _kind_transition(intents, "intention") == ("active", "dropped")
@@ -628,7 +664,7 @@ def test_exchange_completes_intention_and_satisfies_desire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=_live_pair(), tmp_path=tmp_path))
     assert _kind_transition(intents, "desire") == ("active", "satisfied")
     assert _kind_transition(intents, "intention") == ("active", "completed")
@@ -640,8 +676,10 @@ def test_exchange_dominates_verdict_for_both_desire_and_intention(tmp_path) -> N
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = _live_pending_state()
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
-    v = verdict_signal(origin_id="v1", verdict=Verdict.FULFILL, timestamp=None, correlation_id=CORR)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    v = proactive_outcome_signal(
+        origin_id="v1", outcome=ProactiveOutcome.SENT, timestamp=None, correlation_id=CORR
+    )
     intents = _agg().step(_ctx(state, now, [c, ex, v], objects=_live_pair(), tmp_path=tmp_path))
     assert _kind_transition(intents, "desire") == ("active", "satisfied")
     assert _kind_transition(intents, "intention") == ("active", "completed")
@@ -653,7 +691,7 @@ def test_exchange_completes_a_deferred_intention(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(
         _ctx(state, now, [c, ex], objects=_live_pair("deferred", "deferred"), tmp_path=tmp_path)
     )
@@ -668,7 +706,7 @@ def test_desire_resolves_without_a_never_crystallized_intention(tmp_path) -> Non
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
     state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
-    ex = exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
+    ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
     assert _kind_transition(intents, "desire") == ("active", "satisfied")
     assert _kind_transition(intents, "intention") is None  # nothing to transition
@@ -717,7 +755,6 @@ def _run_with_logger(state, now, signals, *, tmp_path):  # type: ignore[no-untyp
         TickContext(
             state=state,
             now=now,
-            bus=FileSignalBus(tmp_path),
             signals=tuple(signals),
             objects=(),
             trace=trace,
@@ -818,7 +855,6 @@ def _traced_ctx(state, now, signals, *, tmp_path, trace):
     return TickContext(
         state=state,
         now=now,
-        bus=FileSignalBus(tmp_path),
         signals=tuple(signals),
         objects=(),
         trace=trace,

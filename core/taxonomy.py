@@ -1,10 +1,14 @@
-"""Signal taxonomy — the typed vocabulary of the pipeline (spec §4).
+"""Signal taxonomy — the typed vocabulary of the pipeline (spec §4/§6).
 
-Phase B1 defines two kinds:
-- ``contact`` — the neuron's *transient* intra-tick output: the unipolar drive
-  value ``[0..u_max]`` plus its per-tick ``delta``. Never persisted.
-- ``exchange`` — a *durable* external input: a real lane event (actor + label,
-  per :mod:`lifemodel.sim.quality`) that the neuron reads to satiate the drive.
+A signal is an ephemeral afferent reading that lives ``<=`` one ExecutionFrame
+(spec §2/§3) — never persisted. The kinds here:
+- ``contact`` — the drive's *transient* intra-frame output: the unipolar urge
+  value ``[0..u_max]`` plus its per-frame ``delta``.
+- ``contact_observed`` — an external contact reading: a real lane event
+  (actor + label, per :mod:`lifemodel.sim.quality`) the sensor transduces so the
+  drive satiates. (Renamed from ``exchange`` — the fact is "contact observed", spec §10.)
+- ``proactive_outcome`` — the efference copy of a finished proactive turn
+  (``sent``/``silent``/``failed``/``stale``, spec §5/§6). (Renamed from ``verdict``.)
 
 Builders keep payloads JSON-native and uniform; readers validate on the way out.
 """
@@ -15,13 +19,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, cast
 
-from ..domain.egress import Verdict
+from ..domain.egress import ProactiveOutcome
 from ..domain.signal import Signal
 from ..sim.quality import Actor, Label
 
 KIND_CONTACT = "contact"
-KIND_EXCHANGE = "exchange"
-KIND_VERDICT = "verdict"
+KIND_CONTACT_OBSERVED = "contact_observed"
+KIND_PROACTIVE_OUTCOME = "proactive_outcome"
 KIND_IN_FLIGHT = "in_flight"
 #: The transient top-down desire spring (lm-27n.9): a deliberated thought that
 #: cleared the Rubicon gate proposed to spring the contact desire — a *proposal*
@@ -31,7 +35,7 @@ KIND_IN_FLIGHT = "in_flight"
 #: dead-in-prod — the kind + helpers stay because ``test_taxonomy`` pins the
 #: contract for the Phase 6 return. Never persisted: an in-tick ``EmitSignal``.
 KIND_THOUGHT_CONTACT_PROPOSAL = "thought_contact_proposal"
-#: The INSTANTANEOUS contact-channel reading (T2 split, spec §3): PresenceNeuron — a
+#: The INSTANTANEOUS contact-channel reading (T2 split, spec §3): ContactSensor — a
 #: stateless receptor — emits it carrying the elapsed silence ``dt`` + this tick's
 #: exchange qualities. SolitudeDrive consumes it to integrate the drive. Raw and
 #: unintegrated: the sensor measures, the center integrates. Never persisted.
@@ -45,21 +49,22 @@ KIND_CONTACT_PRESSURE = "contact_pressure"
 
 Lane = Literal["control", "sensor"]
 
-#: Load-bearing lifecycle events — never salience-shed (spec §5.1). Includes a
-#: forward-looking ``delivery_result`` kind (used by phases D/E) so the lane is
-#: stable before that signal exists.
+#: Load-bearing lifecycle events — never salience-shed (spec §7 ``must_process``).
+#: Includes a forward-looking ``delivery_result`` kind (used by phases D/E) so the
+#: class is stable before that signal exists. (Priority-class backpressure itself is
+#: a later slice; this classification is kept as the stable seam.)
 CONTROL_KINDS: frozenset[str] = frozenset(
-    {KIND_EXCHANGE, KIND_VERDICT, KIND_IN_FLIGHT, "delivery_result"}
+    {KIND_CONTACT_OBSERVED, KIND_PROACTIVE_OUTCOME, KIND_IN_FLIGHT, "delivery_result"}
 )
 
 
 def lane_of(kind: str) -> Lane:
-    """Backpressure lane for a signal kind. Unknown kinds are sensors (never
-    control) so an unknown flood cannot claim the lossless lane."""
+    """Priority class for a signal kind. Unknown kinds are sensors (never
+    ``must_process``) so an unknown flood cannot claim the lossless class."""
     return "control" if kind in CONTROL_KINDS else "sensor"
 
 
-_VERDICTS: dict[str, Verdict] = {v.value: v for v in Verdict}
+_OUTCOMES: dict[str, ProactiveOutcome] = {o.value: o for o in ProactiveOutcome}
 
 _ACTORS: frozenset[str] = frozenset({"user", "assistant", "proactive_internal"})
 _LABELS: frozenset[str] = frozenset({"two_way", "ack", "monologue", "rejection"})
@@ -97,53 +102,55 @@ def contact_pressure_signal(
     )
 
 
-def exchange_signal(*, origin_id: str, actor: Actor, label: Label, timestamp: str | None) -> Signal:
-    """Build a durable exchange-input signal from a lane event."""
+def contact_observed_signal(
+    *, origin_id: str, actor: Actor, label: Label, timestamp: str | None
+) -> Signal:
+    """Build a contact-observed reading from a lane event (the sensor's transduction)."""
     return Signal(
         origin_id=origin_id,
-        kind=KIND_EXCHANGE,
+        kind=KIND_CONTACT_OBSERVED,
         payload={"actor": actor, "label": label},
         timestamp=timestamp,
     )
 
 
-def read_exchange(signal: Signal) -> tuple[Actor, Label]:
-    """Validate and extract ``(actor, label)`` from an exchange signal."""
-    if signal.kind != KIND_EXCHANGE:
-        raise ValueError(f"not an exchange signal: kind={signal.kind!r}")
+def read_contact_observed(signal: Signal) -> tuple[Actor, Label]:
+    """Validate and extract ``(actor, label)`` from a contact-observed signal."""
+    if signal.kind != KIND_CONTACT_OBSERVED:
+        raise ValueError(f"not a contact_observed signal: kind={signal.kind!r}")
     actor = signal.payload.get("actor")
     label = signal.payload.get("label")
     if actor not in _ACTORS or label not in _LABELS:
-        raise ValueError(f"invalid exchange payload: {signal.payload!r}")
+        raise ValueError(f"invalid contact_observed payload: {signal.payload!r}")
     return cast(Actor, actor), cast(Label, label)
 
 
-def verdict_signal(
-    *, origin_id: str, verdict: Verdict, timestamp: str | None, correlation_id: str = ""
+def proactive_outcome_signal(
+    *, origin_id: str, outcome: ProactiveOutcome, timestamp: str | None, correlation_id: str = ""
 ) -> Signal:
-    """Build a durable verdict-input signal (cognition's decision on a desire)."""
+    """Build a proactive-outcome signal (the efference copy of a finished turn)."""
     return Signal(
         origin_id=origin_id,
-        kind=KIND_VERDICT,
-        payload={"verdict": verdict.value, "correlation_id": correlation_id},
+        kind=KIND_PROACTIVE_OUTCOME,
+        payload={"outcome": outcome.value, "correlation_id": correlation_id},
         timestamp=timestamp,
     )
 
 
-def read_verdict(signal: Signal) -> Verdict:
-    """Validate and extract the ``Verdict`` from a verdict signal."""
-    if signal.kind != KIND_VERDICT:
-        raise ValueError(f"not a verdict signal: kind={signal.kind!r}")
-    raw = signal.payload.get("verdict")
-    if raw not in _VERDICTS:
-        raise ValueError(f"invalid verdict payload: {signal.payload!r}")
-    return _VERDICTS[raw]
+def read_proactive_outcome(signal: Signal) -> ProactiveOutcome:
+    """Validate and extract the ``ProactiveOutcome`` from a proactive-outcome signal."""
+    if signal.kind != KIND_PROACTIVE_OUTCOME:
+        raise ValueError(f"not a proactive_outcome signal: kind={signal.kind!r}")
+    raw = signal.payload.get("outcome")
+    if raw not in _OUTCOMES:
+        raise ValueError(f"invalid proactive_outcome payload: {signal.payload!r}")
+    return _OUTCOMES[raw]
 
 
-def read_verdict_correlation(signal: Signal) -> str:
-    """The correlation id a verdict resolves (``""`` if absent)."""
-    if signal.kind != KIND_VERDICT:
-        raise ValueError(f"not a verdict signal: kind={signal.kind!r}")
+def read_proactive_outcome_correlation(signal: Signal) -> str:
+    """The correlation id a proactive outcome resolves (``""`` if absent)."""
+    if signal.kind != KIND_PROACTIVE_OUTCOME:
+        raise ValueError(f"not a proactive_outcome signal: kind={signal.kind!r}")
     raw = signal.payload.get("correlation_id", "")
     return raw if isinstance(raw, str) else ""
 
@@ -189,7 +196,7 @@ def contact_pressure_value(signals: Iterable[Signal], *, default: float) -> floa
 
 @dataclass(frozen=True)
 class ContactPresenceReading:
-    """The instantaneous contact-channel reading :class:`PresenceNeuron` emits (§3).
+    """The instantaneous contact-channel reading :class:`ContactSensor` emits (§3).
 
     Raw and unintegrated: elapsed silence ``dt`` (minutes) plus the ordered
     exchange qualities this tick. :class:`SolitudeDrive` consumes it to run the
@@ -209,7 +216,7 @@ def contact_presence_signal(
     qualities: Iterable[float],
     timestamp: str | None,
 ) -> Signal:
-    """Build the transient contact-presence reading (PresenceNeuron's raw output)."""
+    """Build the transient contact-presence reading (ContactSensor's raw output)."""
     return Signal(
         origin_id=origin_id,
         kind=KIND_CONTACT_PRESENCE,
@@ -222,7 +229,7 @@ def read_contact_presence(signals: Iterable[Signal]) -> ContactPresenceReading |
     """The latest well-formed contact-presence reading in the batch, or ``None``.
 
     Mirrors :func:`contact_value`: a later component (:class:`SolitudeDrive`) reads
-    the freshest reading an earlier one (PresenceNeuron) emitted this tick. A
+    the freshest reading an earlier one (ContactSensor) emitted this tick. A
     malformed payload (a non-numeric ``dt`` or a ``qualities`` entry) is skipped — a
     corrupt in-tick signal degrades to "no reading" (the drive neither rises nor
     satiates), never a crash.

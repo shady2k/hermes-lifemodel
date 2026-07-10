@@ -10,7 +10,8 @@ allowed, injects the being's native proactive turn via
 self-attribution line that doubles as the being's self-exclusion marker.
 
 Launch ≠ fulfilment: a delivered launch leaves the contact desire ``active`` with
-``pending_proactive_id`` set (the FULFILL/REJECT verdict resolves it next tick). A
+``pending_proactive_id`` set (the ``sent``/``silent`` proactive outcome resolves it in
+its own async-completion frame, spec §3/§5). A
 **blocked** launch holds the desire (``active → deferred``); a **failed** launch
 keeps it ``active`` to retry. Either rollback clears ``pending`` and refunds the
 reserved energy in ONE atomic commit through the state-actor (a bus
@@ -28,18 +29,20 @@ signal the debug HEALTH view reads.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
 from ..domain.memory import TransitionOp
 from ..domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID, DesireState, IntentionState
+from ..domain.signal import Signal
 from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
 from ..ports.tracer import parse_traceparent
 from .backstop import allow_send
 from .correlate import open_correlated_span
 from .desire_view import read_live_contact_desire
+from .frame import FrameTrigger, run_frame
 from .intention_view import read_live_contact_intention
 from .intents import Intent, LaunchProactive, TransitionRecord, UpdateState
 from .state_actor import StateActor
@@ -50,10 +53,17 @@ def proactive_tick(
     lm: LifeModel,
     egress: ProactiveEgressPort,
     target: Mapping[str, str | None],
+    *,
+    initial_signals: Sequence[Signal] = (),
+    trigger: FrameTrigger = FrameTrigger.HEARTBEAT,
 ) -> ReachOutcome | None:
-    """Run one proactive tick: pipeline → backstop → deliver. Never raises past
+    """Run one ExecutionFrame: pipeline → backstop → deliver. Never raises past
     the injected collaborators. Assumes a fresh ``LifeModel`` per call (the loop
     builds one each tick), so the rollback reconciliation commit is safe.
+
+    *initial_signals* seed the frame (spec §3): the live heartbeat passes none
+    (empty world), while a test driver may inject a ``contact_observed`` /
+    ``proactive_outcome`` reading to exercise the whole pipeline in one frame.
 
     Every "why" is a span under the launch's ORIGIN TRACE (§4.4), never a bare
     log line: the core stayed quiet → its suppression span was logged in-tick by
@@ -68,7 +78,9 @@ def proactive_tick(
     not this return."""
     assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
     assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
-    report = lm.coreloop.tick()  # pipeline runs + state committed by the state-actor
+    # One ExecutionFrame, serialized through the one process-wide state-actor lock
+    # (spec §3): pipeline runs + state committed by the state-actor.
+    report = run_frame(lm.coreloop, initial_signals, trigger=trigger)
 
     # No reach attempted — the core stayed quiet. This is a core DECISION, not a
     # delivery outcome: aggregation/CognitionLauncher already logged the reason as a

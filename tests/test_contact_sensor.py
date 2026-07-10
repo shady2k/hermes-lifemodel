@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext
-from lifemodel.core.contact_neuron import PresenceNeuron
+from lifemodel.core.contact_sensor import ContactSensor
 from lifemodel.core.intents import EmitSignal, UpdateState
-from lifemodel.core.taxonomy import KIND_CONTACT_PRESENCE, exchange_signal, read_contact_presence
+from lifemodel.core.taxonomy import (
+    KIND_CONTACT_PRESENCE,
+    contact_observed_signal,
+    read_contact_presence,
+)
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
 
@@ -14,14 +17,12 @@ from lifemodel.state.model import State
 _TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 
-def _sensor() -> PresenceNeuron:
-    return PresenceNeuron()
+def _sensor() -> ContactSensor:
+    return ContactSensor()
 
 
 def _ctx(state: State, now: datetime, signals=(), *, tmp_path) -> TickContext:
-    return TickContext(
-        state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals), trace=_TRACE
-    )
+    return TickContext(state=state, now=now, signals=tuple(signals), trace=_TRACE)
 
 
 def test_emits_contact_presence_reading_with_dt(tmp_path) -> None:
@@ -37,7 +38,7 @@ def test_emits_contact_presence_reading_with_dt(tmp_path) -> None:
 
 
 def test_sensor_writes_no_state_and_never_touches_u(tmp_path) -> None:
-    # spec §3: PresenceNeuron is strictly instantaneous — it owns no durable state,
+    # spec §3: ContactSensor is strictly instantaneous — it owns no durable state,
     # does NOT integrate, does NOT write u. Its sole output is the raw reading signal.
     state = State(u=5.0, last_tick_at="2026-07-06T00:00:00+00:00")
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
@@ -50,7 +51,9 @@ def test_sensor_writes_no_state_and_never_touches_u(tmp_path) -> None:
 def test_senses_exchange_quality_into_the_reading(tmp_path) -> None:
     state = State(u=1.0, last_tick_at="2026-07-06T00:00:00+00:00")
     now = datetime(2026, 7, 6, 0, 0, tzinfo=UTC)  # dt=0
-    ex = exchange_signal(origin_id="e-1", actor="user", label="two_way", timestamp=None)  # q=1.0
+    ex = contact_observed_signal(
+        origin_id="e-1", actor="user", label="two_way", timestamp=None
+    )  # q=1.0
     intents = _sensor().step(_ctx(state, now, [ex], tmp_path=tmp_path))
     emit = next(i for i in intents if isinstance(i, EmitSignal))
     reading = read_contact_presence([emit.signal])
@@ -63,7 +66,7 @@ def test_own_impulse_reads_as_zero_quality(tmp_path) -> None:
     # reports it as zero quality, so the drive never self-satiates on its own nudge.
     state = State(u=1.0, last_tick_at="2026-07-06T00:00:00+00:00")
     now = datetime(2026, 7, 6, 0, 0, tzinfo=UTC)
-    own = exchange_signal(
+    own = contact_observed_signal(
         origin_id="e-2", actor="proactive_internal", label="two_way", timestamp=None
     )
     intents = _sensor().step(_ctx(state, now, [own], tmp_path=tmp_path))

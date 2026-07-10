@@ -33,18 +33,20 @@ class ReachOutcome(Enum):
         return self is ReachOutcome.DELIVERED
 
 
-class Verdict(Enum):
-    """The async act-gate's decision on a woken, launched desire (spec §4.5/§9).
+class ProactiveOutcome(Enum):
+    """The outcome of a woken, launched proactive turn — the efference copy (spec §5/§6).
 
-    The real act-gate is the being's own Hermes turn: it either spoke (``FULFILL`` —
-    a message was sent), chose silence (``REJECT`` — a ``[SILENT]`` marker), or held
-    (``DEFER``). The verdict arrives as a ``verdict`` signal on the NEXT tick (the
+    Not a "verdict" but the *fact of what I did* (spec §5): the being's own Hermes
+    turn either spoke (``SENT`` — a message went out), chose silence (``SILENT`` — a
+    ``[SILENT]`` marker), failed to deliver (``FAILED``), or went stale/superseded
+    while it was composing (``STALE``). The outcome arrives as a ``proactive_outcome``
+    signal in its OWN ExecutionFrame the moment the async turn finishes (the
     ``post_llm_call`` read-back in :mod:`lifemodel.hooks`), and aggregation resolves
-    the desire from it. This enum lived in ``sim.aggregation`` historically; it moved
-    here when the toy sim automaton was deleted (T8) — it is a live concept, not sim
-    math. ``FULFILL`` starts an ActionPending window but does NOT satiate ``u``
-    (send ≠ contact); ``REJECT`` records a decline + backoff."""
+    the pending desire from it — immediately, not at the next heartbeat (spec §3).
+    ``SENT`` starts an ActionPending window but does NOT satiate ``u`` (send ≠
+    contact); ``SILENT`` records a decline + growing backoff."""
 
-    FULFILL = "fulfill"  # the being sent a message → contact happened (u unsatiated)
-    DEFER = "defer"  # wrong moment → hold the intention, do not drop it
-    REJECT = "reject"  # chose silence → clear it (+ growing decline backoff)
+    SENT = "sent"  # the being sent a message → contact happened (u unsatiated)
+    SILENT = "silent"  # chose silence → clear it (+ growing decline backoff)
+    FAILED = "failed"  # the turn could not be delivered → clear it, no backoff
+    STALE = "stale"  # superseded while composing (user replied) → clear it, no backoff

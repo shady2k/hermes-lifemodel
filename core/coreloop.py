@@ -1,25 +1,26 @@
-"""CoreLoop — the heart/scheduler (spec §7).
+"""CoreLoop — the heart that runs one ExecutionFrame (spec §3/§7).
 
-Runs the enabled components each tick, isolated so no component fault can crash
-the heart: every ``step`` call is wrapped; an exception skips that component and
-counts toward a per-component circuit-breaker ("living without an organ").
+Runs the enabled components for one frame, isolated so no component fault can
+crash the heart: every ``step`` call is wrapped; an exception skips that component
+and counts toward a per-component circuit-breaker ("living without an organ").
 
-Signal dataflow (spec §7.4): durable external inputs are consumed from the bus
-**once** at tick start; each component then sees those inputs plus every
-transient signal emitted by earlier components this tick (``EmitSignal`` is
-threaded in-tick, **not** re-published — a signal recomputed every tick must not
-be re-consumed and double-counted). State intents are collected and handed —
-together with the tick's own bookkeeping — to the single :class:`StateActor` for
-one atomic checkpoint.
+Signal dataflow (spec §2/§3): a frame is seeded with its trigger's
+``initial_signals`` into an in-memory :class:`~lifemodel.core.frame.SignalFrame`
+(the whole "bus" — ephemeral, never persisted). Each component then sees those
+seeds plus every signal emitted by earlier components THIS frame (``EmitSignal``
+is threaded in-frame). A signal lives ``<=`` one frame. State intents are
+collected and handed — with the frame's own bookkeeping — to the single
+:class:`StateActor` for one atomic end-of-frame commit.
 
-Phase B1 runs *every* enabled component each tick. Energy budgeting (which gates
-the expensive cognition layer) slots into the per-component loop in Phase C.
+A frame is triggered by a heartbeat, an incoming event, an async-cognition
+completion, or an admin mutation (:class:`~lifemodel.core.frame.FrameTrigger`);
+:func:`~lifemodel.core.frame.run_frame` serializes them through one state-actor.
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -35,7 +36,7 @@ from ..ports.tracer import ActiveSpan, TraceContext, TracerPort, start_span
 from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .component import TickContext
-from .intake import IntakeLimits, IntakeResult, apply_intake
+from .frame import FrameTrigger, SignalFrame
 from .intents import (
     EmitSignal,
     Intent,
@@ -47,17 +48,12 @@ from .intents import (
 from .metrics import MetricRegistry, MetricSpec
 from .observer import ComponentObserver
 from .registry import ComponentManifest, ComponentRegistry, UnknownComponent
-from .signal_bus import SignalBus
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
-from .taxonomy import lane_of
 from .tick_metrics import (
     COMPONENT_DURATION,
     COMPONENT_RUNS,
-    INTAKE_COALESCED,
     INTAKE_KEPT,
-    INTAKE_SHED_CONTROL,
-    INTAKE_SHED_SENSOR,
     LAYER_ACCEPTS_SIGNALS,
     RUN_FAILED,
     RUN_OK,
@@ -94,6 +90,7 @@ class TickReport:
     failed: tuple[str, ...]
     committed: bool
     launches: tuple[LaunchProactive, ...] = ()
+    trigger: FrameTrigger = FrameTrigger.HEARTBEAT
 
 
 class CoreLoop:
@@ -102,12 +99,10 @@ class CoreLoop:
         *,
         registry: ComponentRegistry,
         state_actor: StateActor,
-        bus: SignalBus,
         clock: ClockPort,
         trace_writer: TraceSink | None = None,
         event_ring: EventRing | None = None,
         breaker_threshold: int = 3,
-        intake_limits: IntakeLimits | None = None,
         pressure_sensor: PressureSensorPort | None = None,
         memory: MemoryPort | None = None,
         live_states: frozenset[str] | None = None,
@@ -118,7 +113,6 @@ class CoreLoop:
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
-        self._bus = bus
         self._clock = clock
         # Elapsed is measured with a MONOTONIC source (never jumps when the system
         # clock is stepped), injected so a test can control it and prove a span's
@@ -135,7 +129,6 @@ class CoreLoop:
         self._tracer = tracer
         self._trace_exporter = trace_exporter
         self._breaker_threshold = breaker_threshold
-        self._intake_limits = intake_limits or IntakeLimits()
         self._pressure_sensor = pressure_sensor
         self._memory = memory
         self._live_states = live_states if live_states is not None else _DEFAULT_LIVE_STATES
@@ -191,22 +184,47 @@ class CoreLoop:
             attrs=dict(span.attrs) or None,
         )
 
-    def tick(self) -> TickReport:
+    def tick(
+        self,
+        initial_signals: Sequence[Signal] = (),
+        *,
+        trigger: FrameTrigger = FrameTrigger.HEARTBEAT,
+    ) -> TickReport:
+        """Run one ExecutionFrame, seeded with *initial_signals* (spec §3).
+
+        A heartbeat frame passes no signals; an event / async-completion / admin
+        frame passes its trigger signal(s). The signals live in an in-memory
+        :class:`~lifemodel.core.frame.SignalFrame` for this one frame only.
+        """
         now = self._clock.now()
         state = self._state_actor.state
-        # Mint THE tick's root span (continue-or-mint; a cron tick has no upstream).
+        # Mint THE frame's root span (continue-or-mint; a frame has no upstream).
         # Tracing is MANDATORY (spec §5): the tracer is a required dependency, so
-        # every tick has a root span and a log without an active span is structurally
+        # every frame has a root span and a log without an active span is structurally
         # impossible — there is no untraced branch. Components run in CHILD spans of
         # this root (minted per component in ``_run_tick``); each gets a SpanLogger
         # bound to its span that SELF-stamps trace/span/tick (no ambient contextvar
-        # bind to leak across ticks).
+        # bind to leak across frames).
         root = self._tracer.start_root()
         tick_no = state.tick_count + 1
-        return self._run_tick(now=now, state=state, root=root, tick_no=tick_no)
+        return self._run_tick(
+            now=now,
+            state=state,
+            root=root,
+            tick_no=tick_no,
+            initial_signals=initial_signals,
+            trigger=trigger,
+        )
 
     def _run_tick(
-        self, *, now: datetime, state: State, root: TraceContext, tick_no: int
+        self,
+        *,
+        now: datetime,
+        state: State,
+        root: TraceContext,
+        tick_no: int,
+        initial_signals: Sequence[Signal] = (),
+        trigger: FrameTrigger = FrameTrigger.HEARTBEAT,
     ) -> TickReport:
         started = now.isoformat()
         # Monotonic origin for this tick: every span's ``ended_at`` is ``started``
@@ -245,21 +263,16 @@ class CoreLoop:
                 objects = tuple(found)
             except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
                 root_logger.info("objects_snapshot_failed", error=repr(exc))
-        intake = apply_intake(
-            self._bus.consume_unprocessed(), limits=self._intake_limits, lane_of=lane_of
-        )
-        if intake.shed_control or intake.shed_sensor or intake.coalesced_sensor:
-            root_logger.info(
-                "signals_shed",
-                shed_control=intake.shed_control,
-                shed_sensor=intake.shed_sensor,
-                coalesced_sensor=intake.coalesced_sensor,
-            )
-        # Universal metrics (telemetry-core §4.2): the intake buckets and the per-layer
-        # accepts-signals gauge. Emission is fail-open (the registry never raises).
-        self._emit_intake(intake)
+        # The frame's in-memory SignalFrame (spec §2/§3): seed it with the trigger's
+        # signals. No durable bus, no cursor — an impulse lives only for this frame.
+        # Backpressure (must_process vs best_effort shedding) is the AGGREGATION
+        # layer's job now, not the bus's (spec §7) — the frame carries every seed
+        # through; a component sheds what it must.
+        frame = SignalFrame(initial_signals)
+        # Universal metrics (telemetry-core §4.2): the seeded-signal count and the
+        # per-layer accepts-signals gauge. Emission is fail-open (never raises).
+        self._metrics.inc(SIGNALS_INTAKE, len(frame), outcome=INTAKE_KEPT)
         self._emit_accepts_signals()
-        available: list[Signal] = list(intake.kept)
 
         intents: list[Intent] = []
         launches: list[LaunchProactive] = []
@@ -288,8 +301,7 @@ class CoreLoop:
             ctx = TickContext(
                 state=state,
                 now=now,
-                bus=self._bus,
-                signals=tuple(available),
+                signals=frame.snapshot(),
                 pressure=pressure,
                 objects=objects,
                 trace=child_ctx,
@@ -328,9 +340,9 @@ class CoreLoop:
             self._failures[component.id] = 0
             for intent in produced:
                 if isinstance(intent, EmitSignal):
-                    available.append(
-                        intent.signal
-                    )  # transient — visible to later components this tick
+                    # In-memory only (spec §3): visible to LATER components this frame,
+                    # never persisted — the SignalFrame dies at end of frame.
+                    frame.emit(intent.signal)
                 elif isinstance(intent, LaunchProactive):
                     launches.append(intent)
                 else:
@@ -359,6 +371,7 @@ class CoreLoop:
             failed=tuple(failed),
             committed=new_state is not state or had_mutation,
             launches=tuple(launches),
+            trigger=trigger,
         )
         # Ship the finished tick to the (optional) trace backend AFTER the commit —
         # BEST-EFFORT: an exporter that raises must never affect the tick outcome
@@ -433,14 +446,6 @@ class CoreLoop:
         """Count one component run by derived status + record its real duration."""
         self._metrics.inc(COMPONENT_RUNS, component=component_id, layer=layer, outcome=status)
         self._metrics.observe(COMPONENT_DURATION, dt, component=component_id, layer=layer)
-
-    def _emit_intake(self, intake: IntakeResult) -> None:
-        """Count this tick's intake buckets (§4.2). The lane is folded into the
-        ``outcome`` value (the closed label set has no ``lane`` key)."""
-        self._metrics.inc(SIGNALS_INTAKE, len(intake.kept), outcome=INTAKE_KEPT)
-        self._metrics.inc(SIGNALS_INTAKE, intake.shed_control, outcome=INTAKE_SHED_CONTROL)
-        self._metrics.inc(SIGNALS_INTAKE, intake.shed_sensor, outcome=INTAKE_SHED_SENSOR)
-        self._metrics.inc(SIGNALS_INTAKE, intake.coalesced_sensor, outcome=INTAKE_COALESCED)
 
     def _emit_accepts_signals(self) -> None:
         """Set the per-layer accepts-signals gauge from the MANIFEST (§4.2 — registry

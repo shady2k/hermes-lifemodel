@@ -13,7 +13,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext, layer_for_type
 from lifemodel.core.coreloop import CoreLoop
 from lifemodel.core.intents import Intent
@@ -178,13 +177,10 @@ def _drive_manifest() -> ComponentManifest:
     )
 
 
-def _loop(
-    registry: ComponentRegistry, store: RecordingStore, bus: FileSignalBus, metrics: MetricRegistry
-) -> CoreLoop:
+def _loop(registry: ComponentRegistry, store: RecordingStore, metrics: MetricRegistry) -> CoreLoop:
     return CoreLoop(
         registry=registry,
         state_actor=StateActor(store),
-        bus=bus,
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         tracer=FakeTracer(),
         metrics=metrics,
@@ -196,11 +192,11 @@ def test_coreloop_wires_observer_and_drive_emits_contact_drive_u(tmp_path) -> No
     reg = ComponentRegistry()
     reg.register(SolitudeDrive(alpha=1.0 / 240.0, beta=1.0, u_max=100.0), _drive_manifest())
     metrics = MetricRegistry()
-    # No PresenceNeuron → no contact_presence reading → the drive holds u; it still
+    # No ContactSensor → no contact_presence reading → the drive holds u; it still
     # publishes its computed level through ctx.observe. Start-of-tick u = 5.0.
     store = RecordingStore(State(u=5.0))
 
-    _loop(reg, store, FileSignalBus(tmp_path), metrics).tick()
+    _loop(reg, store, metrics).tick()
 
     gauge = metrics.get(CONTACT_DRIVE_U)
     assert gauge is not None
@@ -217,7 +213,7 @@ def test_ctx_observe_undeclared_in_component_does_not_kill_tick(tmp_path) -> Non
     )
     metrics = MetricRegistry()
 
-    report = _loop(reg, RecordingStore(), FileSignalBus(tmp_path), metrics).tick()
+    report = _loop(reg, RecordingStore(), metrics).tick()
 
     # The tick survived and the rogue component ran to completion.
     assert report.ran == ("rogue",)
@@ -233,7 +229,6 @@ def test_bare_context_has_no_observer_and_drive_step_survives(tmp_path) -> None:
     ctx = TickContext(
         state=State(u=3.0),
         now=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
-        bus=FileSignalBus(tmp_path),
         trace=FakeTracer().start_root(),
     )
     assert ctx.observe is None

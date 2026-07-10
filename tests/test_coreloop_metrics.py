@@ -13,14 +13,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext, layer_for_type
 from lifemodel.core.coreloop import CoreLoop
 from lifemodel.core.intents import Intent
 from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
-from lifemodel.core.taxonomy import contact_signal, exchange_signal
+from lifemodel.core.taxonomy import contact_observed_signal, contact_signal
 from lifemodel.core.tick_metrics import (
     COMPONENT_DURATION,
     COMPONENT_RUNS,
@@ -127,7 +126,6 @@ def _manifest(cid: str, ctype: str, *, accepts_signals: bool = False) -> Compone
 def _loop(
     registry: ComponentRegistry,
     store: RecordingStore,
-    bus: FileSignalBus,
     *,
     metrics: MetricRegistry,
     trace_writer: object | None = None,
@@ -136,7 +134,6 @@ def _loop(
     return CoreLoop(
         registry=registry,
         state_actor=StateActor(store),
-        bus=bus,
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         tracer=FakeTracer(),
         metrics=metrics,
@@ -150,7 +147,7 @@ def test_ok_component_records_run_and_positive_duration(tmp_path) -> None:
     reg = ComponentRegistry()
     reg.register(OkComp(), _manifest("ok", "neuron"))
     metrics = MetricRegistry()
-    _loop(reg, RecordingStore(), FileSignalBus(tmp_path), metrics=metrics).tick()
+    _loop(reg, RecordingStore(), metrics=metrics).tick()
 
     runs = metrics.get(COMPONENT_RUNS)
     assert runs is not None
@@ -167,7 +164,7 @@ def test_failed_component_is_failed_and_counts_a_suppression(tmp_path) -> None:
     reg = ComponentRegistry()
     reg.register(FailComp(), _manifest("fail", "neuron"))
     metrics = MetricRegistry()
-    _loop(reg, RecordingStore(), FileSignalBus(tmp_path), metrics=metrics).tick()
+    _loop(reg, RecordingStore(), metrics=metrics).tick()
 
     runs = metrics.get(COMPONENT_RUNS)
     assert runs is not None
@@ -184,7 +181,7 @@ def test_suppressed_span_is_recorded_as_suppressed(tmp_path) -> None:
     reg = ComponentRegistry()
     reg.register(SuppressComp(), _manifest("supp", "neuron"))
     metrics = MetricRegistry()
-    _loop(reg, RecordingStore(), FileSignalBus(tmp_path), metrics=metrics).tick()
+    _loop(reg, RecordingStore(), metrics=metrics).tick()
 
     runs = metrics.get(COMPONENT_RUNS)
     assert runs is not None
@@ -192,22 +189,25 @@ def test_suppressed_span_is_recorded_as_suppressed(tmp_path) -> None:
     assert runs.value(component="supp", layer="autonomic", outcome="ok") == 0.0  # type: ignore[attr-defined]
 
 
-def test_intake_counts_kept_and_coalesced(tmp_path) -> None:
+def test_intake_counts_the_frames_seeded_signals(tmp_path) -> None:
+    # The ephemeral frame carries every seeded signal through (spec §3): priority-class
+    # backpressure is a later slice, so all seeds count as "kept" — no coalescing.
     reg = ComponentRegistry()
     reg.register(OkComp(), _manifest("ok", "neuron"))
-    bus = FileSignalBus(tmp_path)
-    bus.publish(exchange_signal(origin_id="e1", actor="user", label="two_way", timestamp=None))
-    bus.publish(exchange_signal(origin_id="e2", actor="user", label="two_way", timestamp=None))
-    bus.publish(contact_signal(origin_id="c1", value=1.0, delta=0.0, timestamp=None))
-    bus.publish(contact_signal(origin_id="c2", value=2.0, delta=0.0, timestamp=None))
     metrics = MetricRegistry()
-    _loop(reg, RecordingStore(), bus, metrics=metrics).tick()
+    seeds = [
+        contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None),
+        contact_observed_signal(origin_id="e2", actor="user", label="two_way", timestamp=None),
+        contact_signal(origin_id="c1", value=1.0, delta=0.0, timestamp=None),
+        contact_signal(origin_id="c2", value=2.0, delta=0.0, timestamp=None),
+    ]
+    _loop(reg, RecordingStore(), metrics=metrics).tick(seeds)
 
     intake = metrics.get(SIGNALS_INTAKE)
     assert intake is not None
-    # 2 control kept + 1 sensor kept (the two contacts coalesce to latest-wins).
-    assert intake.value(outcome="kept") == 3.0  # type: ignore[attr-defined]
-    assert intake.value(outcome="coalesced") == 1.0  # type: ignore[attr-defined]
+    assert (
+        intake.value(outcome="kept") == 4.0
+    )  # every seeded signal counted  # type: ignore[attr-defined]
 
 
 def test_tick_duration_and_lag(tmp_path) -> None:
@@ -216,7 +216,7 @@ def test_tick_duration_and_lag(tmp_path) -> None:
     metrics = MetricRegistry()
     # last_tick_at is 60s before the fixed clock → lag == 60s.
     store = RecordingStore(State(last_tick_at="2026-07-06T11:59:00+00:00"))
-    _loop(reg, store, FileSignalBus(tmp_path), metrics=metrics).tick()
+    _loop(reg, store, metrics=metrics).tick()
 
     tdur = metrics.get(TICK_DURATION)
     assert tdur is not None
@@ -236,7 +236,7 @@ def test_layer_accepts_signals_gauge(tmp_path) -> None:
         _manifest("lnch", "launcher", accepts_signals=False),
     )
     metrics = MetricRegistry()
-    _loop(reg, RecordingStore(), FileSignalBus(tmp_path), metrics=metrics).tick()
+    _loop(reg, RecordingStore(), metrics=metrics).tick()
 
     gauge = metrics.get(LAYER_ACCEPTS_SIGNALS)
     assert gauge is not None
@@ -251,7 +251,6 @@ def test_writer_snapshot_gauges_absolute(tmp_path) -> None:
     _loop(
         reg,
         RecordingStore(),
-        FileSignalBus(tmp_path),
         metrics=metrics,
         trace_writer=FakeCountingWriter(),
     ).tick()
@@ -311,7 +310,6 @@ def test_tick_never_dies_without_a_metrics_registry(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
-        bus=FileSignalBus(tmp_path),
         clock=FixedClock(datetime(2026, 7, 6, 12, 0, tzinfo=UTC)),
         tracer=FakeTracer(),
         monotonic=Ticking(),

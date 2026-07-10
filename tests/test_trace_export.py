@@ -146,7 +146,6 @@ class _FixedClock:
 
 
 def test_coreloop_swallows_a_failing_exporter(tmp_path) -> None:
-    from lifemodel.adapters.signal_bus import FileSignalBus
 
     reg = ComponentRegistry()
     reg.register(
@@ -159,7 +158,6 @@ def test_coreloop_swallows_a_failing_exporter(tmp_path) -> None:
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(store),
-        bus=FileSignalBus(tmp_path),
         clock=_FixedClock(),
         trace_exporter=_ExplodingExporter(),
         tracer=FakeTracer(),

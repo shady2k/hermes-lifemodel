@@ -1,9 +1,9 @@
-"""Async semantic invalidation of a proactive verdict (spec §7.3).
+"""Async semantic invalidation of a proactive outcome (spec §7.3).
 
-A proactive turn outlives the tick that launched it; when its verdict returns we
+A proactive turn outlives the frame that launched it; when its outcome returns we
 must decide whether it is still valid. Invalidation is **semantic, not
-version-based** (Codex): a mere energy/mood tick must not drop a good verdict.
-A verdict is stale only if the situation it was about has genuinely changed —
+version-based** (Codex): a mere energy/mood frame must not drop a good outcome.
+An outcome is stale only if the situation it was about has genuinely changed —
 the desire was resolved, its correlation no longer matches, the user replied
 after the launch (the reactive path already answered — applying would double-
 message), the pressure was satisfied while thinking, or the deadline elapsed.
@@ -24,11 +24,11 @@ def _parse(ts: str | None) -> datetime | None:
     return value if value.tzinfo is not None else None
 
 
-def is_verdict_stale(
+def is_proactive_outcome_stale(
     *,
     desire_state: str,
     pending_id: str | None,
-    verdict_correlation_id: str,
+    outcome_correlation_id: str,
     last_exchange_at: str | None,
     pending_since: str | None,
     effective: float,
@@ -36,14 +36,14 @@ def is_verdict_stale(
     now: datetime,
     deadline_min: float = 30.0,
 ) -> tuple[bool, str]:
-    """Return ``(stale, reason)`` for a returning proactive verdict.
+    """Return ``(stale, reason)`` for a returning proactive outcome.
 
     ``desire_state`` is the live desire's lifecycle state (``active``/``deferred``/
-    ``none``) read from the typed row — a verdict is only ever fresh for an
+    ``none``) read from the typed row — an outcome is only ever fresh for an
     ``active`` desire; any other state means it was already resolved."""
     if desire_state != "active":
         return True, "desire_resolved"
-    if verdict_correlation_id != pending_id:
+    if outcome_correlation_id != pending_id:
         return True, "stale_desire_id"
 
     launched = _parse(pending_since)

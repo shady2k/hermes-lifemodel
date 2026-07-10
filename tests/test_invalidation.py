@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from lifemodel.core.invalidation import is_verdict_stale
+from lifemodel.core.invalidation import is_proactive_outcome_stale
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 PENDING = "proactive-2026-07-06T11:55:00+00:00"
@@ -12,7 +12,7 @@ def _call(**over: object) -> tuple[bool, str]:
     kw = dict(
         desire_state="active",
         pending_id=PENDING,
-        verdict_correlation_id=PENDING,
+        outcome_correlation_id=PENDING,
         last_exchange_at=None,
         pending_since="2026-07-06T11:55:00+00:00",
         effective=2.0,
@@ -21,7 +21,7 @@ def _call(**over: object) -> tuple[bool, str]:
         deadline_min=30.0,
     )
     kw.update(over)
-    return is_verdict_stale(**kw)  # type: ignore[arg-type]
+    return is_proactive_outcome_stale(**kw)  # type: ignore[arg-type]
 
 
 def test_fresh_verdict_is_applied() -> None:
@@ -34,7 +34,7 @@ def test_resolved_desire_is_stale() -> None:
 
 
 def test_correlation_mismatch_is_stale() -> None:
-    stale, reason = _call(verdict_correlation_id="proactive-OTHER")
+    stale, reason = _call(outcome_correlation_id="proactive-OTHER")
     assert stale is True and reason == "stale_desire_id"
 
 

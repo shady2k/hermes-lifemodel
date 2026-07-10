@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import EmitSignal, UpdateState
 from lifemodel.core.solitude_drive import SolitudeDrive
@@ -27,9 +26,7 @@ def _drive() -> SolitudeDrive:
 
 
 def _ctx(state: State, now: datetime, signals=(), *, tmp_path) -> TickContext:
-    return TickContext(
-        state=state, now=now, bus=FileSignalBus(tmp_path), signals=tuple(signals), trace=_TRACE
-    )
+    return TickContext(state=state, now=now, signals=tuple(signals), trace=_TRACE)
 
 
 def _presence(dt: float, qualities: tuple[float, ...], *, origin_id: str = "p") -> Signal:

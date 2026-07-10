@@ -133,10 +133,10 @@ class State:
     #: outreach; reset to zero by a genuine exchange. Defaults to zero
     #: (additive).
     unanswered_outbound_count: int = 0
-    # NB: signal dedup does *not* live here. It is owned by the SignalBus
-    # consumed-ledger (``signals.consumed``), which persists "already consumed"
-    # independently of this State to avoid racing the tick's own commit — see
-    # :class:`~lifemodel.adapters.signal_bus.FileSignalBus`.
+    # NB: the nervous flow is ephemeral (spec §2/§3) — there is no durable signal bus
+    # and no bus-level dedup. A signal lives inside one ExecutionFrame and is gone;
+    # idempotency of external events (Telegram/Hermes retries) is a later slice's
+    # ``processed_external_event_ids`` ring, not a bus cursor.
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""

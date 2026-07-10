@@ -20,14 +20,12 @@ from lifemodel.domain.memory import (
     StaleTransition,
     TransitionOp,
 )
-from lifemodel.domain.signal import Signal
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import (
     FakeClock,
     FakeDelivery,
     FakeMemoryStore,
-    FakeSignalBus,
     FakeStateStore,
 )
 
@@ -77,17 +75,6 @@ def test_fake_state_store_isolates_from_caller_mutation() -> None:
     loaded = store.load()
     loaded.u = 42.0
     assert store.load().u == 1.0
-
-
-def test_fake_signal_bus_matches_dedup_contract() -> None:
-    bus = FakeSignalBus()
-    bus.publish(Signal(origin_id="m1", kind="x"))
-    bus.publish(Signal(origin_id="m1", kind="y"))  # dup id
-    bus.publish(Signal(origin_id="m2", kind="x"))
-    assert [s.origin_id for s in bus.consume_unprocessed()] == ["m1", "m2"]
-    # Idempotent across calls; re-published id does not re-fire.
-    bus.publish(Signal(origin_id="m1", kind="z"))
-    assert bus.consume_unprocessed() == []
 
 
 # --- lm-27n.2: FakeStateStore.commit_tick (atomic State+memory) ---

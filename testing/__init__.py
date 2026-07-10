@@ -1,7 +1,7 @@
 """Test doubles shipped with the package so every task reuses the same fakes.
 
 Importable as ``from lifemodel.testing import FakeClock, FakeDelivery,
-FakeMemoryStore, FakePressureSensor, FakeSignalBus, FakeStateStore``. See
+FakeMemoryStore, FakePressureSensor, FakeStateStore``. See
 :mod:`lifemodel.testing.fakes`.
 """
 
@@ -14,7 +14,6 @@ from .fakes import (
     FakeDelivery,
     FakeMemoryStore,
     FakePressureSensor,
-    FakeSignalBus,
     FakeSpanLogger,
     FakeStateStore,
     FakeTracer,
@@ -35,7 +34,6 @@ __all__ = [
     "FakeDelivery",
     "FakeMemoryStore",
     "FakePressureSensor",
-    "FakeSignalBus",
     "FakeSpanLogger",
     "FakeStateStore",
     "FakeTracer",

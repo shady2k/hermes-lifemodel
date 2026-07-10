@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import Intent, UpdateState
 from lifemodel.core.personality import Personality
@@ -27,7 +26,7 @@ def _p() -> Personality:
 
 
 def _ctx(state: State, now: datetime, *, tmp_path) -> TickContext:
-    return TickContext(state=state, now=now, bus=FileSignalBus(tmp_path), signals=(), trace=_TRACE)
+    return TickContext(state=state, now=now, signals=(), trace=_TRACE)
 
 
 def _changes(intents: Sequence[Intent]) -> dict:

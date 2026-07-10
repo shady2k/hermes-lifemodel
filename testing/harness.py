@@ -1,21 +1,21 @@
 """Integration harness — drive the REAL CoreLoop + real components through fakes (spec §6).
 
 This is the heart of the rebuild: the simulation no longer has a third tick model.
-The harness runs the actual spine — ``PresenceNeuron → SolitudeDrive →
+The harness runs the actual spine — ``ContactSensor → SolitudeDrive →
 ContactAggregation → CognitionLauncher`` (the same code the live being runs) — over
 the real SQLite store, through fake ports, so a green scenario HONESTLY predicts
 live behaviour. The one thing that is not real here is the async act-gate (the
-being's Hermes turn): the harness scripts its verdict (FULFILL on a message, REJECT
-on ``[SILENT]``) by feeding a ``verdict`` signal into the SAME read-back path the
-``post_llm`` hook uses live.
+being's Hermes turn): the harness scripts its outcome (``sent`` on a message,
+``silent`` on ``[SILENT]``) by seeding a ``proactive_outcome`` signal into the SAME
+read-back path the ``post_llm`` hook uses live.
 
 A scenario is a list of :class:`Step` (advance the fake clock to accumulate
-silence, optionally publish an exchange, optionally script the act-gate verdict).
-Each step runs ONE ``proactive_tick`` (real pipeline → real backstop → recording
-egress) and records what happened: the live desire's state, whether a launch
-reached the egress (and the impulse text), the delivery outcome, and the
-suppression-span reasons emitted that tick — the span tree that makes a quiet tick
-as debuggable as a loud one (spec §5).
+silence, optionally seed a ``contact_observed`` reading, optionally script the
+act-gate outcome). Each step runs ONE ExecutionFrame via ``proactive_tick`` (real
+pipeline → real backstop → recording egress) and records what happened: the live
+desire's state, whether a launch reached the egress (and the impulse text), the
+delivery outcome, and the suppression-span reasons emitted that frame — the span
+tree that makes a quiet frame as debuggable as a loud one (spec §5).
 """
 
 from __future__ import annotations
@@ -27,9 +27,11 @@ from pathlib import Path
 
 from ..composition import build_lifemodel
 from ..core.desire_view import read_live_contact_desire
+from ..core.frame import FrameTrigger
 from ..core.proactive import proactive_tick
-from ..core.taxonomy import exchange_signal, verdict_signal
-from ..domain.egress import ReachOutcome, Verdict
+from ..core.taxonomy import contact_observed_signal, proactive_outcome_signal
+from ..domain.egress import ProactiveOutcome, ReachOutcome
+from ..domain.signal import Signal
 from ..events import EventRing
 from ..ports.memory import MemoryPort
 from ..sim.quality import Actor, Label
@@ -39,17 +41,18 @@ from .fakes import FakeClock
 
 @dataclass(frozen=True)
 class Step:
-    """One harness tick: advance the clock, then optional events, then run the tick.
+    """One harness frame: advance the clock, seed optional signals, run the frame.
 
-    ``advance`` accumulates silence (the drive rises by ``Δt``). ``exchange``
-    publishes a real inbound exchange (``(actor, label)`` — never
-    ``proactive_internal``). ``act_gate`` scripts the async Hermes turn's verdict
-    for the turn currently in flight (``pending_proactive_id``) — the read-back path.
+    ``advance`` accumulates silence (the drive rises by ``Δt``). ``exchange`` seeds a
+    real inbound ``contact_observed`` reading (``(actor, label)`` — never
+    ``proactive_internal``). ``act_gate`` scripts the async Hermes turn's outcome for
+    the turn currently in flight (``pending_proactive_id``) — the read-back path. Both
+    are seeded into the single ExecutionFrame this step runs (spec §3).
     """
 
     advance: timedelta = timedelta(0)
     exchange: tuple[Actor, Label] | None = None
-    act_gate: Verdict | None = None
+    act_gate: ProactiveOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -134,34 +137,41 @@ class IntegrationHarness:
     def _step(self, step: Step) -> TickRecord:
         self.clock.advance(step.advance)
         now = self.clock.now()
-        # Feed this step's events into the same bus the live tick consumes.
+        # Seed this step's readings into the single ExecutionFrame it runs (spec §3):
+        # ephemeral signals, not a durable bus.
+        signals: list[Signal] = []
+        trigger = FrameTrigger.HEARTBEAT
         if step.exchange is not None:
             actor, label = step.exchange
-            self._lm.bus.publish(
-                exchange_signal(
-                    origin_id=f"exchange-{len(self.records)}",
+            signals.append(
+                contact_observed_signal(
+                    origin_id=f"contact-{len(self.records)}",
                     actor=actor,
                     label=label,
                     timestamp=now.isoformat(),
                 )
             )
+            trigger = FrameTrigger.EVENT
         if step.act_gate is not None:
-            # Script the async act-gate: feed its verdict into the read-back path
-            # (the verdict signal), correlated to the turn currently in flight.
+            # Script the async act-gate: feed its outcome into the read-back path
+            # (the proactive_outcome signal), correlated to the turn in flight.
             pending = self._lm.state.load().pending_proactive_id
             if pending:
-                self._lm.bus.publish(
-                    verdict_signal(
-                        origin_id=f"verdict-{pending}",
-                        verdict=step.act_gate,
+                signals.append(
+                    proactive_outcome_signal(
+                        origin_id=f"outcome-{pending}",
+                        outcome=step.act_gate,
                         timestamp=now.isoformat(),
                         correlation_id=pending,
                     )
                 )
+                trigger = FrameTrigger.ASYNC_COMPLETION
         ring_before = len(self.event_ring.read())
         egress_before = len(self.egress.calls)
-        # The real delivery path: pipeline → backstop → recording egress.
-        outcome = proactive_tick(self._lm, self.egress, self.target)
+        # The real delivery path: pipeline (frame) → backstop → recording egress.
+        outcome = proactive_tick(
+            self._lm, self.egress, self.target, initial_signals=signals, trigger=trigger
+        )
         # Suppression spans route through the SpanLogger onto the freshness ring
         # (spec §4.2/§5), not the ad-hoc logger — read this step's slice back.
         new_ring = self.event_ring.read()[ring_before:]

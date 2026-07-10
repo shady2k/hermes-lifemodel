@@ -1,19 +1,18 @@
-"""Core — the Hermes-free brain: extension points and pressure logic (HLA §13).
+"""Core — the Hermes-free brain: the ExecutionFrame pipeline and pressure logic.
 
 The core depends only on :mod:`lifemodel.domain` values and
 :mod:`lifemodel.ports` interfaces — never on Hermes, never on a concrete
-adapter. It holds the ABC extension points the system grows by subclassing:
-:class:`~lifemodel.core.neuron.Neuron`, :class:`~lifemodel.core.layer.Layer`,
-:class:`~lifemodel.core.aggregator.Aggregator`,
-:class:`~lifemodel.core.act_gate.ActGate`, and
-:class:`~lifemodel.core.signal_bus.SignalBus` (HLA §13, lego-swappability).
+adapter. The nervous flow is **ephemeral** (spec §2/§3): a signal lives ``<=`` one
+:class:`~lifemodel.core.frame.SignalFrame`, and only the body (``AgentState``),
+memory and the trace record are durable. Components (sensor → drive → aggregation
+→ cognition launcher) fold the frame's signals and return intents; the single
+:class:`~lifemodel.core.state_actor.StateActor` commits them atomically at end of
+frame.
 """
 
 from __future__ import annotations
 
-from .act_gate import ActGate
 from .aggregation import ContactAggregation
-from .aggregator import Aggregator, SilentAggregator
 from .backstop import allow_send, record_send
 from .circadian import circadian
 from .cognition import CognitionLauncher
@@ -24,14 +23,12 @@ from .component import (
     TickContext,
     layer_for_type,
 )
-from .contact_neuron import PresenceNeuron
+from .contact_sensor import ContactSensor
 from .coreloop import CoreLoop, TickReport
 from .energy import Reservation, can_afford, cost_real, reserve, settle
-from .intake import IntakeLimits, IntakeResult, apply_intake
+from .frame import FrameTrigger, SignalFrame, run_frame
 from .intents import CheckpointState, EmitSignal, Intent, LaunchProactive, UpdateState
-from .invalidation import is_verdict_stale
-from .layer import Layer, ProcessingLayer
-from .neuron import Neuron
+from .invalidation import is_proactive_outcome_stale
 from .personality import Personality
 from .pressure import effective_pressure, inhibition_at
 from .projection import project_contact
@@ -42,7 +39,6 @@ from .registry import (
     IncompleteManifest,
     UnknownComponent,
 )
-from .signal_bus import SignalBus
 from .solitude_drive import SolitudeDrive
 from .state_actor import StateActor, UnknownStateField
 from .suppression import (
@@ -54,35 +50,33 @@ from .suppression import (
 from .taxonomy import (
     CONTROL_KINDS,
     KIND_CONTACT,
+    KIND_CONTACT_OBSERVED,
     KIND_CONTACT_PRESENCE,
     KIND_CONTACT_PRESSURE,
-    KIND_EXCHANGE,
     KIND_IN_FLIGHT,
-    KIND_VERDICT,
+    KIND_PROACTIVE_OUTCOME,
     ContactPresenceReading,
     Lane,
+    contact_observed_signal,
     contact_presence_signal,
     contact_pressure_signal,
     contact_pressure_value,
     contact_signal,
     contact_value,
-    exchange_signal,
     in_flight_signal,
     is_in_flight,
     is_kind,
     lane_of,
+    proactive_outcome_signal,
+    read_contact_observed,
     read_contact_presence,
-    read_exchange,
-    read_verdict,
-    read_verdict_correlation,
-    verdict_signal,
+    read_proactive_outcome,
+    read_proactive_outcome_correlation,
 )
 from .timeutil import minutes_between
 from .wake_packet import IMPULSE_LABEL_PREFIX, ProactivePrompt, build_wake_packet
 
 __all__ = [
-    "ActGate",
-    "Aggregator",
     "allow_send",
     "CheckpointState",
     "can_afford",
@@ -97,7 +91,7 @@ __all__ = [
     "layer_for_type",
     "ContactAggregation",
     "ContactPresenceReading",
-    "PresenceNeuron",
+    "ContactSensor",
     "SolitudeDrive",
     "ComponentRegistry",
     "CONTROL_KINDS",
@@ -106,34 +100,29 @@ __all__ = [
     "EmitSignal",
     "EVENT_SUPPRESSION",
     "emit_suppression_span",
+    "FrameTrigger",
+    "SignalFrame",
+    "run_frame",
     "SUPPRESSION_MIN_FIELDS",
     "SuppressionReason",
-    "IntakeLimits",
-    "IntakeResult",
-    "is_verdict_stale",
+    "is_proactive_outcome_stale",
     "Intent",
     "LaunchProactive",
     "KIND_CONTACT",
+    "KIND_CONTACT_OBSERVED",
     "KIND_CONTACT_PRESENCE",
     "KIND_CONTACT_PRESSURE",
-    "KIND_EXCHANGE",
     "KIND_IN_FLIGHT",
-    "KIND_VERDICT",
+    "KIND_PROACTIVE_OUTCOME",
     "Lane",
-    "Layer",
-    "Neuron",
     "Personality",
     "Reservation",
-    "ProcessingLayer",
-    "SignalBus",
-    "SilentAggregator",
     "StateActor",
     "TickContext",
     "TickReport",
     "UnknownComponent",
     "UnknownStateField",
     "UpdateState",
-    "apply_intake",
     "project_contact",
     "build_wake_packet",
     "IMPULSE_LABEL_PREFIX",
@@ -145,18 +134,18 @@ __all__ = [
     "contact_presence_signal",
     "contact_pressure_signal",
     "contact_pressure_value",
-    "exchange_signal",
+    "contact_observed_signal",
     "in_flight_signal",
     "is_in_flight",
     "is_kind",
     "lane_of",
     "minutes_between",
     "read_contact_presence",
-    "read_exchange",
-    "read_verdict",
-    "read_verdict_correlation",
+    "read_contact_observed",
+    "read_proactive_outcome",
+    "read_proactive_outcome_correlation",
     "record_send",
     "reserve",
     "settle",
-    "verdict_signal",
+    "proactive_outcome_signal",
 ]

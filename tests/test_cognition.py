@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
-from lifemodel.adapters.signal_bus import FileSignalBus
 from lifemodel.core.cognition import CognitionLauncher
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
@@ -46,7 +45,6 @@ def _ctx(state: State, *, objects=(), tmp_path, now: datetime = NOW) -> TickCont
     return TickContext(
         state=state,
         now=now,
-        bus=FileSignalBus(tmp_path),
         signals=(),
         objects=tuple(objects),
         trace=_TRACE,
@@ -116,7 +114,6 @@ def test_launch_submits_correlation_index_row(tmp_path) -> None:
     ctx = TickContext(
         state=State(u=2.0, energy=1.0, fatigue=0.0),
         now=NOW,
-        bus=FileSignalBus(tmp_path),
         objects=tuple(ACTIVE),
         trace=_TRACE,
         trace_writer=_CapturingSink(),
@@ -307,7 +304,6 @@ def _traced_ctx(state: State, *, objects, trace, tmp_path) -> TickContext:
     return TickContext(
         state=state,
         now=NOW,
-        bus=FileSignalBus(tmp_path),
         signals=(),
         objects=tuple(objects),
         trace=trace,
@@ -462,7 +458,6 @@ def _logged_ctx(state: State, *, objects, tmp_path):  # type: ignore[no-untyped-
         TickContext(
             state=state,
             now=NOW,
-            bus=FileSignalBus(tmp_path),
             signals=(),
             objects=tuple(objects),
             trace=trace,

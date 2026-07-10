@@ -1,7 +1,7 @@
 """Acceptance scenarios on REAL components (spec §10) — the phase finale.
 
 Every scenario runs through :class:`lifemodel.testing.IntegrationHarness`, which
-drives the actual ``PresenceNeuron → SolitudeDrive → ContactAggregation →
+drives the actual ``ContactSensor → SolitudeDrive → ContactAggregation →
 CognitionLauncher`` spine (not a third model — T8) over the real SQLite store
 through fake ports, scripting the async act-gate via the verdict read-back path.
 Each asserts BOTH the outcome AND a suppression-span reason, so any silent tick is
@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.core.desire_view import read_live_contact_desire
 from lifemodel.core.wake_packet import build_wake_packet
-from lifemodel.domain.egress import ReachOutcome, Verdict
+from lifemodel.domain.egress import ProactiveOutcome, ReachOutcome
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.state_commands import force_wake_for_dir
@@ -48,7 +48,7 @@ def test_silence_to_threshold_to_a_delivered_message(tmp_path) -> None:
     u_at_launch = launch.u
 
     # scripted act-gate: the being actually sent a message → FULFILL read-back
-    fulfill = h.run([Step(advance=timedelta(minutes=1), act_gate=Verdict.FULFILL)])[-1]
+    fulfill = h.run([Step(advance=timedelta(minutes=1), act_gate=ProactiveOutcome.SENT)])[-1]
     final = h._lm.state.load()
     assert final.action_pending_since is not None  # ActionPending inhibition started
     assert fulfill.u >= u_at_launch  # send ≠ contact: the message did NOT satiate u
@@ -72,7 +72,7 @@ def test_silent_act_gate_rejects_applies_backoff_without_satiating(tmp_path) -> 
     h.run([Step(advance=timedelta(minutes=1))])  # launch + deliver
     u_before = h._lm.state.load().u
     # scripted act-gate: the being chose silence ([SILENT]) → REJECT read-back
-    h.run([Step(advance=timedelta(minutes=1), act_gate=Verdict.REJECT)])
+    h.run([Step(advance=timedelta(minutes=1), act_gate=ProactiveOutcome.SILENT)])
     final = h._lm.state.load()
     assert read_live_contact_desire(h._memory()) is None  # desire dropped (terminal)
     assert final.decline_count >= 1  # decline backoff applied
@@ -85,7 +85,7 @@ def test_repeat_pure_longing_holds_a_second_bid_after_a_send(tmp_path) -> None:
     # full positive flow → a send (FULFILL) leaves an unanswered pure-longing bid
     h.run([Step(advance=timedelta(minutes=100)), Step(advance=timedelta(minutes=200))])
     h.run([Step(advance=timedelta(minutes=1))])  # launch + deliver
-    h.run([Step(advance=timedelta(minutes=1), act_gate=Verdict.FULFILL)])  # send
+    h.run([Step(advance=timedelta(minutes=1), act_gate=ProactiveOutcome.SENT)])  # send
     # wait past ActionPending decay so the urge returns, with no reply since → a
     # second pure-longing bid must HOLD (unobtrusiveness), not relaunch.
     rec = h.run([Step(advance=timedelta(minutes=200))])[-1]

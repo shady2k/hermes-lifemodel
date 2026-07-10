@@ -97,7 +97,7 @@ def test_now_renders_seeded_registry() -> None:
     accepts.set(1.0, layer="autonomic")
     accepts.set(0.0, layer="cognition")
     runs = reg.counter("lifemodel_component_runs_total", label_keys=("component", "layer"))
-    runs.inc(5.0, component="contact_neuron", layer="autonomic")
+    runs.inc(5.0, component="contact_sensor", layer="autonomic")
     runs.inc(2.0, component="aggregation", layer="aggregation")  # total 7
     reg.counter("lifemodel_suppressions_total", label_keys=("reason",)).inc(
         3.0, reason="quiet_hours"

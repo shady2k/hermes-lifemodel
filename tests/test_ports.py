@@ -15,8 +15,6 @@ import pytest
 
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.adapters.delivery import NoopDelivery
-from lifemodel.adapters.signal_bus import FileSignalBus
-from lifemodel.core.signal_bus import SignalBus
 from lifemodel.ports import (
     ClockPort,
     DeliveryPort,
@@ -32,7 +30,6 @@ from lifemodel.testing import (
     FakeDelivery,
     FakeMemoryStore,
     FakePressureSensor,
-    FakeSignalBus,
     FakeStateStore,
 )
 
@@ -57,11 +54,6 @@ def test_state_port_is_satisfied_by_adapter_and_fake(tmp_path: object) -> None:
     clock = FakeClock(datetime.now(UTC))
     assert isinstance(SQLiteRuntimeStore(tmp_path, clock=clock), StatePort)  # type: ignore[arg-type]
     assert isinstance(FakeStateStore(), StatePort)
-
-
-def test_signal_bus_is_satisfied_by_adapter_and_fake(tmp_path: object) -> None:
-    assert isinstance(FileSignalBus(tmp_path), SignalBus)  # type: ignore[arg-type]
-    assert isinstance(FakeSignalBus(), SignalBus)
 
 
 def test_memory_port_is_satisfied_by_sqlite_store_and_fake(tmp_path: object) -> None:

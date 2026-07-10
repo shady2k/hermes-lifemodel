@@ -49,7 +49,6 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "gateway_core.py",
         "adapters/being_platform.py",
         "adapters/delivery.py",
-        "adapters/signal_bus.py",
         "state/sqlite_store.py",
         "state/trace_store.py",
         "state/metrics_store.py",

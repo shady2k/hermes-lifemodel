@@ -22,9 +22,10 @@ def test_defaults_are_documented_and_current_schema() -> None:
 
 
 def test_no_processed_signal_ids_field() -> None:
-    # Finding 4: dedup ownership lives in the SignalBus consumed-ledger, not in
-    # State. The dead field is gone from the model and its serialized shape, so
-    # nothing surfaces it as an always-zero (misleading) dedup metric.
+    # The nervous flow is ephemeral (spec §2/§3): there is no durable bus and no
+    # bus-level signal dedup, so State carries no ``processed_signal_ids`` field —
+    # nothing surfaces it as an always-zero (misleading) dedup metric. (External-event
+    # idempotency is a later slice's ``processed_external_event_ids`` ring, not this.)
     assert not hasattr(State(), "processed_signal_ids")
     assert "processed_signal_ids" not in State().to_dict()
 

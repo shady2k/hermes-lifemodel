@@ -1,8 +1,8 @@
 """In-memory fakes for every Phase-1 port — "imitations before code" (HLA §13).
 
 The DI contract says tests inject fakes, not real adapters. These are the
-canonical ones: a fake clock, delivery, state store, signal bus, memory store
-and pressure sensor, each satisfying its port/ABC. They are shipped in the
+canonical ones: a fake clock, delivery, state store, memory store and pressure
+sensor, each satisfying its port/ABC. They are shipped in the
 package (not hidden in a test folder) so later tasks reuse the *same* fakes
 their upstream defined, rather than re-rolling subtly different ones. Stdlib
 only; no Hermes.
@@ -27,7 +27,6 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, assert_never
 
-from ..core.signal_bus import SignalBus
 from ..domain.memory import (
     MemoryDraft,
     MemoryMutation,
@@ -46,7 +45,6 @@ from ..domain.memory import (
     stamp_iso_utc,
     summarize_pressure_index,
 )
-from ..domain.signal import Signal
 from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
 from ..ports.tracer import (
@@ -316,47 +314,6 @@ class FakeStateStore:
             if self._memory is not None and rows_snapshot is not None:
                 self._memory._rows = rows_snapshot
             raise
-
-
-class FakeSignalBus(SignalBus):
-    """An in-memory :class:`SignalBus` with the same dedup contract (HLA §10).
-
-    Mirrors :class:`~lifemodel.adapters.signal_bus.FileSignalBus` without the
-    filesystem: ``publish`` appends to an in-memory log, ``consume_unprocessed``
-    returns each origin id at most once ever (deduped within a batch and across
-    calls). It has no on-disk state, so restart-persistence is out of scope —
-    that behaviour is covered by the file bus.
-    """
-
-    def __init__(self) -> None:
-        self._log: list[Signal] = []
-        self._consumed: set[str] = set()
-
-    def publish(self, signal: Signal) -> None:
-        self._log.append(signal)
-
-    def consume_unprocessed(self) -> list[Signal]:
-        fresh = self._unprocessed()
-        self._consumed.update(s.origin_id for s in fresh)
-        return fresh
-
-    def peek_unprocessed(self) -> list[Signal]:
-        """Read-only view of the unprocessed signals — never marks them consumed.
-
-        Parity with :meth:`FileSignalBus.peek_unprocessed` so the debug path's
-        read-only bus inspection can be exercised with this fake.
-        """
-        return self._unprocessed()
-
-    def _unprocessed(self) -> list[Signal]:
-        fresh: list[Signal] = []
-        seen = set(self._consumed)
-        for signal in self._log:
-            if signal.origin_id in seen:
-                continue
-            seen.add(signal.origin_id)
-            fresh.append(signal)
-        return fresh
 
 
 class FakeMemoryStore:

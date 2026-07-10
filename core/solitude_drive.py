@@ -1,7 +1,7 @@
 """SolitudeDrive — the AUTONOMIC contact-deficit integrator (spec §3/§8, T2 split).
 
 Owns and writes the vital ``u`` (``runtime_state``): it consumes the fresh
-``contact_presence`` reading from :class:`PresenceNeuron` (elapsed silence ``dt`` +
+``contact_presence`` reading from :class:`ContactSensor` (elapsed silence ``dt`` +
 this tick's exchange qualities) and integrates the CERTIFIED drive
 (:class:`lifemodel.sim.drive.Drive`) — ``rise`` over genuine silence, ``satiate``
 ONLY on a real exchange — then emits the fresh ``u`` as the transient
@@ -13,7 +13,7 @@ the tick's atomic commit, so aggregation — which sees start-of-tick ``ctx.stat
 must read the fresh ``u`` from this transient signal, not from ``ctx.state.u``.
 
 Satiation is ONLY on a real (positive-quality) exchange — the being's own proactive
-impulse carries ``q = 0`` (computed upstream by PresenceNeuron via ``quality_of``)
+impulse carries ``q = 0`` (computed upstream by ContactSensor via ``quality_of``)
 and never self-satiates. The drive math is the certified ``sim`` model, unchanged.
 """
 
@@ -54,7 +54,7 @@ class SolitudeDrive:
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         # Read the instantaneous channel measurement the sensor emitted THIS tick
-        # (PresenceNeuron runs before the drive). Absent (first wiring / corrupt) →
+        # (ContactSensor runs before the drive). Absent (first wiring / corrupt) →
         # no rise, no satiate: the drive holds its value rather than guessing.
         presence = read_contact_presence(ctx.signals)
         dt = presence.dt if presence is not None else 0.0

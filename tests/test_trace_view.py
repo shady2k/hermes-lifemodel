@@ -16,9 +16,8 @@ import pytest
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
 from lifemodel.core.proactive import proactive_tick
-from lifemodel.core.taxonomy import verdict_signal
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
-from lifemodel.domain.egress import ReachOutcome, Verdict
+from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
 from lifemodel.events import EventRing
 from lifemodel.hooks import make_post_llm_observer
@@ -101,30 +100,22 @@ def populated(tmp_path: Path):
         clock.advance(timedelta(minutes=1))
         proactive_tick(lm, egress, {"platform": "t", "chat_id": "1"})
         after = lm.state.load()
-        corr = after.pending_proactive_id
         origin_tid = parse_traceparent(after.pending_proactive_origin_traceparent).trace_id
 
-        make_post_llm_observer(lm)(
+        # The async turn finishes → its OWN frame weaves the outcome AND resolves the
+        # desire under the origin trace, immediately (spec §3) — no separate resolve tick.
+        make_post_llm_observer(lambda: lm)(
             user_message=f"{IMPULSE_LABEL_PREFIX} impulse",
             assistant_response="hi!",
         )
-        clock.advance(timedelta(minutes=2))
-        lm.bus.publish(
-            verdict_signal(
-                origin_id=f"verdict-{corr}",
-                verdict=Verdict.FULFILL,
-                timestamp=clock.now().isoformat(),
-                correlation_id=corr,
-            )
-        )
-        proactive_tick(lm, egress, {"platform": "t", "chat_id": "1"})
 
-        # An orphan: post_llm with a pending id but NO origin anchor.
+        # An orphan (newest root trace): post_llm with a pending id but NO origin anchor.
+        clock.advance(timedelta(minutes=2))
         lm.state.commit(State(pending_proactive_id="lost"))
         lm.state.put(
             encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0))
         )
-        make_post_llm_observer(lm)(
+        make_post_llm_observer(lambda: lm)(
             user_message=f"{IMPULSE_LABEL_PREFIX} again", assistant_response="[SILENT]"
         )
 

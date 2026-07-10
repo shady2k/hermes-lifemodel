@@ -18,9 +18,8 @@ from pathlib import Path
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
 from lifemodel.core.proactive import proactive_tick
-from lifemodel.core.taxonomy import verdict_signal
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
-from lifemodel.domain.egress import ReachOutcome, Verdict
+from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
 from lifemodel.events import EventRing
 from lifemodel.hooks import make_post_llm_observer
@@ -73,23 +72,13 @@ def test_one_proactive_attempt_is_one_trace_id(tmp_path: Path) -> None:
         expected_trace = parse_traceparent(origin).trace_id
         correlation_id = after_launch.pending_proactive_id
 
-        # --- post_llm: the async outcome, woven under origin T (real text = FULFILL) ---
-        make_post_llm_observer(lm)(
+        # --- post_llm: the async turn finishes → its OWN frame weaves the outcome AND
+        # resolves the desire under origin T, immediately (spec §3) — the outcome span
+        # and the resolution span both land under T in this single frame. ---
+        make_post_llm_observer(lambda: lm)(
             user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
             assistant_response="Hey, hi!",
         )
-
-        # --- tick N+k: the verdict resolves the desire → resolution span under T ---
-        clock.advance(timedelta(minutes=2))
-        lm.bus.publish(
-            verdict_signal(
-                origin_id=f"verdict-{correlation_id}",
-                verdict=Verdict.FULFILL,
-                timestamp=clock.now().isoformat(),
-                correlation_id=correlation_id,
-            )
-        )
-        proactive_tick(lm, egress, {"chat_id": "1"})
 
         assert writer.flush(timeout=5.0)
         conn = sqlite3.connect(str(db_path))
@@ -138,7 +127,7 @@ def test_missing_origin_anchor_becomes_orphan_not_foreign_attachment(tmp_path: P
             encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0))
         )
 
-        make_post_llm_observer(lm)(
+        make_post_llm_observer(lambda: lm)(
             user_message=f"{IMPULSE_LABEL_PREFIX} ...",
             assistant_response="[SILENT]",
         )

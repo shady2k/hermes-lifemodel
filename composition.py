@@ -15,32 +15,24 @@ Two call sites this must serve (roadmap 0.4):
 * the cron ``--script`` entrypoint (task 1.1) — wires it from a ``base_dir`` and
   takes the Hermes-free defaults below.
 
-The defaults are the concrete :class:`SystemClock`,
+The defaults are the concrete :class:`SystemClock` and
 :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` (the ``StatePort``
 adapter since lm-fib.6.2 — it replaced the retired ``JsonStateStore``/
-``state.json``), and durable :class:`FileSignalBus`, with a
-:class:`NoopDelivery` stub for the ``DeliveryPort``. Note the *proactive* outbound
-does **not** go through this port: the supervised platform adapter's tick
+``state.json``), with a :class:`NoopDelivery` stub for the ``DeliveryPort``. Note
+the *proactive* outbound does **not** go through this port: the supervised platform
+adapter's tick
 (:mod:`lifemodel.adapters.being_platform` → :func:`lifemodel.core.proactive.proactive_tick`)
 launches proactive turns directly via its own ``ProactiveEgressPort``. The
 ``DeliveryPort`` stays the seam for a future *direct*-from-cognition delivery path,
 so ``NoopDelivery`` remains the default.
 
-**Wire-desire-model plan (Task 4): no decision aggregator/neuron in the live
-path.** The cron tick no longer runs a neuron loop or asks an aggregator to
-decide — the in-process service uses :mod:`lifemodel.core.decision` (which
-reconstructs the certified ``sim`` primitives from ``State`` directly, bypassing
-this ``Aggregator``/``Neuron`` seam entirely). So the live default aggregator is
-now :class:`SilentAggregator` (never wakes, whatever it is asked to decide —
-matching "cron never decides") and the live default neuron list is empty. The
-old ``ThresholdAggregator``/``StubTimerNeuron`` defaults were removed outright
-by Task 8's cleanup pass once confirmed fully orphaned — the ``Aggregator`` and
-``Neuron`` ABCs (plus ``SilentAggregator``) remain as the extension seam for any
-future subclass.
-
-Passing ``neurons`` or ``aggregator`` explicitly — including an empty ``()`` —
-opts out of the default, so real Hermes wiring and the seam tests stay in full
-control.
+**The nervous flow is ephemeral (spec §2/§3).** There is no durable signal bus:
+a frame is seeded with its trigger's ``initial_signals`` into an in-memory
+:class:`~lifemodel.core.frame.SignalFrame`, and the registered pipeline (personality
+→ contact sensor → drive → aggregation → cognition launcher) folds them into intents
+that the single :class:`~lifemodel.core.state_actor.StateActor` commits at end of
+frame. The live decision path IS this registered pipeline — there is no separate
+aggregator/neuron seam.
 
 **This module imports no Hermes** — only Hermes-free adapters and the core — so
 the whole graph is constructible (and testable) with injected fakes off-host.
@@ -55,20 +47,16 @@ from pathlib import Path
 
 from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
-from .adapters.signal_bus import FileSignalBus
 from .adapters.trace_export import make_trace_exporter
 from .adapters.tracer import StdlibTracer
 from .core.aggregation import ContactAggregation
-from .core.aggregator import Aggregator, SilentAggregator
 from .core.cognition import CognitionLauncher
 from .core.component import layer_for_type
-from .core.contact_neuron import PresenceNeuron
+from .core.contact_sensor import ContactSensor
 from .core.coreloop import CoreLoop
 from .core.metrics import MetricRegistry, MetricSpec, get_metric_registry
-from .core.neuron import Neuron
 from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
-from .core.signal_bus import SignalBus
 from .core.solitude_drive import CONTACT_DRIVE_U_SPEC, SolitudeDrive
 from .core.state_actor import StateActor
 from .domain.objects import default_registry
@@ -114,11 +102,8 @@ class LifeModel:
     """
 
     state: StatePort
-    bus: SignalBus
     clock: ClockPort
     delivery: DeliveryPort
-    aggregator: Aggregator
-    neurons: tuple[Neuron, ...] = field(default_factory=tuple)
     registry: ComponentRegistry = field(default_factory=ComponentRegistry)
     state_actor: StateActor | None = None
     coreloop: CoreLoop | None = None
@@ -171,11 +156,8 @@ def build_lifemodel(
     *,
     base_dir: Path,
     state: StatePort | None = None,
-    bus: SignalBus | None = None,
     clock: ClockPort | None = None,
     delivery: DeliveryPort | None = None,
-    aggregator: Aggregator | None = None,
-    neurons: Sequence[Neuron] | None = None,
     registry: ComponentRegistry | None = None,
     tracer: TracerPort | None = None,
     trace_exporter: TraceExportPort | None = None,
@@ -187,16 +169,10 @@ def build_lifemodel(
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
     *base_dir* is the profile-scoped state directory (from
-    :func:`lifemodel.paths.state_dir`); the default state store and signal bus
-    live under it. Every collaborator is overridable so ``register(ctx)`` can
-    inject real Hermes adapters and tests can inject fakes — the wiring is the
-    same, only the parts differ.
-
-    ``neurons`` defaults to an empty tuple and ``aggregator`` defaults to
-    :class:`SilentAggregator` (roadmap Task 4: the cron path decides nothing —
-    the in-process service is the sole brain via ``core/decision``, bypassing
-    this seam). ``None`` means "take the default"; passing an explicit value —
-    including an empty ``()`` — overrides it, so callers keep full control.
+    :func:`lifemodel.paths.state_dir`); the default state store lives under it.
+    Every collaborator is overridable so ``register(ctx)`` can inject real Hermes
+    adapters and tests can inject fakes — the wiring is the same, only the parts
+    differ.
 
     ``display_tz`` is the owner's local timezone for the wake-packet's temporal
     facts, resolved from Hermes at the adapter boundary (this module imports no
@@ -222,7 +198,6 @@ def build_lifemodel(
     resolved_committer: TickCommitPort | None = (
         resolved_state if isinstance(resolved_state, TickCommitPort) else None
     )
-    resolved_bus: SignalBus = bus or FileSignalBus(base_dir)
     resolved_delivery: DeliveryPort = delivery or NoopDelivery()
     # The execution tracer (lm-27n.11): the DEFAULT mints real W3C ids stdlib-only;
     # a test injects a deterministic FakeTracer. The CoreLoop mints ONE root trace per
@@ -241,8 +216,6 @@ def build_lifemodel(
     # (the egress backstop) records through the same sinks as the in-tick pipeline.
     resolved_writer: TraceSink = trace_writer if trace_writer is not None else NULL_TRACE_SINK
     resolved_ring: EventRing = event_ring if event_ring is not None else EventRing()
-    resolved_aggregator: Aggregator = aggregator or SilentAggregator()
-    resolved_neurons: tuple[Neuron, ...] = () if neurons is None else tuple(neurons)
     # The shared metric registry (telemetry-core §4.1): the singleton-per-base_dir
     # instance so tick, hooks, and ``/lifemodel stats`` (all in the one gateway
     # process) read ONE registry. A test injects its own to inspect emitted metrics.
@@ -268,12 +241,12 @@ def build_lifemodel(
     try:
         resolved_registry.manifest("contact")
     except UnknownComponent:
-        # T2 split (spec §3): the instantaneous, stateless contact-channel sensor.
-        # PresenceNeuron keeps the historical ``contact`` slot id; it measures the
+        # The instantaneous, stateless contact-channel sensor (spec §4, afferent).
+        # ContactSensor keeps the historical ``contact`` slot id; it measures the
         # channel now and emits a raw ``contact_presence`` reading — it writes NO u.
-        presence = PresenceNeuron()
+        sensor = ContactSensor()
         resolved_registry.register(
-            presence, _component_manifest(presence.id, "neuron", accepts_signals=True)
+            sensor, _component_manifest(sensor.id, "neuron", accepts_signals=True)
         )
     try:
         resolved_registry.manifest("solitude-drive")
@@ -333,7 +306,6 @@ def build_lifemodel(
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,
         state_actor=resolved_state_actor,
-        bus=resolved_bus,
         clock=resolved_clock,
         trace_writer=resolved_writer,
         event_ring=resolved_ring,
@@ -350,11 +322,8 @@ def build_lifemodel(
 
     return LifeModel(
         state=resolved_state,
-        bus=resolved_bus,
         clock=resolved_clock,
         delivery=resolved_delivery,
-        aggregator=resolved_aggregator,
-        neurons=resolved_neurons,
         registry=resolved_registry,
         state_actor=resolved_state_actor,
         coreloop=resolved_coreloop,

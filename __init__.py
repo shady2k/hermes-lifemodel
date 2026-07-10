@@ -268,12 +268,21 @@ def register(ctx: Any) -> None:
         # attempt, one ``trace_id``. This refcount is held for the plugin's lifetime
         # (register has no teardown), independent of the platform connect/disconnect
         # cycle, so the hook can always write regardless of loop state.
-        verdict_lm = build_lifemodel(
-            base_dir=sdir,
-            trace_writer=acquire_trace_writer(observability_db_path(sdir)),
-            event_ring=EventRing(),
+        # Acquire the durable trace writer ONCE (refcount held for the plugin's life)
+        # and share one freshness ring; the observer builds a FRESH LifeModel per call
+        # (spec §3: each frame loads state fresh under the one state-actor lock) but
+        # keeps writing to the SAME observability.sqlite as the launch — one attempt,
+        # one trace_id.
+        _outcome_writer = acquire_trace_writer(observability_db_path(sdir))
+        _outcome_ring = EventRing()
+        ctx.register_hook(
+            "post_llm_call",
+            make_post_llm_observer(
+                lambda: build_lifemodel(
+                    base_dir=sdir, trace_writer=_outcome_writer, event_ring=_outcome_ring
+                )
+            ),
         )
-        ctx.register_hook("post_llm_call", make_post_llm_observer(verdict_lm))
         _LOG.info("post_llm_observer_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
         _LOG.info("post_llm_observer_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")
@@ -291,8 +300,10 @@ def register(ctx: Any) -> None:
     # pre_gateway_dispatch in VALID_HOOKS, or any wiring hiccup, must not break
     # load.
     try:
-        inbound_lm = build_lifemodel(base_dir=sdir)
-        ctx.register_hook("pre_gateway_dispatch", make_inbound_observer(inbound_lm))
+        ctx.register_hook(
+            "pre_gateway_dispatch",
+            make_inbound_observer(lambda: build_lifemodel(base_dir=sdir)),
+        )
         _LOG.info("inbound_observer_registered")
     except Exception as exc:  # noqa: BLE001 - best-effort; never break load
         _LOG.info("inbound_observer_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")

@@ -1,23 +1,23 @@
 """ContactAggregation — the AGGREGATION layer for the contact desire (spec §3/§7).
 
-Stateless: every tick it reads the live contact desire from the start-of-tick
+Stateless: every frame it reads the live contact desire from the start-of-frame
 records snapshot (``ctx.objects``, via :func:`live_contact_desire`) plus the drive's
-transient ``contact_pressure`` value (the FRESH ``u``) and the durable
-``exchange``/``verdict``/``in_flight`` inputs, applies them in the order
-exchange → verdict → wake (threaded through locals, like ``core/decision.py``'s
+transient ``contact_pressure`` value (the FRESH ``u``) and the ephemeral
+``contact_observed``/``proactive_outcome``/``in_flight`` signals, applies them in the
+order contact → outcome → wake (threaded through locals, like ``core/decision.py``'s
 functions), and emits at most ONE desire-row mutation (a :class:`PutRecord` to
 birth an ``active`` desire, or a :class:`TransitionRecord` to advance a live one)
 plus the residual-field :class:`UpdateState`.
 
 The desire *lifecycle* is a first-class typed row (lm-27n.3): ``urge →
-PutRecord(active)``; ``FULFILL → active→satisfied``; ``REJECT → active→dropped``;
-``DEFER → active→deferred``; a real ``exchange`` terminalizes the live desire
-(``→satisfied``) and **dominates a same-tick verdict**. ``satisfied``/``dropped``/
-``expired`` are terminal — aggregation never transitions out of them (it only ever
-births a fresh ``active`` desire, an upsert on the singleton id). This layer keeps
-its safety gates (effective pressure / ActionPending inhibition, silence window,
-decline backoff, in-flight, the certified ``evaluate_wake`` threshold) and the
-atomic desire/intention interlock.
+PutRecord(active)``; ``SENT → active→satisfied``; ``SILENT → active→dropped``;
+``FAILED``/``STALE → active→dropped`` (attempt ended, nothing to reinforce); a real
+``contact_observed`` terminalizes the live desire (``→satisfied``) and **dominates a
+same-frame proactive_outcome**. ``satisfied``/``dropped``/``expired`` are terminal —
+aggregation never transitions out of them (it only ever births a fresh ``active``
+desire, an upsert on the singleton id). This layer keeps its safety gates (effective
+pressure / ActionPending inhibition, silence window, decline backoff, in-flight, the
+certified ``evaluate_wake`` threshold) and the atomic desire/intention interlock.
 
 **T3 re-cut (spec §3/§8):** drive-only. The baroque gates that did NOT survive the
 rebuild are gone — appropriateness is the async act-gate's job (Hermes turn), not
@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..domain.egress import Verdict
+from ..domain.egress import ProactiveOutcome
 from ..domain.memory import PutOp, TransitionOp
 from ..domain.objects import DesireSpring, DesireState, IntentionState
 from ..sim.wake import GateParams, LaneState, WakeOutcome, evaluate_wake
@@ -45,17 +45,17 @@ from .correlate import open_correlated_span
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
 from .intention_view import live_contact_intention
 from .intents import Intent, PutRecord, TransitionRecord, UpdateState
-from .invalidation import is_verdict_stale
+from .invalidation import is_proactive_outcome_stale
 from .pressure import effective_pressure, inhibition_at
 from .suppression import SuppressionReason, emit_suppression_span
 from .taxonomy import (
-    KIND_EXCHANGE,
-    KIND_VERDICT,
+    KIND_CONTACT_OBSERVED,
+    KIND_PROACTIVE_OUTCOME,
     contact_pressure_value,
     is_in_flight,
-    read_exchange,
-    read_verdict,
-    read_verdict_correlation,
+    read_contact_observed,
+    read_proactive_outcome,
+    read_proactive_outcome_correlation,
 )
 from .timeutil import minutes_between
 from .trace import creation_provenance
@@ -65,10 +65,10 @@ _NONE = "none"
 
 #: The atomic lifecycle interlock (lm-27n.4): when a desire resolution transitions
 #: the desire, the live intention (the decision record) is transitioned in lockstep
-#: — in the SAME tick commit — so the pair can never split-brain. Maps the desire's
-#: resolution target to the intention's. FULFILL/exchange → ``completed``; REJECT →
-#: ``dropped``; DEFER → ``deferred`` (each legal from both ``active`` and, for the
-#: terminal targets, ``deferred``).
+#: — in the SAME frame commit — so the pair can never split-brain. Maps the desire's
+#: resolution target to the intention's. SENT/contact → ``completed``; SILENT/failed/
+#: stale → ``dropped``; a held (deferred) desire → ``deferred`` (each legal from both
+#: ``active`` and, for the terminal targets, ``deferred``).
 _INTENTION_TARGET: dict[str, str] = {
     DesireState.SATISFIED.value: IntentionState.COMPLETED.value,
     DesireState.DROPPED.value: IntentionState.DROPPED.value,
@@ -149,11 +149,11 @@ class ContactAggregation:
         send_log = state.proactive_send_log
         unanswered_outbound_count = state.unanswered_outbound_count
 
-        # Captured when a verdict resolves an in-flight attempt this tick, so the
-        # resolution span is woven UNDER THE ORIGIN TRACE (§4.4) after the reducer.
+        # Captured when a proactive outcome resolves an in-flight attempt this frame,
+        # so the resolution span is woven UNDER THE ORIGIN TRACE (§4.4) after the reducer.
         resolved_correlation: str | None = None
         resolved_origin: str | None = None
-        resolved_verdict: Verdict | None = None
+        resolved_outcome: ProactiveOutcome | None = None
 
         # The single desire-row action this tick: a create, or a transition
         # target for the live desire. At most one of the two ever fires.
@@ -172,11 +172,12 @@ class ContactAggregation:
             ),
         )
 
-        # 1) real exchanges reset clocks and terminalize a live desire (before verdict/wake).
-        #    A real reply this tick dominates any same-tick verdict: it resolves the
-        #    pull, so the verdict loop below is skipped (the desire is already gone).
+        # 1) real contact resets clocks and terminalizes a live desire (before outcome/wake).
+        #    A real reply this frame dominates any same-frame proactive_outcome: it resolves
+        #    the pull, so the outcome loop below is skipped (the desire is already gone).
         had_exchange = any(
-            sig.kind == KIND_EXCHANGE and read_exchange(sig)[0] != "proactive_internal"
+            sig.kind == KIND_CONTACT_OBSERVED
+            and read_contact_observed(sig)[0] != "proactive_internal"
             for sig in ctx.signals
         )
         if had_exchange:
@@ -190,16 +191,17 @@ class ContactAggregation:
                 transition_to = DesireState.SATISFIED  # exchange terminalizes the live desire
             desire_state = _NONE
 
-        # 2) a verdict resolves the woken desire — dropped if stale (async invalidation §7.3).
-        #    Only reached when no exchange dominated this tick (exchange-dominates-verdict).
+        # 2) a proactive outcome resolves the woken desire — dropped if stale (async
+        #    invalidation §7.3). Only reached when no contact dominated this frame
+        #    (contact_observed-dominates-proactive_outcome).
         if not had_exchange:
             for sig in ctx.signals:
-                if sig.kind != KIND_VERDICT:
+                if sig.kind != KIND_PROACTIVE_OUTCOME:
                     continue
-                stale, _reason = is_verdict_stale(
+                stale, _reason = is_proactive_outcome_stale(
                     desire_state=desire_state,
                     pending_id=pending_id,
-                    verdict_correlation_id=read_verdict_correlation(sig),
+                    outcome_correlation_id=read_proactive_outcome_correlation(sig),
                     last_exchange_at=last_exchange_at,
                     pending_since=pending_since,
                     effective=effective_now,
@@ -209,40 +211,34 @@ class ContactAggregation:
                 )
                 if stale:
                     continue
-                verdict = read_verdict(sig)
-                if verdict is Verdict.FULFILL:
+                po = read_proactive_outcome(sig)
+                if po is ProactiveOutcome.SENT:
                     transition_to = DesireState.SATISFIED
                     action_pending_since = now.isoformat()  # send -> inhibition starts
                     last_contact_at = now.isoformat()
                     send_log = record_send(send_log, now)  # backstop counter (spec §14)
-                    # Pure-longing outreach counter: a FULFILLED drive-only send (the
+                    # Pure-longing outreach counter: a SENT drive-only outreach (the
                     # only kind now, T3) is a repeat longing bid -> bump. A legacy
                     # THOUGHT/MIXED-sprung desire (persisted from before the cut) is a
                     # materially-new reason -> not a repeat, does not bump.
                     if live is not None and live.spring == DesireSpring.DRIVE:
                         unanswered_outbound_count += 1
-                    resolved_correlation = read_verdict_correlation(sig)
-                    resolved_origin = pending_origin
-                    resolved_verdict = verdict
-                    pending_id = None
-                    pending_since = None
-                    pending_origin = None
-                    desire_state = _NONE
-                elif verdict is Verdict.REJECT:
+                elif po is ProactiveOutcome.SILENT:
                     transition_to = DesireState.DROPPED
                     declined_at = now.isoformat()
                     decline_count += 1
-                    resolved_correlation = read_verdict_correlation(sig)
-                    resolved_origin = pending_origin
-                    resolved_verdict = verdict
-                    pending_id = None
-                    pending_since = None
-                    pending_origin = None
-                    desire_state = _NONE
-                else:  # Verdict.DEFER — hold the intention (never reached in live Model A)
-                    transition_to = DesireState.DEFERRED
-                    desire_state = DesireState.DEFERRED
-                break  # a resolved desire is no longer active — later verdicts are stale
+                else:  # FAILED / STALE — the attempt ended with nothing to reinforce:
+                    # clear the pending + drop the desire, but no decline backoff and no
+                    # ActionPending window (no send happened).
+                    transition_to = DesireState.DROPPED
+                resolved_correlation = read_proactive_outcome_correlation(sig)
+                resolved_origin = pending_origin
+                resolved_outcome = po
+                pending_id = None
+                pending_since = None
+                pending_origin = None
+                desire_state = _NONE
+                break  # a resolved desire is no longer active — later outcomes are stale
 
         # duration on latent u (never shrinks; latent, not effective — accrues under inhibition)
         dt = max(0.0, minutes_between(state.last_tick_at, now))
@@ -387,10 +383,10 @@ class ContactAggregation:
                         ctx.logger, reason=reason, component=self.id, metrics=ctx.metrics
                     )
 
-        # Async-bridge resolution span (spec §4.4 / §5 step 6): when this tick
-        # consumes the verdict that resolves an in-flight proactive attempt, weave the
+        # Async-bridge resolution span (spec §4.4 / §5 step 6): when this frame
+        # consumes the outcome that resolves an in-flight proactive attempt, weave the
         # resolution UNDER THE ORIGIN TRACE (raised from the state anchor, NOT this
-        # tick's trace) and stamp ``resolved_at`` on the disposable correlation index
+        # frame's trace) and stamp ``resolved_at`` on the disposable correlation index
         # so retention can eventually reclaim the origin trace. The anchor itself is
         # already cleared in ``changes`` above (durable half); this is the observable
         # + index half. Best-effort, fail-open (§4.2): a bare context skips it.
@@ -401,7 +397,7 @@ class ContactAggregation:
             and ctx.event_ring is not None
         ):
             resolved_at = now.isoformat()
-            verdict_value = resolved_verdict.value if resolved_verdict is not None else None
+            outcome_value = resolved_outcome.value if resolved_outcome is not None else None
             bridge = open_correlated_span(
                 tracer=ctx.tracer,
                 writer=ctx.trace_writer,
@@ -413,11 +409,11 @@ class ContactAggregation:
             )
             bridge.span.set(
                 correlation_id=resolved_correlation,
-                verdict=verdict_value,
+                outcome=outcome_value,
                 resolved_at=resolved_at,
             )
             bridge.logger.info(
-                "proactive_resolution", correlation_id=resolved_correlation, verdict=verdict_value
+                "proactive_resolution", correlation_id=resolved_correlation, outcome=outcome_value
             )
             bridge.span.end(status="ok", ended_at=resolved_at)
             bridge.persist(ended_at=resolved_at)

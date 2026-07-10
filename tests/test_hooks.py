@@ -1,8 +1,11 @@
-"""Tests for :mod:`lifemodel.hooks` — verdict/exchange signal publishing (spec §7.1).
+"""Tests for :mod:`lifemodel.hooks` — the afferent frame boundary (spec §3/§4/§5).
 
-Phase E3: the hooks no longer mutate ``State`` directly — they **publish signals**
-(verdict / exchange) to ``lm.bus``. Producers only enqueue (spec §7.1); the
-aggregation layer (inside ``coreloop.tick()``) consumes them on the next tick.
+The hooks no longer publish to a durable bus: each starts an ExecutionFrame that
+folds the reading into the being's durable state and commits IMMEDIATELY (spec §3).
+``pre_gateway_dispatch`` starts an ``EVENT`` frame carrying ``contact_observed``;
+``post_llm_call`` starts an ``ASYNC_COMPLETION`` frame carrying ``proactive_outcome``.
+Each observer takes a builder that yields a fresh ``LifeModel`` per call so the
+frame loads state fresh under the one state-actor lock.
 """
 
 from __future__ import annotations
@@ -21,21 +24,18 @@ from lifemodel.core.desire_view import (
     encode_contact_desire,
     read_live_contact_desire,
 )
-from lifemodel.core.taxonomy import (
-    KIND_EXCHANGE,
-    KIND_VERDICT,
-    read_verdict,
-    read_verdict_correlation,
-)
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
-from lifemodel.domain.egress import Verdict
 from lifemodel.domain.objects import DesireState
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
 from lifemodel.ports.memory import MemoryPort
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+from lifemodel.testing import FakeClock
 
-_T0 = datetime(2026, 7, 5, 12, 0, tzinfo=UTC)
+#: The fixed frame clock so seeded timestamps (last_tick_at, pending_since) stay
+#: consistent — a real SystemClock would make ``dt`` huge and trip deadline-staleness.
+_NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+_T0 = _NOW
 
 #: A valid W3C traceparent standing in for a launch span's origin anchor — the
 #: async bridge (§4.4) re-binds the outcome under THIS trace_id.
@@ -44,23 +44,25 @@ _ORIGIN_TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
 
 
 def _ring_events(lm: Any, event: str) -> list[dict[str, Any]]:
-    """Every ring record for *event* — the async outcome now fans onto the origin
+    """Every ring record for *event* — the async outcome fans onto the origin
     trace's freshness ring (spec §4.4), self-stamped with its ``trace_id``."""
     return [rec for rec in lm.event_ring.read() if rec.get("event") == event]
 
 
 def _seed_active_desire(store: MemoryPort) -> None:
-    """Persist a live active contact-desire row (the old desire_status="active")."""
+    """Persist a live active contact-desire row."""
     store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
 
 
 def _lm_with_pending(tmp_path: Path, corr: str = "p-1", *, origin: str | None = _ORIGIN_TP) -> Any:
-    lm = build_lifemodel(base_dir=tmp_path)
+    lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
     lm.state.commit(
         State(
+            u=1.5,
             pending_proactive_id=corr,
-            pending_proactive_since="2026-07-06T00:00:00+00:00",
+            pending_proactive_since="2026-07-06T11:55:00+00:00",  # 5 min before now
             pending_proactive_origin_traceparent=origin,
+            last_tick_at=_NOW.isoformat(),  # == now → dt=0, no spurious rise
         )
     )
     _seed_active_desire(lm.state)
@@ -91,11 +93,6 @@ def test_is_no_reply_rejects_prose_mentioning_a_marker() -> None:
 
 
 def test_decline_marker_is_a_member_of_substring_declines() -> None:
-    # Single source of truth (lm-md6.3): the marker the wake-packet INSTRUCTS the being
-    # to reply with to decline must be one the classifier maps to REJECT. The packet's
-    # DECLINE_MARKER is spliced INTO _SUBSTRING_DECLINE_MARKERS (the fail-closed set the
-    # classifier substring-matches, lm-md6.5), and _is_no_reply must reject exactly it —
-    # otherwise an instructed decline leaks to the owner as delivered text.
     from lifemodel.core.wake_packet import DECLINE_MARKER
     from lifemodel.hooks import _SUBSTRING_DECLINE_MARKERS
 
@@ -104,113 +101,102 @@ def test_decline_marker_is_a_member_of_substring_declines() -> None:
 
 
 def test_is_no_reply_failclosed_on_bracketed_marker_wrapped_in_prose() -> None:
-    # The lm-md6.5 fix (KEY): the being decides to stay silent but writes deliberation
-    # prose around the bracketed sentinel. Because [SILENT] is matched as a SUBSTRING
-    # (fail-closed), the whole turn is a decline and is NOT delivered — its private
-    # "I won't write" reasoning no longer leaks to the owner.
     assert _is_no_reply("Not going to nudge them right now. [SILENT]") is True
-    # Case-insensitive: a lowercased bracketed sentinel buried in prose still rejects.
     assert _is_no_reply("I think I will hold back for now. [silent]") is True
-    # Marker first, prose after — position does not matter for a substring match.
     assert _is_no_reply("[SILENT] — staying quiet this time.") is True
 
 
 def test_is_no_reply_does_not_substring_match_bare_words() -> None:
-    # FALSE-POSITIVE GUARD (mandatory, lm-md6.5): the bare words are matched ONLY as a
-    # whole (normalised) response, never as a substring. A genuine message that merely
-    # CONTAINS the word "silent" or the phrase "no reply" must be DELIVERED (not a
-    # decline) — otherwise real prose would be misclassified as silence and dropped.
     assert _is_no_reply("we sat in silent comfort tonight") is False
     assert _is_no_reply("No reply is needed here, I just wanted to say hi.") is False
     assert _is_no_reply("It was a silent, easy kind of evening.") is False
 
 
 def test_is_no_reply_bare_marker_whole_response_still_rejects() -> None:
-    # The exact whole-response path is unchanged (lm-md6.5 keeps it): a bare marker that
-    # IS the entire (normalised) response still maps to REJECT, including the bracketed
-    # sentinel on its own.
     assert _is_no_reply("[SILENT]") is True
     assert _is_no_reply("SILENT") is True
     assert _is_no_reply("NO_REPLY") is True
     assert _is_no_reply("no reply") is True
 
 
-# --- make_post_llm_observer — signal publishing (spec §7.1) ------------------
+# --- make_post_llm_observer — the ASYNC_COMPLETION frame (spec §3/§5) ---------
 
 
-def test_post_llm_publishes_fulfill_verdict_signal(tmp_path: Path) -> None:
+def test_post_llm_sent_resolves_pending_and_starts_action_pending(tmp_path: Path) -> None:
+    # Scenario (5) sent + scenario (7) immediacy: a real text turn is a SENT outcome —
+    # its own async-completion frame commits IMMEDIATELY (no heartbeat): the desire
+    # resolves to satisfied, action_pending/backoff are set, u is NOT satiated.
     lm = _lm_with_pending(tmp_path, corr="p-1")
-    obs = make_post_llm_observer(lm)
-    obs(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
         assistant_response="Hey, hi, I miss you!",
     )
-    signals = lm.bus.peek_unprocessed()
-    verdicts = [s for s in signals if s.kind == KIND_VERDICT]
-    assert len(verdicts) == 1
-    assert read_verdict(verdicts[0]) is Verdict.FULFILL
-    assert read_verdict_correlation(verdicts[0]) == "p-1"
+    final = lm.state.load()
+    assert read_live_contact_desire(lm.state) is None  # desire resolved (satisfied)
+    assert lm.state.get("desire", "contact:owner").state == "satisfied"
+    assert final.pending_proactive_id is None  # turn resolved in its own frame
+    assert final.action_pending_since is not None  # ActionPending inhibition started
+    assert final.proactive_send_log  # backstop counter recorded the send
 
 
-def test_post_llm_publishes_reject_on_silent(tmp_path: Path) -> None:
+def test_post_llm_silent_drops_desire_with_decline_backoff(tmp_path: Path) -> None:
+    # Scenario (5) silent: a [SILENT] turn is a SILENT outcome → the desire is dropped
+    # and a decline backoff is recorded; pending is cleaned; u is not touched.
+    lm = _lm_with_pending(tmp_path, corr="p-2")
+    make_post_llm_observer(lambda: lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} ...", assistant_response="[SILENT]"
+    )
+    final = lm.state.load()
+    assert lm.state.get("desire", "contact:owner").state == "dropped"
+    assert final.decline_count >= 1  # decline backoff applied
+    assert final.declined_at is not None
+    assert final.pending_proactive_id is None
+
+
+def test_post_llm_prose_wrapped_silent_marker_is_silent(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path)
-    obs = make_post_llm_observer(lm)
-    obs(user_message=f"{IMPULSE_LABEL_PREFIX} ...", assistant_response="[SILENT]")
-    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
-    assert read_verdict(verdicts[0]) is Verdict.REJECT
-
-
-def test_post_llm_rejects_prose_wrapped_silent_marker(tmp_path: Path) -> None:
-    # The lm-md6.5 fix END-TO-END: the being decided to stay silent but wrapped the
-    # bracketed sentinel in deliberation prose. Fail-closed substring matching maps the
-    # whole turn to REJECT, so its private "I won't write" reasoning is NOT delivered.
-    lm = _lm_with_pending(tmp_path)
-    obs = make_post_llm_observer(lm)
-    obs(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} ...",
         assistant_response="Not going to nudge them right now. [SILENT]",
     )
-    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
-    assert read_verdict(verdicts[0]) is Verdict.REJECT
+    assert lm.state.get("desire", "contact:owner").state == "dropped"
 
 
-def test_post_llm_delivers_message_mentioning_silent_word(tmp_path: Path) -> None:
-    # FALSE-POSITIVE GUARD END-TO-END (lm-md6.5): a genuine proactive message that
-    # merely contains the bare word "silent" is FULFILLED (delivered) — bare words are
-    # never substring-matched, so real prose is not misclassified as silence and dropped.
+def test_post_llm_message_mentioning_silent_word_is_sent(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path)
-    obs = make_post_llm_observer(lm)
-    obs(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} ...",
         assistant_response="Hey — it's been a silent kind of evening, I miss you.",
     )
-    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
-    assert read_verdict(verdicts[0]) is Verdict.FULFILL
+    assert lm.state.get("desire", "contact:owner").state == "satisfied"
 
 
 def test_post_llm_ignores_uncorrelated_turn(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path)
-    obs = make_post_llm_observer(lm)
-    obs(user_message="just a normal user message", assistant_response="hi")  # not our impulse
-    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT] == []
+    make_post_llm_observer(lambda: lm)(
+        user_message="just a normal user message", assistant_response="hi"
+    )
+    # not our impulse → no frame → the pending turn + desire are untouched
+    assert lm.state.load().pending_proactive_id == "p-1"
+    assert lm.state.get("desire", "contact:owner").state == "active"
 
 
 def test_post_llm_ignores_when_desire_not_active(tmp_path: Path) -> None:
-    lm = build_lifemodel(base_dir=tmp_path)
-    # pending turn but NO live desire row (the old desire_status="none")
-    lm.state.commit(State(pending_proactive_id="p-1"))
-    make_post_llm_observer(lm)(user_message=f"{IMPULSE_LABEL_PREFIX} x", assistant_response="hi")
-    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT] == []
+    lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    # pending turn but NO live desire row
+    lm.state.commit(State(pending_proactive_id="p-1", last_tick_at=_NOW.isoformat()))
+    make_post_llm_observer(lambda: lm)(
+        user_message=f"{IMPULSE_LABEL_PREFIX} x", assistant_response="hi"
+    )
+    assert lm.state.load().pending_proactive_id == "p-1"  # untouched — no active desire
 
 
 # --- §4.4: the resolved outcome, WOVEN UNDER THE LAUNCH'S ORIGIN TRACE -------
 
 
 def test_post_llm_weaves_delivered_outcome_under_origin_trace(tmp_path: Path) -> None:
-    # FULFILL (real text): the outcome lands on the origin trace's ring, self-stamped
-    # with the ORIGIN trace_id (§4.4) — one attempt, one trace_id, not a fresh root.
     lm = _lm_with_pending(tmp_path, corr="p-delivered")
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
         assistant_response="Hey, hi, I miss you!",
     )
@@ -222,10 +208,8 @@ def test_post_llm_weaves_delivered_outcome_under_origin_trace(tmp_path: Path) ->
 
 
 def test_post_llm_weaves_silent_outcome_and_act_gate_silent_suppression(tmp_path: Path) -> None:
-    # REJECT ([SILENT]): the outcome is "silent" AND the 4th suppression reason
-    # (ACT_GATE_SILENT) is emitted UNDER THE ORIGIN TRACE (phase-2 carryover, §4.4).
     lm = _lm_with_pending(tmp_path, corr="p-silent")
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} ...",
         assistant_response="[SILENT]",
     )
@@ -242,16 +226,18 @@ def test_post_llm_weaves_silent_outcome_and_act_gate_silent_suppression(tmp_path
 
 def test_post_llm_does_not_emit_outcome_for_uncorrelated_turn(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path)
-    make_post_llm_observer(lm)(user_message="just a normal user message", assistant_response="hi")
+    make_post_llm_observer(lambda: lm)(
+        user_message="just a normal user message", assistant_response="hi"
+    )
     assert _ring_events(lm, "proactive_outcome") == []
 
 
 def test_post_llm_orphan_async_outcome_when_origin_anchor_missing(tmp_path: Path) -> None:
-    # Miss policy (§4.4, load-bearing): a pending turn whose origin anchor is GONE
-    # emits an explicit ``orphan_async_outcome`` on its OWN trace — NEVER attaching the
-    # outcome to a fresh/foreign trace — while the verdict signal still publishes.
+    # Miss policy (§4.4, load-bearing): a pending turn whose origin anchor is GONE emits
+    # an explicit ``orphan_async_outcome`` on its OWN trace — NEVER attaching the outcome
+    # to a fresh/foreign trace — while the resolution still commits.
     lm = _lm_with_pending(tmp_path, corr="p-orphan", origin=None)
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} ...",
         assistant_response="[SILENT]",
     )
@@ -260,71 +246,41 @@ def test_post_llm_orphan_async_outcome_when_origin_anchor_missing(tmp_path: Path
     assert orphans[0]["correlation_id"] == "p-orphan"
     # The outcome is NOT attached to any (foreign) trace — no proactive_outcome at all.
     assert _ring_events(lm, "proactive_outcome") == []
-    # Control flow is intact: the verdict still resolves the desire next tick.
-    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
-    assert len(verdicts) == 1
-    assert read_verdict(verdicts[0]) is Verdict.REJECT
+    # Control flow is intact: the outcome still resolved the desire in its frame.
+    assert lm.state.get("desire", "contact:owner").state == "dropped"
 
 
-# --- proactive_verdict_detail — durable under the origin trace (bead lm-otq) --
+# --- proactive_outcome_detail — durable under the origin trace (bead lm-otq) --
 
 
-def test_post_llm_emits_verdict_detail_under_origin_with_extra_fields(tmp_path: Path) -> None:
-    # The DEBUG discovery detail is now DURABLE in the trace store under the origin
-    # trace regardless of log level (§4.3, 5th-source collapse) — no ambient gating.
+def test_post_llm_emits_outcome_detail_under_origin_with_extra_fields(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-detail")
-
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
         assistant_response="Hey, hi, I miss you!",
         reasoning="because X",
         model="claude",
     )
-
-    events = _ring_events(lm, "proactive_verdict_detail")
+    events = _ring_events(lm, "proactive_outcome_detail")
     assert len(events) == 1
     fields = events[0]
     assert fields["correlation_id"] == "p-detail"
-    assert fields["verdict"] == "fulfill"
+    assert fields["outcome"] == "sent"
     assert fields["assistant_response"] == "Hey, hi, I miss you!"
     assert fields["extra_fields"]["reasoning"] == "because X"
     assert fields["extra_fields"]["model"] == "claude"
     assert fields["trace_id"] == _ORIGIN_TRACE_ID  # under the launch's trace
 
 
-def test_post_llm_does_not_emit_verdict_detail_for_uncorrelated_turn(tmp_path: Path) -> None:
+def test_post_llm_does_not_emit_outcome_detail_for_uncorrelated_turn(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-uncorrelated")
-
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message="just a normal user message",  # not our impulse -> gate short-circuits
         assistant_response="hi",
         reasoning="because X",
     )
-
-    assert _ring_events(lm, "proactive_verdict_detail") == []
+    assert _ring_events(lm, "proactive_outcome_detail") == []
     assert _ring_events(lm, "proactive_outcome") == []
-
-
-def test_post_llm_verdict_detail_does_not_change_signal_or_outcome(tmp_path: Path) -> None:
-    # Regression: the discovery detail must not disturb the verdict signal publish
-    # or the proactive_outcome record.
-    lm = _lm_with_pending(tmp_path, corr="p-regress")
-
-    make_post_llm_observer(lm)(
-        user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
-        assistant_response="Hey, hi, I miss you!",
-        reasoning="because X",
-    )
-
-    verdicts = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_VERDICT]
-    assert len(verdicts) == 1
-    assert read_verdict(verdicts[0]) is Verdict.FULFILL
-    assert read_verdict_correlation(verdicts[0]) == "p-regress"
-
-    outcomes = _ring_events(lm, "proactive_outcome")
-    assert len(outcomes) == 1
-    assert outcomes[0]["outcome"] == "delivered"
-    assert outcomes[0]["correlation_id"] == "p-regress"
 
 
 # --- proactive_reasoning — durable under the origin trace (bead lm-otq step 2) --
@@ -332,9 +288,6 @@ def test_post_llm_verdict_detail_does_not_change_signal_or_outcome(tmp_path: Pat
 
 def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-reason")
-
-    # Longer than the old 800-char truncation cap, but within the new 4000-char
-    # generous cap — proves this event is untruncated relative to the old one.
     long_reasoning = "Sasha asks about a markdown editor... " + ("x" * 2000)
     history = [
         {"role": "user", "content": "hi"},
@@ -352,29 +305,24 @@ def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(tmp_path:
             "reasoning": long_reasoning,
         },
     ]
-
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
         assistant_response="Hey, hi!",
         conversation_history=history,
     )
-
     events = _ring_events(lm, "proactive_reasoning")
     assert len(events) == 1
     fields = events[0]
     assert fields["correlation_id"] == "p-reason"
     assert fields["message_count"] == 3
-    assert fields["trace_id"] == _ORIGIN_TRACE_ID  # under the launch's trace
+    assert fields["trace_id"] == _ORIGIN_TRACE_ID
     messages = fields["messages"]
     assert len(messages) == 3
-
     last = messages[-1]
     assert last["role"] == "assistant"
     assert last["finish_reason"] == "stop"
-    # untruncated (well beyond any short-preview cap like 800 chars)
     assert last["reasoning"] == long_reasoning
     assert len(last["reasoning"]) > 800
-
     tool_msg = messages[1]
     assert tool_msg["has_tool_calls"] is True
     assert "search_session_history" in tool_msg["tool_call_names"]
@@ -383,13 +331,10 @@ def test_post_llm_emits_proactive_reasoning_with_untruncated_reasoning(tmp_path:
 
 def test_post_llm_proactive_reasoning_unavailable_when_history_missing(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-nohistory")
-
-    # No conversation_history kwarg at all — must not raise.
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
         assistant_response="Hey, hi!",
     )
-
     events = _ring_events(lm, "proactive_reasoning")
     assert len(events) == 1
     assert events[0]["available"] is False
@@ -397,13 +342,11 @@ def test_post_llm_proactive_reasoning_unavailable_when_history_missing(tmp_path:
 
 def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-badtype")
-
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} a pull inside...",
         assistant_response="Hey, hi!",
         conversation_history="not-a-list",
     )
-
     events = _ring_events(lm, "proactive_reasoning")
     assert len(events) == 1
     assert events[0]["available"] is False
@@ -411,71 +354,61 @@ def test_post_llm_proactive_reasoning_unavailable_when_history_not_a_list(tmp_pa
 
 def test_post_llm_does_not_emit_proactive_reasoning_for_uncorrelated_turn(tmp_path: Path) -> None:
     lm = _lm_with_pending(tmp_path, corr="p-uncorrelated2")
-
-    make_post_llm_observer(lm)(
+    make_post_llm_observer(lambda: lm)(
         user_message="just a normal user message",  # not our impulse -> gate short-circuits
         assistant_response="hi",
         conversation_history=[{"role": "assistant", "reasoning": "irrelevant"}],
     )
-
     assert _ring_events(lm, "proactive_reasoning") == []
 
 
-# --- make_inbound_observer — signal publishing (spec §7.1) ------------------
+# --- make_inbound_observer — the EVENT frame (spec §3/§4) --------------------
 
 
-def test_inbound_publishes_exchange_signal(tmp_path: Path) -> None:
-    lm = build_lifemodel(base_dir=tmp_path)
+def test_inbound_contact_satiates_drive_and_stamps_last_exchange(tmp_path: Path) -> None:
+    # Scenario (1): a real inbound contact_observed satiates u, sets last_exchange_at,
+    # and resolves any pending desire → SATISFIED — committed in its own EVENT frame.
+    lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    _seed_active_desire(lm.state)
     event = SimpleNamespace(text="hi!", internal=False, id="m-42")
-    make_inbound_observer(lm)(event=event)
-    exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
-    assert len(exchanges) == 1
+    make_inbound_observer(lambda: lm)(event=event)
+    final = lm.state.load()
+    assert final.u < 2.0  # drive satiated by the genuine two_way contact
+    assert final.last_exchange_at is not None
+    assert lm.state.get("desire", "contact:owner").state == "satisfied"
 
 
 def test_inbound_ignores_internal_and_own_impulse(tmp_path: Path) -> None:
-    lm = build_lifemodel(base_dir=tmp_path)
-    make_inbound_observer(lm)(event=SimpleNamespace(text="x", internal=True, id="a"))
-    make_inbound_observer(lm)(
+    lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    make_inbound_observer(lambda: lm)(event=SimpleNamespace(text="x", internal=True, id="a"))
+    make_inbound_observer(lambda: lm)(
         event=SimpleNamespace(text=f"{IMPULSE_LABEL_PREFIX} own", internal=False, id="b")
     )
-    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE] == []
+    # neither started a frame → u untouched, no exchange recorded
+    final = lm.state.load()
+    assert final.u == 2.0
+    assert final.last_exchange_at is None
 
 
-def test_inbound_ignores_own_lifemodel_force_wake_command(tmp_path: Path) -> None:
-    lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="/lifemodel force-wake", internal=False, id="m-1")
-    make_inbound_observer(lm)(event=event)
-    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE] == []
+@pytest.mark.parametrize("text", ["/new", "/model", "/commands", "/lifemodel force-wake"])
+def test_inbound_control_command_is_not_contact_sensor_bandpass(tmp_path: Path, text: str) -> None:
+    # Scenario (2): a slash/control command is filtered at the sensor band-pass (spec §4)
+    # — it must NOT count as contact, so no frame runs and u is untouched.
+    lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    make_inbound_observer(lambda: lm)(event=SimpleNamespace(text=text, internal=False, id="m-4"))
+    final = lm.state.load()
+    assert final.u == 2.0  # unchanged — the command was not contact
+    assert final.last_exchange_at is None
 
 
-def test_inbound_ignores_own_lifemodel_debug_command(tmp_path: Path) -> None:
-    lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="/lifemodel debug", internal=False, id="m-2")
-    make_inbound_observer(lm)(event=event)
-    assert [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE] == []
-
-
-def test_inbound_still_publishes_exchange_for_normal_chat_message(tmp_path: Path) -> None:
-    lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text="hi", internal=False, id="m-3")
-    make_inbound_observer(lm)(event=event)
-    exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
-    assert len(exchanges) == 1
-
-
-@pytest.mark.parametrize(
-    "text",
-    ["/new", "/model", "/commands", "/lifemodel debug"],
-)
-def test_inbound_ignores_any_slash_command(tmp_path: Path, text: str) -> None:
-    # Owner's decision (lm-ia3): operating the tool via a slash/control command
-    # is not conversing with the being — no slash-prefixed message, regardless
-    # of which command, counts as a genuine two-way exchange.
-    lm = build_lifemodel(base_dir=tmp_path)
-    event = SimpleNamespace(text=text, internal=False, id="m-4")
-    make_inbound_observer(lm)(event=event)
-    exchanges = [s for s in lm.bus.peek_unprocessed() if s.kind == KIND_EXCHANGE]
-    assert exchanges == []
+def test_inbound_normal_chat_message_is_contact(tmp_path: Path) -> None:
+    lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    make_inbound_observer(lambda: lm)(event=SimpleNamespace(text="hi", internal=False, id="m-3"))
+    assert lm.state.load().last_exchange_at is not None  # a genuine exchange was recorded
 
 
 # --- register(ctx) wiring smoke test ------------------------------------------
@@ -509,21 +442,18 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     matches = [cb for name, cb in ctx.hooks if name == "post_llm_call"]
     assert len(matches) == 1
 
-    # The registered callback publishes a verdict signal (not state mutation).
+    # The registered callback starts a frame that RESOLVES the pending desire.
     sdir = tmp_path / "workspace" / "lifemodel"
     store = SQLiteRuntimeStore(sdir, clock=SystemClock())
-    pending_state = State(pending_proactive_id="p1", last_tick_at=_T0.isoformat())
-    store.commit(pending_state)
-    _seed_active_desire(store)  # a live desire so the verdict gate passes
+    store.commit(State(pending_proactive_id="p1", last_tick_at=_T0.isoformat()))
+    _seed_active_desire(store)  # a live desire so the outcome gate passes
 
-    matches[0](
-        user_message=f"{IMPULSE_LABEL_PREFIX} impulse text",
-        assistant_response="NO_REPLY",
-    )
+    matches[0](user_message=f"{IMPULSE_LABEL_PREFIX} impulse text", assistant_response="NO_REPLY")
 
-    # Neither State nor the desire row is mutated — the hook only publishes a signal.
+    # The desire was resolved (dropped, silent) — the hook committed via its frame.
     desire = read_live_contact_desire(store)
-    assert desire is not None and desire.state == "active"  # unchanged — published, not applied
+    assert desire is None  # resolved
+    assert store.get("desire", "contact:owner").state == "dropped"
 
 
 def test_register_wires_pre_gateway_dispatch_hook(
@@ -540,14 +470,15 @@ def test_register_wires_pre_gateway_dispatch_hook(
     matches = [cb for name, cb in ctx.hooks if name == "pre_gateway_dispatch"]
     assert len(matches) == 1
 
-    # Genuinely wired: a real inbound message publishes an exchange signal.
+    # Genuinely wired: a real inbound message starts a frame that satiates the drive.
+    # The live path uses the real SystemClock, so anchor last_tick_at at ~now (dt≈0)
+    # to keep the drive's elapsed-silence rise negligible against the satiation.
     sdir = tmp_path / "workspace" / "lifemodel"
     store = SQLiteRuntimeStore(sdir, clock=SystemClock())
-    store.commit(State(u=50.0, last_tick_at=_T0.isoformat()))
+    store.commit(State(u=50.0, last_tick_at=datetime.now(UTC).isoformat()))
 
     matches[0](event=SimpleNamespace(text="hey there", internal=False, id="m-1"))
 
-    # State is NOT mutated — the hook only publishes an exchange signal.
     persisted = store.load()
-    assert persisted.last_exchange_at is None  # unchanged
-    assert persisted.u == 50.0  # unchanged
+    assert persisted.last_exchange_at is not None  # the exchange was recorded
+    assert persisted.u < 50.0  # the drive was satiated by the contact

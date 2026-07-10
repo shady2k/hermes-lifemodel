@@ -2,8 +2,8 @@
 
 A component is anything the CoreLoop schedules on a tick — a neuron, an
 aggregation stage, the personality, cognition. It reads an immutable
-:class:`TickContext` (state snapshot + clock + bus) and returns intents; it
-never mutates state. Kept deliberately minimal so every layer can implement it.
+:class:`TickContext` (state snapshot + clock + the frame's signals) and returns
+intents; it never mutates state. Kept minimal so every layer can implement it.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .intents import Intent
 from .metrics import MetricRegistry
 from .observer import ComponentObserver
-from .signal_bus import SignalBus
 
 
 class ComponentLayer(StrEnum):
@@ -91,7 +90,6 @@ class TickContext:
 
     state: State
     now: datetime
-    bus: SignalBus
     #: THE component's active execution span's W3C ids (spec §5) — set by the
     #: CoreLoop to the CHILD span it minted for this component (parented on the
     #: tick's root), so a creation site stamps the born object's provenance with
