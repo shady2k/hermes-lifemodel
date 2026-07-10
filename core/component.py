@@ -23,6 +23,7 @@ from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .intents import Intent
 from .metrics import MetricRegistry
+from .observer import ComponentObserver
 from .signal_bus import SignalBus
 
 
@@ -126,6 +127,14 @@ class TickContext:
     #: into ``lifemodel_suppressions_total``. ``None`` in a bare unit-test context
     #: (no harness) — the choke-point then simply records no metric.
     metrics: MetricRegistry | None = None
+    #: THIS component's domain-metric channel (telemetry-core §4.3), set by the
+    #: CoreLoop to a :class:`~lifemodel.core.observer.ComponentObserver` bound to the
+    #: component's DECLARED ``metric_surface`` + the shared registry. A component
+    #: publishes the metrics only IT knows (a drive level, token counts) through it —
+    #: ``ctx.observe.set(name, value)`` — fail-open: a metric outside its surface is a
+    #: counted no-op, never a tick crash. ``None`` in a bare unit-test context (no
+    #: graph): a component guards ``if ctx.observe is not None`` and skips emission.
+    observe: ComponentObserver | None = None
 
 
 @runtime_checkable

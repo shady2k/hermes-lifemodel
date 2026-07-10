@@ -64,12 +64,12 @@ from .core.cognition import CognitionLauncher
 from .core.component import layer_for_type
 from .core.contact_neuron import PresenceNeuron
 from .core.coreloop import CoreLoop
-from .core.metrics import MetricRegistry, get_metric_registry
+from .core.metrics import MetricRegistry, MetricSpec, get_metric_registry
 from .core.neuron import Neuron
 from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.signal_bus import SignalBus
-from .core.solitude_drive import SolitudeDrive
+from .core.solitude_drive import CONTACT_DRIVE_U_SPEC, SolitudeDrive
 from .core.state_actor import StateActor
 from .domain.objects import default_registry
 from .events import EventRing
@@ -142,22 +142,27 @@ class LifeModel:
 
 
 def _component_manifest(
-    component_id: str, component_type: str, *, accepts_signals: bool
+    component_id: str,
+    component_type: str,
+    *,
+    accepts_signals: bool,
+    metric_surface: Sequence[MetricSpec | str] = (),
 ) -> ComponentManifest:
     """A registered component's manifest, telemetry contract included (§3).
 
     Its ``layer`` derives from ``component_type`` via
     :func:`~lifemodel.core.component.layer_for_type` (an unmapped type yields
     ``None`` and :meth:`ComponentRegistry.register` then rejects it fail-fast).
-    ``metric_surface`` is declared EMPTY: bead 7.3 wires no domain metrics yet
-    (instrumentation is beads 7.4/7.5), but the invariant requires every component
-    to *declare* its surface, empty or not.
+    ``metric_surface`` DECLARES the domain metrics the component emits through
+    ``ctx.observe`` (bead 7.5) — empty for most, but the invariant requires every
+    component to *declare* it either way; the CoreLoop then registers those specs
+    into the shared registry so the emissions land on a real metric.
     """
     return ComponentManifest(
         id=component_id,
         type=component_type,
         layer=layer_for_type(component_type),
-        metric_surface=(),
+        metric_surface=metric_surface,
         accepts_signals=accepts_signals,
     )
 
@@ -279,7 +284,15 @@ def build_lifemodel(
         # signal, since the drive's UpdateState is only visible after commit).
         drive = SolitudeDrive(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
         resolved_registry.register(
-            drive, _component_manifest(drive.id, "drive", accepts_signals=True)
+            drive,
+            # The first live domain metric (§4.3): the drive publishes its integrated
+            # contact level u through ctx.observe, so it DECLARES that spec here.
+            _component_manifest(
+                drive.id,
+                "drive",
+                accepts_signals=True,
+                metric_surface=(CONTACT_DRIVE_U_SPEC,),
+            ),
         )
     try:
         resolved_registry.manifest("contact-aggregation")

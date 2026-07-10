@@ -24,7 +24,21 @@ from collections.abc import Sequence
 from ..sim.drive import Drive
 from .component import TickContext
 from .intents import EmitSignal, Intent, UpdateState
+from .metrics import MetricSpec
 from .taxonomy import contact_pressure_signal, read_contact_presence
+
+#: The being's current contact-solitude drive level ``u`` — the first live domain
+#: metric emitted through ``ctx.observe`` (telemetry-core §4.3). This is genuine
+#: component knowledge (the integrated deficit only the drive owns), NOT something
+#: the harness can snap from outside. Declared in the drive's ``metric_surface``
+#: (composition root) so the registry knows it and the surface check admits it.
+CONTACT_DRIVE_U = "lifemodel_contact_drive_u"
+CONTACT_DRIVE_U_SPEC = MetricSpec(
+    name=CONTACT_DRIVE_U,
+    kind="gauge",
+    unit="",
+    help="The being's current contact-solitude drive level u (SolitudeDrive).",
+)
 
 
 class SolitudeDrive:
@@ -56,6 +70,10 @@ class SolitudeDrive:
             drive.satiate(q=q)
 
         delta = drive.u - ctx.state.u
+        # Publish the freshly integrated drive level as a domain metric (§4.3). Guard
+        # on the channel: a bare unit-test context (no graph) carries observe=None.
+        if ctx.observe is not None:
+            ctx.observe.set(CONTACT_DRIVE_U, drive.u)
         emit = contact_pressure_signal(
             origin_id=f"contact-pressure-{ctx.now.isoformat()}",
             value=drive.u,

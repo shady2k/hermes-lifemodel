@@ -44,8 +44,9 @@ from .intents import (
     TransitionRecord,
     UpdateState,
 )
-from .metrics import MetricRegistry
-from .registry import ComponentRegistry, UnknownComponent
+from .metrics import MetricRegistry, MetricSpec
+from .observer import ComponentObserver
+from .registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .signal_bus import SignalBus
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
@@ -148,6 +149,12 @@ class CoreLoop:
         # a fresh graph is built every tick), then emitted fail-open on the hot path.
         self._metrics = metrics if metrics is not None else MetricRegistry()
         register_universal_metrics(self._metrics)
+        # Declare every component's DOMAIN metric surface into the same registry
+        # (telemetry-core §4.3): a spec a component emits through ``ctx.observe`` must
+        # exist here first, else the emission fails open as an unknown metric. Fail-fast
+        # on a malformed spec, idempotent for an identical one — a fresh graph is built
+        # every tick, so this re-runs harmlessly.
+        self._register_surface_metrics()
 
     def _span_logger(self, span: ActiveSpan) -> SpanLogger:
         """A :class:`SpanLogger` bound to *span* over this loop's writer + ring."""
@@ -272,7 +279,12 @@ class CoreLoop:
             child_ctx = self._tracer.child_of(root)
             span = start_span(child_ctx, component=component.id, tick=tick_no, started_at=started)
             logger = self._span_logger(span)
-            layer = self._component_layer(component.id)
+            manifest = self._manifest_or_none(component.id)
+            layer = (
+                manifest.layer.value
+                if manifest is not None and manifest.layer is not None
+                else "other"
+            )
             ctx = TickContext(
                 state=state,
                 now=now,
@@ -286,6 +298,12 @@ class CoreLoop:
                 # emits its suppression through the choke-point with this, so an
                 # in-tick gate's suppression is counted like any other.
                 metrics=self._metrics,
+                # THIS component's domain-metric channel (telemetry-core §4.3): bound
+                # to its DECLARED metric_surface, so ``ctx.observe`` can only emit what
+                # the component said it would — anything else is a counted no-op.
+                observe=ComponentObserver.bind(
+                    self._metrics, manifest.metric_surface if manifest is not None else ()
+                ),
                 # The async-bridge emit trio (spec §4.4): a component can weave an
                 # out-of-band span onto a FOREIGN origin trace (aggregation resolving
                 # a proactive attempt under its launch trace) through the SAME sinks.
@@ -388,14 +406,28 @@ class CoreLoop:
 
     # ---- universal-metric emission (telemetry-core §4.2) ---------------- #
 
-    def _component_layer(self, component_id: str) -> str:
-        """The low-cardinality ``layer`` label for *component_id* (``"other"`` if
-        somehow unregistered — register() guarantees a non-``None`` layer)."""
+    def _manifest_or_none(self, component_id: str) -> ComponentManifest | None:
+        """This component's manifest, or ``None`` if somehow unregistered.
+
+        The one lookup the per-component loop needs for both the low-cardinality
+        ``layer`` label and the observer's declared ``metric_surface`` (register()
+        guarantees a registered component has a non-``None`` layer)."""
         try:
-            manifest = self._registry.manifest(component_id)
+            return self._registry.manifest(component_id)
         except UnknownComponent:
-            return "other"
-        return manifest.layer.value if manifest.layer is not None else "other"
+            return None
+
+    def _register_surface_metrics(self) -> None:
+        """Declare every registered component's domain ``metric_surface`` specs into
+        the shared registry (telemetry-core §4.3).
+
+        Only full :class:`~lifemodel.core.metrics.MetricSpec` entries can be declared;
+        a bare-name entry references a metric declared elsewhere. Registration is
+        fail-fast on a malformed spec and idempotent for an identical one."""
+        for manifest in self._registry.manifests():
+            for entry in manifest.metric_surface or ():
+                if isinstance(entry, MetricSpec):
+                    self._metrics.register(entry)
 
     def _emit_component_run(self, component_id: str, layer: str, status: str, dt: float) -> None:
         """Count one component run by derived status + record its real duration."""
