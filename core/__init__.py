@@ -17,7 +17,13 @@ from .aggregator import Aggregator, SilentAggregator
 from .backstop import allow_send, record_send
 from .circadian import circadian
 from .cognition import CognitionLauncher
-from .component import Component, TickContext
+from .component import (
+    LAYER_BY_TYPE,
+    Component,
+    ComponentLayer,
+    TickContext,
+    layer_for_type,
+)
 from .contact_neuron import PresenceNeuron
 from .coreloop import CoreLoop, TickReport
 from .energy import Reservation, can_afford, cost_real, reserve, settle
@@ -33,6 +39,7 @@ from .registry import (
     ComponentManifest,
     ComponentRegistry,
     DuplicateComponent,
+    IncompleteManifest,
     UnknownComponent,
 )
 from .signal_bus import SignalBus
@@ -81,9 +88,13 @@ __all__ = [
     "can_afford",
     "circadian",
     "Component",
+    "ComponentLayer",
     "CognitionLauncher",
     "cost_real",
     "ComponentManifest",
+    "IncompleteManifest",
+    "LAYER_BY_TYPE",
+    "layer_for_type",
     "ContactAggregation",
     "ContactPresenceReading",
     "PresenceNeuron",

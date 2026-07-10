@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from lifemodel.adapters.signal_bus import FileSignalBus
-from lifemodel.core.component import TickContext
+from lifemodel.core.component import TickContext, layer_for_type
 from lifemodel.core.coreloop import CoreLoop, TickReport
 from lifemodel.core.intents import EmitSignal, Intent, LaunchProactive, UpdateState
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
@@ -123,7 +123,12 @@ def _loop(
 
 def test_healthy_component_intents_reach_state_and_tick_bumps(tmp_path) -> None:
     reg = ComponentRegistry()
-    reg.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    reg.register(
+        Healthy(),
+        ComponentManifest(
+            id="healthy", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     store = RecordingStore()
     loop = _loop(reg, store, FileSignalBus(tmp_path))
     report = loop.tick()
@@ -137,7 +142,12 @@ def test_healthy_component_intents_reach_state_and_tick_bumps(tmp_path) -> None:
 def test_emit_signal_is_transient_not_durable(tmp_path) -> None:
     # EmitSignal threads to later components in-tick; it is NOT written to the bus.
     reg = ComponentRegistry()
-    reg.register(ContactEmitter(), ComponentManifest(id="emitter", type="neuron"))
+    reg.register(
+        ContactEmitter(),
+        ComponentManifest(
+            id="emitter", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     bus = FileSignalBus(tmp_path)
     loop = _loop(reg, RecordingStore(), bus)
     loop.tick()
@@ -147,8 +157,18 @@ def test_emit_signal_is_transient_not_durable(tmp_path) -> None:
 def test_later_component_sees_earlier_components_emitted_signal(tmp_path) -> None:
     reg = ComponentRegistry()
     seen = SeenRecorder()
-    reg.register(ContactEmitter(), ComponentManifest(id="emitter", type="neuron"))
-    reg.register(seen, ComponentManifest(id="seen", type="aggregation"))
+    reg.register(
+        ContactEmitter(),
+        ComponentManifest(
+            id="emitter", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
+    reg.register(
+        seen,
+        ComponentManifest(
+            id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
+        ),
+    )
     loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path))
     loop.tick()
     assert "c-tick" in seen.seen  # aggregation saw the neuron's transient contact signal
@@ -157,7 +177,12 @@ def test_later_component_sees_earlier_components_emitted_signal(tmp_path) -> Non
 def test_durable_inbound_signal_is_consumed_once_and_threaded(tmp_path) -> None:
     reg = ComponentRegistry()
     seen = SeenRecorder()
-    reg.register(seen, ComponentManifest(id="seen", type="aggregation"))
+    reg.register(
+        seen,
+        ComponentManifest(
+            id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
+        ),
+    )
     bus = FileSignalBus(tmp_path)
     bus.publish(
         Signal(origin_id="ext-1", kind="exchange", payload={"actor": "user", "label": "two_way"})
@@ -173,8 +198,18 @@ def test_durable_inbound_signal_is_consumed_once_and_threaded(tmp_path) -> None:
 def test_failing_component_is_isolated_and_others_still_run(tmp_path) -> None:
     reg = ComponentRegistry()
     healthy = Healthy()
-    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
-    reg.register(healthy, ComponentManifest(id="healthy", type="neuron"))
+    reg.register(
+        Broken(),
+        ComponentManifest(
+            id="broken", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
+    reg.register(
+        healthy,
+        ComponentManifest(
+            id="healthy", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     store = RecordingStore()
     loop = _loop(reg, store, FileSignalBus(tmp_path))
     report = loop.tick()  # must not raise
@@ -187,7 +222,12 @@ def test_failing_component_is_isolated_and_others_still_run(tmp_path) -> None:
 def test_repeated_failures_open_breaker_and_skip_component(tmp_path) -> None:
     reg = ComponentRegistry()
     broken = Broken()
-    reg.register(broken, ComponentManifest(id="broken", type="neuron"))
+    reg.register(
+        broken,
+        ComponentManifest(
+            id="broken", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path), breaker_threshold=3)
     for _ in range(3):
         loop.tick()
@@ -213,7 +253,12 @@ def test_coreloop_bounds_a_flood_and_survives(tmp_path) -> None:
 
     reg = ComponentRegistry()
     seen = SeenRecorder()
-    reg.register(seen, ComponentManifest(id="seen", type="aggregation"))
+    reg.register(
+        seen,
+        ComponentManifest(
+            id="seen", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
+        ),
+    )
     bus = FileSignalBus(tmp_path)
     for i in range(1000):
         bus.publish(
@@ -254,7 +299,12 @@ class Launcher:
 
 def test_launch_proactive_is_surfaced_in_report(tmp_path) -> None:
     reg = ComponentRegistry()
-    reg.register(Launcher(), ComponentManifest(id="launcher", type="cognition"))
+    reg.register(
+        Launcher(),
+        ComponentManifest(
+            id="launcher", type="cognition", layer=layer_for_type("cognition"), metric_surface=()
+        ),
+    )
     loop = _loop(reg, RecordingStore(), FileSignalBus(tmp_path))
     report = loop.tick()
     assert len(report.launches) == 1
@@ -307,8 +357,16 @@ def test_tick_context_snapshot_populated_once_and_shared(tmp_path) -> None:
     mem = _seeded_memory()
     reg = ComponentRegistry()
     a, b = SnapshotRecorder("a"), SnapshotRecorder("b")
-    reg.register(a, ComponentManifest(id="a", type="neuron"))
-    reg.register(b, ComponentManifest(id="b", type="aggregation"))
+    reg.register(
+        a,
+        ComponentManifest(id="a", type="neuron", layer=layer_for_type("neuron"), metric_surface=()),
+    )
+    reg.register(
+        b,
+        ComponentManifest(
+            id="b", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
+        ),
+    )
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -336,7 +394,12 @@ def test_snapshot_includes_deferred_not_only_active(tmp_path) -> None:
     mem.put(MemoryDraft(kind="desire", id="x", state="satisfied", payload={}, source="t"))
     rec = SnapshotRecorder("only")
     reg = ComponentRegistry()
-    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="only", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -364,7 +427,12 @@ def test_snapshot_includes_parked_thought_and_pending_intention(tmp_path) -> Non
     mem.put(MemoryDraft(kind="thought", id="t-dropped", state="dropped", payload={}, source="t"))
     rec = SnapshotRecorder("only")
     reg = ComponentRegistry()
-    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="only", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -387,7 +455,12 @@ def test_default_snapshot_stays_active_and_deferred_only(tmp_path) -> None:
     mem.put(MemoryDraft(kind="desire", id="d-active", state="active", payload={}, source="t"))
     rec = SnapshotRecorder("only")
     reg = ComponentRegistry()
-    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="only", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -403,7 +476,12 @@ def test_tick_context_snapshot_read_exactly_once_per_tick(tmp_path) -> None:
     counting = CountingMemory(_seeded_memory())
     reg = ComponentRegistry()
     for cid in ("a", "b", "c"):
-        reg.register(SnapshotRecorder(cid), ComponentManifest(id=cid, type="neuron"))
+        reg.register(
+            SnapshotRecorder(cid),
+            ComponentManifest(
+                id=cid, type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+            ),
+        )
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -423,7 +501,12 @@ def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
     # A tick with snapshot ports commits exactly the same bookkeeping bump as one
     # without — no component consumes the snapshot yet (behavior-neutral).
     reg_with = ComponentRegistry()
-    reg_with.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    reg_with.register(
+        Healthy(),
+        ComponentManifest(
+            id="healthy", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     store_with = RecordingStore()
     mem = _seeded_memory()
     CoreLoop(
@@ -437,7 +520,12 @@ def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
     ).tick()
 
     reg_without = ComponentRegistry()
-    reg_without.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    reg_without.register(
+        Healthy(),
+        ComponentManifest(
+            id="healthy", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     store_without = RecordingStore()
     _loop(reg_without, store_without, FileSignalBus(tmp_path / "without")).tick()
 
@@ -447,7 +535,12 @@ def test_snapshot_reads_do_not_change_tick_output(tmp_path) -> None:
 def test_tick_context_snapshot_defaults_empty_without_ports(tmp_path) -> None:
     reg = ComponentRegistry()
     rec = SnapshotRecorder("only")
-    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="only", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     _loop(reg, RecordingStore(), FileSignalBus(tmp_path)).tick()
     assert rec.pressure == PressureIndex()
     assert rec.objects == ()
@@ -466,7 +559,12 @@ def test_objects_snapshot_read_is_fail_soft(tmp_path) -> None:
     # neutral: the tick proceeds, degrading to an empty snapshot.
     reg = ComponentRegistry()
     rec = SnapshotRecorder("only")
-    reg.register(rec, ComponentManifest(id="only", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="only", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     store = RecordingStore()
     loop = CoreLoop(
         registry=reg,
@@ -560,7 +658,12 @@ def test_component_runs_in_a_child_span_of_the_tick_root(tmp_path) -> None:
     # component's logs bind to it.
     reg = ComponentRegistry()
     rec = TraceRecorder()
-    reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="trace-rec", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -589,8 +692,18 @@ def test_every_component_gets_a_distinct_child_span(tmp_path) -> None:
     rec_b = TraceRecorder()
     rec_a.id = "trace-a"
     rec_b.id = "trace-b"
-    reg.register(rec_a, ComponentManifest(id="trace-a", type="neuron"))
-    reg.register(rec_b, ComponentManifest(id="trace-b", type="aggregation"))
+    reg.register(
+        rec_a,
+        ComponentManifest(
+            id="trace-a", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
+    reg.register(
+        rec_b,
+        ComponentManifest(
+            id="trace-b", type="aggregation", layer=layer_for_type("aggregation"), metric_surface=()
+        ),
+    )
     CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -624,7 +737,12 @@ def test_each_tick_gets_a_fresh_trace(tmp_path) -> None:
 
     reg = ComponentRegistry()
     rec = TraceRecorder()
-    reg.register(rec, ComponentManifest(id="trace-rec", type="neuron"))
+    reg.register(
+        rec,
+        ComponentManifest(
+            id="trace-rec", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     loop = CoreLoop(
         registry=reg,
         state_actor=StateActor(RecordingStore()),
@@ -645,7 +763,12 @@ def test_component_failure_is_a_suppression_span_under_the_child_span(tmp_path) 
     # ids (not the tick root) so the span tree records WHICH component faulted. A
     # log without an active span never appears — the SpanLogger stamps it.
     reg = ComponentRegistry()
-    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
+    reg.register(
+        Broken(),
+        ComponentManifest(
+            id="broken", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     sink = _CapturingSink()
     loop = CoreLoop(
         registry=reg,
@@ -737,8 +860,18 @@ def test_every_persisted_span_closes_after_it_started(tmp_path) -> None:
     # and the tick root — are exercised. Before the fix every span was closed with
     # started_at (ended_at == started_at) and latency histograms read empty.
     reg = ComponentRegistry()
-    reg.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
-    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
+    reg.register(
+        Healthy(),
+        ComponentManifest(
+            id="healthy", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
+    reg.register(
+        Broken(),
+        ComponentManifest(
+            id="broken", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     sink = _TimingSink()
     loop = CoreLoop(
         registry=reg,
@@ -765,7 +898,12 @@ def test_component_failure_span_row_is_failed_and_parented_on_root(tmp_path) -> 
     # tick root — the durable span tree makes "which component faulted, under which
     # tick" answerable from ``trace_spans`` alone.
     reg = ComponentRegistry()
-    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
+    reg.register(
+        Broken(),
+        ComponentManifest(
+            id="broken", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     sink = _CapturingSink()
     CoreLoop(
         registry=reg,

@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from lifemodel.core.component import TickContext
+from lifemodel.core.component import ComponentLayer, TickContext
 from lifemodel.core.intents import Intent
 from lifemodel.core.registry import (
     ComponentManifest,
@@ -23,7 +23,13 @@ class Stub:
 
 
 def _manifest(cid: str, *, enabled: bool = True) -> ComponentManifest:
-    return ComponentManifest(id=cid, type="neuron", enabled=enabled)
+    return ComponentManifest(
+        id=cid,
+        type="neuron",
+        enabled=enabled,
+        layer=ComponentLayer.AUTONOMIC,
+        metric_surface=(),
+    )
 
 
 def test_register_then_enabled_returns_in_registration_order() -> None:

@@ -19,7 +19,7 @@ from lifemodel.adapters.trace_export import (
     OtelTraceExporter,
     make_trace_exporter,
 )
-from lifemodel.core.component import TickContext
+from lifemodel.core.component import TickContext, layer_for_type
 from lifemodel.core.coreloop import CoreLoop, TickReport
 from lifemodel.core.intents import Intent, UpdateState
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
@@ -149,7 +149,12 @@ def test_coreloop_swallows_a_failing_exporter(tmp_path) -> None:
     from lifemodel.adapters.signal_bus import FileSignalBus
 
     reg = ComponentRegistry()
-    reg.register(_Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    reg.register(
+        _Healthy(),
+        ComponentManifest(
+            id="healthy", type="neuron", layer=layer_for_type("neuron"), metric_surface=()
+        ),
+    )
     store = _RecordingStore()
     loop = CoreLoop(
         registry=reg,

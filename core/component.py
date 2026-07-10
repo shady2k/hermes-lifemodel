@@ -11,7 +11,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from enum import StrEnum
+from typing import Final, Protocol, runtime_checkable
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
@@ -22,6 +23,57 @@ from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .intents import Intent
 from .signal_bus import SignalBus
+
+
+class ComponentLayer(StrEnum):
+    """The CLOSED architectural layer a component belongs to (telemetry-core §4.2).
+
+    The being's brain runs ``AUTONOMIC → AGGREGATION → COGNITION`` (HLA §1); an
+    :data:`INFRA` layer names the out-of-band operational components (proactive
+    egress, the trace writer) that are not a brain stage. This is the low-cardinality
+    ``layer`` label carried by every component/tick metric — a :class:`~enum.StrEnum`
+    so a member IS its own label value (``ComponentLayer.AUTONOMIC == "autonomic"``).
+
+    Named ``ComponentLayer`` (not ``Layer``) deliberately: :class:`lifemodel.core.layer.Layer`
+    is the unrelated brain-stage ABC extension point. This enum tags a *registered
+    component*; that ABC is a *processing stage* base class.
+    """
+
+    AUTONOMIC = "autonomic"
+    AGGREGATION = "aggregation"
+    COGNITION = "cognition"
+    INFRA = "infra"
+
+
+#: Static ``ComponentManifest.type`` → :class:`ComponentLayer` rollup
+#: (telemetry-core §4.2 / §4.5). The composition root fills each manifest's
+#: ``layer`` from this, and ``/lifemodel stats`` (bead 7.7) folds components up to
+#: their layer through the same table. ``egress`` is deliberately :data:`INFRA`,
+#: NOT ``COGNITION`` — an unknown type maps to nothing (see :func:`layer_for_type`).
+LAYER_BY_TYPE: Final[dict[str, ComponentLayer]] = {
+    "personality": ComponentLayer.AUTONOMIC,
+    "neuron": ComponentLayer.AUTONOMIC,
+    "drive": ComponentLayer.AUTONOMIC,
+    "aggregation": ComponentLayer.AGGREGATION,
+    "launcher": ComponentLayer.COGNITION,
+    "cognition": ComponentLayer.COGNITION,
+    "proactive": ComponentLayer.INFRA,
+    "egress": ComponentLayer.INFRA,
+    "trace-writer": ComponentLayer.INFRA,
+    "writer": ComponentLayer.INFRA,
+}
+
+
+def layer_for_type(component_type: str) -> ComponentLayer | None:
+    """The :class:`ComponentLayer` for a component *type*, or ``None`` if unknown.
+
+    A convenience over :data:`LAYER_BY_TYPE`. Returning ``None`` for an unknown
+    type is load-bearing at the composition root: a manifest built with
+    ``layer=layer_for_type(<typo>)`` then carries ``None`` and
+    :meth:`~lifemodel.core.registry.ComponentRegistry.register` rejects it
+    fail-fast (§3) — a new component type can't slip in unlayered.
+    """
+    return LAYER_BY_TYPE.get(component_type)
 
 
 @dataclass(frozen=True)

@@ -61,6 +61,7 @@ from .adapters.tracer import StdlibTracer
 from .core.aggregation import ContactAggregation
 from .core.aggregator import Aggregator, SilentAggregator
 from .core.cognition import CognitionLauncher
+from .core.component import layer_for_type
 from .core.contact_neuron import PresenceNeuron
 from .core.coreloop import CoreLoop
 from .core.neuron import Neuron
@@ -131,6 +132,27 @@ class LifeModel:
     #: in-tick pipeline. ``NULL_TRACE_SINK`` / a throwaway ring off the live being.
     trace_writer: TraceSink = NULL_TRACE_SINK
     event_ring: EventRing = field(default_factory=EventRing)
+
+
+def _component_manifest(
+    component_id: str, component_type: str, *, accepts_signals: bool
+) -> ComponentManifest:
+    """A registered component's manifest, telemetry contract included (§3).
+
+    Its ``layer`` derives from ``component_type`` via
+    :func:`~lifemodel.core.component.layer_for_type` (an unmapped type yields
+    ``None`` and :meth:`ComponentRegistry.register` then rejects it fail-fast).
+    ``metric_surface`` is declared EMPTY: bead 7.3 wires no domain metrics yet
+    (instrumentation is beads 7.4/7.5), but the invariant requires every component
+    to *declare* its surface, empty or not.
+    """
+    return ComponentManifest(
+        id=component_id,
+        type=component_type,
+        layer=layer_for_type(component_type),
+        metric_surface=(),
+        accepts_signals=accepts_signals,
+    )
 
 
 def build_lifemodel(
@@ -221,7 +243,8 @@ def build_lifemodel(
             peak_hour_utc=CIRCADIAN_PEAK_UTC_HOUR,
         )
         resolved_registry.register(
-            personality, ComponentManifest(id=personality.id, type="personality")
+            personality,
+            _component_manifest(personality.id, "personality", accepts_signals=False),
         )
     try:
         resolved_registry.manifest("contact")
@@ -230,7 +253,9 @@ def build_lifemodel(
         # PresenceNeuron keeps the historical ``contact`` slot id; it measures the
         # channel now and emits a raw ``contact_presence`` reading — it writes NO u.
         presence = PresenceNeuron()
-        resolved_registry.register(presence, ComponentManifest(id=presence.id, type="neuron"))
+        resolved_registry.register(
+            presence, _component_manifest(presence.id, "neuron", accepts_signals=True)
+        )
     try:
         resolved_registry.manifest("solitude-drive")
     except UnknownComponent:
@@ -239,7 +264,9 @@ def build_lifemodel(
         # BEFORE aggregation (which reads the fresh u from the drive's contact
         # signal, since the drive's UpdateState is only visible after commit).
         drive = SolitudeDrive(alpha=CONTACT_ALPHA, beta=CONTACT_BETA, u_max=CONTACT_U_MAX)
-        resolved_registry.register(drive, ComponentManifest(id=drive.id, type="drive"))
+        resolved_registry.register(
+            drive, _component_manifest(drive.id, "drive", accepts_signals=True)
+        )
     try:
         resolved_registry.manifest("contact-aggregation")
     except UnknownComponent:
@@ -253,7 +280,8 @@ def build_lifemodel(
             halflife_min=CONTACT_INHIBITION_HALFLIFE_MIN,
         )
         resolved_registry.register(
-            aggregation, ComponentManifest(id=aggregation.id, type="aggregation")
+            aggregation,
+            _component_manifest(aggregation.id, "aggregation", accepts_signals=True),
         )
     try:
         resolved_registry.manifest("cognition-launcher")
@@ -271,7 +299,9 @@ def build_lifemodel(
             # then UTC (see wake_packet._fmt_ts).
             display_tz=display_tz,
         )
-        resolved_registry.register(launcher, ComponentManifest(id=launcher.id, type="launcher"))
+        resolved_registry.register(
+            launcher, _component_manifest(launcher.id, "launcher", accepts_signals=False)
+        )
     resolved_state_actor = StateActor(resolved_state, committer=resolved_committer)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,
