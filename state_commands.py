@@ -110,7 +110,10 @@ _SET_WHITELIST: dict[str, str] = {
     "fatigue": _KIND_FLOAT,
     "duration_over_theta": _KIND_FLOAT,
     "decline_count": _KIND_INT,
-    "last_exchange_at": _KIND_TIMESTAMP,
+    # last_exchange_at is deliberately ABSENT (lm-md6.1): the real exchange record the
+    # wake packet renders is immune to admin commands. Tune the silence-window gate via
+    # silence_anchor_at instead.
+    "silence_anchor_at": _KIND_TIMESTAMP,
     "last_contact_at": _KIND_TIMESTAMP,
 }
 
@@ -169,7 +172,11 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
     w = composition.CONTACT_PARAMS.w
     u = theta + _FORCE_WAKE_U_MARGIN
     backdate_min = w + _FORCE_WAKE_SILENCE_MARGIN_MIN
-    last_exchange_at = (now - timedelta(minutes=backdate_min)).isoformat()
+    # Satisfy the silence-window gate by backdating the DECOUPLED silence anchor —
+    # NOT the real last_exchange_at, which the wake packet renders and which is immune
+    # to all admin commands (lm-md6.1). The gate reads this anchor; the model still
+    # sees the genuine last exchange.
+    silence_anchor_at = (now - timedelta(minutes=backdate_min)).isoformat()
 
     send_log = before.proactive_send_log
     backstop_was_blocking = not allow_send(send_log, now)
@@ -179,7 +186,7 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
     after = dataclasses.replace(
         before,
         u=u,
-        last_exchange_at=last_exchange_at,
+        silence_anchor_at=silence_anchor_at,
         pending_proactive_id=None,
         pending_proactive_since=None,
         pending_proactive_origin_traceparent=None,  # clear the async anchor in lockstep (§4.4)
@@ -191,7 +198,7 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
 
     fields = [
         "u",
-        "last_exchange_at",
+        "silence_anchor_at",
         "pending_proactive_id",
         "pending_proactive_since",
         "pending_proactive_origin_traceparent",
@@ -203,8 +210,8 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
     gates = [
         f"effective pressure: u={u:.2f} >= theta={theta:.2f} "
         "(action_pending cleared -> inhibition=0)",
-        f"active-silence window: last_exchange_at backdated {backdate_min:.0f}m "
-        f"(window w={w:.0f}m)",
+        f"active-silence window: silence_anchor_at backdated {backdate_min:.0f}m "
+        f"(window w={w:.0f}m; real last_exchange_at left untouched)",
         "no live desire: any live contact-desire row terminalized + pending_proactive_id/since "
         "cleared, so the next tick births a fresh one "
         "(in_flight is a per-tick signal, not persisted state -- unaffected by this command)",
@@ -229,13 +236,20 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
 
 
 def satiate(before: State, now: datetime) -> tuple[State | None, str]:
-    """Simulate a fulfilled contact — as if the user just genuinely reached out."""
+    """Simulate a fulfilled contact — reset the drive as if contact just happened.
+
+    Resets the drive (``u=0``) and opens the active-silence window (``silence_anchor_at
+    =now``) exactly as a genuine exchange would for the gate — but does NOT forge the
+    real ``last_exchange_at`` the wake packet renders (lm-md6.1): that record is written
+    only by an actual two-way exchange. "Reset the drive" is decoupled from "record of
+    a real conversation", so a satiated being still tells the model the true last-exchange
+    time, not a fabricated "just now"."""
     now_iso = now.isoformat()
     after = dataclasses.replace(
         before,
         u=0.0,
         last_contact_at=now_iso,
-        last_exchange_at=now_iso,
+        silence_anchor_at=now_iso,  # open the silence window WITHOUT forging last_exchange_at
         pending_proactive_id=None,
         pending_proactive_since=None,
         pending_proactive_origin_traceparent=None,  # clear the async anchor in lockstep (§4.4)
@@ -244,7 +258,7 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
     fields = [
         "u",
         "last_contact_at",
-        "last_exchange_at",
+        "silence_anchor_at",
         "pending_proactive_id",
         "pending_proactive_since",
         "pending_proactive_origin_traceparent",

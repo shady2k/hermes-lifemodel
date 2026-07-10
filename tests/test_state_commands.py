@@ -51,6 +51,7 @@ from lifemodel.core.thought_view import (
     seed_thought_id,
 )
 from lifemodel.core.timeutil import minutes_between
+from lifemodel.core.wake_packet import build_wake_packet
 from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
 from lifemodel.sim.wake import LaneState, evaluate_wake
 from lifemodel.state.errors import StateCorruptError
@@ -179,11 +180,13 @@ def test_force_wake_raises_u_clearly_over_theta() -> None:
     assert after.u > CONTACT_PARAMS.theta_u
 
 
-def test_force_wake_backdates_last_exchange_past_the_silence_window() -> None:
+def test_force_wake_backdates_the_silence_anchor_past_the_silence_window() -> None:
+    # lm-md6.1: the silence gate is satisfied via the DECOUPLED silence anchor, not by
+    # forging last_exchange_at (which the immunity tests below pin as untouched).
     after, _ = force_wake(_blocked_state(), NOW)
     assert after is not None
-    assert after.last_exchange_at is not None
-    elapsed = minutes_between(after.last_exchange_at, NOW)
+    assert after.silence_anchor_at is not None
+    elapsed = minutes_between(after.silence_anchor_at, NOW)
     assert elapsed >= CONTACT_PARAMS.w
 
 
@@ -253,9 +256,11 @@ def test_force_wake_result_passes_the_real_wake_gate() -> None:
         halflife_min=CONTACT_INHIBITION_HALFLIFE_MIN,
     )
     effective = effective_pressure(after.u, inhibition)
+    # The silence gate reads the decoupled anchor (lm-md6.1), so reconstruct it from
+    # after.silence_anchor_at — exactly as core/aggregation.py does.
     exch_min = (
-        -minutes_between(after.last_exchange_at, NOW)
-        if after.last_exchange_at is not None
+        -minutes_between(after.silence_anchor_at, NOW)
+        if after.silence_anchor_at is not None
         else None
     )
     decl_min = -minutes_between(after.declined_at, NOW) if after.declined_at is not None else None
@@ -274,13 +279,16 @@ def test_force_wake_result_passes_the_real_wake_gate() -> None:
 # --- satiate -------------------------------------------------------------
 
 
-def test_satiate_zeroes_u_and_stamps_contact_and_exchange() -> None:
+def test_satiate_zeroes_u_stamps_contact_and_opens_the_silence_window() -> None:
+    # lm-md6.1: satiate resets the drive + opens the silence window (silence_anchor_at)
+    # but must NOT forge the immune last_exchange_at (pinned unchanged here).
     before = State(u=3.0, last_contact_at=_ago(999), last_exchange_at=_ago(999))
     after, message = satiate(before, NOW)
     assert after is not None
     assert after.u == 0.0
     assert after.last_contact_at == NOW.isoformat()
-    assert after.last_exchange_at == NOW.isoformat()
+    assert after.silence_anchor_at == NOW.isoformat()  # silence window opened
+    assert after.last_exchange_at == _ago(999)  # immune: the real record is untouched
     assert "(mutating)" in message
 
 
@@ -302,6 +310,67 @@ def test_satiate_clears_pending_and_action_pending() -> None:
     # §4.4: the async-correlation anchor is cleared in lockstep with pending_id.
     assert after.pending_proactive_origin_traceparent is None
     assert after.action_pending_since is None
+
+
+# --- lm-md6.1: the real last-exchange record is IMMUNE to admin commands -----
+# The wake-packet temporal fact ("The last time we exchanged messages was X") reads
+# state.last_exchange_at. That field used to be FORGED by force_wake (backdated ~20m
+# to pass the silence-window gate) and satiate (set to now), so the model was told a
+# fabricated "last exchange" instead of the real one. The fix decouples the two
+# roles: the silence-window gate reads the separate ``silence_anchor_at``; the real
+# ``last_exchange_at`` is written ONLY by a genuine two-way exchange (aggregation).
+
+
+def test_force_wake_moves_the_silence_anchor_not_the_exchange_record() -> None:
+    # force_wake satisfies the silence-window gate by backdating the DECOUPLED anchor,
+    # leaving the immune last_exchange_at (what the wake packet reads) untouched.
+    real_last = _ago(12 * 60)  # a real exchange 12h ago
+    after, _ = force_wake(State(u=0.2, last_exchange_at=real_last), NOW)
+    assert after is not None
+    assert after.last_exchange_at == real_last  # immune: the real record is unchanged
+    assert after.silence_anchor_at is not None  # the gate is satisfied via the anchor
+    assert minutes_between(after.silence_anchor_at, NOW) >= CONTACT_PARAMS.w
+
+
+def test_force_wake_wake_packet_shows_the_real_12h_gap_not_the_20m_backdate() -> None:
+    # THE acceptance (lm-md6.1): a force-wake when the real last exchange was 12h ago
+    # must render ~12h in the wake packet, NEVER the ~20-min-ago silence backdate.
+    # Built through the SAME build_wake_packet the live cognition launcher calls,
+    # fed the persisted last_exchange_at (core/cognition.py).
+    real_last = _ago(12 * 60)
+    after, _ = force_wake(State(u=0.2, last_exchange_at=real_last), NOW)
+    assert after is not None
+    packet = build_wake_packet(
+        value=after.u,
+        theta=1.0,
+        correlation_id="c",
+        now=NOW,
+        last_exchange_at=after.last_exchange_at,
+        tz=UTC,
+    )
+    # NOW is 2026-07-06 12:00 UTC → 12h earlier is 2026-07-06 00:00; the ~20-min-ago
+    # silence anchor (11:40) must never leak into the model-facing packet.
+    assert "The last time we exchanged messages was 2026-07-06 00:00 UTC." in packet.prompt
+    assert "11:40" not in packet.prompt
+
+
+def test_satiate_opens_the_silence_window_without_forging_the_exchange_record() -> None:
+    # satiate resets the drive "as if contact happened" (u=0, silence window opened via
+    # the anchor) but must NOT forge the real last-exchange record shown to the model.
+    real_last = _ago(12 * 60)
+    after, _ = satiate(State(u=3.0, last_exchange_at=real_last), NOW)
+    assert after is not None
+    assert after.u == 0.0  # the drive is reset
+    assert after.last_exchange_at == real_last  # immune: the real record is untouched
+    assert after.silence_anchor_at == NOW.isoformat()  # the window is opened instead
+
+
+def test_set_field_rejects_last_exchange_at_as_immune() -> None:
+    # The real last-exchange record is immune to ALL admin commands — `set` can no
+    # longer write it. The silence window is tuned through silence_anchor_at instead.
+    after, message = set_field(State(), NOW, "last_exchange_at now")
+    assert after is None
+    assert "not writable" in message
 
 
 # --- reset -----------------------------------------------------------------
@@ -381,9 +450,9 @@ def test_set_field_rejects_removed_desire_status_field() -> None:
 
 
 def test_set_field_resolves_now_literal_for_timestamps() -> None:
-    after, _ = set_field(State(), NOW, "last_exchange_at now")
+    after, _ = set_field(State(), NOW, "silence_anchor_at now")
     assert after is not None
-    assert after.last_exchange_at == NOW.isoformat()
+    assert after.silence_anchor_at == NOW.isoformat()
 
 
 def test_set_field_accepts_an_explicit_iso_timestamp() -> None:
@@ -442,7 +511,8 @@ def test_satiate_for_dir_persists_through_the_real_store(tmp_path) -> None:
     persisted = _store(tmp_path).load()
     assert persisted.u == 0.0
     assert read_live_contact_desire(_store(tmp_path)) is None  # desire terminalized (satisfied)
-    assert persisted.last_exchange_at is not None
+    assert persisted.silence_anchor_at is not None  # silence window opened
+    assert persisted.last_exchange_at is None  # immune: seeded None, satiate did not forge it
 
 
 def test_reset_for_dir_persists_through_the_real_store(tmp_path) -> None:
@@ -530,7 +600,7 @@ def test_set_field_for_dir_rejects_without_writing(tmp_path) -> None:
 def test_set_field_for_dir_rejects_naive_timestamp_without_writing(tmp_path) -> None:
     original = State(u=1.0)
     _store(tmp_path).commit(original)
-    message = set_field_for_dir(tmp_path, "last_exchange_at 2026-01-01T00:00:00")
+    message = set_field_for_dir(tmp_path, "silence_anchor_at 2026-01-01T00:00:00")
     assert "error" in message
     assert _store(tmp_path).load() == original  # untouched — round-trip validation caught it
 

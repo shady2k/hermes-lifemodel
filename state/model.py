@@ -69,9 +69,23 @@ class State:
     #: a desire resolves; feeds the wake-decision's duration gate.
     duration_over_theta: float = 0.0
     #: ISO-8601 UTC timestamp of the last genuine (non-internal) exchange with
-    #: the user (spec §4/§6). Satiates the drive and opens the active-silence
-    #: window; ``None`` before the first exchange.
+    #: the user (spec §4/§6). This is the RELATIONSHIP RECORD the wake-packet
+    #: temporal fact renders ("The last time we exchanged messages was X",
+    #: :func:`~lifemodel.core.wake_packet.render_temporal_facts`), so it is IMMUNE
+    #: to admin/control commands (lm-md6.1): it is written ONLY by a genuine
+    #: two-way exchange (``core/aggregation.py``), never forged by ``force_wake``/
+    #: ``satiate``/``set`` — those move :attr:`silence_anchor_at` instead. ``None``
+    #: before the first exchange.
     last_exchange_at: str | None = None
+    #: ISO-8601 UTC timestamp anchoring the active-silence WINDOW gate
+    #: (``sim.wake`` gate 3 — suppress a wake for ``w`` minutes after contact),
+    #: DECOUPLED from :attr:`last_exchange_at` (lm-md6.1). ``None`` means "no admin
+    #: override" and the gate falls back to the real :attr:`last_exchange_at`; a
+    #: genuine exchange clears it back to ``None``. Admin/control commands that
+    #: only need to tune the silence gate (``force_wake`` backdates it past ``w``;
+    #: ``satiate`` sets it to now) write HERE, so the immune exchange record the
+    #: model reads is never forged. ``None`` before any override.
+    silence_anchor_at: str | None = None
     # NB: the contact-desire *lifecycle* is no longer a ``State`` flag (lm-27n.3):
     # it lives in the singleton ``kind='desire'`` record ``contact:owner`` (HLA
     # §4.1), read via ``core.desire_view.live_contact_desire``. Only the residual
@@ -158,6 +172,10 @@ class State:
             # value, or a tz-*naive* one that would raise ``TypeError`` when
             # compared, is corruption caught loud at load, never a mid-tick crash.
             last_exchange_at=_as_opt_iso(data.get("last_exchange_at"), "last_exchange_at"),
+            # silence_anchor_at is compared against the clock's aware ``now`` by the
+            # silence-window gate (aggregation / introspect), so — like the exchange
+            # timestamp above — it is validated as a tz-aware ISO-8601 instant.
+            silence_anchor_at=_as_opt_iso(data.get("silence_anchor_at"), "silence_anchor_at"),
             declined_at=_as_opt_iso(data.get("declined_at"), "declined_at"),
             decline_count=_as_int(data.get("decline_count", 0), "decline_count"),
             pending_proactive_id=_as_opt_str(
