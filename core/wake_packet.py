@@ -80,8 +80,9 @@ _IMPULSE_CLOSE_TAG = "</internal_impulse>"
 
 #: The one silence marker the wake-packet INSTRUCTS the being to reply with in order to
 #: DECLINE — to stay silent and have nothing sent. It MUST be a member of
-#: ``lifemodel.hooks._NO_REPLY_MARKERS`` (the set the async act-gate classifier maps to
-#: REJECT); ``hooks`` builds that set FROM this constant, so the marker we advertise and
+#: ``lifemodel.hooks._SUBSTRING_DECLINE_MARKERS`` — the FAIL-CLOSED set the async act-gate
+#: classifier SUBSTRING-matches to REJECT, so a decline wrapped in prose is not delivered
+#: (lm-md6.5). ``hooks`` builds that set FROM this constant, so the marker we advertise and
 #: the marker we classify can never drift, and a test pins the membership. Written once,
 #: here, so "[SILENT]" is never hardcoded in two places (lm-md6.3).
 DECLINE_MARKER = "[SILENT]"

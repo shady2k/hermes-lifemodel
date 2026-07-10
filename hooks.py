@@ -35,24 +35,44 @@ from .domain.objects import DesireState
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 
-#: The exact silence markers Hermes' own gateway treats as intentional silence.
-#: :data:`~lifemodel.core.wake_packet.DECLINE_MARKER` — the one marker the wake-packet
-#: actually INSTRUCTS the being to reply with to decline (lm-md6.3) — is spliced in from
-#: that single source of truth, so the affordance we advertise can never drift out of
-#: the set we classify as REJECT (a drift would silently deliver an intended decline).
-_NO_REPLY_MARKERS = frozenset({"NO_REPLY", "NO REPLY", DECLINE_MARKER, "SILENT"})
+#: The two disjoint concepts that map a proactive turn to REJECT (spec §5/§7). They
+#: are matched DIFFERENTLY on purpose (lm-md6.5):
+#:
+#: * :data:`_SUBSTRING_DECLINE_MARKERS` — the BRACKETED sentinel the wake-packet
+#:   INSTRUCTS the being to reply with to decline
+#:   (:data:`~lifemodel.core.wake_packet.DECLINE_MARKER`, spliced in from that single
+#:   source of truth so the affordance we advertise can never drift out of what we
+#:   classify as REJECT). It is matched as a SUBSTRING and so is FAIL-CLOSED: if it
+#:   appears ANYWHERE in the response, the turn is a decline and is NOT delivered — a
+#:   marker wrapped in deliberation prose ("...I won't nudge them. [SILENT]") no longer
+#:   leaks the being's private "I won't write" reasoning to the owner. The brackets +
+#:   caps make a false positive in natural prose ~impossible, which is exactly why ONLY
+#:   the bracketed token is safe to substring-match.
+#: * :data:`_EXACT_NO_REPLY_MARKERS` — the BARE-WORD markers Hermes' gateway also
+#:   honours. These match ONLY when the WHOLE (normalised) response equals one: a
+#:   substring search for "SILENT"/"NO REPLY" would fire on genuine prose ("we sat in
+#:   silent comfort", "no reply is needed") and deliver FALSE silence, so bare words
+#:   stay exact-only — never substring-matched.
+_SUBSTRING_DECLINE_MARKERS = frozenset({DECLINE_MARKER})
+_EXACT_NO_REPLY_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "SILENT"})
 
 
 def _is_no_reply(text: str) -> bool:
-    """True when *text* is exactly one silence marker (spec §5/§7).
+    """True when *text* is the being choosing silence (spec §5/§7).
 
-    Case-insensitive and whitespace-collapsing (mirrors the host's own
-    ``_canonical_silence_candidate``): ``"no_reply"``, ``" NO_REPLY "``, and
-    ``"no   reply"`` all match, but prose that merely *mentions* a marker does
-    not.
+    Fail-closed on the bracketed sentinel: if :data:`DECLINE_MARKER` appears ANYWHERE
+    in *text* (case-insensitively), the turn is a decline — a marker wrapped in prose
+    is still a decline, never delivered. The bare-word markers ("NO_REPLY", "NO REPLY",
+    "SILENT") match only when the WHOLE response, after collapsing whitespace and
+    uppercasing (mirrors the host's own ``_canonical_silence_candidate``), equals one —
+    so ``" NO_REPLY "`` and ``"no   reply"`` match, but prose that merely *mentions*
+    "silent"/"no reply" is delivered normally (it is not substring-matched).
     """
-    candidate = " ".join(text.strip().upper().split())
-    return candidate in _NO_REPLY_MARKERS
+    upper = text.upper()
+    if any(marker.upper() in upper for marker in _SUBSTRING_DECLINE_MARKERS):
+        return True
+    candidate = " ".join(upper.split())
+    return candidate in _EXACT_NO_REPLY_MARKERS
 
 
 def _is_pending_proactive_turn(pending_proactive_id: str | None, user_message: str) -> bool:
