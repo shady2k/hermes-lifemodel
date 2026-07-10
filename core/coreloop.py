@@ -18,8 +18,10 @@ the expensive cognition layer) slots into the per-component loop in Phase C.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..domain.memory import MemoryRecord, PressureIndex
 from ..domain.signal import Signal
@@ -90,11 +92,17 @@ class CoreLoop:
         live_states: frozenset[str] | None = None,
         tracer: TracerPort,
         trace_exporter: TraceExportPort | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._registry = registry
         self._state_actor = state_actor
         self._bus = bus
         self._clock = clock
+        # Elapsed is measured with a MONOTONIC source (never jumps when the system
+        # clock is stepped), injected so a test can control it and prove a span's
+        # duration is non-zero deterministically. The wall-clock start comes from the
+        # clock; a span's ``ended_at`` is that start plus the monotonic elapsed.
+        self._monotonic = monotonic
         # The tick's durable + freshness sinks (spec §4.2): every component gets a
         # SpanLogger over these, so all tick-path logging is span-bound. Off the
         # live being (a bare test / CLI tick with no BeingAdapter to acquire the
@@ -115,6 +123,18 @@ class CoreLoop:
     def _span_logger(self, span: ActiveSpan) -> SpanLogger:
         """A :class:`SpanLogger` bound to *span* over this loop's writer + ring."""
         return SpanLogger(span, writer=self._writer, ring=self._ring)
+
+    def _span_ended_at(self, tick_started_at: datetime, tick_started_mono: float) -> str:
+        """The REAL wall-clock instant a span closing *now* ended (spec §4.2).
+
+        Elapsed since the tick began is read from the monotonic source (immune to a
+        system-clock step), then added to the tick's wall-clock start — so a span's
+        ``ended_at`` is a genuine later instant than its ``started_at`` and its
+        persisted duration is the true elapsed time, not zero. Called once per span
+        close, so each span records when *it* finished (root last, longest).
+        """
+        elapsed = self._monotonic() - tick_started_mono
+        return (tick_started_at + timedelta(seconds=elapsed)).isoformat()
 
     def _persist_span(self, span: ActiveSpan, *, ended_at: str) -> None:
         """Upsert one finished span row (spec §4.3) — the durable span tree.
@@ -153,6 +173,10 @@ class CoreLoop:
         self, *, now: datetime, state: State, root: TraceContext, tick_no: int
     ) -> TickReport:
         started = now.isoformat()
+        # Monotonic origin for this tick: every span's ``ended_at`` is ``started``
+        # plus the monotonic elapsed at its close (see ``_span_ended_at``), so span
+        # durations are real, not zero.
+        started_mono = self._monotonic()
         # The tick's ROOT span + its logger: tick-level bookkeeping (snapshot/intake
         # failures, trace export) binds here; each component rebinds to its own child.
         root_span = start_span(root, tick=tick_no, started_at=started)
@@ -235,7 +259,7 @@ class CoreLoop:
                 produced = component.step(ctx)
             except Exception as exc:  # isolation: the heart never dies
                 self._record_failure(component.id, exc, logger)
-                self._persist_span(span, ended_at=started)
+                self._persist_span(span, ended_at=self._span_ended_at(now, started_mono))
                 failed.append(component.id)
                 continue
             self._failures[component.id] = 0
@@ -249,7 +273,7 @@ class CoreLoop:
                 else:
                     intents.append(intent)
             ran.append(component.id)
-            self._persist_span(span, ended_at=started)
+            self._persist_span(span, ended_at=self._span_ended_at(now, started_mono))
 
         intents.append(
             UpdateState({"tick_count": state.tick_count + 1, "last_tick_at": now.isoformat()})
@@ -275,8 +299,10 @@ class CoreLoop:
         # root span is always present (tracing is mandatory), so the exporter always
         # has a root span to ship.
         self._export_tick(report, root, root_logger)
-        # Persist the root span row LAST — the tick tree's parent (spec §4.3).
-        self._persist_span(root_span, ended_at=started)
+        # Persist the root span row LAST — the tick tree's parent (spec §4.3). Its
+        # ``ended_at`` snapshots elapsed at the very end of the tick, so the root
+        # encloses every child span.
+        self._persist_span(root_span, ended_at=self._span_ended_at(now, started_mono))
         return report
 
     def _export_tick(self, report: TickReport, trace: TraceContext, logger: SpanLogger) -> None:

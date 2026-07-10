@@ -671,6 +671,95 @@ def test_component_failure_is_a_suppression_span_under_the_child_span(tmp_path) 
     assert supp["tick"] == 1
 
 
+# --- lm-fib.7.1: spans close at their REAL end instant (non-zero duration) ---
+
+
+class _TimingSink:
+    """A :class:`~lifemodel.state.trace_store.TraceSink` that keeps span timing.
+
+    Unlike :class:`_CapturingSink` it retains ``started_at``/``ended_at`` so a test
+    can assert each persisted span has a real, positive duration (spec §4.2:
+    latency histograms read empty when ``started_at == ended_at``).
+    """
+
+    def __init__(self) -> None:
+        self.spans: list[dict] = []  # type: ignore[type-arg]
+
+    def submit_event(self, *, record_id, trace_id, span_id, tick, event, ts, fields=None):  # type: ignore[no-untyped-def]
+        return True
+
+    def submit_span(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        trace_id,
+        span_id,
+        parent_span_id=None,
+        component=None,
+        tick=None,
+        started_at=None,
+        ended_at=None,
+        status=None,
+        attrs=None,
+    ):
+        self.spans.append(
+            {
+                "component": component,
+                "status": status,
+                "started_at": started_at,
+                "ended_at": ended_at,
+            }
+        )
+        return True
+
+
+class _FakeMonotonic:
+    """A controllable ``time.monotonic`` stand-in: each call advances by ``step``.
+
+    Injecting it makes the elapsed-time proof HONEST and deterministic — the wall
+    clock is pinned by ``FixedClock`` (so a real ``time.monotonic`` would give a
+    tiny, flaky delta), but this returns a known, strictly increasing sequence, so
+    the span's ``ended_at`` is provably a real later instant than its ``started_at``.
+    """
+
+    def __init__(self, step: float = 1.0) -> None:
+        self._t = 0.0
+        self._step = step
+
+    def __call__(self) -> float:
+        self._t += self._step
+        return self._t
+
+
+def test_every_persisted_span_closes_after_it_started(tmp_path) -> None:
+    # lm-fib.7.1: a span must close at its REAL end instant, so ended_at is strictly
+    # after started_at (positive duration). Register a healthy AND a failing
+    # component so all three persist sites — an ok child span, a failed child span,
+    # and the tick root — are exercised. Before the fix every span was closed with
+    # started_at (ended_at == started_at) and latency histograms read empty.
+    reg = ComponentRegistry()
+    reg.register(Healthy(), ComponentManifest(id="healthy", type="neuron"))
+    reg.register(Broken(), ComponentManifest(id="broken", type="neuron"))
+    sink = _TimingSink()
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        bus=FileSignalBus(tmp_path),
+        clock=_clock(),
+        trace_writer=sink,
+        tracer=FakeTracer(),
+        monotonic=_FakeMonotonic(),
+    )
+    loop.tick()
+
+    # The healthy child span, the failed child span, and the tick root all persisted.
+    assert {s["component"] for s in sink.spans} == {"healthy", "broken", None}
+    for row in sink.spans:
+        assert row["started_at"] is not None and row["ended_at"] is not None
+        started = datetime.fromisoformat(row["started_at"])
+        ended = datetime.fromisoformat(row["ended_at"])
+        assert ended > started, f"{row['component']!r} span has non-positive duration"
+
+
 def test_component_failure_span_row_is_failed_and_parented_on_root(tmp_path) -> None:
     # The persisted span ROW for the fault closes ``failed`` and is parented on the
     # tick root — the durable span tree makes "which component faulted, under which
