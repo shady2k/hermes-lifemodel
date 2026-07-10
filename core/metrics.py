@@ -145,7 +145,11 @@ class MetricSpec:
     ``label_keys`` are normalised to a sorted, de-duplicated tuple so two specs
     that differ only in label order compare equal (idempotent re-registration).
     ``buckets`` is meaningful only for ``kind == "histogram"`` and defaults to
-    :data:`DEFAULT_BUCKETS`. Construction raises :class:`MetricSpecError` on:
+    :data:`DEFAULT_BUCKETS`. ``export`` is the sampler whitelist flag (design
+    §4.4): when ``False`` the metric stays live in the registry but is NOT
+    written to ``metrics.sqlite`` by the periodic sampler (bead 7.6) — its
+    ``metric_defs`` row still records ``export=0``. Construction raises
+    :class:`MetricSpecError` on:
 
     * an empty ``name`` or an unknown ``kind``;
     * a label key outside :data:`ALLOWED_LABEL_KEYS` (the low-cardinality rule);
@@ -158,6 +162,9 @@ class MetricSpec:
     help: str = ""
     label_keys: tuple[str, ...] = ()
     buckets: tuple[float, ...] = DEFAULT_BUCKETS
+    #: Sampler whitelist (design §4.4). ``True`` → sample into ``metrics.sqlite``;
+    #: ``False`` → live-only (the def is still recorded, flagged ``export=0``).
+    export: bool = True
 
     def __post_init__(self) -> None:
         if not self.name:
