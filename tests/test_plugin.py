@@ -151,6 +151,26 @@ def test_register_lifemodel_debug_subcommand_returns_dump(
     assert "debug" in ctx.commands["lifemodel"]["args_hint"]
 
 
+def test_register_lifemodel_stats_subcommand_returns_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    # `/lifemodel stats` renders the read-only telemetry readout (NOW + WINDOW),
+    # fail-soft even with no metrics.sqlite / no instrumentation yet.
+    out = handler("stats")
+    assert "read-only" in out
+    assert "NOW" in out
+    assert "WINDOW" in out
+    # It is a read-only subcommand (no [mutating] marker) and advertised in the hint.
+    assert not lifemodel._SUBCOMMANDS["stats"].mutating
+    assert "stats" in ctx.commands["lifemodel"]["args_hint"]
+
+
 def test_register_lifemodel_help_subcommand_lists_subcommands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

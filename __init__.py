@@ -36,6 +36,7 @@ from .state_commands import (
     think_for_dir,
     why_for_dir,
 )
+from .stats_view import stats_for_dir
 from .trace_view import trace_for_dir
 
 __version__ = "0.0.0"
@@ -70,6 +71,11 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
     "trace": _Subcommand(
         "trace [<trace_id> | last [N]] — render a durable execution trace "
         "(tick → components → decisions → launch → async outcome), read-only."
+    ),
+    "stats": _Subcommand(
+        "stats [last N] — operational telemetry: live tick/writer/counters (NOW) "
+        "+ rates & approx p95 from metrics.sqlite over the last N samples (WINDOW), "
+        "read-only."
     ),
     "help": _Subcommand("List these subcommands."),
     "nudge": _Subcommand(
@@ -196,6 +202,7 @@ def register(ctx: Any) -> None:
             "debug": lambda: render_dump_for_dir(sdir),
             "why": lambda: why_for_dir(sdir, rest),
             "trace": lambda: trace_for_dir(sdir, rest),
+            "stats": lambda: stats_for_dir(sdir, rest),
             "help": lambda: _command_list() + "\n",
             "nudge": lambda: nudge_for_dir(sdir, rest),
             "force-wake": lambda: force_wake_for_dir(sdir),
