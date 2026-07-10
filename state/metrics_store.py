@@ -274,21 +274,28 @@ def _vacuum(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _delete_oldest_ts_cohort(conn: sqlite3.Connection) -> int:
+    """Delete every row sharing the OLDEST ``ts`` (a whole sample-snapshot).
+
+    Pruning a whole ``ts`` cohort at a time (never an arbitrary rowid batch)
+    keeps each snapshot intact — a histogram's ``_bucket``/``_count``/``_sum``
+    rows for one instant are reclaimed together, never split at the boundary
+    (design §4.4: retention целыми). Returns rows deleted (0 when empty)."""
+    row = conn.execute("SELECT MIN(ts) FROM metric_samples").fetchone()
+    if row is None or row[0] is None:
+        return 0
+    return conn.execute("DELETE FROM metric_samples WHERE ts = ?", (int(row[0]),)).rowcount
+
+
 def _prune_by_size(conn: sqlite3.Connection, max_bytes: int) -> int:
-    """Delete oldest samples in batches until the file is under *max_bytes*."""
+    """Delete oldest whole ts-snapshots until the file is under *max_bytes*."""
     deleted = 0
     while _db_size_bytes(conn) > max_bytes:
-        rowids = [
-            int(r[0])
-            for r in conn.execute(
-                "SELECT rowid FROM metric_samples ORDER BY ts ASC, rowid ASC LIMIT 256"
-            ).fetchall()
-        ]
-        if not rowids:
+        n = _delete_oldest_ts_cohort(conn)
+        if n == 0:
             break
-        conn.executemany("DELETE FROM metric_samples WHERE rowid = ?", [(rid,) for rid in rowids])
         conn.commit()
-        deleted += len(rowids)
+        deleted += n
         _vacuum(conn)
     return deleted
 
@@ -308,14 +315,15 @@ def prune_metric_samples(
         deleted += conn.execute("DELETE FROM metric_samples WHERE ts < ?", (cutoff,)).rowcount
 
     if policy.max_rows is not None:
-        total = int(conn.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0])
-        if total > policy.max_rows:
-            excess = total - policy.max_rows
-            deleted += conn.execute(
-                "DELETE FROM metric_samples WHERE rowid IN "
-                "(SELECT rowid FROM metric_samples ORDER BY ts ASC, rowid ASC LIMIT ?)",
-                (excess,),
-            ).rowcount
+        # Drop whole oldest ts-snapshots (not arbitrary rowids) until under the cap,
+        # so a snapshot is never left partial at the boundary (design §4.4).
+        while (
+            int(conn.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]) > policy.max_rows
+        ):
+            n = _delete_oldest_ts_cohort(conn)
+            if n == 0:
+                break
+            deleted += n
 
     if deleted:
         conn.commit()
@@ -344,16 +352,44 @@ class MetricSample:
     labels: dict[str, str]
 
 
-def read_samples(db_path: Path, *, name: str | None = None) -> list[MetricSample]:
-    """Read ``metric_samples`` (optionally for one *name*), oldest first — test glue."""
-    sql = "SELECT ts, run_id, name, label_key, value, labels_json FROM metric_samples"
-    params: tuple[object, ...] = ()
+def read_samples(
+    db_path: Path,
+    *,
+    name: str | None = None,
+    latest_run: bool = False,
+    limit: int | None = None,
+) -> list[MetricSample]:
+    """Read ``metric_samples`` (optionally for one *name*), oldest first.
+
+    ``latest_run`` restricts to the run of the newest sample (rates are only ever
+    computed within one ``run_id``, so a windowed reader never needs older runs).
+    ``limit`` caps the read to the most-recent rows — the row set is fetched
+    newest-first under the cap and then reversed to oldest-first, so a ``stats``
+    window over a huge store never loads the whole DB into memory (design §4.4).
+    The cap is generous enough to span many heartbeats, so every series still
+    carries a baseline point ``<= t0`` for its windowed delta.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if latest_run:
+        clauses.append(
+            "run_id = (SELECT run_id FROM metric_samples ORDER BY ts DESC, rowid DESC LIMIT 1)"
+        )
     if name is not None:
-        sql += " WHERE name = ?"
-        params = (name,)
-    sql += " ORDER BY ts ASC, rowid ASC"
+        clauses.append("name = ?")
+        params.append(name)
+    sql = "SELECT ts, run_id, name, label_key, value, labels_json FROM metric_samples"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    if limit is not None:
+        sql += " ORDER BY ts DESC, rowid DESC LIMIT ?"
+        params.append(int(limit))
+    else:
+        sql += " ORDER BY ts ASC, rowid ASC"
     with sqlite3.connect(str(db_path)) as conn:
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    if limit is not None:
+        rows = list(reversed(rows))  # newest-first read → present oldest-first
     samples: list[MetricSample] = []
     for ts, run_id, mname, lk, value, labels_json in rows:
         labels: dict[str, str] = json.loads(labels_json) if labels_json else {}

@@ -266,6 +266,48 @@ def test_prune_by_max_rows_keeps_newest(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_prune_by_max_rows_drops_whole_ts_snapshots(tmp_path: Path) -> None:
+    # Two rows per ts (a snapshot). max_rows must drop a WHOLE oldest snapshot,
+    # never leave a ts with only some of its rows (design §4.4: retention целыми).
+    conn = connect(metrics_db_path(tmp_path))
+    try:
+        for ts in (1, 2, 3):
+            _seed_sample(conn, ts, float(ts))
+            _seed_sample(conn, ts, float(ts) + 0.5)
+        conn.commit()
+        prune_metric_samples(
+            conn,
+            policy=MetricsRetentionPolicy(max_age_seconds=None, max_rows=3, max_bytes=None),
+            now_ts=1000,
+        )
+        rows_per_ts = {
+            int(ts): int(n)
+            for ts, n in conn.execute("SELECT ts, COUNT(*) FROM metric_samples GROUP BY ts")
+        }
+        # 6 rows > 3: drop whole ts=1 (→4), still >3: drop whole ts=2 (→2) ≤3 stop.
+        assert rows_per_ts == {3: 2}  # only the newest snapshot, intact — never split
+    finally:
+        conn.close()
+
+
+def test_read_samples_latest_run_and_limit(tmp_path: Path) -> None:
+    path = metrics_db_path(tmp_path)
+    conn = connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO metric_samples (ts, run_id, name, label_key, value, labels_json) "
+            "VALUES (10,'OLD','g','',1.0,NULL),(1000,'NEW','g','',2.0,NULL),"
+            "(1060,'NEW','g','',3.0,NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # latest_run excludes the OLD run entirely (rates are per-run anyway).
+    assert {s.run_id for s in read_samples(path, latest_run=True)} == {"NEW"}
+    # limit bounds the read to the most-recent rows, presented oldest-first.
+    assert [s.ts for s in read_samples(path, limit=2)] == [1000, 1060]
+
+
 # --------------------------------------------------------------------------- #
 # lifecycle: singleton, refcount, daemon
 # --------------------------------------------------------------------------- #

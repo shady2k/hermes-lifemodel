@@ -31,9 +31,15 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from ..composition import build_lifemodel
+from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..events import EventRing
+from ..state.metrics_store import (
+    MetricsSampler,
+    acquire_metrics_sampler,
+    release_metrics_sampler,
+)
 from ..state.trace_store import (
     TraceWriter,
     acquire_trace_writer,
@@ -73,6 +79,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # actually persists ``observability.sqlite``. ``None`` until connected.
         self._trace_writer: TraceWriter | None = None
         self._event_ring = EventRing()
+        # The metrics sampler (telemetry-core §4.4): snapshots the SAME per-base_dir
+        # registry singleton the tick writes into (composition resolves it via
+        # ``get_metric_registry(base_dir)``) into ``metrics.sqlite`` on a daemon
+        # thread. Acquired in :meth:`connect`, released on disconnect. ``None`` until
+        # connected — without this wiring ``metrics.sqlite`` is never created live.
+        self._metrics_sampler: MetricsSampler | None = None
 
     def _tick(self) -> None:
         """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
@@ -114,6 +126,13 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # guarded so a reconnect that skipped disconnect never double-refcounts.
         if self._trace_writer is None:
             self._trace_writer = acquire_trace_writer(observability_db_path(self._base_dir))
+        # Start the metrics sampler on the shared per-base_dir registry singleton so
+        # the live tick's counters land in ``metrics.sqlite``. Idempotent + guarded
+        # like the trace writer so a reconnect never double-refcounts.
+        if self._metrics_sampler is None:
+            self._metrics_sampler = acquire_metrics_sampler(
+                get_metric_registry(self._base_dir), self._base_dir
+            )
         self._loop = SupervisedLoop(
             tick=self._tick, interval_sec=self._interval, on_death=self._on_loop_death
         )
@@ -135,6 +154,10 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         if self._trace_writer is not None:
             release_trace_writer(observability_db_path(self._base_dir))
             self._trace_writer = None
+        # Stop the metrics sampler (stop on the last release, §4.4).
+        if self._metrics_sampler is not None:
+            release_metrics_sampler(self._base_dir)
+            self._metrics_sampler = None
         self._mark_disconnected()  # keep status accurate on a clean stop
         _LOG.info("being_disconnected")
 

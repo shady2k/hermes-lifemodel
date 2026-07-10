@@ -152,6 +152,22 @@ def test_window_rate_does_not_glue_across_run_ids() -> None:
     assert "-987" not in text  # never a negative glued delta
 
 
+def test_window_shedding_sums_shed_control_and_shed_sensor() -> None:
+    # The emitter folds the lane into the value (``shed_control``/``shed_sensor``);
+    # the WINDOW must recognise BOTH as shedding (by the ``shed`` prefix) and sum
+    # them — the old exact ``shed`` match never fired, so shedding was always n/a.
+    samples = [
+        _sample(1000, "lifemodel_signals_intake_total", 2.0, outcome="shed_control"),
+        _sample(1060, "lifemodel_signals_intake_total", 8.0, outcome="shed_control"),
+        _sample(1000, "lifemodel_signals_intake_total", 1.0, outcome="shed_sensor"),
+        _sample(1060, "lifemodel_signals_intake_total", 5.0, outcome="shed_sensor"),
+    ]
+    text = "\n".join(render_window(samples, last_n=30))
+    shed_line = next(line for line in text.splitlines() if "shedding" in line)
+    assert "/min" in shed_line  # a real rate, NOT n/a
+    assert "10" in shed_line  # (8-2) + (5-1) = 10 shed / 60s = 10/min
+
+
 def test_window_p95_from_histogram_buckets() -> None:
     # Baseline (all zero) at t0; at t1 the cumulative buckets describe 6 obs whose
     # p95 (0.95*6 = 5.7) lands in (1.0, 2.5]. Windowed = t1 - t0.

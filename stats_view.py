@@ -69,6 +69,12 @@ DEFAULT_LAST_N = 30
 #: Hard cap so ``stats last 99999`` can never scan an unbounded history slice.
 MAX_LAST_N = 500
 
+#: Hard cap on rows the WINDOW read pulls from ``metrics.sqlite`` — bounds a chat
+#: command's memory regardless of store size (retention allows up to ~1M rows).
+#: Generous enough to span many heartbeats within one run, so every series keeps
+#: a baseline point for its windowed delta (design §4.4).
+_WINDOW_READ_CAP = 200_000
+
 #: The quantile the WINDOW section approximates from the histogram buckets (§4.5).
 WINDOW_QUANTILE = 0.95
 #: The intake ``result`` value that means a signal was dropped under backpressure.
@@ -315,10 +321,12 @@ def render_window(samples: Sequence[MetricSample], *, last_n: int) -> list[str]:
     else:
         lines.append(f"**suppressions/min:** {_NA}")
 
-    # Shedding — intake series whose result is 'shed' (backpressure drops).
+    # Shedding — intake series shed by backpressure. The emitter folds the lane
+    # into the value (``shed_control``/``shed_sensor``), so match by the ``shed``
+    # prefix and sum both, rather than an exact ``shed`` that never matched.
     shed_deltas: list[float] = []
     for key in win.keys_named(SIGNALS_INTAKE):
-        if _SHED not in win.labels[key].values():
+        if not any(v.startswith(_SHED) for v in win.labels[key].values()):
             continue
         delta = win.delta(key)
         if delta is not None:
@@ -407,7 +415,7 @@ def _safe_window(base_dir: Path, last_n: int) -> list[str]:
     if not db_path.exists():
         return ["**WINDOW**", "(no metrics history yet — metrics.sqlite not created)"]
     try:
-        samples = read_samples(db_path)
+        samples = read_samples(db_path, latest_run=True, limit=_WINDOW_READ_CAP)
     except Exception as exc:  # noqa: BLE001 - missing/locked/corrupt store → friendly
         return ["**WINDOW**", f"(metrics history unreadable: {exc})"]
     return render_window(samples, last_n=last_n)
