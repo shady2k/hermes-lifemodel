@@ -17,10 +17,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from lifemodel.state.brain_health import (
+    DEFAULT_TICK_INTERVAL_SECONDS,
+    STALE_AFTER_SECONDS,
     BrainHealth,
     brain_boot_path,
     get_brain_health,
     read_boot_record,
+    tick_staleness,
 )
 
 _NOW = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
@@ -233,3 +236,84 @@ def test_check_connecting_is_enablement_safe_healthy(tmp_path: Path) -> None:
     ok, reason = h.check(last_tick_at=None, now=_NOW, stale_after_seconds=_STALE)
     assert ok is True
     assert "connecting" in reason
+
+
+# --------------------------------------------------------------------------- #
+# snapshot() — the thread-safe read of every display field (Slice 3, /status)
+# --------------------------------------------------------------------------- #
+
+
+def test_snapshot_captures_every_display_field(tmp_path: Path) -> None:
+    h = BrainHealth(tmp_path)
+    h.mark_connected(at=_iso(_NOW))
+    h.record_loop_death("proactive loop died: RuntimeError('boom')", "tb")
+    h.record_observer_error("post_llm_call", "KeyError: x")
+    snap = h.snapshot()
+    assert snap.state == "loop_dead"
+    assert snap.death_count == 1
+    assert snap.last_loop_death is not None and "boom" in snap.last_loop_death
+    assert snap.last_observer_error == {"post_llm_call": "KeyError: x"}
+    assert snap.connected_at == _iso(_NOW)
+
+
+def test_snapshot_is_an_immutable_copy(tmp_path: Path) -> None:
+    # A snapshot must not change under a concurrent writer — the observer map is
+    # copied, not aliased, so a later mutation is invisible to an earlier read.
+    h = BrainHealth(tmp_path)
+    h.record_observer_error("post_llm_call", "first")
+    snap = h.snapshot()
+    h.record_observer_error("post_llm_call", "second")
+    assert snap.last_observer_error == {"post_llm_call": "first"}
+
+
+# --------------------------------------------------------------------------- #
+# tick_staleness() — the shared staleness helper check() and /status both use
+# --------------------------------------------------------------------------- #
+
+
+def test_tick_staleness_no_anchor_is_not_stale(tmp_path: Path) -> None:
+    # Unknown (no connect stamp, no tick) → not stale (age is None).
+    age, stale = tick_staleness(None, None, now=_NOW, stale_after_seconds=_STALE)
+    assert age is None
+    assert stale is False
+
+
+def test_tick_staleness_fresh_tick_is_not_stale(tmp_path: Path) -> None:
+    age, stale = tick_staleness(
+        _iso(_NOW - timedelta(seconds=30)),
+        _iso(_NOW - timedelta(seconds=30)),
+        now=_NOW,
+        stale_after_seconds=_STALE,
+    )
+    assert age == 30.0
+    assert stale is False
+
+
+def test_tick_staleness_old_tick_is_stale(tmp_path: Path) -> None:
+    age, stale = tick_staleness(
+        _iso(_NOW - timedelta(hours=1)),
+        _iso(_NOW - timedelta(hours=1)),
+        now=_NOW,
+        stale_after_seconds=_STALE,
+    )
+    assert age == 3600.0
+    assert stale is True
+
+
+def test_tick_staleness_uses_the_freshest_anchor(tmp_path: Path) -> None:
+    # A recent tick beats an old connect stamp (and vice-versa) — the freshest wins.
+    age, stale = tick_staleness(
+        _iso(_NOW - timedelta(hours=1)),  # connected long ago
+        _iso(_NOW - timedelta(seconds=10)),  # but ticked just now
+        now=_NOW,
+        stale_after_seconds=_STALE,
+    )
+    assert age == 10.0
+    assert stale is False
+
+
+def test_shared_staleness_threshold_constants(tmp_path: Path) -> None:
+    # The threshold lives HERE (Hermes-free) so both the adapter's check_fn and
+    # /lifemodel status read ONE value — "a few intervals" (spec §4.2).
+    assert DEFAULT_TICK_INTERVAL_SECONDS == 60.0
+    assert STALE_AFTER_SECONDS == 300.0

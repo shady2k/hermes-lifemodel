@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -36,6 +37,17 @@ from typing import Literal
 #: The closed set of brain states (spec §4.2). ``never_started`` and ``connecting``
 #: are the pre-connect *transients*; the rest are terminal-ish readouts.
 BrainState = Literal["never_started", "connecting", "connected", "loop_dead", "boot_failed"]
+
+#: The brain's nominal tick cadence (mirrors :class:`BeingAdapter`'s loop interval),
+#: the baseline the staleness threshold derives from. Kept HERE — the leaf health
+#: module, Hermes-free and with no heavy deps — so BOTH the adapter's ``check_fn``
+#: (:func:`~lifemodel.adapters.being_platform.make_check_fn`) AND ``/lifemodel status``
+#: read ONE threshold and can never drift.
+DEFAULT_TICK_INTERVAL_SECONDS = 60.0
+#: How stale the durable ``last_tick_at`` may get before the brain reads unhealthy
+#: (spec §4.2, "a few intervals"). Generous so a slow tick — or a just-connected loop
+#: still inside its grace — is never a false alarm.
+STALE_AFTER_SECONDS = DEFAULT_TICK_INTERVAL_SECONDS * 5
 
 #: The durable boot-health record filename, a sibling of ``lifemodel.sqlite`` /
 #: ``observability.sqlite`` under *base_dir*.
@@ -87,6 +99,48 @@ def _latest(*stamps: str | None) -> datetime | None:
     """Return the most recent parseable instant among *stamps* (``None`` if none)."""
     parsed = [dt for dt in (_parse_iso(s) for s in stamps) if dt is not None]
     return max(parsed) if parsed else None
+
+
+def tick_staleness(
+    connected_at: str | None,
+    last_tick_at: str | None,
+    *,
+    now: datetime,
+    stale_after_seconds: float,
+) -> tuple[float | None, bool]:
+    """Return ``(age_seconds, is_stale)`` for the freshest liveness anchor.
+
+    The single source of the staleness rule, shared by :meth:`BrainHealth.check`
+    (the enablement gate) and ``/lifemodel status`` (the display) so the two can
+    never disagree. The anchor is the most recent of *connected_at* and
+    *last_tick_at*: ``connected_at`` anchors the grace so a just-connected loop that
+    has not ticked yet is not flagged false-stale in its first interval, while a live
+    ``last_tick_at`` takes over once ticks flow. ``age`` is ``None`` when NO anchor is
+    parseable — an unknown age is treated as not-stale (the loud channels carry a real
+    outage), never as a false alarm.
+    """
+    anchor = _latest(connected_at, last_tick_at)
+    if anchor is None:
+        return None, False
+    age = (now - anchor).total_seconds()
+    return age, age > stale_after_seconds
+
+
+@dataclass(frozen=True)
+class BrainHealthSnapshot:
+    """An immutable read of a :class:`BrainHealth`'s display fields (Slice 3).
+
+    Taken under the record's lock (:meth:`BrainHealth.snapshot`) so a status render
+    sees one consistent view even while the tick thread / reconnect watcher writes
+    concurrently. The ``last_observer_error`` map is copied, not aliased.
+    """
+
+    state: BrainState
+    boot_error: str | None
+    last_loop_death: str | None
+    death_count: int
+    last_observer_error: dict[str, str]
+    connected_at: str | None
 
 
 class BrainHealth:
@@ -162,6 +216,25 @@ class BrainHealth:
         with self._lock:
             self.last_observer_error[observer] = error
 
+    # ---- read: a consistent snapshot of the display fields (feeds /status) -- #
+
+    def snapshot(self) -> BrainHealthSnapshot:
+        """Return an immutable, lock-consistent copy of the display fields (Slice 3).
+
+        ``/lifemodel status`` reads this instead of the live attributes so a render
+        sees ONE coherent view — never a torn read while the tick thread / reconnect
+        watcher mutates. The observer map is copied, not aliased.
+        """
+        with self._lock:
+            return BrainHealthSnapshot(
+                state=self.state,
+                boot_error=self.boot_error,
+                last_loop_death=self.last_loop_death,
+                death_count=self.death_count,
+                last_observer_error=dict(self.last_observer_error),
+                connected_at=self.connected_at,
+            )
+
     # ---- read: the enablement-safe liveness predicate (feeds check_fn) ----- #
 
     def check(
@@ -199,13 +272,14 @@ class BrainHealth:
             return True, "connecting: loop coming up (enablement-safe)"
 
         # state == "connected": stale only if the freshest of (connected_at,
-        # last_tick_at) is older than the window. connected_at anchors the grace so
-        # a just-connected loop that hasn't ticked yet is not flagged false-stale.
-        anchor = _latest(connected_at, last_tick_at)
-        if anchor is None:
-            return True, "connected"
-        age = (now - anchor).total_seconds()
-        if age > stale_after_seconds:
+        # last_tick_at) is older than the window (shared :func:`tick_staleness`, so the
+        # enablement gate and ``/lifemodel status`` never disagree). connected_at
+        # anchors the grace so a just-connected loop that hasn't ticked yet is not
+        # flagged false-stale.
+        age, stale = tick_staleness(
+            connected_at, last_tick_at, now=now, stale_after_seconds=stale_after_seconds
+        )
+        if stale and age is not None:
             return False, f"stale: no tick for {age:.0f}s (> {stale_after_seconds:.0f}s)"
         return True, "connected"
 

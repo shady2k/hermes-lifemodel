@@ -37,7 +37,12 @@ from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..events import EventRing
-from ..state.brain_health import BrainHealth, get_brain_health
+from ..state.brain_health import (
+    DEFAULT_TICK_INTERVAL_SECONDS,
+    STALE_AFTER_SECONDS,
+    BrainHealth,
+    get_brain_health,
+)
 from ..state.metrics_store import (
     MetricsSampler,
     acquire_metrics_sampler,
@@ -56,12 +61,11 @@ from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
 
 PLATFORM_NAME = "lifemodel"
-LOOP_INTERVAL_SEC = 60.0
-
-#: How stale the durable ``last_tick_at`` may get before ``check_fn`` reports the
-#: brain unhealthy (spec §4.2, "a few intervals"). Generous so a slow tick or a
-#: just-connected loop within its grace is never a false alarm.
-STALE_AFTER_SECONDS = LOOP_INTERVAL_SEC * 5
+#: The adapter's tick cadence — the SAME baseline the (Hermes-free) staleness
+#: threshold derives from, imported from :mod:`lifemodel.state.brain_health` so the
+#: adapter loop, ``check_fn``, and ``/lifemodel status`` never drift. ``STALE_AFTER_SECONDS``
+#: is re-exported from here for back-compat with existing call sites.
+LOOP_INTERVAL_SEC = DEFAULT_TICK_INTERVAL_SECONDS
 
 _LOG = logging.getLogger("lifemodel.being")
 
