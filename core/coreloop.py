@@ -69,7 +69,7 @@ from .tick_metrics import (
     TRACE_WRITER_WRITE_ERRORS,
     register_universal_metrics,
 )
-from .timeutil import minutes_between
+from .timeutil import minutes_between, to_epoch_seconds
 
 #: How many records the start-of-tick snapshot pulls *per live state*. A per-tick
 #: scan is fine at current scale (lm-fib.6.5 tracks scaling); the cap keeps it
@@ -507,7 +507,10 @@ class CoreLoop:
         # / ``tick_count`` committed above stay the PRIMARY liveness — and fail-open like
         # every other emission here (a metrics hiccup can never break the tick).
         self._metrics.inc(BRAIN_HEARTBEAT)
-        self._metrics.set(BRAIN_LAST_TICK_EPOCH, now.timestamp())
+        # ``BRAIN_LAST_TICK_EPOCH`` is a legitimately epoch-VALUED metric (spec §2/§6):
+        # its VALUE is epoch seconds — that stays — but it is computed through the one
+        # canonical helper, never a raw ``.timestamp()`` (the lint bans that on the hot path).
+        self._metrics.set(BRAIN_LAST_TICK_EPOCH, to_epoch_seconds(now))
         self._metrics.observe(TICK_DURATION, self._monotonic() - started_mono)
         # ``last_tick_at`` is the PREVIOUS tick's stamp; minutes_between is the
         # defensive parser (None / unparseable / naive → 0.0), converted to seconds.
