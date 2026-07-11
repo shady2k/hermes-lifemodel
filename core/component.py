@@ -35,9 +35,11 @@ class ComponentLayer(StrEnum):
     ``layer`` label carried by every component/tick metric — a :class:`~enum.StrEnum`
     so a member IS its own label value (``ComponentLayer.AUTONOMIC == "autonomic"``).
 
-    Named ``ComponentLayer`` (not ``Layer``) deliberately: :class:`lifemodel.core.layer.Layer`
-    is the unrelated brain-stage ABC extension point. This enum tags a *registered
-    component*; that ABC is a *processing stage* base class.
+    Named ``ComponentLayer`` because it tags a *registered component*: it is the
+    ``layer`` field of that component's
+    :class:`~lifemodel.core.registry.ComponentManifest`, filled at the composition
+    root via :func:`layer_for_type`. It is a label ON a component, not a
+    processing-stage base class.
     """
 
     AUTONOMIC = "autonomic"

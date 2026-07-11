@@ -9,8 +9,10 @@ tick's signal (HLA §10).
 
 Kept minimal-but-extensible (YAGNI): only the fields Phase 1 needs. New fields
 slot in later because :meth:`from_dict` is tolerant of missing keys. Every field
-is JSON-native so the durable signal log (:mod:`lifemodel.adapters.signal_bus`)
-round-trips a ``Signal`` with :mod:`json` alone. Imports nothing from Hermes.
+is JSON-native so a ``Signal`` round-trips through :mod:`json` alone. There is no
+durable signal log: the nervous flow is ephemeral (spec §2/§3) — a signal lives
+inside one ExecutionFrame's in-memory :class:`~lifemodel.core.frame.SignalFrame`
+and dies with it. Imports nothing from Hermes.
 """
 
 from __future__ import annotations
