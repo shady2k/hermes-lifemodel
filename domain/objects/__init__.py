@@ -2,7 +2,7 @@
 
 A typed Belief-Desire-Intention layer sitting *on top of* the generic
 ``memory_records`` envelope (:mod:`lifemodel.domain.memory`). Four kinds
-(:class:`Desire`, :class:`Intention`, :class:`Relationship`, :class:`Thought`)
+(:class:`Desire`, :class:`Intention`, :class:`UserModel`, :class:`Thought`)
 subclass a shared :class:`BaseObject`; the :class:`KindRegistry` is the single
 door for every encode/decode/transition. :func:`default_registry` is the blessed
 factory for the closed four-kind catalog — feature code takes one and cannot add
@@ -19,7 +19,7 @@ from __future__ import annotations
 from .base import (
     CONTACT_DESIRE_ID,
     CONTACT_INTENTION_ID,
-    OWNER_RELATIONSHIP_ID,
+    OWNER_USER_MODEL_ID,
     BaseObject,
     derive_id,
     qualified_id,
@@ -39,13 +39,13 @@ from .provenance import (
     parse_traceparent,
 )
 from .registry import KindRegistry, default_registry
-from .relationship import Relationship, RelationshipState
 from .thought import Thought, ThoughtState
+from .user_model import UserModel, UserModelState
 
 __all__ = [
     "CONTACT_DESIRE_ID",
     "CONTACT_INTENTION_ID",
-    "OWNER_RELATIONSHIP_ID",
+    "OWNER_USER_MODEL_ID",
     "BaseObject",
     "Desire",
     "DesireSpring",
@@ -57,12 +57,12 @@ __all__ = [
     "KindRegistry",
     "ObjectCoreError",
     "Provenance",
-    "Relationship",
-    "RelationshipState",
     "Sensitivity",
     "Thought",
     "ThoughtState",
     "UnknownKind",
+    "UserModel",
+    "UserModelState",
     "default_registry",
     "derive_id",
     "format_traceparent",

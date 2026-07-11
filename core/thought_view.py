@@ -4,7 +4,7 @@ lm-27n.6 wires the typed :class:`~lifemodel.domain.objects.Thought` end-to-end
 *without generation*: it persists as ``kind='thought'`` memory records (state
 machine ``active``/``parked`` → terminal ``resolved``/``dropped``/``expired``/
 ``merged``) and RENDERS the live ones into the being's proactive wake packet.
-Unlike the desire/intention/relationship singletons
+Unlike the desire/intention/user-model singletons
 (:mod:`lifemodel.core.desire_view` et al.), a thought is **NON-singleton** —
 there can be many live at once — so this view reads and orders a *set*.
 

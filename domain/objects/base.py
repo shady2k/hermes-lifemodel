@@ -57,12 +57,12 @@ CONTACT_DESIRE_ID = "contact:owner"
 #: are distinct rows sharing the contact frame.
 CONTACT_INTENTION_ID = "contact:owner"
 
-#: The singleton ``kind="relationship"`` id for the owner relationship (lm-27n.5)
-#: — the being's learned interaction norms about its owner (good/bad hours,
-#: cadence, privacy boundaries, acceptable styles, explicit prefs). One row per
-#: being; created/updated only through the intent bus (a ``PutRecord`` upsert),
-#: never direct SQL/config. Read via :mod:`lifemodel.core.relationship_view`.
-OWNER_RELATIONSHIP_ID = "owner"
+#: The singleton ``kind="user_model"`` id for the owner user-model (spec §8) — the
+#: being's derived model of its owner (good/bad hours, cadence, privacy
+#: boundaries, acceptable styles, explicit prefs). One row per being;
+#: created/updated only through the intent bus (a ``PutRecord`` upsert), never
+#: direct SQL/config. Read via :mod:`lifemodel.core.user_model_view`.
+OWNER_USER_MODEL_ID = "owner"
 
 
 def derive_id(*parts: str) -> str:

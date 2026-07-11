@@ -32,7 +32,7 @@ from .state_commands import (
     reset_for_dir,
     satiate_for_dir,
     set_field_for_dir,
-    set_relationship_prefs_for_dir,
+    set_user_model_prefs_for_dir,
     think_for_dir,
     why_for_dir,
 )
@@ -90,12 +90,12 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
     ),
     "reset": _Subcommand(
         "Factory wipe: write a fresh State() AND delete every memory record "
-        "(thoughts/desires/intentions/relationships) — truly as if newly born.",
+        "(thoughts/desires/intentions/user-models) — truly as if newly born.",
         mutating=True,
     ),
     "set": _Subcommand("set <field> <value> — write one whitelisted state field.", mutating=True),
-    "relationship": _Subcommand(
-        "relationship <key>=<value> ... — set owner norms (bad-hours, cadence, "
+    "user-model": _Subcommand(
+        "user-model <key>=<value> ... — set owner norms (bad-hours, cadence, "
         "privacy, topics, styles, ...) that gate proactive contact.",
         mutating=True,
     ),
@@ -209,7 +209,7 @@ def register(ctx: Any) -> None:
             "satiate": lambda: satiate_for_dir(sdir),
             "reset": lambda: reset_for_dir(sdir),
             "set": lambda: set_field_for_dir(sdir, rest),
-            "relationship": lambda: set_relationship_prefs_for_dir(sdir, rest),
+            "user-model": lambda: set_user_model_prefs_for_dir(sdir, rest),
             "think": lambda: think_for_dir(sdir, rest),
             "loglevel": lambda: set_log_level_for_dir(sdir, rest),
         }

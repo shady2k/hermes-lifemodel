@@ -160,7 +160,7 @@ def build_contact_intention(
 
     ``extra_constraints`` appends the receptivity appraisal's composing constraints
     (lm-27n.5 — allowed styles, topic sensitivities) for auditability; empty by
-    default, so an unpopulated relationship leaves the intention byte-identical to
+    default, so an unpopulated user-model leaves the intention byte-identical to
     .4 (behaviour-neutral).
 
     ``provenance`` (lm-27n.11) records the creation lineage + the tick's execution

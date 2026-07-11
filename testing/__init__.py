@@ -25,8 +25,8 @@ from .harness import (
     TickRecord,
 )
 from .intentions import contact_intention_objects, contact_intention_record
-from .relationships import owner_relationship_objects, owner_relationship_record
 from .thoughts import thought_objects, thought_record
+from .user_model import owner_user_model_objects, owner_user_model_record
 
 __all__ = [
     "FakeActiveSpan",
@@ -45,8 +45,8 @@ __all__ = [
     "contact_desire_record",
     "contact_intention_objects",
     "contact_intention_record",
-    "owner_relationship_objects",
-    "owner_relationship_record",
+    "owner_user_model_objects",
+    "owner_user_model_record",
     "thought_objects",
     "thought_record",
 ]

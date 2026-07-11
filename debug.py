@@ -16,8 +16,8 @@ from . import composition
 from .core.desire_view import read_live_contact_desire
 from .core.intention_view import read_live_contact_intention
 from .core.introspect import DebugConfig, Readings, compute_readings, contact_chain_summary
-from .core.relationship_view import read_owner_relationship
 from .core.thought_view import read_live_thoughts
+from .core.user_model_view import read_owner_user_model
 from .core.why_graph import why_contact_intention
 from .ports.clock import ClockPort
 from .ports.memory import MemoryPort
@@ -135,7 +135,7 @@ def render_dump_for_dir(base_dir: Path, *, clock: ClockPort | None = None) -> st
     desire_source_thought_ids = desire.source_thought_ids if desire is not None else ()
     intention = read_live_contact_intention(memory) if memory is not None else None
     intention_state = intention.state if intention is not None else "none"
-    relationship = read_owner_relationship(memory) if memory is not None else None
+    user_model = read_owner_user_model(memory) if memory is not None else None
     thoughts = read_live_thoughts(memory, limit=DEBUG_THOUGHTS_LIMIT) if memory is not None else ()
     # The COMPACT "why did I write" chain (lm-27n.10): a single summary line, NOT the
     # full graph each dump. The full walk lives behind `/lifemodel why`.
@@ -151,7 +151,7 @@ def render_dump_for_dir(base_dir: Path, *, clock: ClockPort | None = None) -> st
             desire_spring=desire_spring,
             desire_source_thought_ids=desire_source_thought_ids,
             intention_state=intention_state,
-            relationship=relationship,
+            user_model=user_model,
             thoughts=thoughts,
             contact_chain=contact_chain,
         )

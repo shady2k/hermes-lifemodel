@@ -216,17 +216,17 @@ def test_dump_survives_a_corrupt_store(tmp_path) -> None:
 
 
 def test_dump_renders_the_receptivity_section(tmp_path) -> None:
-    from lifemodel.core.relationship_view import (
+    from lifemodel.core.user_model_view import (
         EXPLICIT_CONFIDENCE,
-        build_owner_relationship,
-        encode_owner_relationship,
+        build_owner_user_model,
+        encode_owner_user_model,
     )
 
     store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
     store.commit(State(u=2.0, last_tick_at="2026-07-06T00:00:00+00:00"))
     store.put(
-        encode_owner_relationship(
-            build_owner_relationship(bad_hours=(1,), confidence=EXPLICIT_CONFIDENCE)
+        encode_owner_user_model(
+            build_owner_user_model(bad_hours=(1,), confidence=EXPLICIT_CONFIDENCE)
         )
     )
     out = render_dump_for_dir(tmp_path)

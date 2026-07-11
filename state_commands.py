@@ -48,18 +48,18 @@ from typing import Any
 from . import composition
 from .core.backstop import allow_send
 from .core.desire_view import DESIRE_KIND
-from .core.relationship_view import (
-    EXPLICIT_CONFIDENCE,
-    build_owner_relationship,
-    encode_owner_relationship,
-    read_owner_relationship,
-)
 from .core.thought_view import (
     LIVE_THOUGHT_STATES,
     THOUGHT_KIND,
     build_thought,
     encode_thought,
     seed_thought_id,
+)
+from .core.user_model_view import (
+    EXPLICIT_CONFIDENCE,
+    build_owner_user_model,
+    encode_owner_user_model,
+    read_owner_user_model,
 )
 from .core.why_graph import (
     WhyNode,
@@ -74,8 +74,8 @@ from .domain.objects import (
     DesireState,
     InvalidTransition,
     Provenance,
-    Relationship,
     ThoughtState,
+    UserModel,
     default_registry,
 )
 from .ports.memory import MemoryPort
@@ -320,42 +320,42 @@ def set_field(before: State, now: datetime, raw_args: str) -> tuple[State | None
     return after, _echo(f"set {field_name}", before, after, [field_name])
 
 
-# --- relationship prefs (lm-27n.5) ------------------------------------------
-# The owner-facing path to SET the being's learned norms about its owner (good/bad
+# --- user-model prefs (spec §8) ---------------------------------------------
+# The owner-facing path to SET the being's derived norms about its owner (good/bad
 # hours, cadence min, quiet topics, allowed styles, explicit prefs). It builds a
-# typed ``Relationship`` and commits it through the intent bus (a ``PutRecord``
+# typed ``UserModel`` and commits it through the intent bus (a ``PutRecord``
 # upsert via ``commit_tick`` — NOT direct SQL, NOT config), which
 # ``appraise_receptivity`` then reads. Setting prefs marks the row EXPLICIT
 # (``confidence=EXPLICIT_CONFIDENCE``) so its boundaries hard-veto; an unset being
 # keeps the permissive default and behaves exactly as before.
 
-#: Each ``key=value`` token the owner may set, mapped to its ``Relationship`` field
+#: Each ``key=value`` token the owner may set, mapped to its ``UserModel`` field
 #: + coercion kind. This IS the whole whitelist — an unknown key is rejected with a
 #: clear message, never silently splatted.
-_REL_LIST_KEYS: dict[str, str] = {
+_UM_LIST_KEYS: dict[str, str] = {
     "privacy": "privacy_boundaries",
     "topics": "topic_sensitivity",
     "styles": "acceptable_styles",
     "prefs": "explicit_preferences",
 }
-_REL_HOUR_KEYS: dict[str, str] = {"bad-hours": "bad_hours", "good-hours": "good_hours"}
-_REL_STR_KEYS: dict[str, str] = {
+_UM_HOUR_KEYS: dict[str, str] = {"bad-hours": "bad_hours", "good-hours": "good_hours"}
+_UM_STR_KEYS: dict[str, str] = {
     "cadence": "cadence",
     "valence": "response_valence_pattern",
     "load": "known_load",
     "latency": "reply_latency_norm",
 }
-_REL_FLOAT_KEYS: dict[str, str] = {"intimacy": "intimacy_depth"}
+_UM_FLOAT_KEYS: dict[str, str] = {"intimacy": "intimacy_depth"}
 
 #: One ``key=value`` token; the value runs up to the next ``key=`` or end-of-input,
 #: so multi-word values ("load=busy at work") parse without quoting.
-_REL_TOKEN = re.compile(r"(?P<key>[a-z][a-z-]*)=(?P<val>.*?)(?=\s+[a-z][a-z-]*=|$)", re.IGNORECASE)
+_UM_TOKEN = re.compile(r"(?P<key>[a-z][a-z-]*)=(?P<val>.*?)(?=\s+[a-z][a-z-]*=|$)", re.IGNORECASE)
 
 
-def _rel_usage() -> str:
-    keys = ", ".join([*_REL_HOUR_KEYS, *_REL_STR_KEYS, *_REL_LIST_KEYS, *_REL_FLOAT_KEYS])
+def _um_usage() -> str:
+    keys = ", ".join([*_UM_HOUR_KEYS, *_UM_STR_KEYS, *_UM_LIST_KEYS, *_UM_FLOAT_KEYS])
     return (
-        "usage: /lifemodel relationship <key>=<value> ...\n"
+        "usage: /lifemodel user-model <key>=<value> ...\n"
         f"keys: {keys}\n"
         "note: bad-hours/good-hours are UTC hours 0-23 (comma-separated); "
         "keys not named are left unchanged.\n"
@@ -382,12 +382,12 @@ def _parse_list(raw: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-def set_relationship_prefs(
-    raw_args: str, existing: Relationship | None = None
-) -> tuple[Relationship | None, str]:
-    """Parse owner ``key=value`` prefs into the typed owner :class:`Relationship`.
+def set_user_model_prefs(
+    raw_args: str, existing: UserModel | None = None
+) -> tuple[UserModel | None, str]:
+    """Parse owner ``key=value`` prefs into the typed owner :class:`UserModel`.
 
-    Returns ``(relationship, message)`` on success (``confidence=EXPLICIT_CONFIDENCE``
+    Returns ``(user_model, message)`` on success (``confidence=EXPLICIT_CONFIDENCE``
     so its boundaries hard-veto) or ``(None, error_message)`` on bad input — the
     same reject-nothing-to-commit contract the other mutations use. Pure: builds
     the row, persists nothing (the ``*_for_dir`` wrapper commits it through the bus).
@@ -398,54 +398,54 @@ def set_relationship_prefs(
     silently dropped by an unrelated update).
     """
     if not raw_args.strip():
-        return None, _rel_usage()
+        return None, _um_usage()
     kwargs: dict[str, Any] = {}
     set_labels: list[str] = []
     consumed = 0
-    for match in _REL_TOKEN.finditer(raw_args):
+    for match in _UM_TOKEN.finditer(raw_args):
         consumed += 1
         key = match.group("key").lower()
         raw_value = match.group("val").strip()
-        if key in _REL_HOUR_KEYS:
+        if key in _UM_HOUR_KEYS:
             hours = _parse_hours(raw_value)
             if hours is None:
                 return (
                     None,
                     f"error: {key!r} expects comma-separated hours 0-23, got {raw_value!r}\n",
                 )
-            kwargs[_REL_HOUR_KEYS[key]] = hours
-            set_labels.append(f"{_REL_HOUR_KEYS[key]}={hours}")
-        elif key in _REL_LIST_KEYS:
+            kwargs[_UM_HOUR_KEYS[key]] = hours
+            set_labels.append(f"{_UM_HOUR_KEYS[key]}={hours}")
+        elif key in _UM_LIST_KEYS:
             items = _parse_list(raw_value)
-            kwargs[_REL_LIST_KEYS[key]] = items
-            set_labels.append(f"{_REL_LIST_KEYS[key]}={items}")
-        elif key in _REL_STR_KEYS:
-            kwargs[_REL_STR_KEYS[key]] = raw_value
-            set_labels.append(f"{_REL_STR_KEYS[key]}={raw_value!r}")
-        elif key in _REL_FLOAT_KEYS:
+            kwargs[_UM_LIST_KEYS[key]] = items
+            set_labels.append(f"{_UM_LIST_KEYS[key]}={items}")
+        elif key in _UM_STR_KEYS:
+            kwargs[_UM_STR_KEYS[key]] = raw_value
+            set_labels.append(f"{_UM_STR_KEYS[key]}={raw_value!r}")
+        elif key in _UM_FLOAT_KEYS:
             try:
                 number = float(raw_value)
             except ValueError:
                 return None, f"error: {key!r} expects a number, got {raw_value!r}\n"
-            kwargs[_REL_FLOAT_KEYS[key]] = number
-            set_labels.append(f"{_REL_FLOAT_KEYS[key]}={number}")
+            kwargs[_UM_FLOAT_KEYS[key]] = number
+            set_labels.append(f"{_UM_FLOAT_KEYS[key]}={number}")
         else:
-            return None, f"error: unknown relationship key {key!r}.\n{_rel_usage()}"
+            return None, f"error: unknown user-model key {key!r}.\n{_um_usage()}"
     if consumed == 0:
-        return None, _rel_usage()
+        return None, _um_usage()
     if existing is not None:
         # Patch the provided keys onto the existing row (preserve other boundaries).
-        relationship = dataclasses.replace(existing, confidence=EXPLICIT_CONFIDENCE, **kwargs)
+        user_model = dataclasses.replace(existing, confidence=EXPLICIT_CONFIDENCE, **kwargs)
     else:
-        relationship = build_owner_relationship(confidence=EXPLICIT_CONFIDENCE, **kwargs)
+        user_model = build_owner_user_model(confidence=EXPLICIT_CONFIDENCE, **kwargs)
     lines = [
-        "lifemodel relationship  (mutating)",
+        "lifemodel user-model  (mutating)",
         "=" * 30,
         "",
-        f"  owner relationship set (confidence={EXPLICIT_CONFIDENCE:.2f} -> boundaries hard-veto)",
+        f"  owner user-model set (confidence={EXPLICIT_CONFIDENCE:.2f} -> boundaries hard-veto)",
         *(f"  {label}" for label in set_labels),
     ]
-    return relationship, "\n".join(lines) + "\n"
+    return user_model, "\n".join(lines) + "\n"
 
 
 # --- directory-level wrappers (the seam `__init__.py` calls) ----------------
@@ -566,7 +566,7 @@ def reset_for_dir(base_dir: Path) -> str:
     itself, it only degrades the message to a generic banner.
 
     A TRUE factory wipe (lm-7lx) also deletes every ``memory_records`` row —
-    every thought/desire/intention/relationship, not just the vitals row — so
+    every thought/desire/intention/user_model, not just the vitals row — so
     a reset being genuinely starts "as if newly born" with no rumination spiral
     left behind. See :func:`_purge_all_memory` for the best-effort seam.
     """
@@ -621,10 +621,10 @@ def set_field_for_dir(base_dir: Path, raw_args: str) -> str:
     return _apply(base_dir, lambda before, now: set_field(before, now, raw_args))
 
 
-def set_relationship_prefs_for_dir(base_dir: Path, raw_args: str) -> str:
-    """Parse owner prefs and commit the owner-relationship row through the bus.
+def set_user_model_prefs_for_dir(base_dir: Path, raw_args: str) -> str:
+    """Parse owner prefs and commit the owner user-model row through the bus.
 
-    The relationship is a typed ``kind='relationship'`` record, not a ``State``
+    The user-model is a typed ``kind='user_model'`` record, not a ``State``
     field, so this does NOT go through :func:`_apply` (whose ``compute`` returns a
     ``State`` candidate). It builds the typed row, wraps it in a ``PutRecord``
     upsert, and commits it via the SAME atomic ``commit_tick`` the tick pipeline
@@ -633,18 +633,18 @@ def set_relationship_prefs_for_dir(base_dir: Path, raw_args: str) -> str:
     that degrades to a no-op commit (the live ``SQLiteRuntimeStore`` always
     implements it)."""
     lm = composition.build_lifemodel(base_dir=base_dir)
-    # Read the existing owner relationship so the parsed keys PATCH it (an unrelated
+    # Read the existing owner user-model so the parsed keys PATCH it (an unrelated
     # update must not clear a previously-set boundary). Absent → build fresh.
-    existing = read_owner_relationship(lm.state) if isinstance(lm.state, MemoryPort) else None
-    relationship, message = set_relationship_prefs(raw_args, existing)
-    if relationship is None:
+    existing = read_owner_user_model(lm.state) if isinstance(lm.state, MemoryPort) else None
+    user_model, message = set_user_model_prefs(raw_args, existing)
+    if user_model is None:
         return message
     state = lm.state.load()
-    put = PutOp(draft=encode_owner_relationship(relationship))
+    put = PutOp(draft=encode_owner_user_model(user_model))
     if isinstance(lm.state, TickCommitPort):
         lm.state.commit_tick(state, [put])
     else:  # pragma: no cover - the live store is always a TickCommitPort
-        return "error: this store cannot persist a relationship record\n"
+        return "error: this store cannot persist a user-model record\n"
     return message
 
 

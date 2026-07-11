@@ -714,7 +714,7 @@ class SQLiteRuntimeStore:
     def purge_memory_records(self) -> int:
         """Delete every row from ``memory_records`` — the memory-wipe half of a
         TRUE factory reset (bead lm-7lx: ``/lifemodel reset`` must also drop
-        every thought/desire/intention/relationship row, not just the vitals).
+        every thought/desire/intention/user_model row, not just the vitals).
 
         Touches ONLY ``memory_records`` — ``runtime_state``, ``store_meta``, and
         ``schema_migrations`` are untouched. Counts the rows before deleting

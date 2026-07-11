@@ -62,7 +62,7 @@ def test_scenario_1_inbound_contact_satiates_and_resolves_desire(tmp_path: Path)
 
     final = lm.state.load()
     assert final.u < 2.0  # the genuine two_way contact satiated the drive
-    assert final.last_exchange_at is not None  # relationship record stamped
+    assert final.last_exchange_at is not None  # exchange record stamped
     assert read_live_contact_desire(lm.state) is None  # the live desire resolved...
     assert lm.state.get("desire", "contact:owner").state == "satisfied"  # ...to SATISFIED
 
@@ -209,7 +209,7 @@ def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> 
     run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
     after_first = lm.state.load()
     assert after_first.u < 5.0  # the genuine two_way contact satiated the drive once
-    assert after_first.last_exchange_at == _NOW.isoformat()  # relationship record stamped
+    assert after_first.last_exchange_at == _NOW.isoformat()  # exchange record stamped
     assert lm.state.get("desire", "contact:owner").state == "satisfied"  # desire resolved
 
     # A retry of the SAME Hermes event id (clock pinned → dt=0, so any SECOND

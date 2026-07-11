@@ -1,12 +1,14 @@
-"""``Relationship`` — learned norms about a correspondent (BDI, HLA §4.1).
+"""``UserModel`` — our derived model of the Other (the user) (spec §8, HLA §4.1).
 
-A relationship holds *learned* interaction norms and derived receptivity — the
-cadence that works, the good/bad hours, response-valence patterns, privacy
-boundaries, topic sensitivities, intimacy depth, acceptable styles, explicit
-preferences. It is **not** a live counter store: egress counters
-(unanswered-outbound count, backoff, action-pending) stay in ``runtime_state``;
-a relationship *reads* them elsewhere and never duplicates them (the split-brain
-guard, HLA §4.1). State machine: ``active`` may only be ``archived`` (terminal).
+A UserModel holds our *derived* cache of the correspondent — the learned
+interaction norms and receptivity we infer about the owner: the cadence that
+works, the good/bad hours, response-valence patterns, privacy boundaries, topic
+sensitivities, intimacy depth, acceptable styles, explicit preferences. It is
+the model of "the Other", NOT the being's own ``AgentState`` (the self) and NOT
+a live counter store: egress counters (unanswered-outbound count, backoff,
+action-pending) stay in ``runtime_state``; a UserModel *reads* them elsewhere and
+never duplicates them (the split-brain guard, HLA §4.1). State machine:
+``active`` may only be ``archived`` (terminal).
 """
 
 from __future__ import annotations
@@ -27,19 +29,19 @@ from .base import (
 )
 
 
-class RelationshipState(StrEnum):
+class UserModelState(StrEnum):
     ACTIVE = "active"
     ARCHIVED = "archived"
 
 
-RELATIONSHIP_TRANSITIONS: dict[str, frozenset[str]] = {
-    RelationshipState.ACTIVE: state_set(RelationshipState.ARCHIVED),
-    RelationshipState.ARCHIVED: state_set(),
+USER_MODEL_TRANSITIONS: dict[str, frozenset[str]] = {
+    UserModelState.ACTIVE: state_set(UserModelState.ARCHIVED),
+    UserModelState.ARCHIVED: state_set(),
 }
 
 
 @dataclass(frozen=True, kw_only=True)
-class Relationship(BaseObject):
+class UserModel(BaseObject):
     cadence: str
     good_hours: tuple[int, ...]
     bad_hours: tuple[int, ...]
@@ -52,7 +54,7 @@ class Relationship(BaseObject):
     acceptable_styles: tuple[str, ...]
     explicit_preferences: tuple[str, ...]
 
-    KIND: ClassVar[str] = "relationship"
+    KIND: ClassVar[str] = "user_model"
     SCHEMA_VERSION: ClassVar[int] = 1
 
     def _semantic_payload(self) -> JsonObject:

@@ -4,7 +4,7 @@ No feature code constructs a raw ``MemoryDraft``/``MemoryRecord`` for a typed
 kind, and no feature code decides a lifecycle edge by hand: every
 create/decode/transition goes through this registry. The catalog is **closed at
 construction** — there is no public ``register()`` to call — so the set of
-kinds is exactly ``{desire, intention, relationship, thought}``.
+kinds is exactly ``{desire, intention, user_model, thought}``.
 
 Registration validates each kind at construction: semantic field names must not
 use the reserved ``_`` prefix, the transition table must be non-empty, and every
@@ -23,8 +23,8 @@ from .base import RESERVED_KEYS, BaseFields, BaseObject, pack_envelope, unpack_e
 from .desire import DESIRE_TRANSITIONS, Desire
 from .errors import InvalidPayload, InvalidTransition, UnknownKind
 from .intention import INTENTION_TRANSITIONS, Intention
-from .relationship import RELATIONSHIP_TRANSITIONS, Relationship
 from .thought import THOUGHT_TRANSITIONS, Thought
+from .user_model import USER_MODEL_TRANSITIONS, UserModel
 
 #: The envelope field names, computed once — anything on a kind that is *not*
 #: one of these is a semantic field (the reserved-prefix guard checks those).
@@ -229,7 +229,7 @@ class KindRegistry:
 _CATALOG: tuple[KindSpec, ...] = (
     KindSpec(cls=Desire, transitions=DESIRE_TRANSITIONS),
     KindSpec(cls=Intention, transitions=INTENTION_TRANSITIONS),
-    KindSpec(cls=Relationship, transitions=RELATIONSHIP_TRANSITIONS),
+    KindSpec(cls=UserModel, transitions=USER_MODEL_TRANSITIONS),
     KindSpec(cls=Thought, transitions=THOUGHT_TRANSITIONS),
 )
 

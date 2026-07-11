@@ -14,15 +14,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..domain.objects import Relationship, Thought, ThoughtState
+from ..domain.objects import Thought, ThoughtState, UserModel
 from ..sim.wake import GateParams, LaneState, backoff_interval, evaluate_wake
 from ..state.model import State
 from .backstop import allow_send
 from .circadian import circadian
 from .pressure import effective_pressure, inhibition_at
 from .receptivity import appraise_receptivity
-from .relationship_view import DEFAULT_RELATIONSHIP
 from .timeutil import minutes_between
+from .user_model_view import DEFAULT_USER_MODEL
 from .why_graph import WhyNode, display_id
 
 #: Max age (minutes) of ``last_tick_at`` before the brain reads as STALE. The loop
@@ -231,7 +231,7 @@ def compute_readings(
     desire_spring: str = "drive",
     desire_source_thought_ids: tuple[str, ...] = (),
     intention_state: str = "none",
-    relationship: Relationship | None = None,
+    user_model: UserModel | None = None,
     thoughts: Sequence[Thought] = (),
     contact_chain: str = "no current outreach",
 ) -> Readings:
@@ -239,14 +239,14 @@ def compute_readings(
     lifecycle state (``active``/``deferred``/``none``), read by the caller from
     the typed ``kind='desire'`` row (lm-27n.3 — no longer a ``State`` flag);
     ``intention_state`` is the live contact-intention's (the Bratman decision
-    record, lm-27n.4) — the "why did I send" audit line. ``relationship`` is the
-    live owner relationship (lm-27n.5); ``None`` falls back to the permissive
-    :data:`~lifemodel.core.relationship_view.DEFAULT_RELATIONSHIP`, so the
+    record, lm-27n.4) — the "why did I send" audit line. ``user_model`` is the
+    live owner user_model (lm-27n.5); ``None`` falls back to the permissive
+    :data:`~lifemodel.core.user_model_view.DEFAULT_USER_MODEL`, so the
     receptivity readings surface ``allowed=True / multiplier=1.0`` — the "why
     silent" audit is behaviour-neutral until the owner sets prefs. ``thoughts``
     are the being's live thoughts (lm-27n.6), most-salient first — the "what am I
     turning over" audit; empty until one is seeded/generated."""
-    appraisal = appraise_receptivity(relationship or DEFAULT_RELATIONSHIP, state, now)
+    appraisal = appraise_receptivity(user_model or DEFAULT_USER_MODEL, state, now)
     last_tick_ago = _ago(state.last_tick_at, now)
     dt = max(0.0, minutes_between(state.last_tick_at, now))
     u = min(cfg.u_max, state.u + dt * cfg.alpha)

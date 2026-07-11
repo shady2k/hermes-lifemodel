@@ -30,10 +30,10 @@ from lifemodel.domain.objects import (
     KindRegistry,
     ObjectCoreError,
     Provenance,
-    Relationship,
     Sensitivity,
     Thought,
     UnknownKind,
+    UserModel,
     default_registry,
     derive_id,
     format_traceparent,
@@ -50,7 +50,7 @@ TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
 SPAN_ID = "00f067aa0ba902b7"
 PARENT_SPAN_ID = "00f067aa0ba902b8"
 
-EXPECTED_KINDS = frozenset({"desire", "intention", "relationship", "thought"})
+EXPECTED_KINDS = frozenset({"desire", "intention", "user_model", "thought"})
 
 
 def _provenance(**overrides: object) -> Provenance:
@@ -281,7 +281,7 @@ class TestSchemaVersion:
             reg.decode(record)
 
     def test_all_kinds_declare_schema_version_one(self) -> None:
-        for cls in (Desire, Intention, Relationship, Thought):
+        for cls in (Desire, Intention, UserModel, Thought):
             assert cls.SCHEMA_VERSION == 1, cls.__name__
 
 

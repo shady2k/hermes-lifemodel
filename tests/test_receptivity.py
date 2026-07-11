@@ -1,7 +1,7 @@
 # tests/test_receptivity.py
 #
 # The pure 0-LLM receptivity appraisal (lm-27n.5). Behavior-neutral by default:
-# the permissive DEFAULT_RELATIONSHIP returns allowed/1.0 with no reasons, so
+# the permissive DEFAULT_USER_MODEL returns allowed/1.0 with no reasons, so
 # aggregation/cognition behave exactly as .4. Only EXPLICIT boundaries hard-veto;
 # weak norms only down-weight; styles/topics are constraints, not vetoes.
 from __future__ import annotations
@@ -14,11 +14,11 @@ from lifemodel.core.receptivity import (
     appraise_receptivity,
     cadence_min_minutes,
 )
-from lifemodel.core.relationship_view import (
+from lifemodel.core.user_model_view import (
     DEFAULT_CONFIDENCE,
-    DEFAULT_RELATIONSHIP,
+    DEFAULT_USER_MODEL,
     EXPLICIT_CONFIDENCE,
-    build_owner_relationship,
+    build_owner_user_model,
 )
 from lifemodel.state.model import State
 
@@ -26,14 +26,14 @@ NOW = datetime(2026, 7, 6, 3, 0, tzinfo=UTC)  # hour 03 UTC
 
 
 def _explicit(**prefs):
-    return build_owner_relationship(confidence=EXPLICIT_CONFIDENCE, **prefs)
+    return build_owner_user_model(confidence=EXPLICIT_CONFIDENCE, **prefs)
 
 
 # --- behavior-neutral default ------------------------------------------------
 
 
-def test_default_relationship_is_permissive() -> None:
-    r = appraise_receptivity(DEFAULT_RELATIONSHIP, State(), NOW)
+def test_default_user_model_is_permissive() -> None:
+    r = appraise_receptivity(DEFAULT_USER_MODEL, State(), NOW)
     assert r.allowed is True
     assert r.pressure_multiplier == 1.0
     assert r.hard_reasons == ()
@@ -45,7 +45,7 @@ def test_default_relationship_is_permissive() -> None:
 def test_default_never_hard_vetoes_even_at_a_populated_but_low_confidence_hour() -> None:
     # A LOW-confidence (seeded/would-be-inferred) bad hour NEVER hard-vetoes; it
     # only soft down-weights — the "being doesn't disappear" guard.
-    rel = build_owner_relationship(bad_hours=(3,), confidence=DEFAULT_CONFIDENCE)
+    rel = build_owner_user_model(bad_hours=(3,), confidence=DEFAULT_CONFIDENCE)
     r = appraise_receptivity(rel, State(), NOW)
     assert r.allowed is True
     assert r.pressure_multiplier < 1.0
@@ -199,7 +199,7 @@ def test_appraisal_ignores_silence_window_and_decline_backoff() -> None:
         decline_count=5,
         action_pending_since="2026-07-06T02:59:00+00:00",  # ActionPending grace
     )
-    r = appraise_receptivity(DEFAULT_RELATIONSHIP, state, NOW)
+    r = appraise_receptivity(DEFAULT_USER_MODEL, state, NOW)
     assert r.allowed is True
     assert r.pressure_multiplier == 1.0
     assert isinstance(r, ReceptivityResult)

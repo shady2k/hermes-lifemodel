@@ -1,7 +1,7 @@
 """Test builders for the typed thought rows (lm-27n.6).
 
 A thought is a ``kind='thought'`` record — but, unlike the desire/intention/
-relationship singletons (:mod:`lifemodel.testing.desires` et al.), it is
+user-model singletons (:mod:`lifemodel.testing.desires` et al.), it is
 **NON-singleton**: there can be many live at once. Tests seed them as
 :class:`~lifemodel.domain.memory.MemoryRecord`s in the tick snapshot
 (``ctx.objects``) or in a store. These builders go through the same registry

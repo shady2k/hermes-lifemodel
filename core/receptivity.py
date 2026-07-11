@@ -1,12 +1,13 @@
 """Receptivity appraisal — the pure, 0-LLM "is NOW appropriate?" computation
 (lm-27n.5; HLA §4.1, "not-needy is architecture, not prompt vibe").
 
-:func:`appraise_receptivity` reads the owner :class:`~lifemodel.domain.objects.Relationship`
-(LEARNED norms) plus the being's live :class:`~lifemodel.state.model.State` counters
-and ``now``, and answers whether a proactive contact is appropriate *right now* —
-as a :class:`ReceptivityResult`. It **persists nothing** and calls no LLM.
+:func:`appraise_receptivity` reads the owner :class:`~lifemodel.domain.objects.UserModel`
+(our DERIVED norms) plus the being's live :class:`~lifemodel.state.model.State`
+counters and ``now``, and answers whether a proactive contact is appropriate
+*right now* — as a :class:`ReceptivityResult`. It **persists nothing** and calls
+no LLM.
 
-It computes ONLY the NEW relationship gates (hours / cadence / privacy / style /
+It computes ONLY the NEW user-model gates (hours / cadence / privacy / style /
 confidence). It deliberately does **not** re-derive the wake gates that already
 live in aggregation — silence window, decline backoff, ActionPending inhibition,
 in-flight, energy, the send backstop — so there is no duplicate gate; those stay
@@ -17,8 +18,8 @@ where they are and this layer is disjoint from them (it never reads
 
 * HARD veto (``allowed=False``, a ``hard_reason``) only for an **explicit** owner
   boundary — quiet hours, an explicit cadence minimum, a blanket no-contact
-  privacy boundary. "Explicit" = the relationship's ``confidence`` is at/above
-  :data:`~lifemodel.core.relationship_view.EXPLICIT_CONFIDENCE`. A seeded/default
+  privacy boundary. "Explicit" = the user-model's ``confidence`` is at/above
+  :data:`~lifemodel.core.user_model_view.EXPLICIT_CONFIDENCE`. A seeded/default
   or low-confidence row NEVER hard-vetoes.
 * SOFT down-weight (``pressure_multiplier`` < 1, a ``soft_reason``) for weak
   norms — weak negative valence, known load, slow reply latency, or a
@@ -30,9 +31,9 @@ where they are and this layer is disjoint from them (it never reads
   its own turn.
 
 **Behavior-neutral by default:** with the permissive
-:data:`~lifemodel.core.relationship_view.DEFAULT_RELATIONSHIP` (no row) the result
-is ``allowed=True, pressure_multiplier=1.0, hard_reasons=(), soft_reasons=()`` —
-so aggregation and cognition behave EXACTLY as before this task.
+:data:`~lifemodel.core.user_model_view.DEFAULT_USER_MODEL` (no row) the result is
+``allowed=True, pressure_multiplier=1.0, hard_reasons=(), soft_reasons=()`` — so
+aggregation and cognition behave EXACTLY as before this task.
 """
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..domain.objects import Relationship
+from ..domain.objects import UserModel
 from ..state.model import State
-from .relationship_view import EXPLICIT_CONFIDENCE
+from .user_model_view import EXPLICIT_CONFIDENCE
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,7 @@ class ReceptivityResult:
     #: Composing constraints (styles, topic sensitivities) for the wake packet /
     #: intention audit — NOT vetoes.
     constraints: tuple[str, ...]
-    #: The relationship's confidence (how much to trust these norms).
+    #: The user_model's confidence (how much to trust these norms).
     confidence: float
 
 
@@ -80,7 +81,7 @@ BLANKET_NO_CONTACT: frozenset[str] = frozenset(
 
 #: Small 0-LLM lexicons for the soft considerations (free-text norm fields). A
 #: match down-weights; the empty/neutral defaults match nothing, so the default
-#: relationship never down-weights.
+#: user_model never down-weights.
 _NEGATIVE_VALENCE: tuple[str, ...] = (
     "slow",
     "cool",
@@ -113,16 +114,14 @@ _CADENCE_WORDS: dict[str, float] = {
 _UNIT_MINUTES: dict[str, float] = {"min": 1.0, "hr": 60.0, "m": 1.0, "h": 60.0, "d": 1440.0}
 
 
-def appraise_receptivity(
-    relationship: Relationship, state: State, now: datetime
-) -> ReceptivityResult:
+def appraise_receptivity(user_model: UserModel, state: State, now: datetime) -> ReceptivityResult:
     """Appraise whether a proactive contact is appropriate *now* (pure, 0-LLM).
 
-    Reads *relationship*'s learned norms + *state*'s live counters
+    Reads *user_model*'s learned norms + *state*'s live counters
     (``proactive_send_log``, for the cadence gate) + *now*. Computes only the new
-    relationship gates; never re-derives the aggregation wake gates.
+    user_model gates; never re-derives the aggregation wake gates.
     """
-    confidence = relationship.confidence if relationship.confidence is not None else 0.0
+    confidence = user_model.confidence if user_model.confidence is not None else 0.0
     explicit = confidence >= EXPLICIT_CONFIDENCE
 
     hard: list[str] = []
@@ -134,7 +133,7 @@ def appraise_receptivity(
     #     energy). Explicit bad hour now → hard veto; a low-confidence bad hour →
     #     soft. Hours are UTC hours-of-day, matching the engine's circadian clock
     #     (owner-local TZ conversion is a later concern).
-    if now.hour in relationship.bad_hours:
+    if now.hour in user_model.bad_hours:
         if explicit:
             hard.append(f"owner quiet hours (hour {now.hour:02d}:00 UTC is off-limits)")
         else:
@@ -145,14 +144,14 @@ def appraise_receptivity(
     #     OUTSIDE an explicitly-set preferred window is a SOFT down-weight (a
     #     preference, not a forbidden hour — bad_hours is the hard boundary). Empty
     #     (the default) means "no preference" → inert, so the default never gates.
-    if relationship.good_hours and now.hour not in relationship.good_hours:
+    if user_model.good_hours and now.hour not in user_model.good_hours:
         soft.append("outside owner preferred hours")
         multiplier *= SOFT_FACTOR
 
     # --- cadence_fit: an explicit preferred MIN spacing between proactive
     #     contacts (beyond the send-rate backstop), computed from the live
     #     proactive_send_log. Only an EXPLICIT cadence hard-vetoes.
-    min_gap = cadence_min_minutes(relationship.cadence)
+    min_gap = cadence_min_minutes(user_model.cadence)
     if min_gap is not None and explicit:
         since = _minutes_since_last_send(state.proactive_send_log, now)
         if since is not None and since < min_gap:
@@ -164,32 +163,32 @@ def appraise_receptivity(
     # --- privacy_fit: a blanket "no proactive contact" boundary hard-vetoes when
     #     explicit; topic-scoped sensitivities/boundaries ride along as composing
     #     constraints (a topic-less wake cannot evaluate them → never a veto).
-    if _blanket_no_contact(relationship):
+    if _blanket_no_contact(user_model):
         if explicit:
             hard.append("owner privacy boundary: no proactive contact")
         else:
             soft.append("inferred no-contact preference")
             multiplier *= SOFT_FACTOR
-    for topic in relationship.topic_sensitivity:
+    for topic in user_model.topic_sensitivity:
         if topic not in BLANKET_NO_CONTACT:
             constraints.append(f"avoid topic: {topic}")
-    for boundary in relationship.privacy_boundaries:
+    for boundary in user_model.privacy_boundaries:
         if boundary not in BLANKET_NO_CONTACT:
             constraints.append(f"respect boundary: {boundary}")
 
     # --- style_fit: allowed proactive styles are a CONSTRAINT on the packet, not
     #     a veto.
-    if relationship.acceptable_styles:
-        constraints.append("style: " + "|".join(relationship.acceptable_styles))
+    if user_model.acceptable_styles:
+        constraints.append("style: " + "|".join(user_model.acceptable_styles))
 
     # --- soft considerations: weak negative valence / known load / slow latency.
-    if _matches(relationship.response_valence_pattern, _NEGATIVE_VALENCE):
+    if _matches(user_model.response_valence_pattern, _NEGATIVE_VALENCE):
         soft.append("weak negative valence")
         multiplier *= SOFT_FACTOR
-    if _matches(relationship.known_load, _BUSY_LOAD):
+    if _matches(user_model.known_load, _BUSY_LOAD):
         soft.append("known load")
         multiplier *= SOFT_FACTOR
-    if _matches(relationship.reply_latency_norm, _SLOW_LATENCY):
+    if _matches(user_model.reply_latency_norm, _SLOW_LATENCY):
         soft.append("inferred latency")
         multiplier *= SOFT_FACTOR
 
@@ -206,7 +205,7 @@ def appraise_receptivity(
 
 def cadence_min_minutes(cadence: str) -> float | None:
     """Parse an explicit minimum proactive-contact spacing (minutes) from a
-    relationship's ``cadence`` string, or ``None`` when it sets no minimum.
+    user_model's ``cadence`` string, or ``None`` when it sets no minimum.
 
     Accepts a bare number of minutes (``"120"``), a number+unit (``"2h"``,
     ``"90m"``, ``"1d"``), or a cadence word (``"hourly"``/``"daily"``/``"weekly"``/
@@ -235,8 +234,8 @@ def _matches(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in low for needle in needles)
 
 
-def _blanket_no_contact(relationship: Relationship) -> bool:
-    tokens = set(relationship.privacy_boundaries) | set(relationship.topic_sensitivity)
+def _blanket_no_contact(user_model: UserModel) -> bool:
+    tokens = set(user_model.privacy_boundaries) | set(user_model.topic_sensitivity)
     return bool(tokens & BLANKET_NO_CONTACT)
 
 

@@ -26,17 +26,17 @@ from lifemodel.domain.objects import (
     InvalidTransition,
     KindRegistry,
     Provenance,
-    Relationship,
-    RelationshipState,
     Sensitivity,
     Thought,
     ThoughtState,
+    UserModel,
+    UserModelState,
     default_registry,
 )
 from lifemodel.domain.objects.desire import DESIRE_TRANSITIONS
 from lifemodel.domain.objects.intention import INTENTION_TRANSITIONS
-from lifemodel.domain.objects.relationship import RELATIONSHIP_TRANSITIONS
 from lifemodel.domain.objects.thought import THOUGHT_TRANSITIONS
+from lifemodel.domain.objects.user_model import USER_MODEL_TRANSITIONS
 
 TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
 SPAN_ID = "00f067aa0ba902b7"
@@ -105,10 +105,10 @@ def _intention() -> Intention:
     )
 
 
-def _relationship() -> Relationship:
-    return Relationship(
+def _user_model() -> UserModel:
+    return UserModel(
         id="rel-alex",
-        state=RelationshipState.ACTIVE,
+        state=UserModelState.ACTIVE,
         cadence="weekly",
         good_hours=(18, 19, 20),
         bad_hours=(2, 3, 4),
@@ -161,12 +161,12 @@ def _record_from_draft(draft: MemoryDraft, *, schema_version: int = 1) -> Memory
     )
 
 
-ALL_KINDS: list[BaseObject] = [_desire(), _intention(), _relationship(), _thought()]
+ALL_KINDS: list[BaseObject] = [_desire(), _intention(), _user_model(), _thought()]
 
 TRANSITION_TABLES: dict[str, Mapping[str, frozenset[str]]] = {
     "desire": DESIRE_TRANSITIONS,
     "intention": INTENTION_TRANSITIONS,
-    "relationship": RELATIONSHIP_TRANSITIONS,
+    "user_model": USER_MODEL_TRANSITIONS,
     "thought": THOUGHT_TRANSITIONS,
 }
 
@@ -257,11 +257,11 @@ class TestSpecificTransitions:
     def test_intention_pending_to_active_allowed(self) -> None:
         default_registry().validate_transition("intention", "pending", "active")
 
-    def test_relationship_only_archives(self) -> None:
+    def test_user_model_only_archives(self) -> None:
         reg = default_registry()
-        reg.validate_transition("relationship", "active", "archived")
+        reg.validate_transition("user_model", "active", "archived")
         with pytest.raises(InvalidTransition):
-            reg.validate_transition("relationship", "active", "dropped")
+            reg.validate_transition("user_model", "active", "dropped")
 
     def test_thought_active_to_merged_allowed(self) -> None:
         default_registry().validate_transition("thought", "active", "merged")
@@ -270,14 +270,14 @@ class TestSpecificTransitions:
 class TestIntTupleDecoding:
     def test_good_hours_round_trip(self) -> None:
         reg = default_registry()
-        rel = _relationship()
+        rel = _user_model()
         decoded = reg.decode(_record_from_draft(reg.encode(rel)))
-        assert isinstance(decoded, Relationship)
+        assert isinstance(decoded, UserModel)
         assert decoded.good_hours == (18, 19, 20)
 
     def test_non_int_hour_item_raises(self) -> None:
         reg = default_registry()
-        record = _record_from_draft(reg.encode(_relationship()))
+        record = _record_from_draft(reg.encode(_user_model()))
         payload = dict(record.payload)
         payload["good_hours"] = [18, "nineteen", 20]
         with pytest.raises(InvalidPayload):
@@ -285,7 +285,7 @@ class TestIntTupleDecoding:
 
     def test_bool_is_not_a_valid_int_hour(self) -> None:
         reg = default_registry()
-        record = _record_from_draft(reg.encode(_relationship()))
+        record = _record_from_draft(reg.encode(_user_model()))
         payload = dict(record.payload)
         payload["bad_hours"] = [True, 3, 4]
         with pytest.raises(InvalidPayload):
