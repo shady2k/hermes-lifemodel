@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from lifemodel.composition import build_lifemodel
+from lifemodel.core.contact_sensor import CONTACT_SENSOR_ID
 from lifemodel.core.desire_view import (
     build_contact_desire,
     encode_contact_desire,
@@ -337,6 +338,31 @@ def test_scenario_6_contact_sensor_failure_does_not_record_id(tmp_path: Path, mo
     after_retry = lm.state.load()
     assert after_retry.u < 5.0  # the retry re-fired and satiated the drive
     assert "m-boom" in after_retry.processed_external_event_ids  # now durably recorded
+
+
+def test_scenario_6_circuit_broken_contact_sensor_does_not_record_id(tmp_path: Path) -> None:
+    # Regression (spec §8): a CIRCUIT-BROKEN ContactSensor is SKIPPED (coreloop:
+    # ``if component.id in self._broken: continue``), so it lands in NEITHER ``ran``
+    # NOR ``failed``. The inbound is never processed (u unsatiated) — the same durable
+    # loss as the exception path, but reached via the broken/skip path. So the record
+    # gate must key on POSITIVE success (``in ran``), not absence-of-failure: the id
+    # must NOT be recorded, so a retry after the sensor recovers re-fires.
+    lm = _build(tmp_path)
+    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    lm.coreloop._broken.add(CONTACT_SENSOR_ID)  # simulate the tripped breaker
+
+    dup = contact_observed_signal(
+        origin_id="m-broken", actor="user", label="two_way", timestamp=None
+    )
+    report = run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
+
+    assert CONTACT_SENSOR_ID in report.skipped_broken  # skipped, not run
+    assert CONTACT_SENSOR_ID not in report.ran  # ...and NOT in ran
+    after = lm.state.load()
+    assert after.u == 5.0  # never satiated — the sensor didn't run
+    # The id must NOT be durably recorded — otherwise the retry (after recovery) is
+    # deduped away against an id whose effect never landed.
+    assert "m-broken" not in after.processed_external_event_ids
 
 
 def test_scenario_6_ring_is_durable_across_restart(tmp_path: Path) -> None:

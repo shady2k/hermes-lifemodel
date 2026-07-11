@@ -375,15 +375,20 @@ class CoreLoop:
             "tick_count": state.tick_count + 1,
             "last_tick_at": now.isoformat(),
         }
-        # Record this frame's fresh external ids into the durable ring — but ONLY if
-        # the load-bearing contact consumer processed them (ContactSensor did not fault
-        # this frame). If it faulted, the inbound never satiated ``u``, so recording the
-        # id would durably LOSE it: every retry would be deduped against an id whose
-        # effect never landed. Leaving the ring untouched lets the retry re-fire. On a
-        # healthy frame this still sweeps TTL-expired / over-cap entries; persist only
-        # when the ring actually changed — a pure duplicate leaves it byte-identical, so
-        # a retry writes no churn. Durable in AgentState (survives a restart).
-        if CONTACT_SENSOR_ID not in failed:
+        # Record this frame's fresh external ids into the durable ring — but ONLY when
+        # the load-bearing contact consumer ACTUALLY RAN this frame (ContactSensor is in
+        # ``ran``). Keying on positive success — not merely absence-of-failure — closes
+        # BOTH non-processing paths: a sensor that FAULTED lands in ``failed``, and a
+        # CIRCUIT-BROKEN sensor is skipped into NEITHER ``ran`` nor ``failed`` (loop top:
+        # ``if component.id in self._broken: continue``). In either case the inbound
+        # never satiated ``u``, so recording the id would durably LOSE it — every retry
+        # deduped against an id whose effect never landed. Leaving the ring untouched
+        # lets the retry re-fire once the sensor recovers; the TTL/cap upkeep below
+        # intentionally waits for a frame the sensor actually ran. On a healthy frame
+        # this sweeps TTL-expired / over-cap entries; persist only when the ring actually
+        # changed — a pure duplicate leaves it byte-identical, so a retry writes no
+        # churn. Durable in AgentState (survives a restart).
+        if CONTACT_SENSOR_ID in ran:
             new_ring = record_external_events(
                 state.processed_external_event_ids, fresh_external_ids, now
             )
