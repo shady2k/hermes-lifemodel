@@ -46,6 +46,13 @@ SUPPRESSIONS_TOTAL = "lifemodel_suppressions_total"
 #: ``pre_gateway_dispatch`` — a runtime observer failure is plugin-owned + counted,
 #: never left to Hermes' hook wrapper.
 OBSERVER_ERRORS = "lifemodel_observer_errors_total"
+#: The brain HEARTBEAT (spec §4.4, codex MAJOR-8): a monotonic counter advanced once
+#: per completed tick, plus a gauge holding the last tick's wall-clock epoch. These
+#: are SUPPORTING evidence only — the PRIMARY liveness stays the durable
+#: ``last_tick_at`` / ``tick_count`` in ``AgentState`` — so a dead metrics sampler
+#: can never re-introduce the silent-death ambiguity. Both fail-open on the hot path.
+BRAIN_HEARTBEAT = "lifemodel_brain_heartbeat_total"
+BRAIN_LAST_TICK_EPOCH = "lifemodel_brain_last_tick_epoch_seconds"
 
 #: The closed run-status vocabulary carried on the ``outcome`` label (§4.2 derivation:
 #: failed on exception, else suppressed on a suppressed span, else ok).
@@ -124,6 +131,17 @@ UNIVERSAL_SPECS: tuple[MetricSpec, ...] = (
         kind="counter",
         help="Afferent observer bodies that raised, by observer name (component label).",
         label_keys=("component",),
+    ),
+    MetricSpec(
+        name=BRAIN_HEARTBEAT,
+        kind="counter",
+        help="Brain ticks completed since boot (supporting liveness evidence, §4.4).",
+    ),
+    MetricSpec(
+        name=BRAIN_LAST_TICK_EPOCH,
+        kind="gauge",
+        unit="seconds",
+        help="Wall-clock epoch of the last completed brain tick (supporting evidence, §4.4).",
     ),
 )
 

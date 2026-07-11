@@ -53,6 +53,8 @@ from .registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
 from .tick_metrics import (
+    BRAIN_HEARTBEAT,
+    BRAIN_LAST_TICK_EPOCH,
     COMPONENT_DURATION,
     COMPONENT_RUNS,
     INTAKE_KEPT,
@@ -498,7 +500,14 @@ class CoreLoop:
             self._metrics.set(LAYER_ACCEPTS_SIGNALS, 1.0 if accepts else 0.0, layer=layer)
 
     def _emit_tick_summary(self, *, state: State, now: datetime, started_mono: float) -> None:
-        """Emit the tick-level metrics: duration, lag, and the writer snapshot (§4.2)."""
+        """Emit the tick-level metrics: duration, lag, the writer snapshot (§4.2), and
+        the brain HEARTBEAT (§4.4)."""
+        # The HEARTBEAT (spec §4.4, codex MAJOR-8): a per-tick counter + a gauge of the
+        # tick's wall-clock epoch. SUPPORTING evidence only — the durable ``last_tick_at``
+        # / ``tick_count`` committed above stay the PRIMARY liveness — and fail-open like
+        # every other emission here (a metrics hiccup can never break the tick).
+        self._metrics.inc(BRAIN_HEARTBEAT)
+        self._metrics.set(BRAIN_LAST_TICK_EPOCH, now.timestamp())
         self._metrics.observe(TICK_DURATION, self._monotonic() - started_mono)
         # ``last_tick_at`` is the PREVIOUS tick's stamp; minutes_between is the
         # defensive parser (None / unparseable / naive → 0.0), converted to seconds.
