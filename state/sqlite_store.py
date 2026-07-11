@@ -53,7 +53,9 @@ must still pass, or the backup is restored and the migration raises
 *next* construction attempt's recovery step is what would quarantine a
 still-bad file). Migration v1 creates ``store_meta``, ``memory_records``, and
 its two indexes; v2 (lm-fib.6.2) creates the ``runtime_state`` singleton row
-table backing ``StatePort``. No destructive migration ever runs silently.
+table backing ``StatePort``; v3 (lm-fib.10.5) rebuilds an old dual-column file
+into the ISO-only shape IN PLACE, preserving every row. No destructive migration
+ever runs silently.
 
 **STRICT tables** are used when the host's SQLite build supports them
 (feature-detected once, at construction, via a throwaway ``:memory:`` table);
@@ -71,11 +73,15 @@ column. All ordering/expiry comparisons run directly on those TEXT columns
 (``updated_at``/``created_at`` for ordering, ``expires_at`` for the expiry/
 pressure bound), which is provably correct because the width is fixed.
 
-**Store schema version.** Because ``CREATE TABLE IF NOT EXISTS`` cannot reshape
-an existing file, construction guards on :data:`_STORE_SCHEMA_VERSION` (stamped
-into ``store_meta``): a file whose recorded shape is older than this build is
-moved aside (``*.superseded.<ms>``) and rebuilt fresh — the being is resettable,
-so a fresh schema on next boot is expected, not migrated (spec §4 codex #4/#10).
+**MIGRATE THE SELF, RECREATE DERIVED (lm-fib.10.5).** ``lifemodel.sqlite`` IS the
+being's self (drive ``u``, energy, memory records, the UserModel/relationship), so
+a schema change MIGRATES it via the ``schema_migrations`` framework above —
+``_migrate_v3`` rebuilds a pre-10.2 dual-column (ISO + ``*_epoch``) file into the
+ISO-only shape in place, preserving every row and re-normalizing its ISO stamps.
+Reset is an emergency valve, NOT the strategy for a schema change: the destructive
+move-aside (``*.corrupt.<ms>``) fires ONLY for GENUINE corruption (a ``quick_check``
+failure). (``metrics.sqlite`` / ``observability.sqlite`` are DERIVED telemetry with
+no self, so they correctly stay fresh-recreate on a shape mismatch — no migration.)
 """
 
 from __future__ import annotations
@@ -91,7 +97,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, assert_never
 
-from ..core.timeutil import to_iso
+from ..core.timeutil import from_iso, to_iso
 from ..domain.memory import (
     JsonObject,
     MemoryDraft,
@@ -133,15 +139,6 @@ _ORDER_SQL: Final[dict[OrderBy, str]] = {
     "salience_desc": "salience DESC, id ASC",
 }
 
-#: The store's on-disk table SHAPE version (distinct from ``State``'s
-#: :data:`~lifemodel.state.model.SCHEMA_VERSION`, which versions the JSON blob in
-#: the ``runtime_state`` row). Bumped to 3 when the epoch mirror columns were
-#: dropped and ISO-8601 UTC TEXT became the sole ordering/expiry key (spec §4,
-#: lm-fib.10.2). On a version/shape mismatch construction takes the destructive
-#: fresh-DB path (:meth:`SQLiteRuntimeStore._schema_superseded`): the being is
-#: resettable, so a fresh schema on next boot is expected, not migrated.
-_STORE_SCHEMA_VERSION: Final = 3
-
 
 class MigrationFailed(Exception):
     """Raised when a schema migration fails its post-apply ``quick_check``.
@@ -170,19 +167,20 @@ class SQLiteRuntimeStore:
     # ---- construction-time recovery + schema -------------------------------
 
     def _ensure_ready(self) -> None:
-        """Recovery, then schema — run once, before any read/write (§4.1)."""
-        if self._path.exists():
-            if not self._quick_check_ok(self._path):
-                self._move_trio_aside("corrupt", "sqlite_quarantined")
-            elif self._schema_superseded():
-                # A structurally-sound file whose table SHAPE predates this build
-                # (e.g. it still carries the retired *_epoch columns): reshaping
-                # via CREATE TABLE IF NOT EXISTS is impossible, so take the
-                # destructive fresh-DB path — move it aside and rebuild (§4).
-                self._move_trio_aside("superseded", "sqlite_schema_superseded")
+        """Recovery, then schema — run once, before any read/write (§4.1).
+
+        MIGRATE THE SELF, RECREATE DERIVED (lm-fib.10.5): a structurally-sound file
+        whose table SHAPE predates this build is MIGRATED by :meth:`_run_migrations`
+        (the ``schema_migrations`` framework), never wiped — ``lifemodel.sqlite`` is
+        the being's self. The destructive move-aside is reserved for GENUINE
+        corruption (a ``quick_check`` failure), the emergency valve — not a schema
+        change. (``metrics.sqlite`` / ``observability.sqlite`` are derived telemetry
+        and correctly stay fresh-recreate in their own stores.)
+        """
+        if self._path.exists() and not self._quick_check_ok(self._path):
+            self._move_trio_aside("corrupt", "sqlite_quarantined")
         self._ensure_wal_mode()
         self._run_migrations()
-        self._stamp_store_schema_version()
 
     def _quick_check_ok(self, path: Path) -> bool:
         # Opened read-only (a URI connection) so merely *checking* an invalid
@@ -201,9 +199,10 @@ class SQLiteRuntimeStore:
     def _move_trio_aside(self, suffix: str, event: str) -> None:
         """Move the DB trio aside (``*.<suffix>.<ms>``) and log *event*. Never raises.
 
-        The shared engine behind both the corruption quarantine (``suffix``
-        ``"corrupt"``) and the schema-superseded reset (``suffix``
-        ``"superseded"``): a fresh bootstrap follows either way.
+        The emergency valve for GENUINE corruption ONLY (``suffix`` ``"corrupt"``, a
+        ``quick_check`` failure): a fresh bootstrap follows. A stale table SHAPE is NOT
+        corruption — it is MIGRATED in place (lm-fib.10.5), never moved aside, because
+        ``lifemodel.sqlite`` is the being's self.
 
         Preferred outcome: each existing file is renamed for forensics. But if a
         rename fails, the file *must not* remain in place — ``_run_migrations``
@@ -228,53 +227,6 @@ class SQLiteRuntimeStore:
                         "sqlite_move_aside_unlink_failed path=%s error=%s", str(src), str(exc)
                     )
         _LOG.info("%s path=%s epoch_ms=%s", event, str(self._path), stamp)
-
-    def _schema_superseded(self) -> bool:
-        """True if a structurally-sound file's table SHAPE predates this build.
-
-        Read-only (a ``mode=ro`` URI, like :meth:`_quick_check_ok`) so the mere
-        check never mutates the file. A file with no ``store_meta`` table yet is
-        NOT superseded (it will simply bootstrap); a ``store_meta`` lacking the
-        ``schema_version`` key is a pre-cutover file (never versioned) and IS
-        superseded; otherwise the recorded version is compared against
-        :data:`_STORE_SCHEMA_VERSION`. Any read error is treated as "not
-        superseded" (the corruption path, or migrations, will handle a truly
-        broken file) so this never blocks construction.
-        """
-        uri = f"{self._path.resolve().as_uri()}?mode=ro"
-        try:
-            with closing(sqlite3.connect(uri, uri=True)) as conn:
-                has_meta = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_meta'"
-                ).fetchone()
-                if has_meta is None:
-                    return False
-                row = conn.execute(
-                    "SELECT value FROM store_meta WHERE key = 'schema_version'"
-                ).fetchone()
-        except sqlite3.Error:
-            return False
-        if row is None:
-            return True
-        try:
-            return int(row[0]) < _STORE_SCHEMA_VERSION
-        except (TypeError, ValueError):
-            return True
-
-    def _stamp_store_schema_version(self) -> None:
-        """Record the current store schema version in ``store_meta`` (idempotent).
-
-        Runs after migrations on every construction so a freshly-built (or
-        just-rebuilt) DB carries :data:`_STORE_SCHEMA_VERSION`; an already-current
-        DB rewrites the same value. This is the signal :meth:`_schema_superseded`
-        reads on the next boot to decide whether the on-disk shape is stale.
-        """
-        with closing(self._connect()) as conn, conn:
-            conn.execute(
-                "INSERT INTO store_meta (key, value) VALUES ('schema_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(_STORE_SCHEMA_VERSION),),
-            )
 
     def _ensure_wal_mode(self) -> None:
         with suppress(sqlite3.Error), closing(sqlite3.connect(str(self._path))) as conn:
@@ -904,13 +856,12 @@ def _is_schema_error(exc: sqlite3.DatabaseError) -> bool:
     return "no such table" in message or "no such column" in message
 
 
-def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
-    """Create ``store_meta``, ``memory_records``, and its indexes (§4.1)."""
-    strict_kw = " STRICT" if strict else ""
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS store_meta ("
-        "key TEXT PRIMARY KEY, value TEXT NOT NULL)" + strict_kw
-    )
+# The ISO-only table DDL, shared by the fresh-bootstrap migrations (v1/v2) AND the
+# in-place epoch->ISO rebuild (v3), so a migrated file is byte-for-byte the SAME
+# shape as a freshly-bootstrapped one.
+
+
+def _create_memory_records_table(conn: sqlite3.Connection, strict_kw: str) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS memory_records ("
         "kind TEXT NOT NULL, "
@@ -928,6 +879,9 @@ def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
         "schema_version INTEGER NOT NULL DEFAULT 1, "
         "PRIMARY KEY (kind, id))" + strict_kw
     )
+
+
+def _create_memory_records_indexes(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memory_records_kind_state ON memory_records (kind, state)"
     )
@@ -936,15 +890,9 @@ def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
     )
 
 
-def _migrate_v2(conn: sqlite3.Connection, strict: bool) -> None:
-    """Create the ``runtime_state`` singleton row table (``StatePort`` cutover,
-    lm-fib.6.2, HLA §4.1/D7 v0.7 — settled: one JSON blob, not typed columns).
-
-    ``id`` is ``CHECK``'d to always equal 1, so the table can only ever hold
-    the being's one ``State`` row — an INSERT with any other id fails loud at
-    the database layer rather than silently accumulating extra rows.
-    """
-    strict_kw = " STRICT" if strict else ""
+def _create_runtime_state_table(conn: sqlite3.Connection, strict_kw: str) -> None:
+    # ``id`` is CHECK'd to always equal 1, so the table can only ever hold the
+    # being's one ``State`` row.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runtime_state ("
         "id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -954,7 +902,149 @@ def _migrate_v2(conn: sqlite3.Connection, strict: bool) -> None:
     )
 
 
+def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
+    """Create ``store_meta``, ``memory_records``, and its indexes (§4.1)."""
+    strict_kw = " STRICT" if strict else ""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS store_meta ("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL)" + strict_kw
+    )
+    _create_memory_records_table(conn, strict_kw)
+    _create_memory_records_indexes(conn)
+
+
+def _migrate_v2(conn: sqlite3.Connection, strict: bool) -> None:
+    """Create the ``runtime_state`` singleton row table (``StatePort`` cutover,
+    lm-fib.6.2, HLA §4.1/D7 v0.7 — settled: one JSON blob, not typed columns)."""
+    _create_runtime_state_table(conn, " STRICT" if strict else "")
+
+
+def _has_epoch_columns(conn: sqlite3.Connection, table: str) -> bool:
+    """True iff *table* still carries a retired ``*_epoch`` mirror column.
+
+    The idempotency test for :func:`_migrate_v3`: a freshly-bootstrapped file
+    (v1/v2 already build the ISO-only shape) has none, so v3 no-ops there; a
+    pre-10.2 file has them, so v3 rebuilds. An absent table returns ``False``."""
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return any(col.endswith("_epoch") for col in cols)
+
+
+def _renormalize_iso(value: str | None) -> str | None:
+    """Re-serialize a legacy ISO stamp to canonical fixed-width UTC (spec §4).
+
+    Old values were written by ``.isoformat()`` and may lack the fixed 6-µs width
+    the ordering invariant needs, so each is routed through
+    :func:`~lifemodel.core.timeutil.from_iso` -> :func:`~lifemodel.core.timeutil.to_iso`.
+    A NULL stays NULL. Self-preservation over a crash: a value that cannot be parsed
+    (should never happen — legacy stamps come from an aware UTC clock) is kept as-is
+    rather than aborting the migration and losing the being's memory."""
+    if value is None:
+        return None
+    try:
+        return to_iso(from_iso(value))
+    except ValueError:
+        return value
+
+
+def _rebuild_memory_records_iso_only(conn: sqlite3.Connection, strict_kw: str) -> None:
+    """Rebuild ``memory_records`` WITHOUT the ``*_epoch`` mirror columns, preserving
+    every row and RE-NORMALIZING its ``created_at``/``updated_at``/``expires_at`` (§4).
+
+    Standard SQLite rebuild: read the rows out (into Python, so the time columns can be
+    normalized — SQL cannot call :func:`to_iso`), DROP the old table (its ``*_epoch``
+    index falls with it), recreate the ISO-only shape + indexes, and re-INSERT."""
+    rows = conn.execute(
+        "SELECT kind, id, state, recipient_id, payload_json, salience, confidence, "
+        "expires_at, source, created_at, updated_at, revision, schema_version "
+        "FROM memory_records"
+    ).fetchall()
+    conn.execute("DROP TABLE memory_records")
+    _create_memory_records_table(conn, strict_kw)
+    normalized = [
+        (
+            kind,
+            id_,
+            state,
+            recipient_id,
+            payload_json,
+            salience,
+            confidence,
+            _renormalize_iso(expires_at),
+            source,
+            _renormalize_iso(created_at),
+            _renormalize_iso(updated_at),
+            revision,
+            schema_version,
+        )
+        for (
+            kind,
+            id_,
+            state,
+            recipient_id,
+            payload_json,
+            salience,
+            confidence,
+            expires_at,
+            source,
+            created_at,
+            updated_at,
+            revision,
+            schema_version,
+        ) in rows
+    ]
+    conn.executemany(
+        "INSERT INTO memory_records (kind, id, state, recipient_id, payload_json, salience, "
+        "confidence, expires_at, source, created_at, updated_at, revision, schema_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        normalized,
+    )
+    _create_memory_records_indexes(conn)
+
+
+def _rebuild_runtime_state_iso_only(conn: sqlite3.Connection, strict_kw: str) -> None:
+    """Rebuild ``runtime_state`` WITHOUT ``updated_at_epoch``, normalizing ``updated_at``.
+
+    The ``state_json`` blob (u/energy/fatigue/mood/last_exchange_at/…) is preserved
+    VERBATIM — the model owns its internal ISO fields (already stored via ``to_iso`` by
+    the current code); only the row's own ``updated_at`` column is re-normalized here."""
+    rows = conn.execute("SELECT id, state_json, updated_at, revision FROM runtime_state").fetchall()
+    conn.execute("DROP TABLE runtime_state")
+    _create_runtime_state_table(conn, strict_kw)
+    normalized = [
+        (id_, state_json, _renormalize_iso(updated_at), revision)
+        for (id_, state_json, updated_at, revision) in rows
+    ]
+    conn.executemany(
+        "INSERT INTO runtime_state (id, state_json, updated_at, revision) VALUES (?, ?, ?, ?)",
+        normalized,
+    )
+
+
+def _migrate_v3(conn: sqlite3.Connection, strict: bool) -> None:
+    """MIGRATE (don't wipe) an old dual-column lifemodel.sqlite to ISO-only (lm-fib.10.5).
+
+    PRINCIPLE: MIGRATE THE SELF, RECREATE DERIVED. ``lifemodel.sqlite`` IS the being's
+    self (drive ``u``, energy, memory records, the UserModel/relationship), so a schema
+    change must PRESERVE it — reset is an emergency valve (genuine corruption), not the
+    strategy for a shape change. (``metrics.sqlite`` + ``observability.sqlite`` are
+    DERIVED telemetry with no self, so they correctly stay fresh-recreate — this
+    migration deliberately has no counterpart there.)
+
+    The unified-time cutover (lm-fib.10.2) dropped the ``*_epoch`` mirror columns; this
+    migration finishes that non-destructively for an EXISTING file: it rebuilds
+    ``memory_records`` + ``runtime_state`` without the epoch columns and re-normalizes
+    the ISO stamps to fixed-width UTC. Idempotent — on a freshly-bootstrapped file v1/v2
+    already produced the ISO-only shape, so :func:`_has_epoch_columns` is ``False`` and
+    this no-ops."""
+    strict_kw = " STRICT" if strict else ""
+    if _has_epoch_columns(conn, "memory_records"):
+        _rebuild_memory_records_iso_only(conn, strict_kw)
+    if _has_epoch_columns(conn, "runtime_state"):
+        _rebuild_runtime_state_iso_only(conn, strict_kw)
+
+
 _MIGRATIONS: Final[list[tuple[int, Callable[[sqlite3.Connection, bool], None]]]] = [
     (1, _migrate_v1),
     (2, _migrate_v2),
+    (3, _migrate_v3),
 ]

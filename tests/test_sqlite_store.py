@@ -138,7 +138,7 @@ def test_fresh_db_gets_a_schema_migrations_row(tmp_path: Path) -> None:
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert rows == [(1,), (2,)]
+    assert rows == [(1,), (2,), (3,)]
 
 
 def test_constructing_twice_is_idempotent(tmp_path: Path) -> None:
@@ -148,7 +148,7 @@ def test_constructing_twice_is_idempotent(tmp_path: Path) -> None:
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert rows == [(1,), (2,)]
+    assert rows == [(1,), (2,), (3,)]
     # a brand-new DB has nothing to back up, and the second construction found
     # no pending migrations either, so no backup file is ever created.
     assert list(tmp_path.glob("*.bak.*")) == []
@@ -167,7 +167,7 @@ def test_v1_db_upgrades_to_v2_cleanly(tmp_path: Path, monkeypatch: pytest.Monkey
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert rows == [(1,), (2,)]
+    assert rows == [(1,), (2,), (3,)]
     assert "runtime_state" in tables
     assert upgraded.get("desire", "d1") is not None  # pre-existing v1 data survived
     assert len(list(tmp_path.glob(f"{DB_FILENAME}.bak.*"))) == 1  # backup taken before the upgrade
@@ -381,7 +381,7 @@ def test_purge_memory_records_does_not_touch_runtime_state_or_meta_tables(
     assert store.load() == State(tick_count=7, u=3.0)  # runtime_state untouched
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         migrations = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert migrations == 2  # schema_migrations untouched (v1 + v2 still recorded)
+    assert migrations == 3  # schema_migrations untouched (v1 + v2 + v3 still recorded)
 
 
 def _write_raw_state_json(base_dir: Path, raw: str) -> None:
@@ -406,11 +406,11 @@ def test_migration_failure_restores_backup_and_raises(
     # seed a healthy v1+v2 DB (both real migrations, incl. runtime_state, lm-fib.6.2)
     SQLiteRuntimeStore(tmp_path, clock=clock).put(_draft())
 
-    def _v3(conn: sqlite3.Connection, _strict: bool) -> None:
-        conn.execute("CREATE TABLE v3_marker (x INTEGER)")
+    def _v4(conn: sqlite3.Connection, _strict: bool) -> None:
+        conn.execute("CREATE TABLE v4_marker (x INTEGER)")
 
     monkeypatch.setattr(
-        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (3, _v3)]
+        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (4, _v4)]
     )
 
     real_quick_check_ok = SQLiteRuntimeStore._quick_check_ok
@@ -436,7 +436,7 @@ def test_migration_failure_restores_backup_and_raises(
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
-    assert rows == [(1,), (2,)]  # the failed v3 migration was rolled back by the restore
+    assert rows == [(1,), (2,), (3,)]  # the failed v3 migration was rolled back by the restore
 
 
 def test_migration_that_raises_restores_backup_and_propagates(
@@ -452,12 +452,12 @@ def test_migration_that_raises_restores_backup_and_propagates(
     class _MigrationBug(Exception):
         pass
 
-    def _v3(conn: sqlite3.Connection, _strict: bool) -> None:
+    def _v4(conn: sqlite3.Connection, _strict: bool) -> None:
         conn.execute("CREATE TABLE half_applied (x INTEGER)")  # auto-commits
         raise _MigrationBug("bug in migration code")
 
     monkeypatch.setattr(
-        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (3, _v3)]
+        sqlite_store_module, "_MIGRATIONS", [*sqlite_store_module._MIGRATIONS, (4, _v4)]
     )
 
     with pytest.raises(_MigrationBug):
@@ -473,7 +473,7 @@ def test_migration_that_raises_restores_backup_and_propagates(
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
     assert "half_applied" not in tables  # the restore reverted the auto-committed DDL
-    assert rows == [(1,), (2,)]
+    assert rows == [(1,), (2,), (3,)]
 
 
 def test_migration_creates_expected_tables_and_indexes(tmp_path: Path) -> None:

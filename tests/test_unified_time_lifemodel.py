@@ -10,6 +10,7 @@ no raw caller string ever reaches a column.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from lifemodel.core.timeutil import from_iso, to_iso
 from lifemodel.domain.memory import MemoryDraft, PressureIndex, summarize_pressure_index
+from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock, FakeMemoryStore
 
@@ -207,16 +209,26 @@ def _record(**overrides: object) -> object:
     return MemoryRecord(**base)  # type: ignore[arg-type]
 
 
-# ---- destructive fresh-DB path on a superseded shape (spec §4 codex #4/#10) --
+# ---- non-destructive MIGRATION of an old dual-column shape (lm-fib.10.5) ----
+# PRINCIPLE: MIGRATE THE SELF, RECREATE DERIVED. lifemodel.sqlite IS the being's
+# self (drive u, energy, memory records, the UserModel/relationship) — a schema
+# change must PRESERVE it, not reset it. (Reset stays only for genuine corruption.)
 
 
-def test_old_shape_db_is_reset_fresh_on_construction(tmp_path: Path) -> None:
-    db_path = tmp_path / DB_FILENAME
-    # Hand-build a DB in the OLD shape: memory_records + runtime_state carrying
-    # the retired *_epoch columns, migrations 1+2 recorded, and a store_meta with
-    # NO schema_version key (exactly what a pre-cutover file looks like).
+def _build_old_shape_db(
+    db_path: Path,
+    *,
+    state_json: str,
+    mem_created_at: str,
+    mem_updated_at: str,
+    mem_expires_at: str | None = None,
+) -> None:
+    """Hand-build a pre-10.2 lifemodel.sqlite: memory_records + runtime_state carrying
+    the retired ``*_epoch`` mirror columns, with migrations 1+2 recorded (so v3 is the
+    single pending one) and seeded data whose ISO stamps lack the fixed-µs width."""
     with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO store_meta (key, value) VALUES ('schema_version', '2')")
         conn.execute(
             "CREATE TABLE memory_records ("
             "kind TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, "
@@ -227,10 +239,33 @@ def test_old_shape_db_is_reset_fresh_on_construction(tmp_path: Path) -> None:
             "updated_at_epoch INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0, "
             "schema_version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (kind, id))"
         )
+        conn.execute("CREATE INDEX idx_memory_records_kind_state ON memory_records (kind, state)")
+        conn.execute(
+            "CREATE INDEX idx_memory_records_expires_at_epoch ON memory_records (expires_at_epoch)"
+        )
+        conn.execute(
+            "INSERT INTO memory_records (kind, id, state, recipient_id, payload_json, salience, "
+            "confidence, expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
+            "updated_at, updated_at_epoch, revision, schema_version) "
+            "VALUES ('desire','d1','active','owner',?,0.5,NULL,?,NULL,'seed',?,?,?,?,0,1)",
+            (
+                '{"note": "hi"}',
+                mem_expires_at,
+                mem_created_at,
+                1_752_000_000,
+                mem_updated_at,
+                1_752_000_000,
+            ),
+        )
         conn.execute(
             "CREATE TABLE runtime_state (id INTEGER PRIMARY KEY CHECK (id = 1), "
             "state_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
             "updated_at_epoch INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
+            "VALUES (1, ?, '2026-07-11T12:00:00+00:00', 1752000000, 4)",
+            (state_json,),
         )
         conn.execute(
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -240,12 +275,81 @@ def test_old_shape_db_is_reset_fresh_on_construction(tmp_path: Path) -> None:
             [(1, "2026-01-01T00:00:00+00:00"), (2, "2026-01-01T00:00:00+00:00")],
         )
 
-    SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
 
-    # The stale file was moved aside (forensics) and a fresh, new-shape DB built.
-    assert list(tmp_path.glob(f"{DB_FILENAME}.superseded.*"))
+def test_old_shape_db_migrates_preserving_the_self(tmp_path: Path) -> None:
+    db_path = tmp_path / DB_FILENAME
+    # The being's self, seeded into the OLD-shape file: a known u/energy in
+    # runtime_state and a memory record with an UN-normalized created_at (no µs).
+    old_state = State(u=2.5, energy=0.7, tick_count=42)
+    _build_old_shape_db(
+        db_path,
+        state_json=json.dumps(old_state.to_dict()),
+        mem_created_at="2026-07-11T12:00:00+00:00",  # lacks the fixed 6-µs width
+        mem_updated_at="2026-07-11T12:00:00+00:00",
+    )
+
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    # The self was PRESERVED, not wiped: u/energy unchanged.
+    loaded = store.load()
+    assert loaded.u == 2.5
+    assert loaded.energy == 0.7
+    assert loaded.tick_count == 42
+
+    # The memory record survived and its created_at is now NORMALIZED fixed-width ISO.
+    record = store.get("desire", "d1")
+    assert record is not None
+    assert record.created_at == "2026-07-11T12:00:00.000000+00:00"
+    assert record.updated_at == "2026-07-11T12:00:00.000000+00:00"
+    assert json.loads(json.dumps(record.payload)) == {"note": "hi"}
+
+    # The shape is now ISO-only, the ISO index exists, and NOTHING was moved aside
+    # (no destructive .superseded.* reset) — a *.bak.* backup was taken instead.
     assert _columns(tmp_path, "memory_records") & _EPOCH_COLUMNS == set()
     assert "updated_at_epoch" not in _columns(tmp_path, "runtime_state")
+    assert "idx_memory_records_expires_at" in _indexes(tmp_path)
+    assert not any("epoch" in name for name in _indexes(tmp_path))
+    assert list(tmp_path.glob(f"{DB_FILENAME}.superseded.*")) == []
+    assert len(list(tmp_path.glob(f"{DB_FILENAME}.bak.*"))) == 1
+
+    # quick_check passes and schema_migrations records the new version.
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY 1")]
+    assert versions == [1, 2, 3]
+
+
+def test_ordering_and_expiry_correct_after_migration(tmp_path: Path) -> None:
+    # A MIGRATED record (its ISO stamps re-normalized to fixed width) must sort and
+    # expire correctly ALONGSIDE a freshly-written one — the whole point of
+    # re-normalizing on migration (lexical TEXT order == chronological only at fixed µs).
+    db_path = tmp_path / DB_FILENAME
+    _build_old_shape_db(
+        db_path,
+        state_json=json.dumps(State(u=1.0).to_dict()),
+        mem_created_at="2026-07-11T10:00:00+00:00",  # migrated desire d1, un-normalized
+        mem_updated_at="2026-07-11T10:00:00+00:00",
+        mem_expires_at="2026-07-11T18:00:00+00:00",  # a future expiry, un-normalized
+    )
+
+    at_noon = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(at_noon))
+    # A freshly-written desire, stamped by the store's clock (later than d1, normalized).
+    store.put(MemoryDraft(kind="desire", id="d2", state="active", payload={}, source="fresh"))
+
+    # Ordering: created_desc puts the newer d2 (12:00) before the migrated d1 (10:00);
+    # both created_at values are now fixed-width, so the TEXT sort is chronological.
+    ordered = [r.id for r in store.find(kind="desire", order_by="created_desc")]
+    assert ordered == ["d2", "d1"]
+    d1 = store.get("desire", "d1")
+    assert d1 is not None
+    assert d1.created_at == "2026-07-11T10:00:00.000000+00:00"
+
+    # Expiry: at noon d1 (expires 18:00) is still active -> both desires pressure;
+    # after d1's expiry only d2 (no expiry) remains active.
+    assert store.read_pressure_index(at_noon).active_desire_count == 2
+    after_expiry = datetime(2026, 7, 11, 19, 0, tzinfo=UTC)
+    assert store.read_pressure_index(after_expiry).active_desire_count == 1
 
 
 def test_round_trip_from_iso_of_stored_created_at(tmp_path: Path) -> None:
