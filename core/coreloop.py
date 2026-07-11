@@ -36,8 +36,9 @@ from ..ports.tracer import ActiveSpan, TraceContext, TracerPort, start_span
 from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .component import TickContext
+from .contact_sensor import CONTACT_SENSOR_ID
 from .frame import FrameTrigger, SignalFrame
-from .idempotency import dedupe_external_events
+from .idempotency import filter_external_events, record_external_events
 from .intents import (
     EmitSignal,
     Intent,
@@ -268,12 +269,15 @@ class CoreLoop:
         # ring BEFORE seeding the frame. A duplicate external event — a Telegram/Hermes
         # retry of the SAME inbound, keyed by its ``contact_observed`` origin_id — is
         # dropped here so it cannot satiate ``u`` a second time, re-stamp
-        # ``last_exchange_at``, or re-resolve the desire; a fresh id is recorded (oldest
-        # / TTL-expired entries evicted to stay bounded). This is NOT bus-dedup — the
+        # ``last_exchange_at``, or re-resolve the desire. This is NOT bus-dedup — the
         # bus is ephemeral (§2/§3); it is the body remembering what it already handled.
         # The check runs under the one state-actor lock (``run_frame``), so concurrent
-        # retries cannot both slip past it. The updated ring is persisted below.
-        seed_signals, new_ring = dedupe_external_events(
+        # retries cannot both slip past it. A fresh id is NOT recorded here: recording
+        # is split OUT to after the component loop and gated on the load-bearing contact
+        # consumer's success (below), so a ContactSensor fault — which leaves ``u``
+        # unsatiated — cannot durably lose the inbound by recording an id whose effect
+        # never landed. Filtering is pure and side-effect free.
+        seed_signals, fresh_external_ids = filter_external_events(
             state.processed_external_event_ids, initial_signals, now
         )
         # The frame's in-memory SignalFrame (spec §2/§3): seed it with the (deduped)
@@ -371,12 +375,20 @@ class CoreLoop:
             "tick_count": state.tick_count + 1,
             "last_tick_at": now.isoformat(),
         }
-        # Persist the idempotency ring only when it actually changed (a fresh id
-        # recorded, or TTL-expired / over-cap entries swept) — a pure duplicate leaves
-        # it byte-identical, so a retry writes no ring churn. Durable in AgentState, so
-        # it survives a restart (unlike the ephemeral bus).
-        if new_ring != state.processed_external_event_ids:
-            tick_patch["processed_external_event_ids"] = new_ring
+        # Record this frame's fresh external ids into the durable ring — but ONLY if
+        # the load-bearing contact consumer processed them (ContactSensor did not fault
+        # this frame). If it faulted, the inbound never satiated ``u``, so recording the
+        # id would durably LOSE it: every retry would be deduped against an id whose
+        # effect never landed. Leaving the ring untouched lets the retry re-fire. On a
+        # healthy frame this still sweeps TTL-expired / over-cap entries; persist only
+        # when the ring actually changed — a pure duplicate leaves it byte-identical, so
+        # a retry writes no churn. Durable in AgentState (survives a restart).
+        if CONTACT_SENSOR_ID not in failed:
+            new_ring = record_external_events(
+                state.processed_external_event_ids, fresh_external_ids, now
+            )
+            if new_ring != state.processed_external_event_ids:
+                tick_patch["processed_external_event_ids"] = new_ring
         intents.append(UpdateState(tick_patch))
         # A memory mutation commits durable state even when the State row itself is
         # unchanged, so ``committed`` must reflect it too (today the tick always

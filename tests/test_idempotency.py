@@ -15,6 +15,8 @@ from lifemodel.core.idempotency import (
     DEFAULT_RING_CAP,
     DEFAULT_RING_TTL,
     dedupe_external_events,
+    filter_external_events,
+    record_external_events,
 )
 from lifemodel.core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from lifemodel.domain.egress import ProactiveOutcome
@@ -98,3 +100,47 @@ def test_mixed_batch_drops_only_the_duplicate_contact() -> None:
 def test_defaults_are_sane_bounds() -> None:
     assert DEFAULT_RING_CAP > 0
     assert DEFAULT_RING_TTL.total_seconds() > 0
+
+
+# --- the split (lm-fib): filter is pure (never records); record is separate ---
+
+
+def test_filter_reports_fresh_ids_without_touching_the_ring() -> None:
+    # The pure filter drops duplicates and REPORTS the fresh ids to record later —
+    # but it never mutates the ring itself (so a downstream fault can leave it clean).
+    ring = {"m-1": _NOW.isoformat()}
+    kept, fresh = filter_external_events(ring, [_contact("m-1"), _contact("m-2")], _NOW)
+    assert [s.origin_id for s in kept] == ["m-2"]  # the duplicate m-1 dropped
+    assert fresh == ("m-2",)  # only the genuinely new id is reported fresh
+    assert ring == {"m-1": _NOW.isoformat()}  # the input ring is untouched
+
+
+def test_filter_dedups_repeats_within_one_batch() -> None:
+    # The same fresh id twice in ONE batch is reported once and kept once.
+    kept, fresh = filter_external_events({}, [_contact("m-9"), _contact("m-9")], _NOW)
+    assert [s.origin_id for s in kept] == ["m-9"]
+    assert fresh == ("m-9",)
+
+
+def test_record_adds_fresh_ids_and_stays_bounded() -> None:
+    seen = {"m-1": _NOW.isoformat(), "m-2": _NOW.isoformat()}
+    ring = record_external_events(seen, ["m-3"], _NOW, cap=2)
+    assert list(ring) == ["m-2", "m-3"]  # oldest (m-1) evicted, fresh recorded
+    assert ring["m-3"] == _NOW.isoformat()
+
+
+def test_record_with_no_fresh_ids_still_sweeps_ttl() -> None:
+    ttl = timedelta(hours=1)
+    old = (_NOW - timedelta(hours=2)).isoformat()
+    fresh = (_NOW - timedelta(minutes=5)).isoformat()
+    ring = record_external_events({"stale": old, "recent": fresh}, [], _NOW, ttl=ttl)
+    assert set(ring) == {"recent"}  # bounded/TTL upkeep runs even with nothing new
+
+
+def test_record_is_a_noop_ring_for_a_pure_duplicate_frame() -> None:
+    # filter drops the dup → no fresh ids → record returns a ring EQUAL to the input,
+    # so the coreloop writes no churn on a retry.
+    seen = {"m-1": _NOW.isoformat()}
+    _kept, fresh = filter_external_events(seen, [_contact("m-1")], _NOW)
+    assert fresh == ()
+    assert record_external_events(seen, fresh, _NOW) == seen

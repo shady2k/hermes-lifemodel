@@ -28,11 +28,17 @@ from .taxonomy import (
     read_contact_observed,
 )
 
+#: The historical ``contact`` slot id. Named so the coreloop can identify the
+#: load-bearing consumer of ``contact_observed`` when gating the idempotency-ring
+#: record on its success (spec §8): an inbound is only durably remembered once THIS
+#: component has processed it, so a fault does not lose the retry.
+CONTACT_SENSOR_ID = "contact"
+
 
 class ContactSensor:
     """The instantaneous contact-channel sensor. Stateless; emits a raw reading."""
 
-    def __init__(self, *, id: str = "contact") -> None:
+    def __init__(self, *, id: str = CONTACT_SENSOR_ID) -> None:
         self.id = id
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:

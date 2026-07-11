@@ -65,6 +65,75 @@ def _is_live(recorded_at: str, now: datetime, ttl: timedelta) -> bool:
     return (now - ts) <= ttl
 
 
+def filter_external_events(
+    ring: Mapping[str, str],
+    signals: Sequence[Signal],
+    now: datetime,
+    *,
+    ttl: timedelta = DEFAULT_RING_TTL,
+) -> tuple[tuple[Signal, ...], tuple[str, ...]]:
+    """Drop duplicate external events; report the fresh ids to RECORD later.
+
+    A PURE filter — it never mutates the ring. Returns ``(signals to process,
+    fresh external ids)``: a ``contact_observed`` whose id is already live in the
+    ring (within-TTL), or already seen earlier in THIS batch, is dropped; every
+    other signal passes through in original frame order. The fresh ids (first-seen
+    order, de-duplicated within the batch) are the ones the caller records via
+    :func:`record_external_events` — but only AFTER the load-bearing contact
+    consumer has actually processed them (spec §8), so a consumer fault leaves the
+    ring untouched and the retry re-fires instead of being deduped into oblivion.
+    """
+    live = {eid for eid, at in ring.items() if _is_live(at, now, ttl)}
+
+    kept: list[Signal] = []
+    fresh_ids: list[str] = []
+    seen_fresh: set[str] = set()  # fresh ids accepted THIS batch (batch-internal dedup)
+    for signal in signals:
+        if signal.kind != KIND_CONTACT_OBSERVED:
+            kept.append(signal)  # not an external event — never deduped or recorded
+            continue
+        eid = signal.origin_id
+        if eid in live or eid in seen_fresh:
+            continue  # duplicate external event — drop it (no second satiation)
+        seen_fresh.add(eid)
+        fresh_ids.append(eid)
+        kept.append(signal)
+
+    return tuple(kept), tuple(fresh_ids)
+
+
+def record_external_events(
+    ring: Mapping[str, str],
+    fresh_ids: Sequence[str],
+    now: datetime,
+    *,
+    cap: int = DEFAULT_RING_CAP,
+    ttl: timedelta = DEFAULT_RING_TTL,
+) -> dict[str, str]:
+    """Return a fresh ring with *fresh_ids* recorded, TTL-swept, and bounded.
+
+    Applied AFTER the frame's components ran, and ONLY when the load-bearing contact
+    consumer did not fault this frame — so a fault leaves the ring byte-identical and
+    the retry re-fires. The returned ring is a fresh dict (never the input, a state
+    snapshot): TTL-expired entries are swept (even when *fresh_ids* is empty, so the
+    ring stays bounded on quiet frames), each fresh id is recorded at *now*, and the
+    oldest entries are evicted once ``cap`` is exceeded. A pure-duplicate frame (no
+    fresh ids, nothing swept) returns a ring equal to the input, so the coreloop
+    writes no churn.
+    """
+    # Start from the live (within-TTL) subset, preserving oldest-first order.
+    live: dict[str, str] = {eid: at for eid, at in ring.items() if _is_live(at, now, ttl)}
+    for eid in fresh_ids:
+        live[eid] = now.isoformat()  # remember each fresh id at the moment processed
+
+    # Bound the ring: evict oldest (front of insertion order) beyond the cap.
+    while len(live) > cap:
+        oldest = next(iter(live))
+        del live[oldest]
+
+    return live
+
+
 def dedupe_external_events(
     ring: Mapping[str, str],
     signals: Sequence[Signal],
@@ -73,31 +142,15 @@ def dedupe_external_events(
     cap: int = DEFAULT_RING_CAP,
     ttl: timedelta = DEFAULT_RING_TTL,
 ) -> tuple[tuple[Signal, ...], dict[str, str]]:
-    """Drop duplicate external events and return (signals to process, updated ring).
+    """Filter duplicates AND record fresh ids in one call (filter → record).
 
-    See the module docstring for the rule. The returned ring is a fresh dict
-    (never the input, which is a state snapshot): TTL-expired entries are swept,
-    each fresh external id is recorded at *now*, and the oldest entries are evicted
-    once ``cap`` is exceeded. Non-external signals pass through untouched and are
-    never recorded. Original frame order is preserved among the kept signals.
+    The combined form: it records unconditionally, so it is only sound when the
+    caller has no consumer whose failure could strand a recorded id. The coreloop
+    instead splits the two (:func:`filter_external_events` before the component loop,
+    :func:`record_external_events` after it, gated on the contact consumer's success)
+    so a ContactSensor fault cannot durably lose an inbound. Behaviour is identical
+    to filter-then-record-all.
     """
-    # Start from the live (within-TTL) subset, preserving oldest-first order.
-    live: dict[str, str] = {eid: at for eid, at in ring.items() if _is_live(at, now, ttl)}
-
-    kept: list[Signal] = []
-    for signal in signals:
-        if signal.kind != KIND_CONTACT_OBSERVED:
-            kept.append(signal)  # not an external event — never deduped or recorded
-            continue
-        eid = signal.origin_id
-        if eid in live:
-            continue  # duplicate external event — drop it (no second satiation)
-        live[eid] = now.isoformat()  # fresh id: remember it, process it
-        kept.append(signal)
-
-    # Bound the ring: evict oldest (front of insertion order) beyond the cap.
-    while len(live) > cap:
-        oldest = next(iter(live))
-        del live[oldest]
-
-    return tuple(kept), live
+    kept, fresh_ids = filter_external_events(ring, signals, now, ttl=ttl)
+    new_ring = record_external_events(ring, fresh_ids, now, cap=cap, ttl=ttl)
+    return kept, new_ring

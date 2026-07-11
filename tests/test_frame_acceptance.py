@@ -306,6 +306,39 @@ def test_scenario_6_different_origin_id_after_first_still_satiates(tmp_path: Pat
     assert set(final.processed_external_event_ids) == {"m-1", "m-2"}  # both remembered
 
 
+def test_scenario_6_contact_sensor_failure_does_not_record_id(tmp_path: Path, monkeypatch) -> None:
+    # Regression (spec §8): the idempotency ring must not record a fresh external id
+    # until the load-bearing contact consumer (ContactSensor → the u-satiation path)
+    # has actually processed it. If ContactSensor throws (per-component isolation),
+    # u is never satiated — so recording the id would durably lose the inbound: every
+    # retry would be deduped away against an id whose effect never landed.
+    from lifemodel.core.contact_sensor import ContactSensor
+
+    lm = _build(tmp_path)
+    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+
+    def _boom(self, ctx):  # ContactSensor faults this frame
+        raise RuntimeError("sensor down")
+
+    monkeypatch.setattr(ContactSensor, "step", _boom)
+    dup = contact_observed_signal(origin_id="m-boom", actor="user", label="two_way", timestamp=None)
+    report = run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
+
+    assert "contact" in report.failed  # the sensor faulted this frame
+    after_fail = lm.state.load()
+    assert after_fail.u == 5.0  # never satiated — the sensor didn't run, so no drop
+    # The id must NOT be durably recorded — otherwise the retry is deduped forever.
+    assert "m-boom" not in after_fail.processed_external_event_ids
+
+    # The SAME id, retried with a healthy sensor, is re-processed (not deduped) and
+    # satiates u exactly once — proof the first frame left the ring clean.
+    monkeypatch.undo()
+    run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
+    after_retry = lm.state.load()
+    assert after_retry.u < 5.0  # the retry re-fired and satiated the drive
+    assert "m-boom" in after_retry.processed_external_event_ids  # now durably recorded
+
+
 def test_scenario_6_ring_is_durable_across_restart(tmp_path: Path) -> None:
     # Unlike the ephemeral bus, the ring is durable (spec §8): a duplicate that
     # arrives AFTER a restart is still deduped.
