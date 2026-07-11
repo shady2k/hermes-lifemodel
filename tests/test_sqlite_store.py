@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import lifemodel.state.sqlite_store as sqlite_store_module
+from lifemodel.core.timeutil import from_iso, to_iso
 from lifemodel.domain.memory import (
     MemoryDraft,
     MemoryPatch,
@@ -393,9 +394,8 @@ def _write_raw_state_json(base_dir: Path, raw: str) -> None:
     with closing(sqlite3.connect(str(base_dir / DB_FILENAME))) as conn, conn:
         conn.execute("DELETE FROM runtime_state WHERE id = 1")
         conn.execute(
-            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
-            "VALUES (1, ?, ?, ?, 0)",
-            (raw, BASE_TIME.isoformat(), int(BASE_TIME.timestamp() * 1000)),
+            "INSERT INTO runtime_state (id, state_json, updated_at, revision) VALUES (1, ?, ?, 0)",
+            (raw, to_iso(BASE_TIME)),
         )
 
 
@@ -491,7 +491,8 @@ def test_migration_creates_expected_tables_and_indexes(tmp_path: Path) -> None:
     assert {"store_meta", "schema_migrations", "memory_records", "runtime_state"} <= tables
     assert "outbound_ledger" not in tables  # out of scope for this bead (6.4)
     assert any("kind" in name and "state" in name for name in indexes)
-    assert any("expires_at_epoch" in name for name in indexes)
+    assert "idx_memory_records_expires_at" in indexes
+    assert not any("epoch" in name for name in indexes)  # the epoch index is retired
 
 
 # ---- STRICT feature-detection -------------------------------------------
@@ -537,41 +538,38 @@ def test_connect_sets_expected_per_connection_pragmas(tmp_path: Path) -> None:
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
 
 
-# ---- epoch storage --------------------------------------------------------
+# ---- ISO-only time storage (lm-fib.10.2) ----------------------------------
 
 
-def test_epoch_columns_stored_alongside_iso_text_no_lossy_reconstruction(
-    tmp_path: Path,
-) -> None:
+def test_all_time_columns_stored_as_normalized_iso_text(tmp_path: Path) -> None:
     clock = FakeClock(BASE_TIME)
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    expires = (clock.now() + timedelta(days=1)).isoformat()
-    store.put(_draft(expires_at=expires))
+    expires = clock.now() + timedelta(days=1)
+    store.put(_draft(expires_at=expires.isoformat()))
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
-        row = conn.execute(
-            "SELECT created_at, created_at_epoch, updated_at, updated_at_epoch, "
-            "expires_at, expires_at_epoch FROM memory_records WHERE id = 'd1'"
+        created_at, updated_at, expires_at = conn.execute(
+            "SELECT created_at, updated_at, expires_at FROM memory_records WHERE id = 'd1'"
         ).fetchone()
 
-    created_at, created_at_epoch, updated_at, updated_at_epoch, expires_at, expires_at_epoch = row
-    assert created_at == clock.now().isoformat()
-    assert created_at_epoch == int(clock.now().timestamp() * 1000)
-    assert updated_at == clock.now().isoformat()
-    assert updated_at_epoch == int(clock.now().timestamp() * 1000)
-    assert expires_at == expires
-    assert expires_at_epoch == int(datetime.fromisoformat(expires).timestamp() * 1000)
+    # ONE column per instant, all canonical fixed-width ISO-8601 UTC (to_iso);
+    # from_iso round-trips each back to the exact datetime.
+    assert created_at == to_iso(clock.now())
+    assert updated_at == to_iso(clock.now())
+    assert expires_at == to_iso(expires)
+    assert from_iso(created_at) == clock.now()
+    assert from_iso(expires_at) == expires
 
 
-def test_null_expires_at_leaves_epoch_column_null(tmp_path: Path) -> None:
+def test_null_expires_at_stored_as_null(tmp_path: Path) -> None:
     store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
     store.put(_draft(expires_at=None))
 
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
-        row = conn.execute(
-            "SELECT expires_at, expires_at_epoch FROM memory_records WHERE id = 'd1'"
+        (expires_at,) = conn.execute(
+            "SELECT expires_at FROM memory_records WHERE id = 'd1'"
         ).fetchone()
-    assert row == (None, None)
+    assert expires_at is None
 
 
 # ---- atomic UPSERT / concurrent writers (ON CONFLICT) -----------------------
@@ -589,7 +587,7 @@ def test_put_upsert_is_atomic_across_two_store_instances(tmp_path: Path) -> None
     store_b = SQLiteRuntimeStore(tmp_path, clock=clock)
 
     store_a.put(_draft(payload={"note": "from-a"}))  # fresh insert
-    created_stamp = clock.now().isoformat()
+    created_stamp = to_iso(clock.now())
     clock.advance(timedelta(minutes=5))
     store_b.put(_draft(payload={"note": "from-b"}))  # conflict path, no prior read
 
@@ -598,7 +596,7 @@ def test_put_upsert_is_atomic_across_two_store_instances(tmp_path: Path) -> None
     assert record.payload == {"note": "from-b"}  # last writer wins
     assert record.revision == 1  # bumped atomically, not undercounted
     assert record.created_at == created_stamp  # original creation stamp preserved
-    assert record.updated_at == clock.now().isoformat()  # refreshed on update
+    assert record.updated_at == to_iso(clock.now())  # refreshed on update
 
 
 def test_commit_upsert_is_atomic_across_two_store_instances(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from typing import Protocol
 
 import pytest
 
+from lifemodel.core.timeutil import to_iso
 from lifemodel.domain.memory import (
     MemoryDraft,
     MemoryPatch,
@@ -88,8 +89,8 @@ def test_put_then_get_round_trip(backend: tuple[_MemoryStore, FakeClock]) -> Non
     assert record.salience == 0.0
     assert record.confidence is None
     assert record.expires_at is None
-    assert record.created_at == clock.now().isoformat()
-    assert record.updated_at == clock.now().isoformat()
+    assert record.created_at == to_iso(clock.now())
+    assert record.updated_at == to_iso(clock.now())
     assert record.revision == 0
     assert record.schema_version == 1
 
@@ -248,7 +249,7 @@ def test_transition_valid_from_state_bumps_revision_and_state(
     record = store.transition("desire", "d1", "active", "fulfilled")
     assert record.state == "fulfilled"
     assert record.revision == 1
-    assert record.updated_at == clock.now().isoformat()
+    assert record.updated_at == to_iso(clock.now())
 
 
 def test_transition_applies_payload_merge_shallow(
@@ -382,13 +383,14 @@ def test_timestamps_are_canonicalized_to_utc_under_a_non_utc_clock(tmp_path: Pat
         store.put(_draft(id="z"))
         record = store.get("desire", "z")
         assert record is not None
-        assert record.created_at == "2026-07-06T12:00:00+00:00"
-        assert record.updated_at == "2026-07-06T12:00:00+00:00"
+        assert record.created_at == "2026-07-06T12:00:00.000000+00:00"
+        assert record.updated_at == "2026-07-06T12:00:00.000000+00:00"
 
 
 def test_fake_and_real_find_ordering_match_under_non_utc_clock(tmp_path: Path) -> None:
-    # Fix 5: the fake must order by parsed epoch-ms (like SQLite's _epoch columns),
-    # not by raw ISO string, so a non-UTC clock cannot make the two diverge.
+    # The fake and store both sort by the stored, normalized fixed-width ISO TEXT
+    # (a non-UTC clock is canonicalized to UTC on write), so a lexical sort is
+    # byte-identical across the two backends.
     tz = timezone(timedelta(hours=5))
 
     def populate(store: _MemoryStore, clock: FakeClock) -> None:

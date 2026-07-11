@@ -28,7 +28,7 @@ from lifemodel.domain.memory import (
     ensure_json_serializable,
     epoch_ms,
     merge_payload,
-    parse_expires_at_epoch_ms,
+    normalize_expires_at,
     stamp_iso_utc,
     summarize_pressure_index,
 )
@@ -67,38 +67,42 @@ class TestEnsureJsonSerializable:
             ensure_json_serializable({"a": object()})  # type: ignore[dict-item]
 
 
-class TestParseExpiresAtEpochMs:
+class TestNormalizeExpiresAt:
     def test_none_passes_through(self) -> None:
-        assert parse_expires_at_epoch_ms(None) is None
+        assert normalize_expires_at(None) is None
 
-    def test_parses_tz_aware_iso(self) -> None:
-        dt = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
-        assert parse_expires_at_epoch_ms(dt.isoformat()) == epoch_ms(dt)
+    def test_normalizes_tz_aware_iso_to_fixed_width_utc(self) -> None:
+        # A +05:00 offset with whole-second precision must land as canonical,
+        # fixed-width UTC TEXT — no raw caller string reaches a column.
+        assert (
+            normalize_expires_at("2026-07-06T17:00:00+05:00") == "2026-07-06T12:00:00.000000+00:00"
+        )
 
     def test_rejects_naive_timestamp(self) -> None:
         with pytest.raises(MemorySerializationError):
-            parse_expires_at_epoch_ms("2026-07-06T12:00:00")
+            normalize_expires_at("2026-07-06T12:00:00")
 
     def test_rejects_malformed_timestamp(self) -> None:
         with pytest.raises(MemorySerializationError):
-            parse_expires_at_epoch_ms("not-a-timestamp")
+            normalize_expires_at("not-a-timestamp")
 
 
 class TestEpochMs:
     def test_matches_manual_computation(self) -> None:
+        # Retained only for the store's forensic filename stamps, not columns.
         dt = datetime(2026, 7, 6, 12, 0, 0, tzinfo=UTC)
         assert epoch_ms(dt) == int(dt.timestamp() * 1000)
 
 
 class TestStampIsoUtc:
-    def test_passes_through_utc_instant(self) -> None:
+    def test_passes_through_utc_instant_fixed_width(self) -> None:
         dt = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
-        assert stamp_iso_utc(dt) == "2026-07-06T12:00:00+00:00"
+        assert stamp_iso_utc(dt) == "2026-07-06T12:00:00.000000+00:00"
 
     def test_normalizes_non_utc_offset_to_utc(self) -> None:
         tz = timezone(timedelta(hours=5))
         dt = datetime(2026, 7, 6, 17, 0, tzinfo=tz)  # == 12:00 UTC
-        assert stamp_iso_utc(dt) == "2026-07-06T12:00:00+00:00"
+        assert stamp_iso_utc(dt) == "2026-07-06T12:00:00.000000+00:00"
 
     def test_rejects_naive_datetime(self) -> None:
         with pytest.raises(MemorySerializationError):

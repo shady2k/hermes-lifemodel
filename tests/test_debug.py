@@ -205,8 +205,7 @@ def test_dump_survives_a_corrupt_store(tmp_path) -> None:
     SQLiteRuntimeStore(tmp_path, clock=SystemClock())
     with closing(sqlite3.connect(str(tmp_path / "lifemodel.sqlite"))) as conn, conn:
         conn.execute(
-            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
-            "VALUES (1, ?, ?, 0, 0)",
+            "INSERT INTO runtime_state (id, state_json, updated_at, revision) VALUES (1, ?, ?, 0)",
             ("{ not json", "2026-07-06T00:00:00+00:00"),
         )
     out = render_dump_for_dir(tmp_path)

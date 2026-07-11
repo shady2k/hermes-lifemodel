@@ -39,9 +39,8 @@ from ..domain.memory import (
     coalesce_patch,
     describe_stale_transition,
     ensure_json_serializable,
-    epoch_ms,
     merge_payload,
-    parse_expires_at_epoch_ms,
+    normalize_expires_at,
     stamp_iso_utc,
     summarize_pressure_index,
 )
@@ -339,8 +338,8 @@ class FakeMemoryStore:
 
     def put(self, draft: MemoryDraft) -> str:
         ensure_json_serializable(draft.payload)
-        parse_expires_at_epoch_ms(draft.expires_at)  # validate before writing
-        now = stamp_iso_utc(self._clock.now())  # canonical UTC; rejects a naive clock
+        expires_at = normalize_expires_at(draft.expires_at)  # validate + normalize on write
+        now = stamp_iso_utc(self._clock.now())  # canonical fixed-width UTC; rejects a naive clock
         key = (draft.kind, draft.id)
         existing = self._rows.get(key)
         created_at = existing.created_at if existing is not None else now
@@ -354,7 +353,7 @@ class FakeMemoryStore:
             recipient_id=draft.recipient_id,
             salience=draft.salience,
             confidence=draft.confidence,
-            expires_at=draft.expires_at,
+            expires_at=expires_at,
             created_at=created_at,
             updated_at=now,
             revision=revision,
@@ -405,9 +404,9 @@ class FakeMemoryStore:
             actual_state = existing.state if existing is not None else None
             raise StaleTransition(describe_stale_transition(kind, id, from_state, actual_state))
 
-        new_expires_at = coalesce_patch(patch.expires_at, existing.expires_at)
-        parse_expires_at_epoch_ms(new_expires_at)  # validate before writing
-        now = stamp_iso_utc(self._clock.now())  # canonical UTC; rejects a naive clock
+        # Normalize on write (existing is already canonical; a patch value is raw).
+        new_expires_at = normalize_expires_at(coalesce_patch(patch.expires_at, existing.expires_at))
+        now = stamp_iso_utc(self._clock.now())  # canonical fixed-width UTC; rejects a naive clock
         updated = MemoryRecord(
             kind=existing.kind,
             id=existing.id,
@@ -456,15 +455,13 @@ def _sort_records(records: list[MemoryRecord], order_by: OrderBy) -> list[Memory
     # Two stable passes (minor key ascending, then major key descending) so
     # ties break by id ASC even though the major key sorts DESC — a single
     # `reverse=True` over a combined tuple key would reverse the tiebreak too.
-    # Sort timestamps by parsed epoch-ms (NOT the raw ISO string) so ordering is
-    # identical to SQLite's `_epoch` columns under any timezone offset.
+    # Sort timestamps by the stored normalized ISO string directly: every stamp
+    # is canonical fixed-width UTC TEXT (:func:`stamp_iso_utc`), so a lexical sort
+    # is byte-identical to SQLite's `updated_at DESC` / `created_at DESC` under
+    # any timezone offset — the same normalized-TEXT ordering the store rests on.
     by_id = sorted(records, key=lambda r: r.id)
     if order_by == "updated_desc":
-        return sorted(
-            by_id, key=lambda r: epoch_ms(datetime.fromisoformat(r.updated_at)), reverse=True
-        )
+        return sorted(by_id, key=lambda r: r.updated_at, reverse=True)
     if order_by == "created_desc":
-        return sorted(
-            by_id, key=lambda r: epoch_ms(datetime.fromisoformat(r.created_at)), reverse=True
-        )
+        return sorted(by_id, key=lambda r: r.created_at, reverse=True)
     return sorted(by_id, key=lambda r: r.salience, reverse=True)

@@ -528,8 +528,7 @@ def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> 
     store = _store(tmp_path)  # constructs + migrates the DB
     with closing(sqlite3.connect(str(tmp_path / "lifemodel.sqlite"))) as conn, conn:
         conn.execute(
-            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
-            "VALUES (1, ?, ?, 0, 0)",
+            "INSERT INTO runtime_state (id, state_json, updated_at, revision) VALUES (1, ?, ?, 0)",
             ("{ not json", "2026-01-01T00:00:00+00:00"),
         )
     with pytest.raises(StateCorruptError):

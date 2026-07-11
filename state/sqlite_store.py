@@ -60,10 +60,22 @@ table backing ``StatePort``. No destructive migration ever runs silently.
 older builds fall back to ordinary column-typed tables. ``fts5`` is out of
 scope for this bead.
 
-**Epochs** are stored as ``INTEGER`` milliseconds UTC
-(:func:`~lifemodel.domain.memory.epoch_ms`) *alongside* the ISO-8601 text
-column they were derived from — never reconstructed lossily from one or the
-other. All ordering/expiry comparisons use the epoch columns.
+**Time is stored ONCE, as normalized ISO-8601 UTC TEXT** (spec §4, lm-fib.10.2).
+The retired epoch mirror columns are gone: every ``_at`` value — including a
+caller-provided ``expires_at`` — is passed through
+:func:`~lifemodel.core.timeutil.to_iso` BEFORE storage
+(:func:`~lifemodel.domain.memory.normalize_expires_at` /
+:func:`~lifemodel.domain.memory.stamp_iso_utc`), so the stored form is always
+fixed-width and lexically sortable and no raw caller string ever reaches a
+column. All ordering/expiry comparisons run directly on those TEXT columns
+(``updated_at``/``created_at`` for ordering, ``expires_at`` for the expiry/
+pressure bound), which is provably correct because the width is fixed.
+
+**Store schema version.** Because ``CREATE TABLE IF NOT EXISTS`` cannot reshape
+an existing file, construction guards on :data:`_STORE_SCHEMA_VERSION` (stamped
+into ``store_meta``): a file whose recorded shape is older than this build is
+moved aside (``*.superseded.<ms>``) and rebuilt fresh — the being is resettable,
+so a fresh schema on next boot is expected, not migrated (spec §4 codex #4/#10).
 """
 
 from __future__ import annotations
@@ -79,6 +91,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, assert_never
 
+from ..core.timeutil import to_iso
 from ..domain.memory import (
     JsonObject,
     MemoryDraft,
@@ -94,7 +107,7 @@ from ..domain.memory import (
     ensure_json_serializable,
     epoch_ms,
     merge_payload,
-    parse_expires_at_epoch_ms,
+    normalize_expires_at,
     stamp_iso_utc,
 )
 from ..ports.clock import ClockPort
@@ -115,10 +128,19 @@ _SELECT_COLUMNS = (
 )
 
 _ORDER_SQL: Final[dict[OrderBy, str]] = {
-    "updated_desc": "updated_at_epoch DESC, id ASC",
-    "created_desc": "created_at_epoch DESC, id ASC",
+    "updated_desc": "updated_at DESC, id ASC",
+    "created_desc": "created_at DESC, id ASC",
     "salience_desc": "salience DESC, id ASC",
 }
+
+#: The store's on-disk table SHAPE version (distinct from ``State``'s
+#: :data:`~lifemodel.state.model.SCHEMA_VERSION`, which versions the JSON blob in
+#: the ``runtime_state`` row). Bumped to 3 when the epoch mirror columns were
+#: dropped and ISO-8601 UTC TEXT became the sole ordering/expiry key (spec §4,
+#: lm-fib.10.2). On a version/shape mismatch construction takes the destructive
+#: fresh-DB path (:meth:`SQLiteRuntimeStore._schema_superseded`): the being is
+#: resettable, so a fresh schema on next boot is expected, not migrated.
+_STORE_SCHEMA_VERSION: Final = 3
 
 
 class MigrationFailed(Exception):
@@ -149,10 +171,18 @@ class SQLiteRuntimeStore:
 
     def _ensure_ready(self) -> None:
         """Recovery, then schema — run once, before any read/write (§4.1)."""
-        if self._path.exists() and not self._quick_check_ok(self._path):
-            self._quarantine()
+        if self._path.exists():
+            if not self._quick_check_ok(self._path):
+                self._move_trio_aside("corrupt", "sqlite_quarantined")
+            elif self._schema_superseded():
+                # A structurally-sound file whose table SHAPE predates this build
+                # (e.g. it still carries the retired *_epoch columns): reshaping
+                # via CREATE TABLE IF NOT EXISTS is impossible, so take the
+                # destructive fresh-DB path — move it aside and rebuild (§4).
+                self._move_trio_aside("superseded", "sqlite_schema_superseded")
         self._ensure_wal_mode()
         self._run_migrations()
+        self._stamp_store_schema_version()
 
     def _quick_check_ok(self, path: Path) -> bool:
         # Opened read-only (a URI connection) so merely *checking* an invalid
@@ -168,33 +198,83 @@ class SQLiteRuntimeStore:
             return False
         return row is not None and row[0] == "ok"
 
-    def _quarantine(self) -> None:
-        """Move the corrupt trio aside and log an incident. Never raises.
+    def _move_trio_aside(self, suffix: str, event: str) -> None:
+        """Move the DB trio aside (``*.<suffix>.<ms>``) and log *event*. Never raises.
 
-        Preferred outcome: each existing file is renamed to ``*.corrupt.<ms>``
-        for forensics. But if a rename fails, the corrupt file *must not* remain
-        in place — ``_run_migrations`` would then run against it and could raise,
-        restart-looping the being (the very failure recovery exists to prevent),
-        and a stale ``-wal``/``-shm`` left pointing at the fresh DB we bootstrap
-        next would re-corrupt it. Such a file is already deemed unrecoverable, so
-        availability beats forensics: force it out with a best-effort ``unlink``,
-        logging if even that fails.
+        The shared engine behind both the corruption quarantine (``suffix``
+        ``"corrupt"``) and the schema-superseded reset (``suffix``
+        ``"superseded"``): a fresh bootstrap follows either way.
+
+        Preferred outcome: each existing file is renamed for forensics. But if a
+        rename fails, the file *must not* remain in place — ``_run_migrations``
+        would then run against it and could raise, restart-looping the being (the
+        very failure recovery exists to prevent), and a stale ``-wal``/``-shm``
+        left pointing at the fresh DB we bootstrap next would re-corrupt it. Such
+        a file is already deemed unusable, so availability beats forensics: force
+        it out with a best-effort ``unlink``, logging if even that fails.
         """
         stamp = epoch_ms(self._clock.now())
-        trio = [Path(f"{self._path}{suffix}") for suffix in ("", "-wal", "-shm")]
+        trio = [Path(f"{self._path}{suffix_part}") for suffix_part in ("", "-wal", "-shm")]
         for src in trio:
             if src.exists():
                 with suppress(OSError):
-                    src.rename(Path(f"{src}.corrupt.{stamp}"))
+                    src.rename(Path(f"{src}.{suffix}.{stamp}"))
         for src in trio:
             if src.exists():  # rename failed above — drop it so bootstrap is clean
                 try:
                     src.unlink()
                 except OSError as exc:
                     _LOG.info(
-                        "sqlite_quarantine_unlink_failed path=%s error=%s", str(src), str(exc)
+                        "sqlite_move_aside_unlink_failed path=%s error=%s", str(src), str(exc)
                     )
-        _LOG.info("sqlite_quarantined path=%s epoch_ms=%s", str(self._path), stamp)
+        _LOG.info("%s path=%s epoch_ms=%s", event, str(self._path), stamp)
+
+    def _schema_superseded(self) -> bool:
+        """True if a structurally-sound file's table SHAPE predates this build.
+
+        Read-only (a ``mode=ro`` URI, like :meth:`_quick_check_ok`) so the mere
+        check never mutates the file. A file with no ``store_meta`` table yet is
+        NOT superseded (it will simply bootstrap); a ``store_meta`` lacking the
+        ``schema_version`` key is a pre-cutover file (never versioned) and IS
+        superseded; otherwise the recorded version is compared against
+        :data:`_STORE_SCHEMA_VERSION`. Any read error is treated as "not
+        superseded" (the corruption path, or migrations, will handle a truly
+        broken file) so this never blocks construction.
+        """
+        uri = f"{self._path.resolve().as_uri()}?mode=ro"
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as conn:
+                has_meta = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_meta'"
+                ).fetchone()
+                if has_meta is None:
+                    return False
+                row = conn.execute(
+                    "SELECT value FROM store_meta WHERE key = 'schema_version'"
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        if row is None:
+            return True
+        try:
+            return int(row[0]) < _STORE_SCHEMA_VERSION
+        except (TypeError, ValueError):
+            return True
+
+    def _stamp_store_schema_version(self) -> None:
+        """Record the current store schema version in ``store_meta`` (idempotent).
+
+        Runs after migrations on every construction so a freshly-built (or
+        just-rebuilt) DB carries :data:`_STORE_SCHEMA_VERSION`; an already-current
+        DB rewrites the same value. This is the signal :meth:`_schema_superseded`
+        reads on the next boot to decide whether the on-disk shape is stale.
+        """
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(_STORE_SCHEMA_VERSION),),
+            )
 
     def _ensure_wal_mode(self) -> None:
         with suppress(sqlite3.Error), closing(sqlite3.connect(str(self._path))) as conn:
@@ -283,7 +363,7 @@ class SQLiteRuntimeStore:
         # single-op contract): the SQL body lives in :meth:`_put_on` so the same
         # write can also run inside :meth:`commit_tick`'s multi-op transaction.
         ensure_json_serializable(draft.payload)
-        parse_expires_at_epoch_ms(draft.expires_at)  # validate expires_at before writing
+        normalize_expires_at(draft.expires_at)  # validate expires_at before writing
         now = self._clock.now()
         stamp_iso_utc(now)  # validate the clock (tz-aware) before touching the DB
         with closing(self._connect()) as conn, conn:
@@ -301,29 +381,30 @@ class SQLiteRuntimeStore:
         same file (the 60s tick + a separate-process command) could both read "no
         row" and both INSERT (a PRIMARY KEY IntegrityError), or read the same
         revision and each write revision+1 (an undercount). ON CONFLICT collapses
-        that to last-writer-wins with an atomic bump. ``created_at``/
-        ``created_at_epoch`` appear ONLY in the INSERT VALUES, never in DO UPDATE
-        SET, so an update preserves the original creation stamp (the pre-existing
-        contract); ``revision`` bumps off the row's own stored value, so concurrent
-        updates cannot undercount it. ``schema_version`` is stamped from the draft
-        (the kind's version), not a hardcoded literal (lm-27n.2).
+        that to last-writer-wins with an atomic bump. ``created_at`` appears ONLY
+        in the INSERT VALUES, never in DO UPDATE SET, so an update preserves the
+        original creation stamp (the pre-existing contract); ``revision`` bumps off
+        the row's own stored value, so concurrent updates cannot undercount it.
+        ``expires_at`` is normalized on write (:func:`normalize_expires_at`) so no
+        raw caller string reaches the column (spec §4 codex #1); ``created_at``/
+        ``updated_at`` come from :func:`stamp_iso_utc` — both are canonical
+        fixed-width ISO-8601 UTC TEXT, the sole ordering/expiry key.
+        ``schema_version`` is stamped from the draft (the kind's version), not a
+        hardcoded literal (lm-27n.2).
         """
         payload_json = json.dumps(draft.payload, allow_nan=False)
-        expires_at_epoch = parse_expires_at_epoch_ms(draft.expires_at)
+        expires_at = normalize_expires_at(draft.expires_at)
         now_iso = stamp_iso_utc(now)
-        now_epoch = epoch_ms(now)
         conn.execute(
             "INSERT INTO memory_records ("
             "kind, id, state, recipient_id, payload_json, salience, confidence, "
-            "expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
-            "updated_at, updated_at_epoch, revision, schema_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?) "
+            "expires_at, source, created_at, updated_at, revision, schema_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?) "
             "ON CONFLICT(kind, id) DO UPDATE SET "
             "state=excluded.state, recipient_id=excluded.recipient_id, "
             "payload_json=excluded.payload_json, salience=excluded.salience, "
             "confidence=excluded.confidence, expires_at=excluded.expires_at, "
-            "expires_at_epoch=excluded.expires_at_epoch, source=excluded.source, "
-            "updated_at=excluded.updated_at, updated_at_epoch=excluded.updated_at_epoch, "
+            "source=excluded.source, updated_at=excluded.updated_at, "
             "revision=memory_records.revision + 1",
             (
                 draft.kind,
@@ -333,13 +414,10 @@ class SQLiteRuntimeStore:
                 payload_json,
                 draft.salience,
                 draft.confidence,
-                draft.expires_at,
-                expires_at_epoch,
+                expires_at,
                 draft.source,
                 now_iso,
-                now_epoch,
                 now_iso,
-                now_epoch,
                 draft.schema_version,
             ),
         )
@@ -440,14 +518,16 @@ class SQLiteRuntimeStore:
 
         payload_json, salience, confidence, expires_at, source = row
         payload: JsonObject = merge_payload(json.loads(payload_json), patch.payload_merge)
-        new_expires_at = coalesce_patch(patch.expires_at, expires_at)
-        new_expires_epoch = parse_expires_at_epoch_ms(new_expires_at)
-        now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
+        # Normalize on write: the stored ``expires_at`` is already canonical, but a
+        # patch-provided value is a raw caller string — route both through
+        # ``normalize_expires_at`` so no raw string ever reaches the column.
+        new_expires_at = normalize_expires_at(coalesce_patch(patch.expires_at, expires_at))
+        now_iso = stamp_iso_utc(now)  # canonical fixed-width UTC text; rejects a naive clock
 
         cursor = conn.execute(
             "UPDATE memory_records SET state = ?, payload_json = ?, salience = ?, "
-            "confidence = ?, expires_at = ?, expires_at_epoch = ?, source = ?, "
-            "updated_at = ?, updated_at_epoch = ?, revision = revision + 1 "
+            "confidence = ?, expires_at = ?, source = ?, "
+            "updated_at = ?, revision = revision + 1 "
             "WHERE kind = ? AND id = ? AND state = ?",
             (
                 to_state,
@@ -455,10 +535,8 @@ class SQLiteRuntimeStore:
                 coalesce_patch(patch.salience, salience),
                 coalesce_patch(patch.confidence, confidence),
                 new_expires_at,
-                new_expires_epoch,
                 coalesce_patch(patch.source, source),
                 now_iso,
-                epoch_ms(now),
                 kind,
                 id,
                 from_state,
@@ -559,8 +637,8 @@ class SQLiteRuntimeStore:
         Fail-closed like ``JsonStateStore.commit``: the payload is serialized
         with ``allow_nan=False`` *before* the database is touched, so a
         non-finite float raises :class:`~lifemodel.state.errors.StateSerializationError`
-        with nothing written. ``updated_at``/``updated_at_epoch`` are stamped
-        from the injected clock (canonical UTC via
+        with nothing written. ``updated_at`` is stamped from the injected clock
+        (canonical fixed-width UTC via
         :func:`~lifemodel.domain.memory.stamp_iso_utc`, which rejects a naive
         clock) and ``revision`` is bumped on every commit past the first.
 
@@ -602,17 +680,15 @@ class SQLiteRuntimeStore:
         computed off the row's own stored value — the exact pre-existing semantic.
         """
         payload = json.dumps(state.to_dict(), allow_nan=False)
-        now_iso = stamp_iso_utc(now)  # canonical UTC text; rejects a naive clock
-        now_epoch = epoch_ms(now)
+        now_iso = stamp_iso_utc(now)  # canonical fixed-width UTC text; rejects a naive clock
         conn.execute(
             "INSERT INTO runtime_state "
-            "(id, state_json, updated_at, updated_at_epoch, revision) "
-            "VALUES (1, ?, ?, ?, 0) "
+            "(id, state_json, updated_at, revision) "
+            "VALUES (1, ?, ?, 0) "
             "ON CONFLICT(id) DO UPDATE SET "
             "state_json=excluded.state_json, updated_at=excluded.updated_at, "
-            "updated_at_epoch=excluded.updated_at_epoch, "
             "revision=runtime_state.revision + 1",
-            (payload, now_iso, now_epoch),
+            (payload, now_iso),
         )
 
     # ---- TickCommitPort (lm-27n.2) ----------------------------------------
@@ -654,12 +730,12 @@ class SQLiteRuntimeStore:
             match mutation:
                 case PutOp():
                     ensure_json_serializable(mutation.draft.payload)
-                    parse_expires_at_epoch_ms(mutation.draft.expires_at)
+                    normalize_expires_at(mutation.draft.expires_at)
                 case TransitionOp():
                     if mutation.patch is not None:
                         if mutation.patch.payload_merge is not None:
                             ensure_json_serializable(mutation.patch.payload_merge)
-                        parse_expires_at_epoch_ms(mutation.patch.expires_at)
+                        normalize_expires_at(mutation.patch.expires_at)
                 case _:  # pragma: no cover - exhaustive over the closed union
                     assert_never(mutation)
 
@@ -733,14 +809,18 @@ class SQLiteRuntimeStore:
     # ---- PressureSensorPort ---------------------------------------------------
 
     def read_pressure_index(self, now: datetime) -> PressureIndex:
-        now_epoch = epoch_ms(now)
+        # Normalized ISO bound: stored ``expires_at`` is canonical fixed-width UTC
+        # TEXT, so the lexical ``>`` compares correctly. Strict ``>`` = active,
+        # ``<=`` = expired (boundary ``== now`` is expired), preserving the old
+        # epoch semantics exactly (spec §4 codex #2).
+        now_iso = to_iso(now)
         try:
             with closing(self._connect()) as conn:
                 row = conn.execute(
                     "SELECT COUNT(*), MAX(salience) FROM memory_records "
                     "WHERE kind = 'desire' AND state = 'active' "
-                    "AND (expires_at_epoch IS NULL OR expires_at_epoch > ?)",
-                    (now_epoch,),
+                    "AND (expires_at IS NULL OR expires_at > ?)",
+                    (now_iso,),
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
             # Fail-soft the transient/operational cases (locked DB) AND a
@@ -841,12 +921,9 @@ def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
         "salience REAL NOT NULL DEFAULT 0, "
         "confidence REAL, "
         "expires_at TEXT, "
-        "expires_at_epoch INTEGER, "
         "source TEXT NOT NULL, "
         "created_at TEXT NOT NULL, "
-        "created_at_epoch INTEGER NOT NULL, "
         "updated_at TEXT NOT NULL, "
-        "updated_at_epoch INTEGER NOT NULL, "
         "revision INTEGER NOT NULL DEFAULT 0, "
         "schema_version INTEGER NOT NULL DEFAULT 1, "
         "PRIMARY KEY (kind, id))" + strict_kw
@@ -855,8 +932,7 @@ def _migrate_v1(conn: sqlite3.Connection, strict: bool) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_records_kind_state ON memory_records (kind, state)"
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_memory_records_expires_at_epoch "
-        "ON memory_records (expires_at_epoch)"
+        "CREATE INDEX IF NOT EXISTS idx_memory_records_expires_at ON memory_records (expires_at)"
     )
 
 
@@ -874,7 +950,6 @@ def _migrate_v2(conn: sqlite3.Connection, strict: bool) -> None:
         "id INTEGER PRIMARY KEY CHECK (id = 1), "
         "state_json TEXT NOT NULL, "
         "updated_at TEXT NOT NULL, "
-        "updated_at_epoch INTEGER NOT NULL, "
         "revision INTEGER NOT NULL DEFAULT 0)" + strict_kw
     )
 

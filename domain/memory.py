@@ -26,8 +26,10 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TypeAlias, TypeVar
+
+from ..core.timeutil import from_iso, to_iso
 
 #: Any value that round-trips through :mod:`json` with no custom encoder.
 #: Recursive: a ``JsonValue`` is a JSON scalar, or a list/dict of ``JsonValue``.
@@ -64,7 +66,7 @@ class MemorySerializationError(MemoryPortError):
     a non-JSON-serializable payload (e.g. a non-finite float, or a value with
     no JSON encoding), a malformed/timezone-naive ``expires_at``, or a
     timezone-naive clock value is rejected by :func:`ensure_json_serializable` /
-    :func:`parse_expires_at_epoch_ms` / :func:`stamp_iso_utc` *before* either
+    :func:`normalize_expires_at` / :func:`stamp_iso_utc` *before* either
     store implementation touches its backing storage.
     """
 
@@ -88,8 +90,8 @@ class MemoryDraft:
     salience: float = 0.0
     confidence: float | None = None
     #: Caller-provided, timezone-aware ISO-8601 instant, or ``None`` for "never
-    #: expires". The store derives the epoch-millisecond column from this; see
-    #: :func:`parse_expires_at_epoch_ms`.
+    #: expires". Normalized to canonical UTC TEXT via :func:`normalize_expires_at`
+    #: before storage (spec §4 codex #1) — no raw caller string reaches a column.
     expires_at: str | None = None
     #: The typed-kind payload schema version the store must stamp on the row.
     #: Defaults to ``1`` (every kind is v1 today); :meth:`KindRegistry.encode`
@@ -211,55 +213,60 @@ def ensure_json_serializable(payload: JsonObject) -> None:
         ) from exc
 
 
-def parse_expires_at_epoch_ms(expires_at: str | None) -> int | None:
-    """Parse a caller-provided ``expires_at`` into epoch milliseconds UTC.
+def normalize_expires_at(expires_at: str | None) -> str | None:
+    """Normalize a caller-provided ``expires_at`` to canonical ISO-8601 UTC TEXT.
 
-    Mirrors :func:`lifemodel.state.model._as_opt_iso`: ``None`` passes through
-    as ``None`` ("never expires"); otherwise the string must be a
-    timezone-*aware* ISO-8601 instant, or :class:`MemorySerializationError` is
-    raised — a naive value would silently misorder against the epoch columns.
-    Shared by every ``MemoryPort`` implementation so "caller gave us a bad
-    timestamp" fails identically everywhere.
+    ``None`` passes through as ``None`` ("never expires"). Otherwise the string
+    must be a timezone-*aware* ISO-8601 instant (a naive value would silently
+    misorder against the normalized TEXT column), and it is returned re-serialized
+    through :func:`~lifemodel.core.timeutil.to_iso` — fixed-width, UTC, lexically
+    sortable — so **no raw caller string** (a ``+03:00`` offset, whitespace, or a
+    short-fraction value) ever reaches a column (spec §4 codex #1: normalize on
+    write, not merely validate). A malformed or naive value raises
+    :class:`MemorySerializationError`, identically for every ``MemoryPort``
+    implementation.
     """
     if expires_at is None:
         return None
     try:
-        parsed = datetime.fromisoformat(expires_at)
+        parsed = from_iso(expires_at)
     except ValueError as exc:
         raise MemorySerializationError(
-            f"'expires_at' must be an ISO-8601 timestamp, got {expires_at!r}"
+            f"'expires_at' must be a timezone-aware ISO-8601 timestamp, got {expires_at!r}"
         ) from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise MemorySerializationError(
-            f"'expires_at' must be a timezone-aware timestamp, got naive {expires_at!r}"
-        )
-    return epoch_ms(parsed)
+    return to_iso(parsed)
 
 
 def epoch_ms(instant: datetime) -> int:
-    """Convert a timezone-aware ``datetime`` to whole epoch milliseconds UTC."""
+    """Whole epoch milliseconds UTC — an internal, non-column forensic stamp.
+
+    NOT a storage-column path (spec §2: "drop epoch" applies to DB time COLUMNS
+    only). Every persisted instant is normalized ISO-8601 TEXT now; this survives
+    only to stamp the quarantine/backup FILENAMES the store moves aside
+    (``lifemodel.sqlite.corrupt.<ms>`` / ``.bak.<ms>``), where a colon-free,
+    compact suffix is wanted and ISO text (with its ``:``) makes a poor filename.
+    """
     return int(instant.timestamp() * 1000)
 
 
 def stamp_iso_utc(instant: datetime) -> str:
-    """Canonical ISO-8601 UTC text for a store-stamped timestamp (``ClockPort``).
+    """Canonical, fixed-width ISO-8601 UTC text for a store-stamped timestamp.
 
     ``ClockPort`` promises a timezone-aware UTC ``datetime``, but a misconfigured
     clock could hand back a naive value; rather than silently misinterpret it as
-    local time (``.isoformat()`` would emit an offset-less string that later reads
-    back naive and misorders against the epoch columns), reject it before write —
-    mirroring :func:`parse_expires_at_epoch_ms`'s tz-aware requirement. The result
-    is normalized through ``astimezone(UTC)`` so the text column is canonical UTC
-    regardless of the clock's zone; :func:`epoch_ms` is tz-independent for an
-    aware instant, so the two stay consistent. Shared by every ``MemoryPort``
-    implementation so fake and real stamp identically.
+    local time, reject it before write (raising :class:`MemorySerializationError`,
+    the shared fail-before-write taxonomy). A valid instant is serialized through
+    :func:`~lifemodel.core.timeutil.to_iso` so every stored ``_at`` value is the
+    same normalized, lexically-sortable form the ordering/expiry keys now rest on.
+    Shared by every ``MemoryPort`` implementation so fake and real stamp
+    identically.
     """
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise MemorySerializationError(
             f"clock returned a timezone-naive datetime {instant!r}; "
             "MemoryPort requires a timezone-aware UTC clock"
         )
-    return instant.astimezone(UTC).isoformat()
+    return to_iso(instant)
 
 
 def merge_payload(existing: JsonObject, payload_merge: JsonObject | None) -> JsonObject:
@@ -307,15 +314,15 @@ def summarize_pressure_index(records: Iterable[MemoryRecord], now: datetime) -> 
     answer matches :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`'s
     SQL aggregate exactly. A record counts as *active* iff ``kind == "desire"``,
     ``state == "active"``, and it is unexpired (``expires_at is None`` or its
-    epoch is strictly after *now*'s).
+    normalized instant is strictly after *now* — the same strict ``>`` active /
+    ``<=`` expired boundary the SQL uses, spec §4 codex #2).
     """
-    now_epoch = epoch_ms(now)
     active = [
         record
         for record in records
         if record.kind == "desire"
         and record.state == "active"
-        and (record.expires_at is None or _expires_after(record.expires_at, now_epoch))
+        and (record.expires_at is None or from_iso(record.expires_at) > now)
     ]
     if not active:
         return PressureIndex()
@@ -324,8 +331,3 @@ def summarize_pressure_index(records: Iterable[MemoryRecord], now: datetime) -> 
         max_desire_salience=max(record.salience for record in active),
         contact_frame_available=True,
     )
-
-
-def _expires_after(expires_at: str, now_epoch: int) -> bool:
-    expires_epoch = parse_expires_at_epoch_ms(expires_at)
-    return expires_epoch is None or expires_epoch > now_epoch
