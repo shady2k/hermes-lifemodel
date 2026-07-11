@@ -44,7 +44,10 @@ _EXCLUDE_PARTS = {"tests", "testing", "__pycache__", "docs", ".git", ".beads", "
 #: boundaries with NO ambient span), the brain-liveness status renderer (spec §4.4 —
 #: logs a fail-soft WARNING on a degraded health/state read at the ``/lifemodel status``
 #: boundary, again with no ambient span), the afferent hook boundary (a frame-machinery
-#: failure is observed before any span exists, spec §4.3/MAJOR-4), and the adapters
+#: failure is observed before any span exists, spec §4.3/MAJOR-4), the pure time helper
+#: (spec §3/lm-fib.10 — ``core/timeutil.to_display`` is fail-open on a bad stored row and
+#: logs a WARNING; a leaf format/parse utility called with no ctx, it is NOT a tick
+#: component and can hold no ``SpanBoundLogger``), and the adapters
 #: that have no ambient span. Everything else — every ``core/`` tick component above
 #: all — must log ONLY through a ``SpanBoundLogger``.
 _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
@@ -53,6 +56,7 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "__init__.py",
         "gateway_core.py",
         "hooks.py",
+        "core/timeutil.py",
         "adapters/being_platform.py",
         "adapters/delivery.py",
         "state/sqlite_store.py",

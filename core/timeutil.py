@@ -8,7 +8,10 @@ tz-naive value, so a malformed ``last_tick_at`` never crashes a tick.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import logging
+from datetime import UTC, datetime, tzinfo
+
+_LOG = logging.getLogger("lifemodel.timeutil")
 
 
 def to_iso(dt: datetime) -> str:
@@ -50,6 +53,36 @@ def to_epoch_seconds(dt: datetime) -> float:
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise ValueError(f"to_epoch_seconds requires a timezone-aware datetime, got naive {dt!r}")
     return dt.astimezone(UTC).timestamp()
+
+
+def to_display(value: datetime | str, tz: tzinfo | None) -> str:
+    """Render a stored instant in the owner's local zone for a human surface.
+
+    The ONE fail-open path (spec §3 codex #7): a debug/status view must never be
+    blanked by one bad row. Accepts an aware ``datetime`` or an ISO string; on a
+    malformed or tz-naive value it logs a WARNING and returns the raw value as a
+    string rather than raising (``from_iso`` stays strict — this is the display
+    layer's tolerance, not the storage layer's). *tz* is the owner's zone from
+    the adapter boundary; ``None`` falls back to the server's local zone, matching
+    ``core/wake_packet.py``'s ``astimezone`` convention, and a bad *tz* falls back
+    to UTC rather than drop the render.
+    """
+    if isinstance(value, str):
+        try:
+            dt = from_iso(value)
+        except ValueError:
+            _LOG.warning("to_display: unparseable stored time %r; showing raw", value)
+            return value
+    else:
+        dt = value
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            _LOG.warning("to_display: tz-naive datetime %r; showing raw", value)
+            return str(value)
+    try:
+        local = dt.astimezone(tz)
+    except Exception:  # noqa: BLE001 - a bad tz must never blank the view
+        local = dt.astimezone(UTC)
+    return local.isoformat()
 
 
 def minutes_between(a_iso: str | None, b: datetime) -> float:

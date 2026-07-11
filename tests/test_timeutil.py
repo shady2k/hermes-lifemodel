@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from lifemodel.core.timeutil import (
     from_iso,
     minutes_between,
+    to_display,
     to_epoch_seconds,
     to_iso,
 )
+
+#: Moscow is a fixed +03:00 (no DST since 2014) — a stable owner-local zone for
+#: the display tests.
+_MOSCOW = ZoneInfo("Europe/Moscow")
 
 #: The load-bearing normalization invariant (spec §3/§6.2): fixed-width, always
 #: 6-digit microseconds, always ``+00:00`` — the shape that makes TEXT order ==
@@ -101,6 +108,40 @@ def test_to_epoch_seconds_round_trips_within_a_microsecond() -> None:
     epoch = to_epoch_seconds(from_iso(s))
     reconstructed = datetime.fromtimestamp(epoch, UTC)
     assert abs((reconstructed - from_iso(s)).total_seconds()) < 1e-6
+
+
+def test_to_display_renders_owner_local_offset_from_iso_string() -> None:
+    # A normalized 08:05 UTC instant is 11:05 in Moscow (+03:00).
+    rendered = to_display("2026-07-11T08:05:03.500000+00:00", _MOSCOW)
+    assert "+03:00" in rendered
+    assert "11:05:03" in rendered
+
+
+def test_to_display_accepts_an_aware_datetime() -> None:
+    rendered = to_display(datetime(2026, 7, 11, 8, 5, 3, tzinfo=UTC), _MOSCOW)
+    assert "+03:00" in rendered
+
+
+def test_to_display_fail_open_on_garbage_returns_raw_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        assert to_display("garbage", _MOSCOW) == "garbage"
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_to_display_fail_open_on_naive_datetime_returns_raw_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    naive = datetime(2026, 7, 11, 8, 5, 3)
+    with caplog.at_level(logging.WARNING):
+        assert to_display(naive, _MOSCOW) == str(naive)
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_to_display_tz_none_does_not_raise() -> None:
+    # tz=None -> server-local (wake_packet convention); never raises.
+    assert to_display("2026-07-11T08:05:03.500000+00:00", None)
 
 
 def test_minutes_between_counts_forward() -> None:
