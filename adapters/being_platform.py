@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import traceback
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,22 +37,31 @@ from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..events import EventRing
+from ..state.brain_health import BrainHealth, get_brain_health
 from ..state.metrics_store import (
     MetricsSampler,
     acquire_metrics_sampler,
     release_metrics_sampler,
 )
+from ..state.sqlite_store import SQLiteRuntimeStore
 from ..state.trace_store import (
     TraceWriter,
     acquire_trace_writer,
     observability_db_path,
     release_trace_writer,
 )
+from ..state.wiring import wire
+from .clock import SystemClock
 from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
 
 PLATFORM_NAME = "lifemodel"
 LOOP_INTERVAL_SEC = 60.0
+
+#: How stale the durable ``last_tick_at`` may get before ``check_fn`` reports the
+#: brain unhealthy (spec §4.2, "a few intervals"). Generous so a slow tick or a
+#: just-connected loop within its grace is never a false alarm.
+STALE_AFTER_SECONDS = LOOP_INTERVAL_SEC * 5
 
 _LOG = logging.getLogger("lifemodel.being")
 
@@ -85,6 +96,15 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # thread. Acquired in :meth:`connect`, released on disconnect. ``None`` until
         # connected — without this wiring ``metrics.sqlite`` is never created live.
         self._metrics_sampler: MetricsSampler | None = None
+        # Degraded flag (spec §4.3/MAJOR-6): the metrics sampler is optional — if its
+        # acquisition fails we keep the brain alive but flip this, so the degradation
+        # is observable rather than silent. Cleared once the sampler comes up.
+        self._metrics_degraded = False
+
+    @property
+    def metrics_degraded(self) -> bool:
+        """True when the (optional) metrics sampler failed to start (spec §4.3)."""
+        return self._metrics_degraded
 
     def _tick(self) -> None:
         """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
@@ -100,11 +120,26 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         proactive_tick(lm, self._egress, self._target)
 
     def _on_loop_death(self, exc: BaseException | None) -> None:
-        """Convert an unexpected loop death into a gateway-visible fatal error."""
+        """Convert an unexpected loop death into a gateway-visible fatal error.
+
+        Fail-loud (spec §4.3/MAJOR-7): a death carrying an exception is logged
+        **ERROR with the traceback** (never INFO), and drives :class:`BrainHealth`
+        to ``loop_dead`` with the death detail + a bumped ``death_count`` so
+        ``check_fn`` / ``/lifemodel status`` reflect it until a clean reconnect.
+        """
         if self._shutting_down:
             return
-        _LOG.info("being_loop_died error=%r", exc)
-        self._set_fatal_error("brain_loop_exited", f"proactive loop died: {exc!r}", retryable=True)
+        message = f"proactive loop died: {exc!r}"
+        tb_text: str | None = None
+        if exc is not None:
+            _LOG.error("being_loop_died error=%r", exc, exc_info=exc)
+            tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
+        else:
+            # A clean-looking None death is still unexpected here (the loop only
+            # calls on_death on failure) — ERROR, not a silent shrug.
+            _LOG.error("being_loop_died error=None (loop exited without an exception)")
+        get_brain_health(self._base_dir).record_loop_death(message, tb_text)
+        self._set_fatal_error("brain_loop_exited", message, retryable=True)
         # always on the gateway loop in practice; suppress if somehow off-loop.
         # Track the notify task so a failure to notify (which would strand the
         # reconnect) is at least logged rather than a silent event-loop warning.
@@ -117,27 +152,52 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             return
         exc = task.exception()
         if exc is not None:
-            _LOG.info("being_notify_fatal_failed error=%r", exc)
+            # A failed fatal-notify strands the reconnect — ERROR + traceback, not INFO.
+            _LOG.error("being_notify_fatal_failed error=%r", exc, exc_info=exc)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Bring the brain loop up under fail-loud wiring (spec §4.3/MAJOR-6).
+
+        Every acquisition step goes through :func:`wire`, driving
+        :class:`BrainHealth` from ``connecting`` (entry) → ``connected`` (loop up).
+        The trace writer and the brain loop are **required** — their failure is
+        loud (ERROR + traceback) and re-raised so the gateway sees the connect fail;
+        the metrics sampler is **optional/degraded** — its failure warns (with
+        traceback), keeps the brain alive, and flips :attr:`metrics_degraded`.
+        """
         self._shutting_down = False
-        # Acquire the singleton durable trace writer (spec §4.2) so the live tick's
-        # ``observability.sqlite`` is created + flushed. Idempotent + reconnect-safe:
-        # guarded so a reconnect that skipped disconnect never double-refcounts.
-        if self._trace_writer is None:
-            self._trace_writer = acquire_trace_writer(observability_db_path(self._base_dir))
-        # Start the metrics sampler on the shared per-base_dir registry singleton so
-        # the live tick's counters land in ``metrics.sqlite``. Idempotent + guarded
-        # like the trace writer so a reconnect never double-refcounts.
-        if self._metrics_sampler is None:
-            self._metrics_sampler = acquire_metrics_sampler(
-                get_metric_registry(self._base_dir), self._base_dir
+        health = get_brain_health(self._base_dir)
+        health.mark_connecting()
+
+        # The durable trace writer is REQUIRED-FOR-OBSERVABILITY (spec §4.3): its whole
+        # job is making failure visible, so a failure to acquire it must itself be
+        # loud, not swallowed. Idempotent + reconnect-safe: guarded so a reconnect that
+        # skipped disconnect never double-refcounts.
+        with wire("trace_writer", required=True, health=health, logger=_LOG):
+            if self._trace_writer is None:
+                self._trace_writer = acquire_trace_writer(observability_db_path(self._base_dir))
+
+        # The metrics sampler is OPTIONAL/DEGRADED (spec §4.3/MAJOR-6): ``metrics.sqlite``
+        # is supporting evidence only (the primary liveness is the durable
+        # ``last_tick_at``), so a dead sampler degrades the being, never kills it.
+        with wire("metrics_sampler", required=False, health=health, logger=_LOG):
+            if self._metrics_sampler is None:
+                self._metrics_sampler = acquire_metrics_sampler(
+                    get_metric_registry(self._base_dir), self._base_dir
+                )
+        self._metrics_degraded = self._metrics_sampler is None
+
+        # The brain loop itself is REQUIRED — a failure to start it is the outage.
+        with wire("brain_loop_start", required=True, health=health, logger=_LOG):
+            self._loop = SupervisedLoop(
+                tick=self._tick, interval_sec=self._interval, on_death=self._on_loop_death
             )
-        self._loop = SupervisedLoop(
-            tick=self._tick, interval_sec=self._interval, on_death=self._on_loop_death
-        )
-        self._loop_task = asyncio.create_task(self._loop.run())
+            self._loop_task = asyncio.create_task(self._loop.run())
+
         self._mark_connected()
+        # The loop is up → clear any prior boot_failed / loop_dead + the durable
+        # boot record (a clean (re)connect means we are healthy now, spec §4.3).
+        health.mark_connected(at=datetime.now(UTC).isoformat())
         _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
         return True
 
@@ -174,6 +234,52 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         return {"id": chat_id, "platform": PLATFORM_NAME, "type": "internal"}
 
 
+def _read_last_tick_at(base_dir: Path) -> str | None:
+    """Read the durable ``last_tick_at`` for the staleness check (spec §4.2).
+
+    This is the PRIMARY liveness signal — advanced every tick by the CoreLoop into
+    ``AgentState`` (never a parallel counter). Defensive: a locked/corrupt read must
+    never crash ``check_fn`` (the gateway polls it), so it logs a WARNING with the
+    traceback (observable) and degrades to ``None`` (unknown → not-stale), letting
+    the primary loud channels (the register re-raise, the loop-death ERROR) carry
+    the signal instead.
+    """
+    try:
+        return SQLiteRuntimeStore(base_dir, clock=SystemClock()).load().last_tick_at
+    except Exception:  # noqa: BLE001 - check_fn must never raise on a flaky read
+        _LOG.warning("check_fn_state_read_failed base_dir=%s", base_dir, exc_info=True)
+        return None
+
+
+def make_check_fn(base_dir: Path, health: BrainHealth) -> Any:
+    """Build the platform ``check_fn`` — a health-derived predicate (spec §4.2/item 7).
+
+    Replaces ``check_fn=lambda: True``. Returns ``BrainHealth``-derived liveness:
+    unhealthy for ``boot_failed`` / ``loop_dead`` / a ``connected`` brain whose tick
+    went stale, healthy otherwise.
+
+    **Enablement-safety.** ``check_fn`` is Hermes' *enablement/instantiation* gate —
+    evaluated at gateway config-load and in ``_create_adapter``, BEFORE ``connect()``
+    ever runs (state = ``never_started``). So the pre-connect transients stay healthy
+    (see :meth:`BrainHealth.check`); a False there would make the gateway never
+    instantiate the adapter and permanently brick the being — the very incident.
+    """
+
+    def _check() -> bool:
+        ok, reason = health.check(
+            last_tick_at=_read_last_tick_at(base_dir),
+            now=datetime.now(UTC),
+            stale_after_seconds=STALE_AFTER_SECONDS,
+        )
+        # The reason rides a DEBUG line (check_fn is polled — avoid probe spam); the
+        # loud channels are the register re-raise, the loop-death ERROR, and (Slice 3)
+        # ``/lifemodel status`` which renders the full reason.
+        _LOG.debug("being_check ok=%s reason=%s", ok, reason)
+        return ok
+
+    return _check
+
+
 def register_being_platform(
     ctx: Any,
     *,
@@ -185,6 +291,6 @@ def register_being_platform(
         PLATFORM_NAME,
         label="Life Model",
         adapter_factory=lambda cfg: BeingAdapter(cfg, base_dir=base_dir, target=target),
-        check_fn=lambda: True,
+        check_fn=make_check_fn(base_dir, get_brain_health(base_dir)),
         emoji="🫀",
     )

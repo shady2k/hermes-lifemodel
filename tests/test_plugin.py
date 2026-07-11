@@ -49,6 +49,7 @@ class FakeCtx:
         self.commands: dict[str, dict[str, Any]] = {}
         self.tools: dict[str, dict[str, Any]] = {}
         self.hooks: list[tuple[str, Callable[..., Any]]] = []
+        self.platforms: dict[str, Any] = {}
 
     def register_command(
         self,
@@ -68,6 +69,21 @@ class FakeCtx:
 
     def register_hook(self, hook_name: str, callback: Callable[..., Any]) -> None:
         self.hooks.append((hook_name, callback))
+
+    def register_platform(self, name: str, **kwargs: Any) -> None:
+        # register() now wires the being as a REQUIRED gateway platform (spec §4.3);
+        # record it so the (deferred) factory / check_fn aren't invoked here.
+        self.platforms[name] = kwargs
+
+
+@pytest.fixture(autouse=True)
+def _stub_gateway_for_register() -> None:
+    """register() wires the platform as a REQUIRED step whose ``being_platform`` import
+    needs ``gateway.*``; provide minimal stubs so register() completes off-host (spec
+    §4.3 — the failure IS loud in prod where gateway is present)."""
+    from gateway_stubs import install_gateway_stubs
+
+    install_gateway_stubs()
 
 
 def test_register_adds_lifemodel_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

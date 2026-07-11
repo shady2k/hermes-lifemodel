@@ -24,11 +24,13 @@ from lifemodel.core.desire_view import (
     read_live_contact_desire,
 )
 from lifemodel.core.frame import FrameTrigger, run_frame
+from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from lifemodel.domain.egress import ProactiveOutcome, ReachOutcome
 from lifemodel.domain.objects import DesireState
 from lifemodel.hooks import make_inbound_observer
+from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
 from lifemodel.testing import FakeClock
 from lifemodel.testing.harness import RecordingEgress
@@ -132,7 +134,7 @@ def test_scenario_2_control_command_is_not_contact(tmp_path: Path) -> None:
     lm = _build(tmp_path)
     lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
 
-    make_inbound_observer(lambda: lm)(
+    make_inbound_observer(lambda: lm, health=BrainHealth(tmp_path), metrics=MetricRegistry())(
         event=SimpleNamespace(text="/lifemodel force-wake", internal=False, id="m-2")
     )
 

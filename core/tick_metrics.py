@@ -41,6 +41,11 @@ LAYER_ACCEPTS_SIGNALS = "lifemodel_layer_accepts_signals"
 TRACE_WRITER_DROPPED = "lifemodel_trace_writer_dropped_records"
 TRACE_WRITER_WRITE_ERRORS = "lifemodel_trace_writer_write_errors"
 SUPPRESSIONS_TOTAL = "lifemodel_suppressions_total"
+#: Afferent observer bodies that raised (fail-loud, spec §4.3/MAJOR-4). The observer
+#: NAME rides the ``component`` label (closed-set), e.g. ``post_llm_call`` /
+#: ``pre_gateway_dispatch`` — a runtime observer failure is plugin-owned + counted,
+#: never left to Hermes' hook wrapper.
+OBSERVER_ERRORS = "lifemodel_observer_errors_total"
 
 #: The closed run-status vocabulary carried on the ``outcome`` label (§4.2 derivation:
 #: failed on exception, else suppressed on a suppressed span, else ok).
@@ -113,6 +118,12 @@ UNIVERSAL_SPECS: tuple[MetricSpec, ...] = (
         kind="counter",
         help="Suppression spans by component + closed reason (choke-point counted).",
         label_keys=("component", "reason"),
+    ),
+    MetricSpec(
+        name=OBSERVER_ERRORS,
+        kind="counter",
+        help="Afferent observer bodies that raised, by observer name (component label).",
+        label_keys=("component",),
     ),
 )
 

@@ -20,12 +20,16 @@ from typing import Any, NamedTuple
 from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
+from .core.metrics import get_metric_registry
+from .core.tick_metrics import register_universal_metrics
 from .debug import render_dump_for_dir
 from .events import EventRing
 from .hooks import make_inbound_observer, make_post_llm_observer
 from .log import apply_log_level, parse_log_level
 from .paths import state_dir
+from .state.brain_health import get_brain_health
 from .state.trace_store import acquire_trace_writer, observability_db_path
+from .state.wiring import wire
 from .state_commands import (
     force_wake_for_dir,
     nudge_for_dir,
@@ -237,12 +241,30 @@ def register(ctx: Any) -> None:
             return f"{status}\n\n{_command_list()}\n"
         return status
 
-    ctx.register_command(
-        "lifemodel",
-        lifemodel_command,
-        description="Show plugin status; 'help' lists read-only and mutating subcommands.",
-        args_hint=" | ".join(_SUBCOMMANDS),
-    )
+    # The shared per-base_dir liveness backbone (spec §4.2) + metric registry, both
+    # resolved before any wiring so every ``wire`` boundary below writes to the SAME
+    # ``BrainHealth`` the platform ``check_fn`` / observers / ``/lifemodel status``
+    # read. Declare the universal metric surface now (idempotent) so the observer
+    # failure counter exists even if a wiring failure means no tick graph is ever
+    # built.
+    health = get_brain_health(sdir)
+    metrics = get_metric_registry(sdir)
+    register_universal_metrics(metrics)
+
+    # --- The diagnostic lever FIRST (spec §4.3 "both" strategy, codex CRITICAL-2) --
+    # Register ``/lifemodel`` BEFORE any load-bearing wiring, so that even if the
+    # brain wiring below re-raises (Hermes then marks the plugin not-enabled + logs),
+    # the owner keeps the diagnostic command if Hermes retains partial registration,
+    # and ``/lifemodel status`` can report ``boot_failed: <reason>`` from the durable
+    # boot record. Command registration is itself load-bearing (it is the entire
+    # owner interface), so a failure here is required-loud.
+    with wire("register_command", required=True, health=health, logger=_LOG):
+        ctx.register_command(
+            "lifemodel",
+            lifemodel_command,
+            description="Show plugin status; 'help' lists read-only and mutating subcommands.",
+            args_hint=" | ".join(_SUBCOMMANDS),
+        )
 
     _LOG.info(
         "plugin_registered plugin=lifemodel version=%s profile=%s state_dir=%s",
@@ -251,15 +273,18 @@ def register(ctx: Any) -> None:
         str(sdir),
     )
 
-    # --- Verdict feedback wiring (Task 5, spec §5/§7) -------------------------
+    # --- Verdict feedback wiring (Task 5, spec §5/§7) — REQUIRED --------------
     # Resolves the pending proactive desire from the FINAL LLM output
     # (NO_REPLY -> reject + growing backoff, real text -> fulfill) via the
-    # post_llm_call lifecycle hook — this is the anti-drum guarantee: a wake
-    # that produces nothing genuine to say never queues a duplicate reach-out.
-    # See lifemodel.hooks for the SPIKE findings (real payload shape) and the
-    # correlation-needs-field-verification caveat. Best-effort: a host without
-    # post_llm_call in VALID_HOOKS, or any wiring hiccup, must not break load.
-    try:
+    # post_llm_call lifecycle hook — the anti-drum guarantee: a wake that produces
+    # nothing genuine to say never queues a duplicate reach-out. Classification
+    # (spec §4.3): REQUIRED. Hermes' ``register_hook`` does NOT fail on an unknown
+    # hook — it stores + warns (plugins.py:1156) — so a throw here can only come from
+    # OUR builder/import (``acquire_trace_writer`` / ``make_post_llm_observer`` /
+    # ``build_lifemodel``), i.e. our bug. VALID_HOOKS is a host module global, NOT
+    # exposed on ``ctx``, so the "host lacks the hook" case is neither inspectable
+    # nor able to manifest as a throw — per the spec, not inspectable → keep required.
+    with wire("post_llm_observer", required=True, health=health, logger=_LOG):
         # The async read-back MUST reach the LIVE durable trace writer (spec §4.4):
         # ``acquire_trace_writer`` returns the SAME singleton-per-db-path instance the
         # ``BeingAdapter.connect()`` tick loop acquires (both resolve
@@ -268,11 +293,6 @@ def register(ctx: Any) -> None:
         # attempt, one ``trace_id``. This refcount is held for the plugin's lifetime
         # (register has no teardown), independent of the platform connect/disconnect
         # cycle, so the hook can always write regardless of loop state.
-        # Acquire the durable trace writer ONCE (refcount held for the plugin's life)
-        # and share one freshness ring; the observer builds a FRESH LifeModel per call
-        # (spec §3: each frame loads state fresh under the one state-actor lock) but
-        # keeps writing to the SAME observability.sqlite as the launch — one attempt,
-        # one trace_id.
         _outcome_writer = acquire_trace_writer(observability_db_path(sdir))
         _outcome_ring = EventRing()
         ctx.register_hook(
@@ -280,45 +300,39 @@ def register(ctx: Any) -> None:
             make_post_llm_observer(
                 lambda: build_lifemodel(
                     base_dir=sdir, trace_writer=_outcome_writer, event_ring=_outcome_ring
-                )
+                ),
+                health=health,
+                metrics=metrics,
             ),
         )
-        _LOG.info("post_llm_observer_registered")
-    except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-        _LOG.info("post_llm_observer_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")
 
-    # --- Inbound observation wiring (Task 6, spec §4/§6) ----------------------
-    # RC1: the being is currently deaf to inbound user messages. On a genuine
-    # user message, satiate the drive + stamp last_exchange_at + clear the
-    # reject record + resolve any live desire, so silence resets on real
-    # contact. Wired on pre_gateway_dispatch (SPIKE, see lifemodel.hooks module
-    # docstring): it fires once per incoming MessageEvent, and the host itself
-    # never invokes it for our own injected proactive impulse (internal=True
-    # skips the hook entirely at the call site) — disjoint from the
-    # post_llm_call verdict path by host guarantee, reinforced defensively in
-    # the observer via the impulse-label prefix. Best-effort: a host without
-    # pre_gateway_dispatch in VALID_HOOKS, or any wiring hiccup, must not break
-    # load.
-    try:
+    # --- Inbound observation wiring (Task 6, spec §4/§6) — REQUIRED -----------
+    # On a genuine user message, satiate the drive + stamp last_exchange_at + clear
+    # the reject record + resolve any live desire, so silence resets on real contact.
+    # Wired on pre_gateway_dispatch: it fires once per incoming MessageEvent, and the
+    # host never invokes it for our own injected proactive impulse (internal=True skips
+    # the hook). REQUIRED for the same reason as post_llm above — a throw is our bug.
+    with wire("inbound_observer", required=True, health=health, logger=_LOG):
         ctx.register_hook(
             "pre_gateway_dispatch",
-            make_inbound_observer(lambda: build_lifemodel(base_dir=sdir)),
+            make_inbound_observer(
+                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
+            ),
         )
-        _LOG.info("inbound_observer_registered")
-    except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-        _LOG.info("inbound_observer_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")
 
-    # --- Proactive brain wiring (the being as a gateway platform) -------------
+    # --- Proactive brain wiring (the being as a gateway platform) — REQUIRED --
     # The autonomic brain is hosted as a gateway-supervised platform adapter: its
-    # connect() runs the tick loop, and the gateway's reconnect watcher restarts
-    # it on failure (no self-spawned task, no cron fallback, no loop-timing luck).
-    # The import is lazy + best-effort: the adapter subclasses ``BasePlatformAdapter``
-    # (a top-level ``gateway`` import), so importing it off-host would fail — a
-    # failure here must only skip the registration, never break plugin load.
-    try:
+    # connect() runs the tick loop, and the gateway's reconnect watcher restarts it on
+    # failure. This is the LOAD-BEARING wiring whose silent failure caused the
+    # 2026-07-11 incident: an absolute self-import made ``being_platform`` unimportable
+    # and the old ``except → INFO "…_skipped"`` left a brain-dead shell reporting
+    # "enabled". REQUIRED: a failure is now ERROR + traceback + ``boot_failed`` (durable
+    # record) + re-raise, so Hermes marks the plugin not-enabled (the loud channel).
+    with wire("register_being_platform", required=True, health=health, logger=_LOG):
         from .adapters.being_platform import register_being_platform
 
         register_being_platform(ctx, base_dir=sdir, target=resolve_home_origin())
-        _LOG.info("being_platform_registered")
-    except Exception as exc:  # noqa: BLE001 - best-effort; never break load
-        _LOG.info("being_platform_registration_skipped error=%s", f"{type(exc).__name__}: {exc}")
+
+    # All REQUIRED wiring for this process succeeded → wipe any stale durable
+    # boot-failure record from a previously-broken deploy (a fixed deploy is healthy).
+    health.mark_boot_ok()

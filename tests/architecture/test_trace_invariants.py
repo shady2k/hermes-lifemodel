@@ -39,19 +39,25 @@ _EXCLUDE_PARTS = {"tests", "testing", "__pycache__", "docs", ".git", ".beads", "
 
 #: The ONLY runtime modules permitted to touch stdlib ``logging`` directly
 #: (spec §4.5 allowlist): the log surface itself, lifecycle/registration, the
-#: reach-in boundary, the being platform, the disposable-store infra, and the
-#: adapters that have no ambient span. Everything else — every ``core/`` tick
-#: component above all — must log ONLY through a ``SpanBoundLogger``.
+#: reach-in boundary, the being platform, the disposable-store infra, the
+#: fail-loud wiring backbone (spec §4.3 — ``wire``/``BrainHealth`` log at wiring
+#: boundaries with NO ambient span), the afferent hook boundary (a frame-machinery
+#: failure is observed before any span exists, spec §4.3/MAJOR-4), and the adapters
+#: that have no ambient span. Everything else — every ``core/`` tick component above
+#: all — must log ONLY through a ``SpanBoundLogger``.
 _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
     {
         "log.py",
         "__init__.py",
         "gateway_core.py",
+        "hooks.py",
         "adapters/being_platform.py",
         "adapters/delivery.py",
         "state/sqlite_store.py",
         "state/trace_store.py",
         "state/metrics_store.py",
+        "state/brain_health.py",
+        "state/wiring.py",
     }
 )
 

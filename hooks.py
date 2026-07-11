@@ -24,6 +24,7 @@ state-actor lock — no cached ``State`` can drift between frames.
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -31,13 +32,49 @@ from .composition import LifeModel
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.frame import FrameTrigger, run_frame
+from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
+from .core.tick_metrics import OBSERVER_ERRORS
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
 from .domain.objects import DesireState
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
+from .state.brain_health import BrainHealth
+
+#: Observer names — carried on the ``component`` metric label + keyed into
+#: :attr:`BrainHealth.last_observer_error` when a body raises (spec §4.3).
+POST_LLM_OBSERVER = "post_llm_call"
+INBOUND_OBSERVER = "pre_gateway_dispatch"
+
+_LOG = logging.getLogger("lifemodel.hooks")
+
+
+def _record_observer_failure(
+    *,
+    observer_name: str,
+    exc: Exception,
+    health: BrainHealth | None,
+    metrics: MetricRegistry | None,
+) -> None:
+    """Plugin-owned handling for an observer body that raised (spec §4.3/MAJOR-4).
+
+    ERROR + full traceback ALWAYS (never rely on Hermes' hook wrapper); when the
+    live *health* / *metrics* are wired (they always are from ``register()``),
+    record the LAST error for this observer on :class:`BrainHealth` and bump the
+    failure metric. Never re-raises — an afferent hiccup must not crash the host's
+    dispatch. *health* / *metrics* are optional only so off-host unit tests of the
+    frame behavior can construct an observer without the full backbone; production
+    always passes both, so live failures are fully observable.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    _LOG.error("observer_body_failed observer=%s error=%s", observer_name, detail, exc_info=True)
+    if health is not None:
+        health.record_observer_error(observer_name, detail)
+    if metrics is not None:
+        metrics.inc(OBSERVER_ERRORS, component=observer_name)
+
 
 #: The two disjoint concepts that map a proactive turn to SILENT (spec §5). They
 #: are matched DIFFERENTLY on purpose (lm-md6.5):
@@ -281,8 +318,19 @@ def _emit_async_outcome(
     bridge.persist(ended_at=now)
 
 
-def make_post_llm_observer(build_lm: Callable[[], LifeModel]) -> Callable[..., None]:
-    """Return a ``post_llm_call`` handler that starts an ASYNC_COMPLETION frame (§3/§5)."""
+def make_post_llm_observer(
+    build_lm: Callable[[], LifeModel],
+    *,
+    health: BrainHealth | None = None,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., None]:
+    """Return a ``post_llm_call`` handler that starts an ASYNC_COMPLETION frame (§3/§5).
+
+    The whole body is plugin-owned fail-loud (spec §4.3/MAJOR-4): a throw anywhere
+    in it (even in ``build_lm``) is logged ERROR + traceback, recorded on
+    *health* + *metrics*, and swallowed — the host's dispatch is never crashed by an
+    afferent hiccup, and the failure is observable rather than silent.
+    """
 
     def _observer(
         *,
@@ -291,48 +339,55 @@ def make_post_llm_observer(build_lm: Callable[[], LifeModel]) -> Callable[..., N
         conversation_history: Any = None,
         **_ignored: Any,
     ) -> None:
-        lm = build_lm()
-        state = lm.state.load()
-        if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
-            return
-        memory = lm.state if isinstance(lm.state, MemoryPort) else None
-        desire = read_live_contact_desire(memory) if memory is not None else None
-        if desire is None or desire.state != DesireState.ACTIVE:
-            return
-        outcome = (
-            ProactiveOutcome.SILENT if _is_no_reply(assistant_response) else ProactiveOutcome.SENT
-        )
-        correlation_id = state.pending_proactive_id or ""
-        # Weave the outcome onto the ORIGIN trace (§4.4). Best-effort: the async trace
-        # is observability, NEVER the outcome control flow below — a trace hiccup (or a
-        # lost origin anchor) must not stop the desire from resolving.
-        with contextlib.suppress(Exception):  # advisory: must never break a turn
-            _emit_async_outcome(
-                lm,
-                origin_traceparent=state.pending_proactive_origin_traceparent,
-                correlation_id=correlation_id,
-                outcome=outcome,
-                assistant_response=assistant_response,
-                conversation_history=conversation_history,
-                extra=_ignored,
+        try:
+            lm = build_lm()
+            state = lm.state.load()
+            if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
+                return
+            memory = lm.state if isinstance(lm.state, MemoryPort) else None
+            desire = read_live_contact_desire(memory) if memory is not None else None
+            if desire is None or desire.state != DesireState.ACTIVE:
+                return
+            outcome = (
+                ProactiveOutcome.SILENT
+                if _is_no_reply(assistant_response)
+                else ProactiveOutcome.SENT
             )
-        now = lm.clock.now()
-        assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
-        # The async turn finished → its OWN frame commits the outcome immediately
-        # (spec §3): aggregation resolves the pending desire + writes action_pending /
-        # backoff to AgentState. Not deferred to the next heartbeat.
-        run_frame(
-            lm.coreloop,
-            [
-                proactive_outcome_signal(
-                    origin_id=f"outcome-{correlation_id}",
-                    outcome=outcome,
-                    timestamp=now.isoformat(),
+            correlation_id = state.pending_proactive_id or ""
+            # Weave the outcome onto the ORIGIN trace (§4.4). Best-effort: the async
+            # trace is observability, NEVER the outcome control flow below — a trace
+            # hiccup (or a lost origin anchor) must not stop the desire from resolving.
+            with contextlib.suppress(Exception):  # advisory: must never break a turn
+                _emit_async_outcome(
+                    lm,
+                    origin_traceparent=state.pending_proactive_origin_traceparent,
                     correlation_id=correlation_id,
+                    outcome=outcome,
+                    assistant_response=assistant_response,
+                    conversation_history=conversation_history,
+                    extra=_ignored,
                 )
-            ],
-            trigger=FrameTrigger.ASYNC_COMPLETION,
-        )
+            now = lm.clock.now()
+            assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+            # The async turn finished → its OWN frame commits the outcome immediately
+            # (spec §3): aggregation resolves the pending desire + writes action_pending
+            # / backoff to AgentState. Not deferred to the next heartbeat.
+            run_frame(
+                lm.coreloop,
+                [
+                    proactive_outcome_signal(
+                        origin_id=f"outcome-{correlation_id}",
+                        outcome=outcome,
+                        timestamp=now.isoformat(),
+                        correlation_id=correlation_id,
+                    )
+                ],
+                trigger=FrameTrigger.ASYNC_COMPLETION,
+            )
+        except Exception as exc:  # plugin-owned observability — do not crash the caller
+            _record_observer_failure(
+                observer_name=POST_LLM_OBSERVER, exc=exc, health=health, metrics=metrics
+            )
 
     return _observer
 
@@ -355,8 +410,18 @@ def _is_control_command(text: str) -> bool:
     return text.strip().startswith("/")
 
 
-def make_inbound_observer(build_lm: Callable[[], LifeModel]) -> Callable[..., None]:
-    """Return a ``pre_gateway_dispatch`` handler that starts an EVENT frame (§3/§4)."""
+def make_inbound_observer(
+    build_lm: Callable[[], LifeModel],
+    *,
+    health: BrainHealth | None = None,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., None]:
+    """Return a ``pre_gateway_dispatch`` handler that starts an EVENT frame (§3/§4).
+
+    Plugin-owned fail-loud (spec §4.3/MAJOR-4): a throw in the body (past the sensor
+    band-pass) is logged ERROR + traceback, recorded on *health* + *metrics*, and
+    swallowed — the host's dispatch is never crashed by an afferent hiccup.
+    """
 
     def _observer(*, event: Any = None, **_ignored: Any) -> None:
         if event is None or getattr(event, "internal", False):
@@ -366,28 +431,33 @@ def make_inbound_observer(build_lm: Callable[[], LifeModel]) -> Callable[..., No
         # become contact — filtered here at the afferent boundary before any frame.
         if _is_own_impulse(text) or _is_control_command(text):
             return
-        lm = build_lm()
-        assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
-        now = lm.clock.now()
-        origin = (
-            getattr(event, "id", None)
-            or getattr(event, "message_id", None)
-            or f"contact-{now.isoformat()}"
-        )
-        # A genuine inbound → its OWN EVENT frame, processed at the moment of the event
-        # (spec §3): the frame satiates u, stamps last_exchange_at, and resolves any
-        # live desire → SATISFIED, committed immediately.
-        run_frame(
-            lm.coreloop,
-            [
-                contact_observed_signal(
-                    origin_id=str(origin),
-                    actor="user",
-                    label="two_way",
-                    timestamp=now.isoformat(),
-                )
-            ],
-            trigger=FrameTrigger.EVENT,
-        )
+        try:
+            lm = build_lm()
+            assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+            now = lm.clock.now()
+            origin = (
+                getattr(event, "id", None)
+                or getattr(event, "message_id", None)
+                or f"contact-{now.isoformat()}"
+            )
+            # A genuine inbound → its OWN EVENT frame, processed at the moment of the
+            # event (spec §3): the frame satiates u, stamps last_exchange_at, and
+            # resolves any live desire → SATISFIED, committed immediately.
+            run_frame(
+                lm.coreloop,
+                [
+                    contact_observed_signal(
+                        origin_id=str(origin),
+                        actor="user",
+                        label="two_way",
+                        timestamp=now.isoformat(),
+                    )
+                ],
+                trigger=FrameTrigger.EVENT,
+            )
+        except Exception as exc:  # plugin-owned observability — do not crash the caller
+            _record_observer_failure(
+                observer_name=INBOUND_OBSERVER, exc=exc, health=health, metrics=metrics
+            )
 
     return _observer

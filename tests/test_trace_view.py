@@ -15,6 +15,7 @@ import pytest
 
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
+from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
@@ -22,6 +23,7 @@ from lifemodel.domain.objects import DesireState
 from lifemodel.events import EventRing
 from lifemodel.hooks import make_post_llm_observer
 from lifemodel.ports.tracer import parse_traceparent
+from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
 from lifemodel.state.trace_store import (
     acquire_trace_writer,
@@ -104,7 +106,7 @@ def populated(tmp_path: Path):
 
         # The async turn finishes → its OWN frame weaves the outcome AND resolves the
         # desire under the origin trace, immediately (spec §3) — no separate resolve tick.
-        make_post_llm_observer(lambda: lm)(
+        make_post_llm_observer(lambda: lm, health=BrainHealth(tmp_path), metrics=MetricRegistry())(
             user_message=f"{IMPULSE_LABEL_PREFIX} impulse",
             assistant_response="hi!",
         )
@@ -115,7 +117,7 @@ def populated(tmp_path: Path):
         lm.state.put(
             encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0))
         )
-        make_post_llm_observer(lambda: lm)(
+        make_post_llm_observer(lambda: lm, health=BrainHealth(tmp_path), metrics=MetricRegistry())(
             user_message=f"{IMPULSE_LABEL_PREFIX} again", assistant_response="[SILENT]"
         )
 

@@ -21,11 +21,15 @@ from lifemodel.state.wiring import wire
 _LOG = logging.getLogger("lifemodel.test.wire")
 
 
-def test_success_logs_debug_and_leaves_state(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_success_logs_debug_and_leaves_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     h = BrainHealth(tmp_path)
-    with caplog.at_level(logging.DEBUG, logger="lifemodel.test.wire"):
-        with wire("ok_step", required=True, health=h, logger=_LOG):
-            pass
+    with (
+        caplog.at_level(logging.DEBUG, logger="lifemodel.test.wire"),
+        wire("ok_step", required=True, health=h, logger=_LOG),
+    ):
+        pass
     assert h.state == "never_started"  # untouched on success
     # start + success both DEBUG (no ERROR/WARNING on the happy path).
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -36,10 +40,12 @@ def test_required_failure_reraises_and_is_loud(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     h = BrainHealth(tmp_path)
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(RuntimeError, match="boom"):
-            with wire("brain_step", required=True, health=h, logger=_LOG):
-                raise RuntimeError("boom")
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(RuntimeError, match="boom"),
+        wire("brain_step", required=True, health=h, logger=_LOG),
+    ):
+        raise RuntimeError("boom")
     # LOUD: ERROR with a full traceback (exc_info), independent of debug env.
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert errors, "required failure must log at ERROR"

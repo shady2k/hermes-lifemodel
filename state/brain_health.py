@@ -225,9 +225,7 @@ class BrainHealth:
             # Losing the durable diagnostic is itself a (lesser) observability
             # failure — log it loudly, but never mask the boot failure we are in
             # the middle of reporting (the caller re-raises regardless).
-            _module_logger.warning(
-                "brain_boot_record_write_failed path=%s", path, exc_info=True
-            )
+            _module_logger.warning("brain_boot_record_write_failed path=%s", path, exc_info=True)
 
     def _clear_boot_record(self) -> None:
         try:

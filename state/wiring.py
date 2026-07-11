@@ -58,9 +58,7 @@ def wire(
             raise
         # OPTIONAL: a capability the host genuinely lacks — degrade, don't die.
         # WARNING still carries the full traceback (never a silent INFO).
-        logger.warning(
-            "wire_skipped_optional step=%s error=%s", step_name, detail, exc_info=True
-        )
+        logger.warning("wire_skipped_optional step=%s error=%s", step_name, detail, exc_info=True)
         return
     else:
         logger.debug("wire_ok step=%s", step_name)

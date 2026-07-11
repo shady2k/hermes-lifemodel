@@ -56,7 +56,9 @@ def test_connecting_then_connected(tmp_path: Path) -> None:
 def test_record_loop_death_sets_state_and_counts(tmp_path: Path) -> None:
     h = BrainHealth(tmp_path)
     h.mark_connected(at=_iso(_NOW))
-    h.record_loop_death("proactive loop died: RuntimeError('boom')", "Traceback...\nRuntimeError: boom")
+    h.record_loop_death(
+        "proactive loop died: RuntimeError('boom')", "Traceback...\nRuntimeError: boom"
+    )
     assert h.state == "loop_dead"
     assert h.last_loop_death is not None
     assert "boom" in h.last_loop_death
@@ -204,9 +206,7 @@ def test_check_just_connected_without_a_tick_is_healthy_within_grace(tmp_path: P
     # grace so we don't flag a false-stale in the first interval.
     h = BrainHealth(tmp_path)
     h.mark_connected(at=_iso(_NOW))
-    ok, _ = h.check(
-        last_tick_at=None, now=_NOW + timedelta(seconds=30), stale_after_seconds=_STALE
-    )
+    ok, _ = h.check(last_tick_at=None, now=_NOW + timedelta(seconds=30), stale_after_seconds=_STALE)
     assert ok is True
 
 

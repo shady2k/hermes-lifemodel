@@ -420,6 +420,7 @@ class _FakeCtx:
     def __init__(self) -> None:
         self.commands: dict[str, Any] = {}
         self.hooks: list[tuple[str, Any]] = []
+        self.platforms: dict[str, Any] = {}
 
     def register_command(
         self, name: str, handler: Any, description: str = "", args_hint: str = ""
@@ -429,6 +430,19 @@ class _FakeCtx:
     def register_hook(self, hook_name: str, callback: Any) -> None:
         self.hooks.append((hook_name, callback))
 
+    def register_platform(self, name: str, **kwargs: Any) -> None:
+        self.platforms[name] = kwargs
+
+
+@pytest.fixture(autouse=True)
+def _stub_gateway_for_register() -> None:
+    """register() wires the being platform as a REQUIRED step (spec §4.3) whose
+    ``being_platform`` import needs ``gateway.*`` — stub it so register() completes
+    off-host (in prod, where gateway is present, that step is genuinely required)."""
+    from gateway_stubs import install_gateway_stubs
+
+    install_gateway_stubs()
+
 
 def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import lifemodel
@@ -437,7 +451,7 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
 
     ctx = _FakeCtx()
-    lifemodel.register(ctx)  # must not raise even without a real Hermes host
+    lifemodel.register(ctx)  # completes with gateway stubbed (autouse fixture)
 
     matches = [cb for name, cb in ctx.hooks if name == "post_llm_call"]
     assert len(matches) == 1
@@ -465,7 +479,7 @@ def test_register_wires_pre_gateway_dispatch_hook(
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
 
     ctx = _FakeCtx()
-    lifemodel.register(ctx)  # must not raise even without a real Hermes host
+    lifemodel.register(ctx)  # completes with gateway stubbed (autouse fixture)
 
     matches = [cb for name, cb in ctx.hooks if name == "pre_gateway_dispatch"]
     assert len(matches) == 1
