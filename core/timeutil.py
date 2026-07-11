@@ -40,6 +40,18 @@ def from_iso(s: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def to_epoch_seconds(dt: datetime) -> float:
+    """Epoch seconds (UTC) for a legitimately epoch-VALUED metric (spec §2/§3).
+
+    Not a storage-column path — epoch survives only as a *metric value* (e.g. a
+    gauge whose value is epoch seconds). Rejects a tz-naive *dt* for the same
+    reason as :func:`to_iso`, normalizes to UTC, and returns ``.timestamp()``.
+    """
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError(f"to_epoch_seconds requires a timezone-aware datetime, got naive {dt!r}")
+    return dt.astimezone(UTC).timestamp()
+
+
 def minutes_between(a_iso: str | None, b: datetime) -> float:
     if a_iso is None:
         return 0.0

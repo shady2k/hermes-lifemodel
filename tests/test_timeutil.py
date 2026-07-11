@@ -5,7 +5,12 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from lifemodel.core.timeutil import from_iso, minutes_between, to_iso
+from lifemodel.core.timeutil import (
+    from_iso,
+    minutes_between,
+    to_epoch_seconds,
+    to_iso,
+)
 
 #: The load-bearing normalization invariant (spec §3/§6.2): fixed-width, always
 #: 6-digit microseconds, always ``+00:00`` — the shape that makes TEXT order ==
@@ -84,6 +89,18 @@ def test_round_trip_from_iso_to_iso_preserves_offset_instant() -> None:
 def test_round_trip_to_iso_from_iso_is_identity_for_normalized() -> None:
     s = "2026-07-11T08:05:03.500000+00:00"
     assert to_iso(from_iso(s)) == s
+
+
+def test_to_epoch_seconds_rejects_tz_naive() -> None:
+    with pytest.raises(ValueError):
+        to_epoch_seconds(datetime(2026, 7, 11, 8, 5, 3))
+
+
+def test_to_epoch_seconds_round_trips_within_a_microsecond() -> None:
+    s = "2026-07-11T08:05:03.500000+00:00"
+    epoch = to_epoch_seconds(from_iso(s))
+    reconstructed = datetime.fromtimestamp(epoch, UTC)
+    assert abs((reconstructed - from_iso(s)).total_seconds()) < 1e-6
 
 
 def test_minutes_between_counts_forward() -> None:
