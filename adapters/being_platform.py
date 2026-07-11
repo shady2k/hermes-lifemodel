@@ -256,30 +256,35 @@ def _read_last_tick_at(base_dir: Path) -> str | None:
 
 
 def make_check_fn(base_dir: Path, health: BrainHealth) -> Any:
-    """Build the platform ``check_fn`` — a health-derived predicate (spec §4.2/item 7).
+    """Build the platform ``check_fn`` — Hermes' ENABLEMENT gate, NOT liveness (spec §5).
 
-    Replaces ``check_fn=lambda: True``. Returns ``BrainHealth``-derived liveness:
-    unhealthy for ``boot_failed`` / ``loop_dead`` / a ``connected`` brain whose tick
-    went stale, healthy otherwise.
+    ``check_fn`` is Hermes' *enablement/instantiation* gate: Hermes adds the platform
+    to ``cfg.platforms`` only when this returns True, AND re-evaluates it to drive the
+    **reconnect-after-death** recovery. At the registry pass the brain is necessarily
+    ``never_started``, so a liveness-derived gate that returned False for
+    ``never_started`` / ``loop_dead`` / stale / ``boot_failed`` would (a) prevent the
+    being from EVER booting and (b) block the gateway's own reconnect after a loop
+    death — the exact silent-death class this epic exists to kill, self-inflicted.
 
-    **Enablement-safety.** ``check_fn`` is Hermes' *enablement/instantiation* gate —
-    evaluated at gateway config-load and in ``_create_adapter``, BEFORE ``connect()``
-    ever runs (state = ``never_started``). So the pre-connect transients stay healthy
-    (see :meth:`BrainHealth.check`); a False there would make the gateway never
-    instantiate the adapter and permanently brick the being — the very incident.
+    So enablement is **permissive: always True**. The rich liveness verdict
+    (:meth:`BrainHealth.check`) is NOT this gate — it is surfaced where a False cannot
+    brick the being: ``/lifemodel status`` (the display) and the poll-cadence DEBUG log
+    below. The loud channels stay the register re-raise, the loop-death ERROR, and the
+    status block.
     """
 
     def _check() -> bool:
+        # Compute the liveness verdict for OBSERVABILITY ONLY (a DEBUG line at the
+        # gateway poll cadence) — it never gates enablement. Returning False here would
+        # brick boot / block reconnect (codex MAJOR); the truth is surfaced by
+        # /lifemodel status + this log, not by refusing enablement.
         ok, reason = health.check(
             last_tick_at=_read_last_tick_at(base_dir),
             now=datetime.now(UTC),
             stale_after_seconds=STALE_AFTER_SECONDS,
         )
-        # The reason rides a DEBUG line (check_fn is polled — avoid probe spam); the
-        # loud channels are the register re-raise, the loop-death ERROR, and (Slice 3)
-        # ``/lifemodel status`` which renders the full reason.
-        _LOG.debug("being_check ok=%s reason=%s", ok, reason)
-        return ok
+        _LOG.debug("being_check enablement=True liveness_ok=%s reason=%s", ok, reason)
+        return True
 
     return _check
 

@@ -235,25 +235,24 @@ class BrainHealth:
                 connected_at=self.connected_at,
             )
 
-    # ---- read: the enablement-safe liveness predicate (feeds check_fn) ----- #
+    # ---- read: the rich liveness verdict (feeds /status + logs, NOT the gate) - #
 
     def check(
         self, *, last_tick_at: str | None, now: datetime, stale_after_seconds: float
     ) -> tuple[bool, str]:
-        """Return ``(healthy, reason)`` for the platform ``check_fn`` (spec §4.2).
+        """Return ``(healthy, reason)`` — the liveness verdict for the DISPLAY (spec §5).
 
-        **Enablement-safety (deliberate, invariant-serving deviation).** The literal
-        spec text says "``state != connected`` → False", but ``check_fn`` is Hermes'
-        *enablement/instantiation* gate — evaluated at gateway config-load and inside
-        ``_create_adapter``, BEFORE ``connect()`` ever runs, when the state is
-        necessarily ``never_started``. Returning False there makes Hermes never
-        enable / never instantiate the platform, so ``connect()`` never runs and the
-        brain is PERMANENTLY dead at every cold boot — the exact silent-death
-        incident this spec kills, self-inflicted. So the *pre-connect transients*
-        (``never_started`` / ``connecting``) are healthy-for-enablement, while the
-        reason still names the state so the display surface shows the truth. Genuine
-        post-start unhealth — ``boot_failed`` / ``loop_dead`` / a ``connected`` brain
-        whose ticks went stale — returns ``(False, reason)``.
+        This is NOT the Hermes ``check_fn`` (codex MAJOR): ``check_fn`` is an
+        *enablement* gate — a False there would brick the being at boot (the state is
+        ``never_started`` at the registry pass) and block the gateway's reconnect after
+        a loop death — so it is permissive/always-True (see
+        :func:`~lifemodel.adapters.being_platform.make_check_fn`). This verdict instead
+        drives where a False cannot brick anything: ``/lifemodel status`` and the
+        poll-cadence DEBUG log. So it reports the TRUTH — genuine post-start unhealth
+        (``boot_failed`` / ``loop_dead`` / a ``connected`` brain whose ticks went stale)
+        returns ``(False, reason)`` — while the *pre-connect transients*
+        (``never_started`` / ``connecting``) are "not a failure, just not up yet" and
+        return ``(True, reason)`` with the reason still naming the state.
         """
         with self._lock:
             state = self.state

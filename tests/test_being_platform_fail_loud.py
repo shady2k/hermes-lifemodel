@@ -94,11 +94,18 @@ def _make_adapter(bp: types.ModuleType, base_dir: Path):
 
 
 # --------------------------------------------------------------------------- #
-# check_fn (item 7) — no longer lambda: True; reflects BrainHealth
+# check_fn (item 5) — Hermes ENABLEMENT gate, NOT a liveness signal (codex MAJOR).
+# Hermes adds the platform to cfg.platforms only when check_fn returns True AND
+# re-evaluates it to drive reconnect-after-death; a False for loop_dead/stale/
+# boot_failed would brick the being at boot OR block the gateway's own reconnect.
+# So enablement is PERMISSIVE (always True); liveness is surfaced via /lifemodel
+# status + logs (BrainHealth.check()), never as this gate.
 # --------------------------------------------------------------------------- #
 
 
-def test_register_being_platform_wires_health_derived_check_fn(tmp_path: Path) -> None:
+def test_register_being_platform_check_fn_is_permissive_enablement(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
     bp = _fresh_being_platform()
     ctx = _FakeCtx()
     bp.register_being_platform(ctx, base_dir=tmp_path, target=None)
@@ -106,18 +113,39 @@ def test_register_being_platform_wires_health_derived_check_fn(tmp_path: Path) -
     check_fn = ctx.platforms[0][1]["check_fn"]
 
     health = get_brain_health(tmp_path)
-    # Enablement-safe: a fresh (never_started) brain is healthy so the gateway will
-    # instantiate the adapter and connect() can run (a False here bricks the being).
+    # never_started (the registry-pass state) → True, so the being can EVER boot.
     assert check_fn() is True
-    # A boot failure → unhealthy.
-    health.mark_boot_failed("register_being_platform: ImportError: x")
-    assert check_fn() is False
-    # A clean connect → healthy again.
+    # connecting → True.
+    health.mark_connecting()
+    assert check_fn() is True
+    # connected → True.
     health.mark_connected(at=None)
     assert check_fn() is True
-    # A loop death → unhealthy.
+    # loop_dead → STILL True, so the gateway's reconnect-after-death is never blocked.
     health.record_loop_death("died", "tb")
-    assert check_fn() is False
+    assert check_fn() is True
+    # a stale-connected (wedged) brain → STILL True (enablement, not liveness).
+    health.mark_connected(at=(datetime.now(UTC) - timedelta(hours=1)).isoformat())
+    assert check_fn() is True
+    # boot_failed → STILL True (enablement is unconditional).
+    health.mark_boot_failed("register_being_platform: ImportError: x")
+    assert check_fn() is True
+
+
+def test_brain_health_check_still_reports_unhealth_for_the_status_surface(tmp_path: Path) -> None:
+    # The rich liveness verdict is KEPT — it drives /lifemodel status + the debug log,
+    # NOT the Hermes enablement gate. So check() still returns (False, reason) for a
+    # dead/failed/stale brain (the display shows the truth).
+    from datetime import UTC, datetime, timedelta
+
+    health = get_brain_health(tmp_path)
+    health.mark_connected(at=(datetime.now(UTC) - timedelta(hours=1)).isoformat())
+    health.record_loop_death("died", "tb")
+    ok, reason = health.check(
+        last_tick_at=None, now=datetime.now(UTC), stale_after_seconds=300.0
+    )
+    assert ok is False
+    assert "loop_dead" in reason
 
 
 # --------------------------------------------------------------------------- #
