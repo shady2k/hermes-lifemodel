@@ -394,6 +394,41 @@ def test_register_lifemodel_command_catches_handler_exception_and_returns_error_
     assert "schema_version=99" in failures[0]
 
 
+# --- diagnostic lever ordering (spec §4.3 "both", codex MINOR) ---------------
+
+
+def test_register_command_is_wired_before_the_metric_registry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # codex MINOR: a metric-registry/spec conflict must NOT abort register() before the
+    # diagnostic /lifemodel command exists (and before a boot record can be written) —
+    # that would lose the only lever the owner has to see WHY the brain failed. So
+    # register_command MUST run before the metric registry is created/registered.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    order: list[str] = []
+
+    real_get_metric_registry = lifemodel.get_metric_registry
+
+    def _recording_get_metric_registry(base_dir: Path) -> Any:
+        order.append("metric_registry")
+        return real_get_metric_registry(base_dir)
+
+    monkeypatch.setattr(lifemodel, "get_metric_registry", _recording_get_metric_registry)
+
+    class OrderCtx(FakeCtx):
+        def register_command(
+            self, name: str, handler: Callable[..., Any], description: str = "", args_hint: str = ""
+        ) -> None:
+            order.append(f"command:{name}")
+            super().register_command(name, handler, description, args_hint)
+
+    lifemodel.register(OrderCtx())
+
+    assert "command:lifemodel" in order
+    assert "metric_registry" in order
+    assert order.index("command:lifemodel") < order.index("metric_registry")
+
+
 # --- brain-liveness block on /lifemodel status (spec §4.4, lm-fib.9.3) -------
 
 

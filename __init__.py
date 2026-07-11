@@ -255,23 +255,20 @@ def register(ctx: Any) -> None:
         # Any unrecognized subcommand: the compact one-line summary (unchanged).
         return _status_line(profile, sdir)
 
-    # The shared per-base_dir liveness backbone (spec §4.2) + metric registry, both
-    # resolved before any wiring so every ``wire`` boundary below writes to the SAME
-    # ``BrainHealth`` the platform ``check_fn`` / observers / ``/lifemodel status``
-    # read. Declare the universal metric surface now (idempotent) so the observer
-    # failure counter exists even if a wiring failure means no tick graph is ever
-    # built.
+    # The shared per-base_dir liveness backbone (spec §4.2), resolved FIRST so every
+    # ``wire`` boundary below writes to the SAME ``BrainHealth`` the platform
+    # ``check_fn`` / observers / ``/lifemodel status`` read.
     health = get_brain_health(sdir)
-    metrics = get_metric_registry(sdir)
-    register_universal_metrics(metrics)
 
-    # --- The diagnostic lever FIRST (spec §4.3 "both" strategy, codex CRITICAL-2) --
-    # Register ``/lifemodel`` BEFORE any load-bearing wiring, so that even if the
-    # brain wiring below re-raises (Hermes then marks the plugin not-enabled + logs),
-    # the owner keeps the diagnostic command if Hermes retains partial registration,
-    # and ``/lifemodel status`` can report ``boot_failed: <reason>`` from the durable
-    # boot record. Command registration is itself load-bearing (it is the entire
-    # owner interface), so a failure here is required-loud.
+    # --- The diagnostic lever FIRST (spec §4.3 "both" strategy, codex CRITICAL-2 +
+    # MINOR) --- Register ``/lifemodel`` BEFORE any load-bearing wiring AND before the
+    # metric registry below, so that (a) even if the brain wiring re-raises (Hermes then
+    # marks the plugin not-enabled + logs) the owner keeps the diagnostic command and
+    # ``/lifemodel status`` can report ``boot_failed: <reason>`` from the durable boot
+    # record, AND (b) a metric registry / spec conflict cannot abort ``register()``
+    # before the command exists (and before a boot record can be written) — losing the
+    # only lever the owner has to see WHY. Command registration is itself load-bearing
+    # (it is the entire owner interface), so a failure here is required-loud.
     with wire("register_command", required=True, health=health, logger=_LOG):
         ctx.register_command(
             "lifemodel",
@@ -279,6 +276,13 @@ def register(ctx: Any) -> None:
             description="Show plugin status; 'help' lists read-only and mutating subcommands.",
             args_hint=" | ".join(_SUBCOMMANDS),
         )
+
+    # The shared metric registry (spec §4.2), resolved only now that the diagnostic
+    # lever is safely registered. Declare the universal metric surface (idempotent) so
+    # the observer failure counter exists even if a wiring failure means no tick graph
+    # is ever built.
+    metrics = get_metric_registry(sdir)
+    register_universal_metrics(metrics)
 
     _LOG.info(
         "plugin_registered plugin=lifemodel version=%s profile=%s state_dir=%s",
