@@ -6,12 +6,12 @@ Each test maps to one numbered regression scenario in the design doc's "Крит
 the real SQLite store through fake ports, exercising ExecutionFrames via
 ``run_frame`` / ``proactive_tick`` and the afferent hooks.
 
-Scenario (6) (external-event idempotency ring) is OUT OF SCOPE for this slice.
+Scenario (6) (external-event idempotency ring) is owned by SLICE 3 (lm-fib.8.5).
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -194,6 +194,81 @@ def test_scenario_5b_silent_applies_decline_backoff_and_clears_pending(tmp_path:
     assert final.declined_at is not None
     assert final.action_pending_since is None  # silence is not a send → no inhibition window
     assert final.pending_proactive_id is None  # pending cleaned
+
+
+# --- (6) a duplicate external event (same origin_id) is deduped by the ring ---
+
+
+def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> None:
+    clock = FakeClock(_NOW)
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
+    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    _seed_active_desire(lm)
+
+    dup = contact_observed_signal(origin_id="m-dup", actor="user", label="two_way", timestamp=None)
+    run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
+    after_first = lm.state.load()
+    assert after_first.u < 5.0  # the genuine two_way contact satiated the drive once
+    assert after_first.last_exchange_at == _NOW.isoformat()  # relationship record stamped
+    assert lm.state.get("desire", "contact:owner").state == "satisfied"  # desire resolved
+
+    # A retry of the SAME Hermes event id (clock pinned → dt=0, so any SECOND
+    # satiation would show as a further drop in u). The ring must drop it: u,
+    # last_exchange_at, and the resolved desire all stay put.
+    run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
+    after_dup = lm.state.load()
+    assert after_dup.u == after_first.u  # satiated EXACTLY once (the retry was deduped)
+    assert after_dup.last_exchange_at == _NOW.isoformat()  # last_exchange_at stamped once
+    assert lm.state.get("desire", "contact:owner").state == "satisfied"  # resolved once
+    assert "m-dup" in after_dup.processed_external_event_ids  # remembered in the ring
+
+
+def test_scenario_6_different_origin_id_after_first_still_satiates(tmp_path: Path) -> None:
+    clock = FakeClock(_NOW)
+    lm = build_lifemodel(base_dir=tmp_path, clock=clock)
+    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+
+    run_frame(
+        lm.coreloop,
+        [contact_observed_signal(origin_id="m-1", actor="user", label="two_way", timestamp=None)],
+        trigger=FrameTrigger.EVENT,
+    )
+    assert lm.state.load().last_exchange_at == _NOW.isoformat()
+
+    # A DIFFERENT inbound 30 min later: the ring dedups by id, not blanket-suppress,
+    # so this genuine new contact satiates normally and re-stamps last_exchange_at.
+    later = _NOW + timedelta(minutes=30)
+    clock.set(later)
+    run_frame(
+        lm.coreloop,
+        [contact_observed_signal(origin_id="m-2", actor="user", label="two_way", timestamp=None)],
+        trigger=FrameTrigger.EVENT,
+    )
+    final = lm.state.load()
+    assert final.last_exchange_at == later.isoformat()  # the new id satiated normally
+    assert set(final.processed_external_event_ids) == {"m-1", "m-2"}  # both remembered
+
+
+def test_scenario_6_ring_is_durable_across_restart(tmp_path: Path) -> None:
+    # Unlike the ephemeral bus, the ring is durable (spec §8): a duplicate that
+    # arrives AFTER a restart is still deduped.
+    lm1 = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    lm1.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    dup = contact_observed_signal(
+        origin_id="m-restart", actor="user", label="two_way", timestamp=None
+    )
+    run_frame(lm1.coreloop, [dup], trigger=FrameTrigger.EVENT)
+    after_first = lm1.state.load()
+    assert after_first.u < 5.0  # satiated once
+    assert "m-restart" in after_first.processed_external_event_ids  # persisted to sqlite
+
+    # "Restart": a brand-new graph over the SAME durable store, clock pinned to _NOW
+    # so a second satiation (dt=0) would show as a further drop in u.
+    lm2 = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    run_frame(lm2.coreloop, [dup], trigger=FrameTrigger.EVENT)
+    after_restart = lm2.state.load()
+    assert after_restart.u == after_first.u  # the durable ring deduped the post-restart retry
+    assert after_restart.last_exchange_at == _NOW.isoformat()  # not re-stamped
 
 
 # --- (7) an async-completion frame commits the outcome IMMEDIATELY -----------

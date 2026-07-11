@@ -37,6 +37,7 @@ from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .component import TickContext
 from .frame import FrameTrigger, SignalFrame
+from .idempotency import dedupe_external_events
 from .intents import (
     EmitSignal,
     Intent,
@@ -263,12 +264,24 @@ class CoreLoop:
                 objects = tuple(found)
             except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
                 root_logger.info("objects_snapshot_failed", error=repr(exc))
-        # The frame's in-memory SignalFrame (spec §2/§3): seed it with the trigger's
-        # signals. No durable bus, no cursor — an impulse lives only for this frame.
-        # Backpressure (must_process vs best_effort shedding) is the AGGREGATION
+        # External-event idempotency (spec §8): the intake path checks the durable
+        # ring BEFORE seeding the frame. A duplicate external event — a Telegram/Hermes
+        # retry of the SAME inbound, keyed by its ``contact_observed`` origin_id — is
+        # dropped here so it cannot satiate ``u`` a second time, re-stamp
+        # ``last_exchange_at``, or re-resolve the desire; a fresh id is recorded (oldest
+        # / TTL-expired entries evicted to stay bounded). This is NOT bus-dedup — the
+        # bus is ephemeral (§2/§3); it is the body remembering what it already handled.
+        # The check runs under the one state-actor lock (``run_frame``), so concurrent
+        # retries cannot both slip past it. The updated ring is persisted below.
+        seed_signals, new_ring = dedupe_external_events(
+            state.processed_external_event_ids, initial_signals, now
+        )
+        # The frame's in-memory SignalFrame (spec §2/§3): seed it with the (deduped)
+        # trigger signals. No durable bus, no cursor — an impulse lives only for this
+        # frame. Backpressure (must_process vs best_effort shedding) is the AGGREGATION
         # layer's job now, not the bus's (spec §7) — the frame carries every seed
         # through; a component sheds what it must.
-        frame = SignalFrame(initial_signals)
+        frame = SignalFrame(seed_signals)
         # Universal metrics (telemetry-core §4.2): the seeded-signal count and the
         # per-layer accepts-signals gauge. Emission is fail-open (never raises).
         self._metrics.inc(SIGNALS_INTAKE, len(frame), outcome=INTAKE_KEPT)
@@ -354,9 +367,17 @@ class CoreLoop:
             status = RUN_SUPPRESSED if span.status == "suppressed" else RUN_OK
             self._emit_component_run(component.id, layer, status, component_dt)
 
-        intents.append(
-            UpdateState({"tick_count": state.tick_count + 1, "last_tick_at": now.isoformat()})
-        )
+        tick_patch: dict[str, object] = {
+            "tick_count": state.tick_count + 1,
+            "last_tick_at": now.isoformat(),
+        }
+        # Persist the idempotency ring only when it actually changed (a fresh id
+        # recorded, or TTL-expired / over-cap entries swept) — a pure duplicate leaves
+        # it byte-identical, so a retry writes no ring churn. Durable in AgentState, so
+        # it survives a restart (unlike the ephemeral bus).
+        if new_ring != state.processed_external_event_ids:
+            tick_patch["processed_external_event_ids"] = new_ring
+        intents.append(UpdateState(tick_patch))
         # A memory mutation commits durable state even when the State row itself is
         # unchanged, so ``committed`` must reflect it too (today the tick always
         # bumps ``tick_count`` so the State always changes, but this keeps the

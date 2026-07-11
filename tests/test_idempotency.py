@@ -61,9 +61,7 @@ def test_ttl_expired_entries_are_evicted_even_with_no_new_events() -> None:
     ttl = timedelta(hours=1)
     old = (_NOW - timedelta(hours=2)).isoformat()
     fresh = (_NOW - timedelta(minutes=5)).isoformat()
-    kept, ring = dedupe_external_events(
-        {"stale": old, "recent": fresh}, [], _NOW, ttl=ttl
-    )
+    kept, ring = dedupe_external_events({"stale": old, "recent": fresh}, [], _NOW, ttl=ttl)
     assert kept == ()
     assert set(ring) == {"recent"}  # the stale entry is swept, the recent one stays
 
@@ -99,4 +97,4 @@ def test_mixed_batch_drops_only_the_duplicate_contact() -> None:
 
 def test_defaults_are_sane_bounds() -> None:
     assert DEFAULT_RING_CAP > 0
-    assert DEFAULT_RING_TTL > timedelta(0)
+    assert DEFAULT_RING_TTL.total_seconds() > 0

@@ -82,9 +82,7 @@ def dedupe_external_events(
     never recorded. Original frame order is preserved among the kept signals.
     """
     # Start from the live (within-TTL) subset, preserving oldest-first order.
-    live: dict[str, str] = {
-        eid: at for eid, at in ring.items() if _is_live(at, now, ttl)
-    }
+    live: dict[str, str] = {eid: at for eid, at in ring.items() if _is_live(at, now, ttl)}
 
     kept: list[Signal] = []
     for signal in signals:

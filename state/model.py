@@ -223,9 +223,7 @@ class State:
             unanswered_outbound_count=_as_int(
                 data.get("unanswered_outbound_count", 0), "unanswered_outbound_count"
             ),
-            processed_external_event_ids=_as_str_str_dict(
-                data, "processed_external_event_ids", {}
-            ),
+            processed_external_event_ids=_as_str_str_dict(data, "processed_external_event_ids", {}),
         )
 
 
