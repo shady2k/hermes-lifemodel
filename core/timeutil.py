@@ -8,7 +8,21 @@ tz-naive value, so a malformed ``last_tick_at`` never crashes a tick.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
+
+
+def to_iso(dt: datetime) -> str:
+    """Serialize an aware ``datetime`` to canonical, fixed-width ISO-8601 UTC.
+
+    Rejects a tz-naive *dt* (a naive value would silently misorder), converts to
+    UTC, and returns ``.isoformat(timespec="microseconds")`` — always 6-digit
+    microseconds, always ``+00:00``. That fixed width is load-bearing: it defeats
+    Python's omission of ``.000000`` and makes the TEXT string lexically sortable
+    == chronologically sortable, which is what all ordering/expiry now rests on.
+    """
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError(f"to_iso requires a timezone-aware datetime, got naive {dt!r}")
+    return dt.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 def minutes_between(a_iso: str | None, b: datetime) -> float:
