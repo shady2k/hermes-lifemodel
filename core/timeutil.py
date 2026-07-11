@@ -25,6 +25,21 @@ def to_iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+def from_iso(s: str) -> datetime:
+    """Strictly parse an ISO-8601 string to an aware UTC ``datetime``.
+
+    The one storage parser (spec §3). Raises ``ValueError`` on a malformed
+    string (``datetime.fromisoformat`` does) and, deliberately, on a string that
+    parses to a tz-*naive* value — a naive stored instant would misorder against
+    normalized text, so it is rejected here rather than silently assumed UTC. A
+    parsed offset is normalized to UTC via ``astimezone(UTC)``.
+    """
+    parsed = datetime.fromisoformat(s)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"from_iso requires a timezone-aware timestamp, got naive {s!r}")
+    return parsed.astimezone(UTC)
+
+
 def minutes_between(a_iso: str | None, b: datetime) -> float:
     if a_iso is None:
         return 0.0
