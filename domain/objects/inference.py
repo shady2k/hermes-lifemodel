@@ -18,7 +18,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Final, Generic, TypeVar
+from typing import Any, Final, Generic, TypeVar
+
+from ..memory import JsonObject, JsonValue
+from .base import opt_float, opt_str, req_float, req_int_tuple, req_str, req_str_tuple
+from .errors import InvalidPayload
 
 T = TypeVar("T")
 
@@ -69,3 +73,53 @@ class InferredField(Generic[T]):
         which for the UserModel is exactly the behavior-neutral default.
         """
         return default if self.is_stale(now) else self.value
+
+
+# --- The InferredField payload codec: one field <-> {value, inferred_at, ttl}. ---
+# A UserModel field is packed as a sub-object rather than a bare scalar, so the
+# inference metadata rides in the SAME memory-record payload as the value.
+
+
+def pack_inferred(field: InferredField[Any], value_json: JsonValue) -> JsonObject:
+    """Pack *field* into its ``{value, inferred_at, ttl}`` payload sub-object.
+
+    *value_json* is the field's value already reduced to a JSON-safe form (a
+    kind's ``_semantic_payload`` turns tuples into lists first), so this codec
+    stays value-type-agnostic.
+    """
+    return {"value": value_json, "inferred_at": field.inferred_at, "ttl": field.ttl_seconds}
+
+
+def _field_object(payload: JsonObject, key: str) -> JsonObject:
+    if key not in payload:
+        raise InvalidPayload(f"missing required field {key!r}")
+    value = payload[key]
+    if not isinstance(value, dict):
+        raise InvalidPayload(
+            f"field {key!r} must be an inferred-field object, got {type(value).__name__}"
+        )
+    return value
+
+
+def _meta(obj: JsonObject) -> tuple[str | None, float | None]:
+    return opt_str(obj, "inferred_at"), opt_float(obj, "ttl")
+
+
+def req_inferred_str(payload: JsonObject, key: str) -> InferredField[str]:
+    obj = _field_object(payload, key)
+    return InferredField(req_str(obj, "value"), *_meta(obj))
+
+
+def req_inferred_float(payload: JsonObject, key: str) -> InferredField[float]:
+    obj = _field_object(payload, key)
+    return InferredField(req_float(obj, "value"), *_meta(obj))
+
+
+def req_inferred_str_tuple(payload: JsonObject, key: str) -> InferredField[tuple[str, ...]]:
+    obj = _field_object(payload, key)
+    return InferredField(req_str_tuple(obj, "value"), *_meta(obj))
+
+
+def req_inferred_int_tuple(payload: JsonObject, key: str) -> InferredField[tuple[int, ...]]:
+    obj = _field_object(payload, key)
+    return InferredField(req_int_tuple(obj, "value"), *_meta(obj))

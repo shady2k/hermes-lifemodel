@@ -20,6 +20,7 @@ from lifemodel.domain.objects import (
     Desire,
     DesireSpring,
     DesireState,
+    InferredField,
     Intention,
     IntentionState,
     InvalidPayload,
@@ -109,17 +110,17 @@ def _user_model() -> UserModel:
     return UserModel(
         id="rel-alex",
         state=UserModelState.ACTIVE,
-        cadence="weekly",
-        good_hours=(18, 19, 20),
-        bad_hours=(2, 3, 4),
-        response_valence_pattern="warm-but-slow",
-        privacy_boundaries=("no health details",),
-        topic_sensitivity=("work",),
-        intimacy_depth=0.6,
-        reply_latency_norm="hours",
-        known_load="busy at work",
-        acceptable_styles=("playful", "concise"),
-        explicit_preferences=("texts over calls",),
+        cadence=InferredField("weekly"),
+        good_hours=InferredField((18, 19, 20)),
+        bad_hours=InferredField((2, 3, 4)),
+        response_valence_pattern=InferredField("warm-but-slow"),
+        privacy_boundaries=InferredField(("no health details",)),
+        topic_sensitivity=InferredField(("work",)),
+        intimacy_depth=InferredField(0.6),
+        reply_latency_norm=InferredField("hours"),
+        known_load=InferredField("busy at work"),
+        acceptable_styles=InferredField(("playful", "concise")),
+        explicit_preferences=InferredField(("texts over calls",)),
         **_ENVELOPE,  # type: ignore[arg-type]
     )
 
@@ -273,13 +274,14 @@ class TestIntTupleDecoding:
         rel = _user_model()
         decoded = reg.decode(_record_from_draft(reg.encode(rel)))
         assert isinstance(decoded, UserModel)
-        assert decoded.good_hours == (18, 19, 20)
+        assert decoded.good_hours.value == (18, 19, 20)
 
     def test_non_int_hour_item_raises(self) -> None:
         reg = default_registry()
         record = _record_from_draft(reg.encode(_user_model()))
         payload = dict(record.payload)
-        payload["good_hours"] = [18, "nineteen", 20]
+        # The inferred-field value list holds a non-int item -> reject on decode.
+        payload["good_hours"] = {"value": [18, "nineteen", 20], "inferred_at": None, "ttl": None}
         with pytest.raises(InvalidPayload):
             reg.decode(replace(record, payload=payload))
 
@@ -287,7 +289,7 @@ class TestIntTupleDecoding:
         reg = default_registry()
         record = _record_from_draft(reg.encode(_user_model()))
         payload = dict(record.payload)
-        payload["bad_hours"] = [True, 3, 4]
+        payload["bad_hours"] = {"value": [True, 3, 4], "inferred_at": None, "ttl": None}
         with pytest.raises(InvalidPayload):
             reg.decode(replace(record, payload=payload))
 

@@ -631,9 +631,9 @@ def test_force_wake_wakes_on_the_next_real_tick(tmp_path) -> None:
 def test_set_user_model_prefs_parses_and_marks_explicit() -> None:
     rel, message = set_user_model_prefs("bad-hours=2,3,4 cadence=2h styles=playful,concise")
     assert rel is not None
-    assert rel.bad_hours == (2, 3, 4)
-    assert rel.cadence == "2h"
-    assert rel.acceptable_styles == ("playful", "concise")
+    assert rel.bad_hours.value == (2, 3, 4)
+    assert rel.cadence.value == "2h"
+    assert rel.acceptable_styles.value == ("playful", "concise")
     assert rel.confidence == EXPLICIT_CONFIDENCE  # explicit -> boundaries hard-veto
     assert "(mutating)" in message
 
@@ -641,8 +641,8 @@ def test_set_user_model_prefs_parses_and_marks_explicit() -> None:
 def test_set_user_model_prefs_multiword_value() -> None:
     rel, _ = set_user_model_prefs("load=busy at work cadence=daily")
     assert rel is not None
-    assert rel.known_load == "busy at work"
-    assert rel.cadence == "daily"
+    assert rel.known_load.value == "busy at work"
+    assert rel.cadence.value == "daily"
 
 
 def test_set_user_model_prefs_rejects_unknown_key() -> None:
@@ -671,7 +671,7 @@ def test_set_user_model_prefs_for_dir_round_trips_and_gates(tmp_path) -> None:
     # the row is readable through the SAME store the adapter loop uses
     rel = read_owner_user_model(_store(tmp_path))
     assert rel is not None
-    assert rel.bad_hours == (2, 3)
+    assert rel.bad_hours.value == (2, 3)
     assert rel.confidence == EXPLICIT_CONFIDENCE
     # and a later appraisal reads it and hard-vetoes during a bad hour
     bad_hour = datetime(2026, 7, 6, 2, 0, tzinfo=UTC)
@@ -686,8 +686,8 @@ def test_set_user_model_prefs_for_dir_patches_not_replaces(tmp_path) -> None:
     set_user_model_prefs_for_dir(tmp_path, "cadence=2h")
     rel = read_owner_user_model(_store(tmp_path))
     assert rel is not None
-    assert rel.bad_hours == (2, 3)  # the earlier boundary SURVIVES the cadence update
-    assert rel.cadence == "2h"  # and the new key is applied
+    assert rel.bad_hours.value == (2, 3)  # the earlier boundary SURVIVES the cadence update
+    assert rel.cadence.value == "2h"  # and the new key is applied
     assert rel.confidence == EXPLICIT_CONFIDENCE
 
 

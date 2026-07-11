@@ -69,7 +69,7 @@ class State:
     #: a desire resolves; feeds the wake-decision's duration gate.
     duration_over_theta: float = 0.0
     #: ISO-8601 UTC timestamp of the last genuine (non-internal) exchange with
-    #: the user (spec §4/§6). This is the RELATIONSHIP RECORD the wake-packet
+    #: the user (spec §4/§6). This is the real EXCHANGE RECORD the wake-packet
     #: temporal fact renders ("The last time we exchanged messages was X",
     #: :func:`~lifemodel.core.wake_packet.render_temporal_facts`), so it is IMMUNE
     #: to admin/control commands (lm-md6.1): it is written ONLY by a genuine

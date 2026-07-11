@@ -124,6 +124,20 @@ def appraise_receptivity(user_model: UserModel, state: State, now: datetime) -> 
     confidence = user_model.confidence if user_model.confidence is not None else 0.0
     explicit = confidence >= EXPLICIT_CONFIDENCE
 
+    # Resolve each DERIVED field at `now`: a field whose inference has gone stale
+    # (spec §8, ``inferred_at + ttl`` past) reads as its permissive default here —
+    # "no information" — which is exactly the behavior-neutral fallback, so an
+    # expired inference silently stops gating rather than gating on a stale value.
+    bad_hours = user_model.bad_hours.resolve_or(now, ())
+    good_hours = user_model.good_hours.resolve_or(now, ())
+    cadence = user_model.cadence.resolve_or(now, "")
+    topic_sensitivity = user_model.topic_sensitivity.resolve_or(now, ())
+    privacy_boundaries = user_model.privacy_boundaries.resolve_or(now, ())
+    acceptable_styles = user_model.acceptable_styles.resolve_or(now, ())
+    response_valence_pattern = user_model.response_valence_pattern.resolve_or(now, "")
+    known_load = user_model.known_load.resolve_or(now, "")
+    reply_latency_norm = user_model.reply_latency_norm.resolve_or(now, "")
+
     hard: list[str] = []
     soft: list[str] = []
     constraints: list[str] = []
@@ -133,7 +147,7 @@ def appraise_receptivity(user_model: UserModel, state: State, now: datetime) -> 
     #     energy). Explicit bad hour now → hard veto; a low-confidence bad hour →
     #     soft. Hours are UTC hours-of-day, matching the engine's circadian clock
     #     (owner-local TZ conversion is a later concern).
-    if now.hour in user_model.bad_hours:
+    if now.hour in bad_hours:
         if explicit:
             hard.append(f"owner quiet hours (hour {now.hour:02d}:00 UTC is off-limits)")
         else:
@@ -144,14 +158,14 @@ def appraise_receptivity(user_model: UserModel, state: State, now: datetime) -> 
     #     OUTSIDE an explicitly-set preferred window is a SOFT down-weight (a
     #     preference, not a forbidden hour — bad_hours is the hard boundary). Empty
     #     (the default) means "no preference" → inert, so the default never gates.
-    if user_model.good_hours and now.hour not in user_model.good_hours:
+    if good_hours and now.hour not in good_hours:
         soft.append("outside owner preferred hours")
         multiplier *= SOFT_FACTOR
 
     # --- cadence_fit: an explicit preferred MIN spacing between proactive
     #     contacts (beyond the send-rate backstop), computed from the live
     #     proactive_send_log. Only an EXPLICIT cadence hard-vetoes.
-    min_gap = cadence_min_minutes(user_model.cadence)
+    min_gap = cadence_min_minutes(cadence)
     if min_gap is not None and explicit:
         since = _minutes_since_last_send(state.proactive_send_log, now)
         if since is not None and since < min_gap:
@@ -163,32 +177,32 @@ def appraise_receptivity(user_model: UserModel, state: State, now: datetime) -> 
     # --- privacy_fit: a blanket "no proactive contact" boundary hard-vetoes when
     #     explicit; topic-scoped sensitivities/boundaries ride along as composing
     #     constraints (a topic-less wake cannot evaluate them → never a veto).
-    if _blanket_no_contact(user_model):
+    if _blanket_no_contact(privacy_boundaries, topic_sensitivity):
         if explicit:
             hard.append("owner privacy boundary: no proactive contact")
         else:
             soft.append("inferred no-contact preference")
             multiplier *= SOFT_FACTOR
-    for topic in user_model.topic_sensitivity:
+    for topic in topic_sensitivity:
         if topic not in BLANKET_NO_CONTACT:
             constraints.append(f"avoid topic: {topic}")
-    for boundary in user_model.privacy_boundaries:
+    for boundary in privacy_boundaries:
         if boundary not in BLANKET_NO_CONTACT:
             constraints.append(f"respect boundary: {boundary}")
 
     # --- style_fit: allowed proactive styles are a CONSTRAINT on the packet, not
     #     a veto.
-    if user_model.acceptable_styles:
-        constraints.append("style: " + "|".join(user_model.acceptable_styles))
+    if acceptable_styles:
+        constraints.append("style: " + "|".join(acceptable_styles))
 
     # --- soft considerations: weak negative valence / known load / slow latency.
-    if _matches(user_model.response_valence_pattern, _NEGATIVE_VALENCE):
+    if _matches(response_valence_pattern, _NEGATIVE_VALENCE):
         soft.append("weak negative valence")
         multiplier *= SOFT_FACTOR
-    if _matches(user_model.known_load, _BUSY_LOAD):
+    if _matches(known_load, _BUSY_LOAD):
         soft.append("known load")
         multiplier *= SOFT_FACTOR
-    if _matches(user_model.reply_latency_norm, _SLOW_LATENCY):
+    if _matches(reply_latency_norm, _SLOW_LATENCY):
         soft.append("inferred latency")
         multiplier *= SOFT_FACTOR
 
@@ -234,8 +248,10 @@ def _matches(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in low for needle in needles)
 
 
-def _blanket_no_contact(user_model: UserModel) -> bool:
-    tokens = set(user_model.privacy_boundaries) | set(user_model.topic_sensitivity)
+def _blanket_no_contact(
+    privacy_boundaries: tuple[str, ...], topic_sensitivity: tuple[str, ...]
+) -> bool:
+    tokens = set(privacy_boundaries) | set(topic_sensitivity)
     return bool(tokens & BLANKET_NO_CONTACT)
 
 

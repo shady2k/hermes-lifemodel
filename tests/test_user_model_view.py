@@ -37,11 +37,11 @@ def test_owner_user_model_id_and_kind() -> None:
 
 def test_default_user_model_is_permissive_and_low_confidence() -> None:
     d = DEFAULT_USER_MODEL
-    assert d.bad_hours == ()
-    assert d.privacy_boundaries == ()
-    assert d.topic_sensitivity == ()
-    assert d.acceptable_styles == ()
-    assert d.cadence == ""
+    assert d.bad_hours.value == ()
+    assert d.privacy_boundaries.value == ()
+    assert d.topic_sensitivity.value == ()
+    assert d.acceptable_styles.value == ()
+    assert d.cadence.value == ""
     assert (d.confidence or 0.0) < EXPLICIT_CONFIDENCE
 
 
@@ -49,7 +49,7 @@ def test_live_owner_user_model_reads_the_snapshot() -> None:
     objects = owner_user_model_objects(bad_hours=(2, 3), confidence=EXPLICIT_CONFIDENCE)
     um = live_owner_user_model(objects)
     assert um is not None
-    assert um.bad_hours == (2, 3)
+    assert um.bad_hours.value == (2, 3)
     assert um.confidence == EXPLICIT_CONFIDENCE
 
 
@@ -71,8 +71,8 @@ def test_encode_round_trips_through_the_store() -> None:
     store.put(draft)
     um = read_owner_user_model(store)
     assert um is not None
-    assert um.bad_hours == (1,)
-    assert um.cadence == "2h"
+    assert um.bad_hours.value == (1,)
+    assert um.cadence.value == "2h"
 
 
 def test_read_owner_user_model_absent_is_none() -> None:

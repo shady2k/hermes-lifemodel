@@ -72,6 +72,7 @@ from .domain.memory import MemoryMutation, PutOp, StaleTransition, TransitionOp
 from .domain.objects import (
     CONTACT_DESIRE_ID,
     DesireState,
+    InferredField,
     InvalidTransition,
     Provenance,
     ThoughtState,
@@ -435,7 +436,9 @@ def set_user_model_prefs(
         return None, _um_usage()
     if existing is not None:
         # Patch the provided keys onto the existing row (preserve other boundaries).
-        user_model = dataclasses.replace(existing, confidence=EXPLICIT_CONFIDENCE, **kwargs)
+        # Owner-set values are authoritative → wrapped with no ttl (never go stale).
+        patched: dict[str, Any] = {name: InferredField(value) for name, value in kwargs.items()}
+        user_model = dataclasses.replace(existing, confidence=EXPLICIT_CONFIDENCE, **patched)
     else:
         user_model = build_owner_user_model(confidence=EXPLICIT_CONFIDENCE, **kwargs)
     lines = [

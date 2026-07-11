@@ -31,6 +31,7 @@ from .errors import (
     ObjectCoreError,
     UnknownKind,
 )
+from .inference import UNKNOWN, InferredField
 from .intention import Intention, IntentionState
 from .provenance import (
     Provenance,
@@ -46,10 +47,12 @@ __all__ = [
     "CONTACT_DESIRE_ID",
     "CONTACT_INTENTION_ID",
     "OWNER_USER_MODEL_ID",
+    "UNKNOWN",
     "BaseObject",
     "Desire",
     "DesireSpring",
     "DesireState",
+    "InferredField",
     "InvalidPayload",
     "InvalidTransition",
     "Intention",

@@ -34,6 +34,7 @@ before this task (.4). A seeded/default row NEVER hard-vetoes.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypeVar
 
 from ..domain.memory import MemoryDraft, MemoryRecord
 from ..domain.objects import (
@@ -42,7 +43,10 @@ from ..domain.objects import (
     UserModelState,
     default_registry,
 )
+from ..domain.objects.inference import InferredField
 from ..ports.memory import MemoryPort
+
+T = TypeVar("T")
 
 #: The kind of the owner user-model record (``kind`` column, HLA §4.1).
 USER_MODEL_KIND = "user_model"
@@ -83,6 +87,8 @@ def build_owner_user_model(
     explicit_preferences: tuple[str, ...] = (),
     confidence: float = DEFAULT_CONFIDENCE,
     source: str = "owner-user-model",
+    inferred_at: str | None = None,
+    ttl_seconds: float | None = None,
 ) -> UserModel:
     """Construct the singleton owner :class:`UserModel`.
 
@@ -91,23 +97,33 @@ def build_owner_user_model(
     IS :data:`DEFAULT_USER_MODEL`; the owner's explicit-set path passes the
     populated fields plus ``confidence=EXPLICIT_CONFIDENCE`` so its boundaries
     hard-veto.
+
+    Each field is wrapped in an
+    :class:`~lifemodel.domain.objects.inference.InferredField` stamped with
+    *inferred_at* / *ttl_seconds*. Both default to ``None`` — an owner-SET row is
+    authoritative and never goes stale; an inference path passes a stamp + TTL so
+    the fields expire to ``UNKNOWN`` once past their shelf life (spec §8).
     """
+
+    def field(value: T) -> InferredField[T]:
+        return InferredField(value, inferred_at=inferred_at, ttl_seconds=ttl_seconds)
+
     return UserModel(
         id=OWNER_USER_MODEL_ID,
         state=str(state),
         source=source,
         confidence=confidence,
-        cadence=cadence,
-        good_hours=good_hours,
-        bad_hours=bad_hours,
-        response_valence_pattern=response_valence_pattern,
-        privacy_boundaries=privacy_boundaries,
-        topic_sensitivity=topic_sensitivity,
-        intimacy_depth=intimacy_depth,
-        reply_latency_norm=reply_latency_norm,
-        known_load=known_load,
-        acceptable_styles=acceptable_styles,
-        explicit_preferences=explicit_preferences,
+        cadence=field(cadence),
+        good_hours=field(good_hours),
+        bad_hours=field(bad_hours),
+        response_valence_pattern=field(response_valence_pattern),
+        privacy_boundaries=field(privacy_boundaries),
+        topic_sensitivity=field(topic_sensitivity),
+        intimacy_depth=field(intimacy_depth),
+        reply_latency_norm=field(reply_latency_norm),
+        known_load=field(known_load),
+        acceptable_styles=field(acceptable_styles),
+        explicit_preferences=field(explicit_preferences),
     )
 
 
