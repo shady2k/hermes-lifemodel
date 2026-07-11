@@ -141,9 +141,7 @@ def test_brain_health_check_still_reports_unhealth_for_the_status_surface(tmp_pa
     health = get_brain_health(tmp_path)
     health.mark_connected(at=(datetime.now(UTC) - timedelta(hours=1)).isoformat())
     health.record_loop_death("died", "tb")
-    ok, reason = health.check(
-        last_tick_at=None, now=datetime.now(UTC), stale_after_seconds=300.0
-    )
+    ok, reason = health.check(last_tick_at=None, now=datetime.now(UTC), stale_after_seconds=300.0)
     assert ok is False
     assert "loop_dead" in reason
 
