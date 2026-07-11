@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from lifemodel.core.metrics import (
+from ..core.metrics import (
     Counter,
     Gauge,
     Histogram,
