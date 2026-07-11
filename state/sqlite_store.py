@@ -935,15 +935,30 @@ def _renormalize_iso(value: str | None) -> str | None:
     Old values were written by ``.isoformat()`` and may lack the fixed 6-µs width
     the ordering invariant needs, so each is routed through
     :func:`~lifemodel.core.timeutil.from_iso` -> :func:`~lifemodel.core.timeutil.to_iso`.
-    A NULL stays NULL. Self-preservation over a crash: a value that cannot be parsed
-    (should never happen — legacy stamps come from an aware UTC clock) is kept as-is
-    rather than aborting the migration and losing the being's memory."""
+    A NULL stays NULL. Re-normalizing an already-canonical value is a no-op (idempotent).
+
+    FAIL-CLOSED on the WRITE path (mirror of the ``trace_store`` ingress fix): a value
+    that cannot be normalized must NEVER be persisted raw. Keeping it would silently rot
+    the lexical ordering/expiry invariant *forever* — a raw string mis-sorts against
+    fixed-width TEXT and can satisfy ``expires_at > now`` lexically (an immortal desire) —
+    and because v3 is then recorded in ``schema_migrations`` the bad value is never
+    revisited. So we RAISE: :meth:`SQLiteRuntimeStore._run_migrations` restores the
+    ``*.bak.*`` backup and construction fails LOUD with the being's self intact on disk,
+    which is the whole fail-loud foundation (contrast :func:`~lifemodel.core.timeutil.to_display`
+    — the READ/display path — deliberately fail-OPEN so one bad legacy row can't blank a
+    debug view). This cannot happen for data our own code wrote (every ``to_iso`` output
+    re-parses via ``from_iso``); a value that trips it means the file was corrupted or
+    tampered with outside the store — exactly when a loud stop beats silent corruption."""
     if value is None:
         return None
     try:
         return to_iso(from_iso(value))
-    except ValueError:
-        return value
+    except ValueError as exc:
+        raise ValueError(
+            f"lifemodel.sqlite migration v3: cannot normalize legacy time value "
+            f"{value!r} to canonical ISO-8601 UTC; refusing to persist it raw "
+            f"(fail-closed). The pre-migration file is restored from backup."
+        ) from exc
 
 
 def _rebuild_memory_records_iso_only(conn: sqlite3.Connection, strict_kw: str) -> None:
@@ -1037,10 +1052,22 @@ def _migrate_v3(conn: sqlite3.Connection, strict: bool) -> None:
     already produced the ISO-only shape, so :func:`_has_epoch_columns` is ``False`` and
     this no-ops."""
     strict_kw = " STRICT" if strict else ""
+    migrating_old_file = _has_epoch_columns(conn, "memory_records") or _has_epoch_columns(
+        conn, "runtime_state"
+    )
     if _has_epoch_columns(conn, "memory_records"):
         _rebuild_memory_records_iso_only(conn, strict_kw)
     if _has_epoch_columns(conn, "runtime_state"):
         _rebuild_runtime_state_iso_only(conn, strict_kw)
+    if migrating_old_file:
+        # Drop the pre-cutover ``store_meta('schema_version', …)`` marker left by the
+        # retired ``_stamp_store_schema_version`` guard: ``schema_migrations`` is the
+        # SOLE version authority now, so a migrated file must be indistinguishable from
+        # a freshly-bootstrapped one (whose ``store_meta`` carries no such key) — no
+        # stale, contradictory version marker sitting beside ``schema_migrations``.
+        # ``store_meta`` is guaranteed present here: an old file with ``*_epoch`` columns
+        # went through v1, which creates ``store_meta`` and ``memory_records`` together.
+        conn.execute("DELETE FROM store_meta WHERE key = 'schema_version'")
 
 
 _MIGRATIONS: Final[list[tuple[int, Callable[[sqlite3.Connection, bool], None]]]] = [

@@ -16,6 +16,8 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from lifemodel.core.timeutil import from_iso, to_iso
 from lifemodel.domain.memory import MemoryDraft, PressureIndex, summarize_pressure_index
 from lifemodel.state.model import State
@@ -350,6 +352,205 @@ def test_ordering_and_expiry_correct_after_migration(tmp_path: Path) -> None:
     assert store.read_pressure_index(at_noon).active_desire_count == 2
     after_expiry = datetime(2026, 7, 11, 19, 0, tzinfo=UTC)
     assert store.read_pressure_index(after_expiry).active_desire_count == 1
+
+
+def test_migration_fails_loud_on_unnormalizable_time_value(tmp_path: Path) -> None:
+    # FAIL-CLOSED on the WRITE path (codex MAJOR): a legacy value that cannot be
+    # normalized to fixed-width ISO must NEVER be persisted raw — it would silently rot
+    # the lexical ordering/expiry invariant forever ('not-a-timestamp' > '2026-…' is
+    # true, an immortal desire) and, since v3 is then recorded, never be revisited. So
+    # the migration RAISES; the framework restores the *.bak.* backup and the being's
+    # self stays intact on disk. (Contrast core/timeutil.to_display — the READ path —
+    # is fail-OPEN.) It can't happen for data our own code wrote, so failing loud here
+    # is the right stop, not a silent shrug.
+    db_path = tmp_path / DB_FILENAME
+    old_state = State(u=2.5, energy=0.7, tick_count=42)
+    expected_state_json = json.dumps(old_state.to_dict())
+    _build_old_shape_db(
+        db_path,
+        state_json=expected_state_json,
+        mem_created_at="2026-07-11T12:00:00+00:00",
+        mem_updated_at="2026-07-11T12:00:00+00:00",
+        mem_expires_at="not-a-timestamp",  # unparseable -> fail CLOSED, loud
+    )
+
+    with pytest.raises(ValueError, match="cannot normalize"):
+        SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    # The self was PRESERVED on disk (backup restored to the original path), NOT wiped
+    # and NOT half-migrated: the file is back to the OLD shape and no raw value ever
+    # reached an ISO-only column. v3 was rolled back (not recorded).
+    assert _columns(tmp_path, "memory_records") & _EPOCH_COLUMNS == _EPOCH_COLUMNS
+    assert "updated_at_epoch" in _columns(tmp_path, "runtime_state")
+    assert list(tmp_path.glob(f"{DB_FILENAME}.superseded.*")) == []
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        (state_json,) = conn.execute("SELECT state_json FROM runtime_state").fetchone()
+        versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY 1")]
+    assert state_json == expected_state_json  # self intact, byte-for-byte
+    assert versions == [1, 2]  # v3 rolled back by the restore
+
+
+def test_migration_removes_stale_store_meta_schema_version(tmp_path: Path) -> None:
+    # NIT (codex): a migrated DB must be indistinguishable from a freshly-bootstrapped
+    # one, whose store_meta carries NO schema_version key (schema_migrations is the sole
+    # version authority since lm-fib.10.5). The pre-cutover marker left by the retired
+    # _stamp_store_schema_version guard is dropped on migration.
+    db_path = tmp_path / DB_FILENAME
+    _build_old_shape_db(
+        db_path,
+        state_json=json.dumps(State(u=1.0).to_dict()),
+        mem_created_at="2026-07-11T12:00:00+00:00",
+        mem_updated_at="2026-07-11T12:00:00+00:00",
+    )
+    # sanity: the old file DID carry the stale marker (see _build_old_shape_db)
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        assert conn.execute(
+            "SELECT value FROM store_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("2",)
+
+    SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT value FROM store_meta WHERE key = 'schema_version'").fetchone()
+    assert row is None  # stale marker gone -> migrated == fresh
+
+
+def test_migration_preserves_multiple_rows_and_is_idempotent_on_normalized(
+    tmp_path: Path,
+) -> None:
+    # Codex test-gap: several memory rows — one whose legacy stamp ALREADY has the fixed
+    # µs width (normalization must be idempotent, not double-shift it), one NON-NULL
+    # un-normalized expires_at, one NULL expires_at (stays NULL). All survive migration,
+    # all land normalized.
+    db_path = tmp_path / DB_FILENAME
+    _build_old_shape_db(
+        db_path,
+        state_json=json.dumps(State(u=3.0).to_dict()),
+        mem_created_at="2026-07-11T09:00:00.500000+00:00",  # already fixed-width µs
+        mem_updated_at="2026-07-11T09:00:00.500000+00:00",
+        mem_expires_at="2026-07-11T20:00:00+00:00",  # non-null, un-normalized
+    )
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        conn.execute(
+            "INSERT INTO memory_records (kind, id, state, recipient_id, payload_json, salience, "
+            "confidence, expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
+            "updated_at, updated_at_epoch, revision, schema_version) "
+            "VALUES ('desire','d2','active','owner','{}',0.4,NULL,NULL,NULL,'seed',"
+            "'2026-07-11T08:00:00+00:00',1752000000,'2026-07-11T08:00:00+00:00',1752000000,0,1)"
+        )
+        conn.execute(
+            "INSERT INTO memory_records (kind, id, state, recipient_id, payload_json, salience, "
+            "confidence, expires_at, expires_at_epoch, source, created_at, created_at_epoch, "
+            "updated_at, updated_at_epoch, revision, schema_version) "
+            "VALUES ('opinion','o1','active','owner','{}',0.2,NULL,'2026-07-11T22:00:00+00:00',"
+            "NULL,'seed','2026-07-11T07:00:00+00:00',1752000000,"
+            "'2026-07-11T07:00:00+00:00',1752000000,0,1)"
+        )
+
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    d1 = store.get("desire", "d1")
+    d2 = store.get("desire", "d2")
+    o1 = store.get("opinion", "o1")
+    assert d1 is not None and d2 is not None and o1 is not None
+    # already-µs value is unchanged (idempotent); un-normalized ones gain fixed width
+    assert d1.created_at == "2026-07-11T09:00:00.500000+00:00"
+    assert d1.expires_at == "2026-07-11T20:00:00.000000+00:00"
+    assert d2.expires_at is None  # NULL stayed NULL
+    assert o1.expires_at == "2026-07-11T22:00:00.000000+00:00"
+    assert {r.id for r in store.find()} == {"d1", "d2", "o1"}  # every row survived
+    assert store.load().u == 3.0  # self preserved
+
+
+def _build_epoch_scaffold(conn: sqlite3.Connection) -> None:
+    """Create ``store_meta`` + ``schema_migrations`` (v1/v2 recorded) shared by the
+    empty-tables and partial-epoch old-shape fixtures below."""
+    conn.execute("CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    conn.executemany(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+        [(1, "2026-01-01T00:00:00+00:00"), (2, "2026-01-01T00:00:00+00:00")],
+    )
+
+
+_OLD_MEMORY_DDL = (
+    "CREATE TABLE memory_records ("
+    "kind TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, "
+    "recipient_id TEXT NOT NULL DEFAULT 'owner', payload_json TEXT NOT NULL, "
+    "salience REAL NOT NULL DEFAULT 0, confidence REAL, expires_at TEXT, "
+    "expires_at_epoch INTEGER, source TEXT NOT NULL, created_at TEXT NOT NULL, "
+    "created_at_epoch INTEGER NOT NULL, updated_at TEXT NOT NULL, "
+    "updated_at_epoch INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0, "
+    "schema_version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (kind, id))"
+)
+_OLD_RUNTIME_DDL = (
+    "CREATE TABLE runtime_state (id INTEGER PRIMARY KEY CHECK (id = 1), "
+    "state_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+    "updated_at_epoch INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 0)"
+)
+
+
+def test_migration_handles_empty_old_shape_tables(tmp_path: Path) -> None:
+    # Codex test-gap: an old-shape file with NO rows still migrates to the ISO-only
+    # shape (empty rebuild) and records v3 — no crash on empty SELECT/executemany.
+    db_path = tmp_path / DB_FILENAME
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        _build_epoch_scaffold(conn)
+        conn.execute(_OLD_MEMORY_DDL)
+        conn.execute(_OLD_RUNTIME_DDL)  # empty runtime_state (no self row yet)
+
+    SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    assert _columns(tmp_path, "memory_records") & _EPOCH_COLUMNS == set()
+    assert "updated_at_epoch" not in _columns(tmp_path, "runtime_state")
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY 1")]
+        (mem_count,) = conn.execute("SELECT COUNT(*) FROM memory_records").fetchone()
+    assert versions == [1, 2, 3]
+    assert mem_count == 0  # empty rebuild preserved zero rows
+
+
+def test_migration_rebuilds_only_the_table_that_still_has_epoch_columns(tmp_path: Path) -> None:
+    # Codex test-gap: v3 checks each table independently. Build a file where
+    # memory_records is ALREADY iso-only but runtime_state still carries
+    # updated_at_epoch -> only runtime_state is rebuilt; the memory row is untouched.
+    db_path = tmp_path / DB_FILENAME
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        _build_epoch_scaffold(conn)
+        conn.execute(
+            "CREATE TABLE memory_records ("
+            "kind TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, "
+            "recipient_id TEXT NOT NULL DEFAULT 'owner', payload_json TEXT NOT NULL, "
+            "salience REAL NOT NULL DEFAULT 0, confidence REAL, expires_at TEXT, "
+            "source TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "revision INTEGER NOT NULL DEFAULT 0, schema_version INTEGER NOT NULL DEFAULT 1, "
+            "PRIMARY KEY (kind, id))"
+        )
+        conn.execute("CREATE INDEX idx_memory_records_kind_state ON memory_records (kind, state)")
+        conn.execute("CREATE INDEX idx_memory_records_expires_at ON memory_records (expires_at)")
+        conn.execute(
+            "INSERT INTO memory_records (kind,id,state,recipient_id,payload_json,salience,"
+            "confidence,expires_at,source,created_at,updated_at,revision,schema_version) "
+            "VALUES ('desire','d1','active','owner','{}',0.5,NULL,NULL,'seed',"
+            "'2026-07-11T12:00:00.000000+00:00','2026-07-11T12:00:00.000000+00:00',0,1)"
+        )
+        conn.execute(_OLD_RUNTIME_DDL)
+        conn.execute(
+            "INSERT INTO runtime_state (id, state_json, updated_at, updated_at_epoch, revision) "
+            "VALUES (1, ?, '2026-07-11T12:00:00+00:00', 1752000000, 4)",
+            (json.dumps(State(u=1.5).to_dict()),),
+        )
+
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    assert "updated_at_epoch" not in _columns(tmp_path, "runtime_state")  # rebuilt
+    assert store.load().u == 1.5  # self preserved through the runtime_state rebuild
+    record = store.get("desire", "d1")
+    assert record is not None  # the already-iso memory row was left untouched
+    assert record.created_at == "2026-07-11T12:00:00.000000+00:00"
 
 
 def test_round_trip_from_iso_of_stored_created_at(tmp_path: Path) -> None:
