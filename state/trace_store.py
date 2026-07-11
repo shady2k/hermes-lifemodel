@@ -164,6 +164,16 @@ def _dumps(value: Mapping[str, Any] | None) -> str | None:
         return json.dumps({"_unserializable": True})
 
 
+class _UnnormalizableTimestamp(Exception):
+    """A caller-supplied trace timestamp that cannot be normalized (naive/malformed).
+
+    Raised by :func:`_normalize_ts` at the write boundary so the ``submit_*`` methods
+    can DROP the record fail-*closed* (spec §2/§4) rather than persist an
+    un-normalized string — the read/display side (``timeutil.to_display``) is the
+    only fail-*open* path.
+    """
+
+
 @overload
 def _normalize_ts(value: str) -> str: ...
 @overload
@@ -177,19 +187,19 @@ def _normalize_ts(value: str | None) -> str | None:
     ISO — which is what makes retention's lexical ``MIN(ts)`` / ``< cutoff`` a
     correct chronological compare.
 
-    A tz-*aware* value is re-serialized to canonical UTC. A tz-naive or malformed
-    value is NOT silently coerced to UTC on the write path (the reader's
-    :func:`_parse_ts` stays defensive for *legacy* rows, but a NEW write never
-    relies on that): because this store is disposable and fail-open (§4.2), such a
-    value is kept raw and a WARNING is logged, never dropped and never guessed-UTC.
+    ``None`` passes through (an absent optional stamp). A tz-*aware* value is
+    re-serialized to canonical UTC. A tz-naive or malformed value is FAIL-CLOSED:
+    it is NEVER coerced (naive->UTC would misorder) nor persisted raw — instead
+    :class:`_UnnormalizableTimestamp` is raised so the caller drops the record.
+    The writer's own stamps come from the injected clock (already aware UTC) and
+    always normalize; only a bad caller-supplied value hits this path.
     """
     if value is None:
         return None
     try:
         return to_iso(from_iso(value))
-    except ValueError:
-        _module_logger.warning("trace_ts_not_normalized value=%r; storing raw", value)
-        return value
+    except ValueError as exc:
+        raise _UnnormalizableTimestamp(value) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -446,6 +456,7 @@ class TraceWriter:
         self._lifecycle_lock = threading.Lock()
         self._dropped = 0
         self._write_errors = 0
+        self._unnormalizable_dropped = 0
         self._commits_since_prune = 0
 
     # ---- lifecycle ------------------------------------------------------- #
@@ -483,6 +494,16 @@ class TraceWriter:
         """Records that raised on write and were swallowed (fail-open, §4.2)."""
         return self._write_errors
 
+    @property
+    def unnormalizable_dropped(self) -> int:
+        """Records dropped fail-CLOSED for an un-normalizable timestamp (spec §2/§4).
+
+        A caller-supplied ``ts``/``started_at``/… that is tz-naive or malformed is
+        never persisted raw (that would rot lexical retention/ordering) — the whole
+        record is dropped and counted here. Distinct from :attr:`dropped_count`
+        (queue-full backpressure)."""
+        return self._unnormalizable_dropped
+
     # ---- submit (non-blocking, fail-open) -------------------------------- #
 
     def _submit(self, item: _QueueItem) -> bool:
@@ -492,6 +513,16 @@ class TraceWriter:
         except queue.Full:
             self._dropped += 1
             return False
+
+    def _drop_unnormalizable(self, kind: str, **stamps: str | None) -> bool:
+        """Count + log a record dropped for an un-normalizable timestamp; return False.
+
+        Fail-closed (spec §2/§4) but never raising into the caller — this is a
+        best-effort observability store that must never break a tick."""
+        self._unnormalizable_dropped += 1
+        bad = {name: value for name, value in stamps.items() if value is not None}
+        _module_logger.warning("dropped un-normalizable trace ts kind=%s stamps=%r", kind, bad)
+        return False
 
     def submit_event(
         self,
@@ -504,15 +535,18 @@ class TraceWriter:
         ts: str,
         fields: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Enqueue one ``trace_events`` row. Returns ``False`` (dropped) if full.
+        """Enqueue one ``trace_events`` row. Returns ``False`` if dropped.
 
         ``ts`` is normalized to canonical ISO here at the enqueue boundary (§4
-        codex #9), so the DB only ever holds normalized time.
+        codex #9); an un-normalizable ``ts`` drops the record fail-closed (§2/§4)
+        rather than persist a raw string. Returns ``False`` on a drop or a full queue.
         """
+        try:
+            norm_ts = _normalize_ts(ts)
+        except _UnnormalizableTimestamp:
+            return self._drop_unnormalizable("event", ts=ts)
         return self._submit(
-            _EventWrite(
-                record_id, trace_id, span_id, tick, event, _normalize_ts(ts), _dumps(fields)
-            )
+            _EventWrite(record_id, trace_id, span_id, tick, event, norm_ts, _dumps(fields))
         )
 
     def submit_span(
@@ -528,11 +562,18 @@ class TraceWriter:
         status: str | None = None,
         attrs: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Enqueue one ``trace_spans`` upsert. Returns ``False`` (dropped) if full.
+        """Enqueue one ``trace_spans`` upsert. Returns ``False`` if dropped.
 
         ``started_at``/``ended_at`` are normalized to canonical ISO here at the
-        enqueue boundary (§4 codex #9), so the DB only ever holds normalized time.
+        enqueue boundary (§4 codex #9); if EITHER present stamp is un-normalizable
+        the whole span is dropped fail-closed (§2/§4) — never a half-normalized row.
+        Returns ``False`` on a drop or a full queue.
         """
+        try:
+            norm_started = _normalize_ts(started_at)
+            norm_ended = _normalize_ts(ended_at)
+        except _UnnormalizableTimestamp:
+            return self._drop_unnormalizable("span", started_at=started_at, ended_at=ended_at)
         return self._submit(
             _SpanWrite(
                 trace_id,
@@ -540,8 +581,8 @@ class TraceWriter:
                 parent_span_id,
                 component,
                 tick,
-                _normalize_ts(started_at),
-                _normalize_ts(ended_at),
+                norm_started,
+                norm_ended,
                 status,
                 _dumps(attrs),
             )
@@ -560,16 +601,24 @@ class TraceWriter:
         """Enqueue one ``trace_correlations`` upsert (index only — §4.4).
 
         ``created_at``/``resolved_at`` are normalized to canonical ISO here at the
-        enqueue boundary (§4 codex #9), so the DB only ever holds normalized time.
+        enqueue boundary (§4 codex #9); an un-normalizable stamp drops the record
+        fail-closed (§2/§4). Returns ``False`` on a drop or a full queue.
         """
+        try:
+            norm_created = _normalize_ts(created_at)
+            norm_resolved = _normalize_ts(resolved_at)
+        except _UnnormalizableTimestamp:
+            return self._drop_unnormalizable(
+                "correlation", created_at=created_at, resolved_at=resolved_at
+            )
         return self._submit(
             _CorrelationWrite(
                 correlation_id,
                 origin_trace_id,
                 origin_traceparent,
                 kind,
-                _normalize_ts(created_at),
-                _normalize_ts(resolved_at),
+                norm_created,
+                norm_resolved,
             )
         )
 

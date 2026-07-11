@@ -573,11 +573,11 @@ def test_writer_thread_retention_uses_injected_clock(tmp_path: Path) -> None:
     assert "fresh" in remaining  # 1d before the injected now -> kept
 
 
-def test_submit_does_not_silently_coerce_naive_ts(tmp_path: Path, caplog: object) -> None:
-    # A tz-naive ``ts`` must NEVER be silently coerced to an aware +00:00 form on the
-    # write path (spec §4: normalize at ingress, don't naive->UTC on writes). The
-    # disposable store is fail-open, so the record is kept (raw) + a WARNING logged,
-    # never dropped and never silently coerced.
+def test_submit_event_drops_unnormalizable_ts(tmp_path: Path, caplog: object) -> None:
+    # A WRITE/storage path must be fail-CLOSED (spec §2/§4): an un-normalizable
+    # ``ts`` (tz-naive or garbage) must NEVER be persisted raw — the whole record
+    # is DROPPED (submit -> False), counted, and logged, never a naive->UTC guess
+    # and never a raw string in the column (else lexical retention/ordering rots).
     import pytest  # local: keep the module's top imports minimal
 
     assert isinstance(caplog, pytest.LogCaptureFixture)
@@ -586,18 +586,88 @@ def test_submit_does_not_silently_coerce_naive_ts(tmp_path: Path, caplog: object
     writer.start()
     try:
         with caplog.at_level(logging.WARNING, logger="lifemodel.trace_store"):
-            assert writer.submit_event(
+            assert not writer.submit_event(  # naive — no offset -> dropped
                 record_id=next_record_id(),
-                trace_id="t",
+                trace_id="t-naive",
                 span_id="s",
                 tick=1,
                 event="e",
-                ts="2026-07-09T12:00:00",  # naive — no offset
+                ts="2026-07-09T12:00:00",
+            )
+            assert not writer.submit_event(  # garbage -> dropped
+                record_id=next_record_id(),
+                trace_id="t-garbage",
+                span_id="s",
+                tick=2,
+                event="e",
+                ts="not-a-timestamp",
             )
         assert writer.flush(timeout=5.0)
-        (stored,) = _read(path, "SELECT ts FROM trace_events WHERE trace_id='t'")[0]
-        assert stored == "2026-07-09T12:00:00"  # kept raw, NOT coerced to +00:00
-        assert not _CANONICAL_ISO_RE.match(str(stored))
-        assert any("trace_ts_not_normalized" in r.getMessage() for r in caplog.records)
+        # Nothing un-normalizable ever reached the table.
+        assert _read(path, "SELECT COUNT(*) FROM trace_events WHERE trace_id='t-naive'")[0][0] == 0
+        assert (
+            _read(path, "SELECT COUNT(*) FROM trace_events WHERE trace_id='t-garbage'")[0][0] == 0
+        )
+        # No row in the WHOLE table carries a non-normalized ts.
+        for (ts_value,) in _read(path, "SELECT ts FROM trace_events"):
+            assert _CANONICAL_ISO_RE.match(str(ts_value))
+        assert writer.unnormalizable_dropped == 2
+        assert any("un-normalizable trace ts" in r.getMessage() for r in caplog.records)
+    finally:
+        writer.stop()
+
+
+def test_submit_span_drops_unnormalizable_started_or_ended(tmp_path: Path) -> None:
+    # A span with a bad started_at OR a bad ended_at is dropped wholesale — never a
+    # half-normalized row (fail-closed). A None optional stamp is fine (absent, not bad).
+    path = _db(tmp_path)
+    writer = TraceWriter(path, batch_size=1)
+    writer.start()
+    try:
+        assert not writer.submit_span(  # naive started_at -> dropped
+            trace_id="s-bad-start",
+            span_id="a",
+            started_at="2026-07-09T12:00:00",
+            ended_at=_UNNORMALIZED_PLUS3,
+        )
+        assert not writer.submit_span(  # valid started, garbage ended -> dropped
+            trace_id="s-bad-end",
+            span_id="b",
+            started_at=_UNNORMALIZED_PLUS3,
+            ended_at="garbage",
+        )
+        assert writer.submit_span(  # both None -> fine, stored
+            trace_id="s-ok",
+            span_id="c",
+            started_at=None,
+            ended_at=None,
+        )
+        assert writer.flush(timeout=5.0)
+        remaining = {r[0] for r in _read(path, "SELECT DISTINCT trace_id FROM trace_spans")}
+        assert remaining == {"s-ok"}  # only the clean span landed
+        assert writer.unnormalizable_dropped == 2
+    finally:
+        writer.stop()
+
+
+def test_submit_correlation_drops_unnormalizable_created_or_resolved(tmp_path: Path) -> None:
+    path = _db(tmp_path)
+    writer = TraceWriter(path, batch_size=1)
+    writer.start()
+    try:
+        assert not writer.submit_correlation(  # naive created_at -> dropped
+            correlation_id="c-bad-created",
+            origin_trace_id="t",
+            created_at="2026-07-09T12:00:00",
+        )
+        assert not writer.submit_correlation(  # garbage resolved_at -> dropped
+            correlation_id="c-bad-resolved",
+            origin_trace_id="t",
+            created_at=_UNNORMALIZED_PLUS3,
+            resolved_at="nonsense",
+        )
+        assert writer.flush(timeout=5.0)
+        assert _read(path, "SELECT COUNT(*) FROM trace_correlations")[0][0] == 0
+        assert writer.unnormalizable_dropped == 2
     finally:
         writer.stop()
