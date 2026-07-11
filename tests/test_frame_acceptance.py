@@ -11,6 +11,7 @@ Scenario (6) (external-event idempotency ring) is owned by SLICE 3 (lm-fib.8.5).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +66,62 @@ def test_scenario_1_inbound_contact_satiates_and_resolves_desire(tmp_path: Path)
     assert final.last_exchange_at is not None  # exchange record stamped
     assert read_live_contact_desire(lm.state) is None  # the live desire resolved...
     assert lm.state.get("desire", "contact:owner").state == "satisfied"  # ...to SATISFIED
+
+
+# --- (1b) a real inbound while a proactive turn is IN FLIGHT clears pending ---
+# Regression (contact-dominates-proactive, spec §7.3): when a genuine contact
+# dominates a same-frame/in-flight proactive attempt it must clear the pending-
+# proactive anchor in lockstep with terminalizing the desire. Otherwise a stranded
+# pending_proactive_id deadlocks proactive cognition forever — the ASYNC_COMPLETION
+# frame that would clear it never runs (the desire is already gone), and the
+# launcher HOLDs every future launch while pending is set.
+
+
+def test_inbound_while_proactive_in_flight_clears_pending_and_unblocks_cognition(
+    tmp_path: Path,
+) -> None:
+    lm = _build(tmp_path)
+    # A proactive turn is IN FLIGHT (pending set) with a live ACTIVE desire and a
+    # high drive, when a real reply lands the very same moment.
+    lm.state.commit(
+        State(
+            u=3.0,
+            pending_proactive_id="p-inflight",
+            pending_proactive_since="2026-07-06T11:55:00+00:00",
+            pending_proactive_origin_traceparent=_ORIGIN_TP,
+            last_tick_at=_NOW.isoformat(),
+        )
+    )
+    _seed_active_desire(lm)
+
+    run_frame(
+        lm.coreloop,
+        [contact_observed_signal(origin_id="m-1", actor="user", label="two_way", timestamp=None)],
+        trigger=FrameTrigger.EVENT,
+    )
+
+    after = lm.state.load()
+    # (a) the pending-proactive attempt is cleared in lockstep — no stranded anchor.
+    assert after.pending_proactive_id is None
+    assert after.pending_proactive_since is None
+    assert after.pending_proactive_origin_traceparent is None
+    # (b) the live desire terminalized to SATISFIED (the reply resolved the pull)...
+    assert lm.state.get("desire", "contact:owner").state == "satisfied"
+    # (c) ...and the exchange record was stamped this frame.
+    assert after.last_exchange_at == _NOW.isoformat()
+
+    # A subsequent over-threshold tick is NOT gated: pending is clear, so cognition
+    # can launch again. (On the buggy code pending stays "p-inflight" and the
+    # launcher HOLDs forever — proactive cognition deadlocked.)
+    lm.state.commit(replace(after, u=3.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"))
+    _seed_active_desire(lm)  # a fresh live desire to reach for
+    egress = RecordingEgress(ReachOutcome.DELIVERED)
+
+    outcome = proactive_tick(lm, egress, _TARGET)
+
+    assert outcome is ReachOutcome.DELIVERED  # cognition launched again — not gated
+    assert len(egress.calls) == 1
+    assert lm.state.load().pending_proactive_id is not None  # a NEW turn is in flight
 
 
 # --- (2) a /... control command is NOT contact (sensor band-pass) ------------

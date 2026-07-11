@@ -203,6 +203,17 @@ class ContactAggregation:
             decline_count = 0
             action_pending_since = None
             unanswered_outbound_count = 0  # a genuine reply resets the longing bid
+            # Contact DOMINATES a same-frame/in-flight proactive attempt (spec §7.3):
+            # clear the pending-proactive anchor in LOCKSTEP with terminalizing the
+            # desire. Leaving it set would strand pending_proactive_id — the desire is
+            # gone, so the eventual LLM-turn completion's ASYNC_COMPLETION frame no
+            # longer runs (hooks returns early on the missing desire) and the launcher
+            # HOLDs every future launch forever (cognition deadlocked). Clearing it
+            # also makes that stale completion a clean no-op (the crossed outreach is
+            # ignored — the accepted stale-outreach semantics).
+            pending_id = None
+            pending_since = None
+            pending_origin = None
             if desire_state in (DesireState.ACTIVE, DesireState.DEFERRED):
                 transition_to = DesireState.SATISFIED  # exchange terminalizes the live desire
             desire_state = _NONE
