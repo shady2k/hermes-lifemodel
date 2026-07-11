@@ -66,9 +66,12 @@ def render_brain_liveness(
     # an in-memory boot_failed wins; else a durable boot_failed record upgrades a
     # never_started / unknown read (a fresh process after a re-raise+restart); else the
     # in-memory state; else unknown (the health read itself failed).
-    record_is_boot_failed = boot_record is not None and str(boot_record.get("state")) == _BOOT_FAILED
+    record_is_boot_failed = (
+        boot_record is not None and str(boot_record.get("state")) == _BOOT_FAILED
+    )
 
     boot_error: str | None = None
+    displayed: str  # a BrainState OR "unknown" (a failed health read) — widened to str
     if snapshot is not None and snapshot.state == _BOOT_FAILED:
         displayed = _BOOT_FAILED
         boot_error = snapshot.boot_error

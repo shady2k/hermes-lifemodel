@@ -28,6 +28,7 @@ from .hooks import make_inbound_observer, make_post_llm_observer
 from .log import apply_log_level, parse_log_level
 from .paths import state_dir
 from .state.brain_health import get_brain_health
+from .state.brain_liveness import brain_liveness_lines
 from .state.trace_store import acquire_trace_writer, observability_db_path
 from .state.wiring import wire
 from .state_commands import (
@@ -66,7 +67,7 @@ class _Subcommand(NamedTuple):
 # text, and args_hint are all derived from this dict, so adding a subcommand
 # means editing here — nowhere else.
 _SUBCOMMANDS: dict[str, _Subcommand] = {
-    "status": _Subcommand("Show the one-line plugin status (default)."),
+    "status": _Subcommand("Show brain liveness + the one-line plugin status (default)."),
     "debug": _Subcommand("Read-only state/event dump for owner introspection."),
     "why": _Subcommand(
         "why [desire|intention|write|<kind>:<id>] — trace the causal chain behind a "
@@ -137,6 +138,18 @@ def _status_line(profile: str, sdir: Path) -> str:
     return f"lifemodel {__version__} alive · profile={profile} · state_dir={sdir}"
 
 
+def _status_view(profile: str, sdir: Path) -> str:
+    """The full ``/lifemodel status`` view (spec §4.4): the one-line 'alive' summary
+    plus the owner-facing **brain-liveness block** — so liveness is readable in the
+    surface the owner already uses, without grepping logs.
+
+    :func:`~lifemodel.state.brain_liveness.brain_liveness_lines` is fail-soft by
+    construction (a flaky health read → a clear ``unknown`` line, a locked state read →
+    ``ticks_total: ?``, both logged), so this composition never raises."""
+    lines = [_status_line(profile, sdir), "", *brain_liveness_lines(sdir)]
+    return "\n".join(lines) + "\n"
+
+
 def _command_list() -> str:
     """Render every registered subcommand with its one-line description.
 
@@ -203,6 +216,7 @@ def register(ctx: Any) -> None:
         # tick — see lifemodel.state_commands for the gate-satisfaction
         # rationale; "debug"/"why" are read-only introspection (NFR9, HLA §9).
         dispatch: dict[str, Callable[[], str]] = {
+            "status": lambda: _status_view(profile, sdir),
             "debug": lambda: render_dump_for_dir(sdir),
             "why": lambda: why_for_dir(sdir, rest),
             "trace": lambda: trace_for_dir(sdir, rest),
@@ -233,13 +247,13 @@ def register(ctx: Any) -> None:
                 )
                 return f"lifemodel: command failed — {exc}\n"
 
-        status = _status_line(profile, sdir)
         if sub == "":
-            # Bare invocation: keep the status line, then surface the full
-            # subcommand list (discoverability — no separate `help` round trip
-            # needed just to learn what's available).
-            return f"{status}\n\n{_command_list()}\n"
-        return status
+            # Bare invocation: the full status view (one-line summary + brain-liveness
+            # block), then the full subcommand list (discoverability — no separate
+            # `help` round trip needed just to learn what's available).
+            return f"{_status_view(profile, sdir)}\n{_command_list()}\n"
+        # Any unrecognized subcommand: the compact one-line summary (unchanged).
+        return _status_line(profile, sdir)
 
     # The shared per-base_dir liveness backbone (spec §4.2) + metric registry, both
     # resolved before any wiring so every ``wire`` boundary below writes to the SAME

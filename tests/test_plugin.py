@@ -394,6 +394,86 @@ def test_register_lifemodel_command_catches_handler_exception_and_returns_error_
     assert "schema_version=99" in failures[0]
 
 
+# --- brain-liveness block on /lifemodel status (spec §4.4, lm-fib.9.3) -------
+
+
+def test_status_subcommand_shows_the_brain_liveness_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    out = handler("status")
+    # The one-line summary is kept AND the brain-liveness section is added.
+    assert "alive" in out
+    assert "brain liveness" in out
+    assert "**state:**" in out
+    assert "**ticks_total:**" in out
+    # A never-connected being reads never_started, 0 ticks — not a crash, not silence.
+    assert "never_started" in out
+
+
+def test_bare_command_shows_the_brain_liveness_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    bare = handler("")
+    # Bare `/lifemodel` keeps the status line, the liveness block, AND the command list.
+    assert "alive" in bare
+    assert "brain liveness" in bare
+    assert "**status**" in bare  # the command list is still surfaced
+
+
+def test_status_surfaces_a_simulated_loop_death(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lifemodel.state.brain_health import get_brain_health
+
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    sdir = tmp_path / "workspace" / "lifemodel"
+    health = get_brain_health(sdir)
+    health.mark_connected()
+    health.record_loop_death("proactive loop died: RuntimeError('boom')", "tb")
+
+    out = handler("status")
+    assert "loop_dead" in out
+    assert "boom" in out
+    assert "death_count:** 1" in out
+
+
+def test_status_surfaces_a_durable_boot_failure_in_a_fresh_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # register() succeeded here (mark_boot_ok wiped any record), so the in-memory
+    # singleton is never_started. Simulate a PRIOR process that boot-failed and left
+    # brain_boot.json behind: the command must still surface WHY from the durable record.
+    from lifemodel.state.brain_health import BrainHealth
+
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    sdir = tmp_path / "workspace" / "lifemodel"
+    BrainHealth(sdir).mark_boot_failed(
+        "register_being_platform: ModuleNotFoundError: No module named 'lifemodel'"
+    )
+
+    out = handler("status")
+    assert "boot_failed" in out
+    assert "ModuleNotFoundError" in out
+
+
 def test_register_lifemodel_command_success_path_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

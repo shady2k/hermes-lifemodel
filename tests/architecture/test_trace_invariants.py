@@ -41,7 +41,9 @@ _EXCLUDE_PARTS = {"tests", "testing", "__pycache__", "docs", ".git", ".beads", "
 #: (spec §4.5 allowlist): the log surface itself, lifecycle/registration, the
 #: reach-in boundary, the being platform, the disposable-store infra, the
 #: fail-loud wiring backbone (spec §4.3 — ``wire``/``BrainHealth`` log at wiring
-#: boundaries with NO ambient span), the afferent hook boundary (a frame-machinery
+#: boundaries with NO ambient span), the brain-liveness status renderer (spec §4.4 —
+#: logs a fail-soft WARNING on a degraded health/state read at the ``/lifemodel status``
+#: boundary, again with no ambient span), the afferent hook boundary (a frame-machinery
 #: failure is observed before any span exists, spec §4.3/MAJOR-4), and the adapters
 #: that have no ambient span. Everything else — every ``core/`` tick component above
 #: all — must log ONLY through a ``SpanBoundLogger``.
@@ -57,6 +59,7 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "state/trace_store.py",
         "state/metrics_store.py",
         "state/brain_health.py",
+        "state/brain_liveness.py",
         "state/wiring.py",
     }
 )

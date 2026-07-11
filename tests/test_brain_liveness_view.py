@@ -20,7 +20,6 @@ from pathlib import Path
 import pytest
 
 from lifemodel.state.brain_health import (
-    STALE_AFTER_SECONDS,
     BrainHealth,
     BrainHealthSnapshot,
     get_brain_health,
