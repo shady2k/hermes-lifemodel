@@ -133,10 +133,20 @@ class State:
     #: outreach; reset to zero by a genuine exchange. Defaults to zero
     #: (additive).
     unanswered_outbound_count: int = 0
-    # NB: the nervous flow is ephemeral (spec §2/§3) — there is no durable signal bus
-    # and no bus-level dedup. A signal lives inside one ExecutionFrame and is gone;
-    # idempotency of external events (Telegram/Hermes retries) is a later slice's
-    # ``processed_external_event_ids`` ring, not a bus cursor.
+    #: The external-event idempotency ring (spec §8 / lm-fib.8.5): a bounded,
+    #: TTL'd map of external event id → ISO-8601 UTC stamp of when it was first
+    #: processed, ordered oldest-first (Python dict insertion order). This is
+    #: **not** a bus cursor and **not** bus-dedup (the nervous flow is ephemeral,
+    #: spec §2/§3 — a signal lives inside one ExecutionFrame and is gone). It is
+    #: the BODY remembering "I already processed this external event id", so a
+    #: Telegram/Hermes retry of the SAME inbound cannot satiate ``u`` twice, reset
+    #: ``last_exchange_at`` again, or re-resolve the desire. The intake path
+    #: (:mod:`lifemodel.core.idempotency`, called from ``core/coreloop.py``) checks
+    #: it before seeding a frame, dropping a duplicate ``contact_observed`` and
+    #: recording each fresh id (evicting oldest / TTL-expired to stay bounded).
+    #: Durable in ``runtime_state`` (survives a restart, unlike the bus); a
+    #: factory-reset simply starts it empty. Defaults to empty (additive).
+    processed_external_event_ids: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -213,6 +223,9 @@ class State:
             unanswered_outbound_count=_as_int(
                 data.get("unanswered_outbound_count", 0), "unanswered_outbound_count"
             ),
+            processed_external_event_ids=_as_str_str_dict(
+                data, "processed_external_event_ids", {}
+            ),
         )
 
 
@@ -249,6 +262,20 @@ def _as_str_list(data: Mapping[str, Any], key: str, default: list[str]) -> list[
     if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
         raise StateCorruptError(f"'{key}' must be a list[str]")
     return list(value)
+
+
+def _as_str_str_dict(data: Mapping[str, Any], key: str, default: dict[str, str]) -> dict[str, str]:
+    # The idempotency ring is a JSON object of id → ISO stamp, both strings; a
+    # missing key is the additive default (empty). Insertion order is preserved by
+    # ``dict`` (and by json round-trip), so callers can treat it as oldest-first.
+    if key not in data:
+        return dict(default)
+    value = data[key]
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise StateCorruptError(f"'{key}' must be a dict[str, str]")
+    return dict(value)
 
 
 def _as_opt_iso(value: object, field_name: str) -> str | None:

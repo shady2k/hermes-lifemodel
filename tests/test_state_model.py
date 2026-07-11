@@ -24,8 +24,10 @@ def test_defaults_are_documented_and_current_schema() -> None:
 def test_no_processed_signal_ids_field() -> None:
     # The nervous flow is ephemeral (spec §2/§3): there is no durable bus and no
     # bus-level signal dedup, so State carries no ``processed_signal_ids`` field —
-    # nothing surfaces it as an always-zero (misleading) dedup metric. (External-event
-    # idempotency is a later slice's ``processed_external_event_ids`` ring, not this.)
+    # nothing surfaces it as an always-zero (misleading) dedup metric. External-event
+    # idempotency lives in a SEPARATE, real field (``processed_external_event_ids``,
+    # lm-fib.8.5) — the body remembering "I processed this external event id", NOT a
+    # bus cursor — so the retired bus-dedup name must never reappear.
     assert not hasattr(State(), "processed_signal_ids")
     assert "processed_signal_ids" not in State().to_dict()
 
@@ -261,3 +263,26 @@ def test_silence_anchor_at_defaults_none_and_roundtrips() -> None:
     assert State.from_dict({}).silence_anchor_at is None
     s = State(silence_anchor_at="2026-07-06T11:40:00+00:00")
     assert State.from_dict(s.to_dict()).silence_anchor_at == "2026-07-06T11:40:00+00:00"
+
+
+def test_processed_external_event_ids_defaults_empty_and_roundtrips() -> None:
+    # lm-fib.8.5: the external-event idempotency ring — id → recorded-at ISO stamp,
+    # oldest-first. Additive (missing key → empty, so older runtime_state files load
+    # clean, no schema bump) and round-trips through the JSON blob.
+    assert State().processed_external_event_ids == {}
+    assert State.from_dict({}).processed_external_event_ids == {}  # additive
+    ring = {"m-1": "2026-07-06T12:00:00+00:00", "m-2": "2026-07-06T12:01:00+00:00"}
+    s = State(processed_external_event_ids=ring)
+    assert State.from_dict(s.to_dict()).processed_external_event_ids == ring
+
+
+def test_processed_external_event_ids_rejects_non_dict() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"processed_external_event_ids": ["m-1"]})
+
+
+def test_processed_external_event_ids_rejects_non_string_values() -> None:
+    # The ring is id (str) → recorded-at ISO stamp (str); a non-string stamp (or key)
+    # is corruption caught loud at load, not a mid-frame surprise.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"processed_external_event_ids": {"m-1": 123}})
