@@ -63,19 +63,22 @@ def render_brain_liveness(
     read to ``boot_failed`` (the fresh-process case).
     """
     # Displayed state + boot_error, with the durable boot record's precedence rules:
-    # an in-memory boot_failed wins; else a durable boot_failed record upgrades a
-    # never_started / unknown read (a fresh process after a re-raise+restart); else the
-    # in-memory state; else unknown (the health read itself failed).
+    # an in-memory boot_failed wins; else a durable boot_failed record upgrades ONLY a
+    # fresh-process read (snapshot None, or the singleton still ``never_started`` after a
+    # re-raise+restart) — a LIVE snapshot (connected / connecting / loop_dead) MUST win,
+    # so a STALE brain_boot.json cannot mislabel a running brain as boot_failed (codex
+    # MAJOR); else the in-memory state; else unknown (the health read itself failed).
     record_is_boot_failed = (
         boot_record is not None and str(boot_record.get("state")) == _BOOT_FAILED
     )
+    snapshot_is_fresh = snapshot is None or snapshot.state == "never_started"
 
     boot_error: str | None = None
     displayed: str  # a BrainState OR "unknown" (a failed health read) — widened to str
     if snapshot is not None and snapshot.state == _BOOT_FAILED:
         displayed = _BOOT_FAILED
         boot_error = snapshot.boot_error
-    elif record_is_boot_failed:
+    elif record_is_boot_failed and snapshot_is_fresh:
         displayed = _BOOT_FAILED
         boot_error = boot_record.get("boot_error") if boot_record is not None else None
     elif snapshot is not None:

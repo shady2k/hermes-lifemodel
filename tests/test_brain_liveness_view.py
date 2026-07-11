@@ -148,6 +148,58 @@ def test_in_memory_boot_failed_takes_precedence_over_a_record() -> None:
     assert "nope" in text
 
 
+def test_live_connected_snapshot_wins_over_a_stale_boot_record() -> None:
+    # codex MAJOR: a stale brain_boot.json from a PRIOR failed deploy must NOT make a
+    # live, freshly-ticking connected brain render as boot_failed. The durable record
+    # is only for the fresh-process (never_started / None) case.
+    lines = render_brain_liveness(
+        _snap("connected", connected_at=_iso(_NOW - timedelta(seconds=20))),
+        last_tick_at=_iso(_NOW - timedelta(seconds=20)),
+        ticks_total=500,
+        boot_record={"state": "boot_failed", "boot_error": "an OLD reason from a prior process"},
+        now=_NOW,
+    )
+    text = _text(lines)
+    assert "connected" in text
+    assert "loop_alive:** yes" in text
+    assert "boot_failed" not in text
+    assert "OLD reason" not in text
+
+
+def test_live_loop_dead_snapshot_wins_over_a_stale_boot_record() -> None:
+    # A live loop_dead is the current truth — a stale durable boot record must not
+    # overwrite it with boot_failed.
+    lines = render_brain_liveness(
+        _snap(
+            "loop_dead",
+            last_loop_death="proactive loop died: RuntimeError('boom')",
+            death_count=1,
+            connected_at=_iso(_NOW - timedelta(minutes=2)),
+        ),
+        last_tick_at=_iso(_NOW - timedelta(minutes=2)),
+        ticks_total=100,
+        boot_record={"state": "boot_failed", "boot_error": "an OLD reason"},
+        now=_NOW,
+    )
+    text = _text(lines)
+    assert "loop_dead" in text
+    assert "boot_failed" not in text
+    assert "OLD reason" not in text
+
+
+def test_live_connecting_snapshot_wins_over_a_stale_boot_record() -> None:
+    lines = render_brain_liveness(
+        _snap("connecting"),
+        last_tick_at=None,
+        ticks_total=0,
+        boot_record={"state": "boot_failed", "boot_error": "an OLD reason"},
+        now=_NOW,
+    )
+    text = _text(lines)
+    assert "connecting" in text
+    assert "boot_failed" not in text
+
+
 def test_observer_errors_are_shown() -> None:
     lines = render_brain_liveness(
         _snap(
