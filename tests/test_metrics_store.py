@@ -20,11 +20,13 @@ Stdlib only; every test uses ``tmp_path`` and closes/stops what it opens.
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from lifemodel.core.metrics import MetricRegistry, MetricSpec
+from lifemodel.core.timeutil import to_iso
 from lifemodel.state.metrics_store import (
     SCHEMA_VERSION,
     MetricsRetentionPolicy,
@@ -38,8 +40,22 @@ from lifemodel.state.metrics_store import (
     read_samples,
     release_metrics_sampler,
 )
+from lifemodel.testing.fakes import FakeClock
 
 _RUN = "run-test-0001"
+#: Time is now ISO-8601 UTC TEXT (spec §4). A fixed aware-UTC anchor lets each test
+#: name an instant by "seconds since anchor" and keep the old integer spacing (1s/60s
+#: gaps, boundary rows) so the ordering/retention intent is unchanged.
+_ANCHOR = datetime(2026, 7, 11, 0, 0, 0, tzinfo=UTC)
+
+
+def _dt(offset_seconds: float) -> datetime:
+    return _ANCHOR + timedelta(seconds=offset_seconds)
+
+
+def _ts(offset_seconds: float) -> str:
+    """The canonical ISO ``ts`` for ``anchor + offset_seconds``."""
+    return to_iso(_dt(offset_seconds))
 
 
 def _sampler(registry: MetricRegistry, tmp_path: Path, **kwargs: object) -> MetricsSampler:
@@ -53,7 +69,7 @@ def _read(path: Path, sql: str, params: tuple[object, ...] = ()) -> list[tuple[o
         return conn.execute(sql, params).fetchall()
 
 
-def _seed_sample(conn: sqlite3.Connection, ts: int, value: float) -> None:
+def _seed_sample(conn: sqlite3.Connection, ts: str, value: float) -> None:
     conn.execute(
         "INSERT INTO metric_samples (ts, run_id, name, label_key, value, labels_json) "
         "VALUES (?, ?, 'g', '', ?, NULL)",
@@ -112,7 +128,7 @@ def test_sample_writes_counter_and_gauge_rows_with_run_id(tmp_path: Path) -> Non
 
     sampler = _sampler(reg, tmp_path)
     try:
-        sampler.sample_once(ts=1000)
+        sampler.sample_once(now=_dt(1000))
     finally:
         sampler.close()
 
@@ -120,7 +136,7 @@ def test_sample_writes_counter_and_gauge_rows_with_run_id(tmp_path: Path) -> Non
     run = by[("lifemodel_runs_total", "component=neuron")]
     assert run.value == 3.0
     assert run.run_id == _RUN
-    assert run.ts == 1000
+    assert run.ts == _ts(1000)
     assert run.labels == {"component": "neuron"}
     assert by[("lifemodel_drive_u", "")].value == 0.5
 
@@ -138,7 +154,7 @@ def test_only_exported_metrics_are_sampled_but_all_defs_recorded(tmp_path: Path)
 
     sampler = _sampler(reg, tmp_path)
     try:
-        sampler.sample_once(ts=1000)
+        sampler.sample_once(now=_dt(1000))
     finally:
         sampler.close()
 
@@ -164,12 +180,12 @@ def test_unchanged_value_is_not_re_sampled(tmp_path: Path) -> None:
     reg.gauge("g").set(1.0)
     sampler = _sampler(reg, tmp_path, heartbeat_every=10_000)
     try:
-        sampler.sample_once(ts=1000)
-        sampler.sample_once(ts=1001)  # value unchanged, no heartbeat → skipped
+        sampler.sample_once(now=_dt(1000))
+        sampler.sample_once(now=_dt(1001))  # value unchanged, no heartbeat → skipped
     finally:
         sampler.close()
     rows = read_samples(metrics_db_path(tmp_path), name="g")
-    assert [r.ts for r in rows] == [1000]
+    assert [r.ts for r in rows] == [_ts(1000)]
 
 
 def test_changed_value_writes_a_new_row(tmp_path: Path) -> None:
@@ -178,13 +194,13 @@ def test_changed_value_writes_a_new_row(tmp_path: Path) -> None:
     gauge.set(1.0)
     sampler = _sampler(reg, tmp_path, heartbeat_every=10_000)
     try:
-        sampler.sample_once(ts=1000)
+        sampler.sample_once(now=_dt(1000))
         gauge.set(2.0)
-        sampler.sample_once(ts=1001)
+        sampler.sample_once(now=_dt(1001))
     finally:
         sampler.close()
     rows = sorted(read_samples(metrics_db_path(tmp_path), name="g"), key=lambda s: s.ts)
-    assert [(r.ts, r.value) for r in rows] == [(1000, 1.0), (1001, 2.0)]
+    assert [(r.ts, r.value) for r in rows] == [(_ts(1000), 1.0), (_ts(1001), 2.0)]
 
 
 def test_heartbeat_forces_write_every_m_cycles(tmp_path: Path) -> None:
@@ -192,12 +208,13 @@ def test_heartbeat_forces_write_every_m_cycles(tmp_path: Path) -> None:
     reg.gauge("g").set(1.0)
     sampler = _sampler(reg, tmp_path, heartbeat_every=2)
     try:
-        for ts in (1000, 1001, 1002):  # cycle 0 (force), 1 (skip), 2 (force)
-            sampler.sample_once(ts=ts)
+        for secs in (1000, 1001, 1002):  # cycle 0 (force), 1 (skip), 2 (force)
+            sampler.sample_once(now=_dt(secs))
     finally:
         sampler.close()
     rows = sorted(read_samples(metrics_db_path(tmp_path), name="g"), key=lambda s: s.ts)
-    assert [r.ts for r in rows] == [1000, 1002]  # 1001 skipped, 1002 re-written by heartbeat
+    # 1001 skipped, 1002 re-written by heartbeat.
+    assert [r.ts for r in rows] == [_ts(1000), _ts(1002)]
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +231,7 @@ def test_histogram_decomposes_into_bucket_count_sum(tmp_path: Path) -> None:
 
     sampler = _sampler(reg, tmp_path)
     try:
-        sampler.sample_once(ts=1000)
+        sampler.sample_once(now=_dt(1000))
     finally:
         sampler.close()
 
@@ -234,16 +251,16 @@ def test_histogram_decomposes_into_bucket_count_sum(tmp_path: Path) -> None:
 def test_prune_by_age_cuts_at_the_boundary(tmp_path: Path) -> None:
     conn = connect(metrics_db_path(tmp_path))
     try:
-        for ts in (898, 899, 900, 901):
-            _seed_sample(conn, ts, float(ts))
+        for secs in (898, 899, 900, 901):
+            _seed_sample(conn, _ts(secs), float(secs))
         conn.commit()
         deleted = prune_metric_samples(
             conn,
             policy=MetricsRetentionPolicy(max_age_seconds=100, max_rows=None, max_bytes=None),
-            now_ts=1000,  # cutoff = 900; ts < 900 pruned, ts >= 900 kept
+            now_iso=_ts(1000),  # cutoff = anchor+900; ts < that pruned, the boundary kept
         )
-        remaining = sorted(int(r[0]) for r in conn.execute("SELECT ts FROM metric_samples"))
-        assert remaining == [900, 901]
+        remaining = sorted(r[0] for r in conn.execute("SELECT ts FROM metric_samples"))
+        assert remaining == [_ts(900), _ts(901)]
         assert deleted == 2
     finally:
         conn.close()
@@ -252,16 +269,16 @@ def test_prune_by_age_cuts_at_the_boundary(tmp_path: Path) -> None:
 def test_prune_by_max_rows_keeps_newest(tmp_path: Path) -> None:
     conn = connect(metrics_db_path(tmp_path))
     try:
-        for ts in range(1, 6):
-            _seed_sample(conn, ts, float(ts))
+        for secs in range(1, 6):
+            _seed_sample(conn, _ts(secs), float(secs))
         conn.commit()
         prune_metric_samples(
             conn,
             policy=MetricsRetentionPolicy(max_age_seconds=None, max_rows=2, max_bytes=None),
-            now_ts=1000,
+            now_iso=_ts(1000),
         )
-        remaining = sorted(int(r[0]) for r in conn.execute("SELECT ts FROM metric_samples"))
-        assert remaining == [4, 5]  # only the two newest survive
+        remaining = sorted(r[0] for r in conn.execute("SELECT ts FROM metric_samples"))
+        assert remaining == [_ts(4), _ts(5)]  # only the two newest survive
     finally:
         conn.close()
 
@@ -271,21 +288,21 @@ def test_prune_by_max_rows_drops_whole_ts_snapshots(tmp_path: Path) -> None:
     # never leave a ts with only some of its rows (design §4.4: retention целыми).
     conn = connect(metrics_db_path(tmp_path))
     try:
-        for ts in (1, 2, 3):
-            _seed_sample(conn, ts, float(ts))
-            _seed_sample(conn, ts, float(ts) + 0.5)
+        for secs in (1, 2, 3):
+            _seed_sample(conn, _ts(secs), float(secs))
+            _seed_sample(conn, _ts(secs), float(secs) + 0.5)
         conn.commit()
         prune_metric_samples(
             conn,
             policy=MetricsRetentionPolicy(max_age_seconds=None, max_rows=3, max_bytes=None),
-            now_ts=1000,
+            now_iso=_ts(1000),
         )
         rows_per_ts = {
-            int(ts): int(n)
+            ts: int(n)
             for ts, n in conn.execute("SELECT ts, COUNT(*) FROM metric_samples GROUP BY ts")
         }
         # 6 rows > 3: drop whole ts=1 (→4), still >3: drop whole ts=2 (→2) ≤3 stop.
-        assert rows_per_ts == {3: 2}  # only the newest snapshot, intact — never split
+        assert rows_per_ts == {_ts(3): 2}  # only the newest snapshot, intact — never split
     finally:
         conn.close()
 
@@ -296,8 +313,9 @@ def test_read_samples_latest_run_and_limit(tmp_path: Path) -> None:
     try:
         conn.execute(
             "INSERT INTO metric_samples (ts, run_id, name, label_key, value, labels_json) "
-            "VALUES (10,'OLD','g','',1.0,NULL),(1000,'NEW','g','',2.0,NULL),"
-            "(1060,'NEW','g','',3.0,NULL)"
+            "VALUES (?,'OLD','g','',1.0,NULL),(?,'NEW','g','',2.0,NULL),"
+            "(?,'NEW','g','',3.0,NULL)",
+            (_ts(10), _ts(1000), _ts(1060)),
         )
         conn.commit()
     finally:
@@ -305,7 +323,7 @@ def test_read_samples_latest_run_and_limit(tmp_path: Path) -> None:
     # latest_run excludes the OLD run entirely (rates are per-run anyway).
     assert {s.run_id for s in read_samples(path, latest_run=True)} == {"NEW"}
     # limit bounds the read to the most-recent rows, presented oldest-first.
-    assert [s.ts for s in read_samples(path, limit=2)] == [1000, 1060]
+    assert [s.ts for s in read_samples(path, limit=2)] == [_ts(1000), _ts(1060)]
 
 
 # --------------------------------------------------------------------------- #
@@ -320,7 +338,9 @@ def test_process_run_id_is_stable(tmp_path: Path) -> None:
 def test_acquire_is_singleton_per_path_and_refcounted(tmp_path: Path) -> None:
     reg = MetricRegistry()
     reg.gauge("g").set(1.0)
-    s1 = acquire_metrics_sampler(reg, tmp_path, interval_seconds=0.01, run_id=_RUN)
+    s1 = acquire_metrics_sampler(
+        reg, tmp_path, interval_seconds=0.01, run_id=_RUN, clock=FakeClock(_dt(0))
+    )
     try:
         s2 = acquire_metrics_sampler(reg, tmp_path)
         assert s1 is s2  # same instance for the same path
@@ -334,7 +354,9 @@ def test_acquire_is_singleton_per_path_and_refcounted(tmp_path: Path) -> None:
 def test_daemon_thread_samples_and_writes_rows(tmp_path: Path) -> None:
     reg = MetricRegistry()
     reg.gauge("g").set(7.0)
-    sampler = MetricsSampler(reg, metrics_db_path(tmp_path), interval_seconds=0.01, run_id=_RUN)
+    sampler = MetricsSampler(
+        reg, metrics_db_path(tmp_path), interval_seconds=0.01, run_id=_RUN, clock=FakeClock(_dt(0))
+    )
     sampler.start()
     try:
         assert sampler.wait_first_sample(timeout=5.0)  # event-driven, no fixed sleep
@@ -348,7 +370,9 @@ def test_daemon_thread_samples_and_writes_rows(tmp_path: Path) -> None:
 def test_start_is_idempotent(tmp_path: Path) -> None:
     reg = MetricRegistry()
     reg.gauge("g").set(1.0)
-    sampler = MetricsSampler(reg, metrics_db_path(tmp_path), interval_seconds=0.01, run_id=_RUN)
+    sampler = MetricsSampler(
+        reg, metrics_db_path(tmp_path), interval_seconds=0.01, run_id=_RUN, clock=FakeClock(_dt(0))
+    )
     sampler.start()
     thread = sampler._thread
     try:

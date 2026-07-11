@@ -186,8 +186,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # ``last_tick_at``), so a dead sampler degrades the being, never kills it.
         with wire("metrics_sampler", required=False, health=health, logger=_LOG):
             if self._metrics_sampler is None:
+                # The sampler daemon sources "now" from the injected clock (spec §3.1),
+                # never system time — the SAME ``SystemClock`` the tick/store use, so
+                # every ``metrics.sqlite`` ISO ``ts`` is stamped through one clock.
                 self._metrics_sampler = acquire_metrics_sampler(
-                    get_metric_registry(self._base_dir), self._base_dir
+                    get_metric_registry(self._base_dir), self._base_dir, clock=SystemClock()
                 )
         self._metrics_degraded = self._metrics_sampler is None
 

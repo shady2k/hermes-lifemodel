@@ -10,6 +10,11 @@ Losing it never changes the being's behaviour, so — exactly like
 :mod:`~lifemodel.state.trace_store` — every write is **fail-open**: the sampler
 swallows its own errors and a tick never waits on this I/O.
 
+Time is normalized ISO-8601 UTC TEXT (spec §4): every ``ts`` / ``created_at`` /
+``updated_at`` goes through :func:`~lifemodel.core.timeutil.to_iso`, and the sampler
+sources "now" from an injected :class:`~lifemodel.ports.clock.ClockPort` — never
+``time.time()`` — so ordering/retention rest on the one canonical serializer.
+
 Shape (all stdlib — ``sqlite3``/``threading``/``uuid``; the plugin runs inside
 Hermes' own interpreter, no third-party deps):
 
@@ -43,9 +48,9 @@ import json
 import logging
 import sqlite3
 import threading
-import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -57,13 +62,19 @@ from ..core.metrics import (
     MetricSpec,
     label_key,
 )
+from ..core.timeutil import from_iso, to_iso
+from ..ports.clock import ClockPort
 
 #: The metrics DB's filename, a sibling of ``lifemodel.sqlite`` in the state dir.
 _DB_FILENAME: Final = "metrics.sqlite"
 
 #: The metrics schema version. Even a disposable store carries one (mirrors the
-#: trace store) so a future shape change is detectable rather than silently misread.
-SCHEMA_VERSION: Final = 1
+#: trace store) so a shape change is detectable rather than silently misread.
+#: Bumped 1 → 2 for the unified-time migration (spec §4, lm-fib.10.3): the time
+#: columns went INTEGER epoch → ISO-8601 UTC TEXT. A file still on version 1 keeps
+#: its INTEGER columns under ``CREATE TABLE IF NOT EXISTS``, so :func:`initialize_schema`
+#: destructively recreates on a version mismatch (the being is resettable).
+SCHEMA_VERSION: Final = 2
 
 #: Default sampling period in seconds (design §4.4). Coarse: the being ticks
 #: ~every 60s, so 15s over-samples enough to catch intra-tick change.
@@ -111,21 +122,38 @@ def process_run_id() -> str:
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Create the metrics schema (design §4.4) if absent; idempotent."""
+    """Create the metrics schema (design §4.4) if absent; idempotent.
+
+    Time columns are normalized ISO-8601 UTC TEXT (spec §4): ``metric_samples.ts``
+    and ``metric_defs.created_at/updated_at`` — the same :func:`to_iso` serializer as
+    every other store, so TEXT ordering == chronological ordering.
+
+    On a **version mismatch** (a pre-migration file still carrying INTEGER epoch
+    columns) this takes a destructive fresh-DB path — ``CREATE TABLE IF NOT EXISTS``
+    would silently keep the old column types, so the stale tables are DROPPED and
+    recreated (codex #4/#10; the being is resettable, no data migration).
+    """
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
-    if conn.execute("SELECT version FROM schema_version").fetchone() is None:
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    if row is None:
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+    elif row[0] != SCHEMA_VERSION:
+        # Shape mismatch: drop the old-typed tables (the index falls with its table)
+        # and re-stamp the version. Recreation happens via the CREATEs just below.
+        conn.execute("DROP TABLE IF EXISTS metric_samples")
+        conn.execute("DROP TABLE IF EXISTS metric_defs")
+        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
     conn.execute(
         "CREATE TABLE IF NOT EXISTS metric_defs ("
         "  name TEXT PRIMARY KEY, kind TEXT NOT NULL,"
         "  unit TEXT, help TEXT,"
         "  label_keys_json TEXT NOT NULL,"
         "  export INTEGER NOT NULL DEFAULT 1,"
-        "  created_at INTEGER, updated_at INTEGER)"
+        "  created_at TEXT, updated_at TEXT)"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS metric_samples ("
-        "  ts INTEGER NOT NULL, run_id TEXT NOT NULL,"
+        "  ts TEXT NOT NULL, run_id TEXT NOT NULL,"
         "  name TEXT NOT NULL,"
         "  label_key TEXT NOT NULL,"
         "  value REAL NOT NULL, labels_json TEXT)"
@@ -217,8 +245,12 @@ def snapshot_rows(registry: MetricRegistry) -> list[_SampleRow]:
     return rows
 
 
-def sync_metric_defs(conn: sqlite3.Connection, specs: list[MetricSpec], ts: int) -> None:
-    """Upsert ``metric_defs`` from *specs* — records EVERY metric, export or not."""
+def sync_metric_defs(conn: sqlite3.Connection, specs: list[MetricSpec], ts: str) -> None:
+    """Upsert ``metric_defs`` from *specs* — records EVERY metric, export or not.
+
+    *ts* is the cycle's ISO-8601 UTC stamp (spec §4), stored in the TEXT
+    ``created_at``/``updated_at`` columns.
+    """
     conn.executemany(
         "INSERT INTO metric_defs "
         "(name, kind, unit, help, label_keys_json, export, created_at, updated_at) "
@@ -284,7 +316,10 @@ def _delete_oldest_ts_cohort(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT MIN(ts) FROM metric_samples").fetchone()
     if row is None or row[0] is None:
         return 0
-    return conn.execute("DELETE FROM metric_samples WHERE ts = ?", (int(row[0]),)).rowcount
+    # ``ts`` is normalized ISO TEXT (spec §4): ``MIN`` is the lexically-least string,
+    # which — because :func:`to_iso` is fixed-width — is the chronologically-oldest
+    # cohort. Delete by the exact per-cycle string, never an int cast.
+    return conn.execute("DELETE FROM metric_samples WHERE ts = ?", (str(row[0]),)).rowcount
 
 
 def _prune_by_size(conn: sqlite3.Connection, max_bytes: int) -> int:
@@ -301,18 +336,21 @@ def _prune_by_size(conn: sqlite3.Connection, max_bytes: int) -> int:
 
 
 def prune_metric_samples(
-    conn: sqlite3.Connection, *, policy: MetricsRetentionPolicy, now_ts: int
+    conn: sqlite3.Connection, *, policy: MetricsRetentionPolicy, now_iso: str
 ) -> int:
     """Prune samples past the policy (age → rows → size). Returns rows deleted.
 
     A pure function over *conn* so it is unit-testable off the sampler thread and
-    reused by it. Fail-open is the caller's concern (the sampler swallows).
+    reused by it. Fail-open is the caller's concern (the sampler swallows). *now_iso*
+    is the cycle's ISO stamp (spec §4); the age cutoff is computed on real
+    ``datetime`` arithmetic and re-serialized so the ``ts < cutoff`` compare is a
+    correct chronological TEXT compare.
     """
     deleted = 0
 
     if policy.max_age_seconds is not None:
-        cutoff = now_ts - policy.max_age_seconds
-        deleted += conn.execute("DELETE FROM metric_samples WHERE ts < ?", (cutoff,)).rowcount
+        cutoff_iso = to_iso(from_iso(now_iso) - timedelta(seconds=policy.max_age_seconds))
+        deleted += conn.execute("DELETE FROM metric_samples WHERE ts < ?", (cutoff_iso,)).rowcount
 
     if policy.max_rows is not None:
         # Drop whole oldest ts-snapshots (not arbitrary rowids) until under the cap,
@@ -344,7 +382,7 @@ def prune_metric_samples(
 class MetricSample:
     """One decoded ``metric_samples`` row (labels parsed back from JSON)."""
 
-    ts: int
+    ts: str  # normalized ISO-8601 UTC (spec §4); TEXT order == chronological order
     run_id: str
     name: str
     label_key: str
@@ -395,7 +433,7 @@ def read_samples(
         labels: dict[str, str] = json.loads(labels_json) if labels_json else {}
         samples.append(
             MetricSample(
-                ts=int(ts),
+                ts=str(ts),
                 run_id=str(run_id),
                 name=str(mname),
                 label_key=str(lk),
@@ -438,6 +476,7 @@ class MetricsSampler:
         retention: MetricsRetentionPolicy | None = None,
         run_id: str | None = None,
         prune_every_cycles: int = _DEFAULT_PRUNE_EVERY_CYCLES,
+        clock: ClockPort | None = None,
     ) -> None:
         self._registry = registry
         self._db_path = Path(db_path)
@@ -446,6 +485,10 @@ class MetricsSampler:
         self._retention = retention or MetricsRetentionPolicy()
         self._run_id = run_id or process_run_id()
         self._prune_every_cycles = max(1, prune_every_cycles)
+        # The ONE source of "now" for the sampler thread (spec §3.1): the injected
+        # clock, never ``time.time()``/``datetime.now``. The direct :meth:`sample_once`
+        # path may override with an explicit ``now`` (tests); the daemon requires it.
+        self._clock = clock
 
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
@@ -465,20 +508,37 @@ class MetricsSampler:
 
     # ---- synchronous core (unit-testable) ------------------------------- #
 
-    def sample_once(self, *, ts: int | None = None) -> int:
+    def sample_once(self, *, now: datetime | str | None = None) -> int:
         """Snapshot the registry once, writing changed rows. Returns rows written.
 
         For direct/testing use — lazily opens (and reuses) a thread-affine
         connection on the calling thread. The daemon path uses its OWN connection
         (do not mix the two on one instance). May raise (so tests see failures);
         the daemon wraps it fail-open.
+
+        *now* stamps the whole cycle: a ``datetime`` (or ISO string), normalized to
+        ONE ISO ``ts`` shared by every row (spec §4 — µs must not split a snapshot
+        into per-row cohorts). Omit it to read the injected clock.
         """
         if self._conn is None:
             self._conn = connect(self._db_path)
-        return self._sample_into(self._conn, _now_ts() if ts is None else ts)
+        return self._sample_into(self._conn, self._stamp(now))
 
-    def _sample_into(self, conn: sqlite3.Connection, ts: int) -> int:
-        """Do one sample against *conn*: sync defs, write changed rows, maybe prune."""
+    def _stamp(self, now: datetime | str | None) -> str:
+        """Resolve the cycle's single ISO ``ts`` from *now* or the injected clock."""
+        if now is None:
+            if self._clock is None:
+                raise ValueError("MetricsSampler has no clock and no explicit now to stamp")
+            return to_iso(self._clock.now())
+        if isinstance(now, str):
+            return to_iso(from_iso(now))  # re-normalize a caller-supplied ISO string
+        return to_iso(now)
+
+    def _sample_into(self, conn: sqlite3.Connection, ts: str) -> int:
+        """Do one sample against *conn*: sync defs, write changed rows, maybe prune.
+
+        *ts* is the cycle's single ISO stamp, reused for every row (spec §4).
+        """
         with self._lock:
             force = (self._cycles % self._heartbeat_every) == 0
             self._cycles += 1
@@ -487,7 +547,7 @@ class MetricsSampler:
 
             sync_metric_defs(conn, specs, ts)
 
-            to_write: list[tuple[int, str, str, str, float, str | None]] = []
+            to_write: list[tuple[str, str, str, str, float, str | None]] = []
             for row in rows:
                 key = (row.name, row.label_key)
                 previous = self._last_written.get(key)
@@ -508,13 +568,13 @@ class MetricsSampler:
             self._maybe_prune(conn, ts)
             return len(to_write)
 
-    def _maybe_prune(self, conn: sqlite3.Connection, ts: int) -> None:
+    def _maybe_prune(self, conn: sqlite3.Connection, ts: str) -> None:
         self._commits_since_prune += 1
         if self._commits_since_prune < self._prune_every_cycles:
             return
         self._commits_since_prune = 0
         try:
-            prune_metric_samples(conn, policy=self._retention, now_ts=ts)
+            prune_metric_samples(conn, policy=self._retention, now_iso=ts)
         except sqlite3.Error:
             self.sample_errors += 1
 
@@ -555,6 +615,12 @@ class MetricsSampler:
         return self._first_sample.wait(timeout)
 
     def _run(self) -> None:
+        if self._clock is None:
+            # The daemon MUST source "now" from an injected clock (spec §3.1); with
+            # none it degrades like a failed open rather than reading system time.
+            _module_logger.warning("metrics_sampler_no_clock path=%s", self._db_path)
+            self._first_sample.set()
+            return
         try:
             conn = connect(self._db_path)
         except sqlite3.Error:
@@ -566,7 +632,7 @@ class MetricsSampler:
         try:
             while not self._stop.is_set():
                 try:
-                    self._sample_into(conn, _now_ts())
+                    self._sample_into(conn, to_iso(self._clock.now()))
                 except Exception:  # never let the sampler thread die (fail-open, §4.4)
                     self.sample_errors += 1
                 finally:
@@ -577,10 +643,6 @@ class MetricsSampler:
                 conn.commit()
             with contextlib.suppress(sqlite3.Error):
                 conn.close()
-
-
-def _now_ts() -> int:
-    return int(time.time())
 
 
 # --------------------------------------------------------------------------- #
@@ -611,6 +673,7 @@ def acquire_metrics_sampler(
     retention: MetricsRetentionPolicy | None = None,
     run_id: str | None = None,
     prune_every_cycles: int = _DEFAULT_PRUNE_EVERY_CYCLES,
+    clock: ClockPort | None = None,
 ) -> MetricsSampler:
     """Return the started :class:`MetricsSampler` for *base_dir*, refcounted (§4.4).
 
@@ -618,7 +681,8 @@ def acquire_metrics_sampler(
     refcount and return the same instance (idempotent start). After the matching
     :func:`release_metrics_sampler` calls drop the count to zero the sampler is
     stopped and forgotten, so a subsequent acquire is reconnect-safe. Construction
-    options are honoured only on the first acquire of a path.
+    options are honoured only on the first acquire of a path. *clock* is the daemon's
+    injected source of "now" (spec §3.1) — the sampler thread never reads system time.
     """
     db_path = metrics_db_path(base_dir)
     key = _sampler_key(db_path)
@@ -633,6 +697,7 @@ def acquire_metrics_sampler(
                 retention=retention,
                 run_id=run_id,
                 prune_every_cycles=prune_every_cycles,
+                clock=clock,
             )
             sampler.start()
             _samplers[key] = _SamplerHandle(sampler, 1)
