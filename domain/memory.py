@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeAlias, TypeVar
 
-from ..core.timeutil import from_iso, to_iso
+from ..core.timeutil import from_iso, to_epoch_seconds, to_iso
 
 #: Any value that round-trips through :mod:`json` with no custom encoder.
 #: Recursive: a ``JsonValue`` is a JSON scalar, or a list/dict of ``JsonValue``.
@@ -245,8 +245,10 @@ def epoch_ms(instant: datetime) -> int:
     only to stamp the quarantine/backup FILENAMES the store moves aside
     (``lifemodel.sqlite.corrupt.<ms>`` / ``.bak.<ms>``), where a colon-free,
     compact suffix is wanted and ISO text (with its ``:``) makes a poor filename.
+    The epoch VALUE is derived through the canonical :func:`to_epoch_seconds`
+    helper (spec §5), never a raw ``.timestamp()`` on the hot path.
     """
-    return int(instant.timestamp() * 1000)
+    return int(to_epoch_seconds(instant) * 1000)
 
 
 def stamp_iso_utc(instant: datetime) -> str:

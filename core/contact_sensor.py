@@ -42,7 +42,7 @@ class ContactSensor:
         self.id = id
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
-        from .timeutil import minutes_between
+        from .timeutil import minutes_between, to_iso
 
         # A pure measurement of the channel NOW: how long silent + each observed
         # contact's quality. Nothing is accumulated, no state written, no ``u`` touched.
@@ -56,9 +56,9 @@ class ContactSensor:
                 # contact, decided downstream by the drive.
                 qualities.append(quality_of(actor=actor, label=label))
         emit = contact_presence_signal(
-            origin_id=f"presence-{ctx.now.isoformat()}",
+            origin_id=f"presence-{to_iso(ctx.now)}",
             dt=dt,
             qualities=qualities,
-            timestamp=ctx.now.isoformat(),
+            timestamp=to_iso(ctx.now),
         )
         return [EmitSignal(emit)]

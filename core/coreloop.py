@@ -69,7 +69,7 @@ from .tick_metrics import (
     TRACE_WRITER_WRITE_ERRORS,
     register_universal_metrics,
 )
-from .timeutil import minutes_between, to_epoch_seconds
+from .timeutil import minutes_between, to_epoch_seconds, to_iso
 
 #: How many records the start-of-tick snapshot pulls *per live state*. A per-tick
 #: scan is fine at current scale (lm-fib.6.5 tracks scaling); the cap keeps it
@@ -167,7 +167,7 @@ class CoreLoop:
         close, so each span records when *it* finished (root last, longest).
         """
         elapsed = self._monotonic() - tick_started_mono
-        return (tick_started_at + timedelta(seconds=elapsed)).isoformat()
+        return to_iso(tick_started_at + timedelta(seconds=elapsed))
 
     def _persist_span(self, span: ActiveSpan, *, ended_at: str) -> None:
         """Upsert one finished span row (spec §4.3) — the durable span tree.
@@ -230,7 +230,7 @@ class CoreLoop:
         initial_signals: Sequence[Signal] = (),
         trigger: FrameTrigger = FrameTrigger.HEARTBEAT,
     ) -> TickReport:
-        started = now.isoformat()
+        started = to_iso(now)
         # Monotonic origin for this tick: every span's ``ended_at`` is ``started``
         # plus the monotonic elapsed at its close (see ``_span_ended_at``), so span
         # durations are real, not zero.
@@ -375,7 +375,7 @@ class CoreLoop:
 
         tick_patch: dict[str, object] = {
             "tick_count": state.tick_count + 1,
-            "last_tick_at": now.isoformat(),
+            "last_tick_at": to_iso(now),
         }
         # Record this frame's fresh external ids into the durable ring — but ONLY when
         # the load-bearing contact consumer ACTUALLY RAN this frame (ContactSensor is in

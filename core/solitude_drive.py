@@ -26,6 +26,7 @@ from .component import TickContext
 from .intents import EmitSignal, Intent, UpdateState
 from .metrics import MetricSpec
 from .taxonomy import contact_pressure_signal, read_contact_presence
+from .timeutil import to_iso
 
 #: The being's current contact-solitude drive level ``u`` — the first live domain
 #: metric emitted through ``ctx.observe`` (telemetry-core §4.3). This is genuine
@@ -75,10 +76,10 @@ class SolitudeDrive:
         if ctx.observe is not None:
             ctx.observe.set(CONTACT_DRIVE_U, drive.u)
         emit = contact_pressure_signal(
-            origin_id=f"contact-pressure-{ctx.now.isoformat()}",
+            origin_id=f"contact-pressure-{to_iso(ctx.now)}",
             value=drive.u,
             delta=delta,
-            timestamp=ctx.now.isoformat(),
+            timestamp=to_iso(ctx.now),
         )
         # Write u (visible NEXT tick via state) AND emit the fresh u this tick (so
         # aggregation sees the same-tick value, not the stale start-of-tick one).

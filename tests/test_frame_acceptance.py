@@ -27,6 +27,7 @@ from lifemodel.core.frame import FrameTrigger, run_frame
 from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.proactive import proactive_tick
 from lifemodel.core.taxonomy import contact_observed_signal, proactive_outcome_signal
+from lifemodel.core.timeutil import to_iso
 from lifemodel.domain.egress import ProactiveOutcome, ReachOutcome
 from lifemodel.domain.objects import DesireState
 from lifemodel.hooks import make_inbound_observer
@@ -55,7 +56,7 @@ def _seed_active_desire(lm, salience: float = 3.0) -> None:
 
 def test_scenario_1_inbound_contact_satiates_and_resolves_desire(tmp_path: Path) -> None:
     lm = _build(tmp_path)
-    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(u=2.0, last_tick_at=to_iso(_NOW)))
     _seed_active_desire(lm)
 
     run_frame(
@@ -92,7 +93,7 @@ def test_inbound_while_proactive_in_flight_clears_pending_and_unblocks_cognition
             pending_proactive_id="p-inflight",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
             pending_proactive_origin_traceparent=_ORIGIN_TP,
-            last_tick_at=_NOW.isoformat(),
+            last_tick_at=to_iso(_NOW),
         )
     )
     _seed_active_desire(lm)
@@ -111,7 +112,7 @@ def test_inbound_while_proactive_in_flight_clears_pending_and_unblocks_cognition
     # (b) the live desire terminalized to SATISFIED (the reply resolved the pull)...
     assert lm.state.get("desire", "contact:owner").state == "satisfied"
     # (c) ...and the exchange record was stamped this frame.
-    assert after.last_exchange_at == _NOW.isoformat()
+    assert after.last_exchange_at == to_iso(_NOW)
 
     # A subsequent over-threshold tick is NOT gated: pending is clear, so cognition
     # can launch again. (On the buggy code pending stays "p-inflight" and the
@@ -132,7 +133,7 @@ def test_inbound_while_proactive_in_flight_clears_pending_and_unblocks_cognition
 
 def test_scenario_2_control_command_is_not_contact(tmp_path: Path) -> None:
     lm = _build(tmp_path)
-    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(u=2.0, last_tick_at=to_iso(_NOW)))
 
     make_inbound_observer(lambda: lm, health=BrainHealth(tmp_path), metrics=MetricRegistry())(
         event=SimpleNamespace(text="/lifemodel force-wake", internal=False, id="m-2")
@@ -197,7 +198,7 @@ def test_scenario_5a_sent_sets_action_pending_and_clears_pending(tmp_path: Path)
             pending_proactive_id="p-sent",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
             pending_proactive_origin_traceparent=_ORIGIN_TP,
-            last_tick_at=_NOW.isoformat(),
+            last_tick_at=to_iso(_NOW),
         )
     )
     _seed_active_desire(lm)
@@ -230,7 +231,7 @@ def test_scenario_5b_silent_applies_decline_backoff_and_clears_pending(tmp_path:
             pending_proactive_id="p-silent",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
             pending_proactive_origin_traceparent=_ORIGIN_TP,
-            last_tick_at=_NOW.isoformat(),
+            last_tick_at=to_iso(_NOW),
         )
     )
     _seed_active_desire(lm)
@@ -262,14 +263,14 @@ def test_scenario_5b_silent_applies_decline_backoff_and_clears_pending(tmp_path:
 def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> None:
     clock = FakeClock(_NOW)
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
-    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
     _seed_active_desire(lm)
 
     dup = contact_observed_signal(origin_id="m-dup", actor="user", label="two_way", timestamp=None)
     run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
     after_first = lm.state.load()
     assert after_first.u < 5.0  # the genuine two_way contact satiated the drive once
-    assert after_first.last_exchange_at == _NOW.isoformat()  # exchange record stamped
+    assert after_first.last_exchange_at == to_iso(_NOW)  # exchange record stamped
     assert lm.state.get("desire", "contact:owner").state == "satisfied"  # desire resolved
 
     # A retry of the SAME Hermes event id (clock pinned → dt=0, so any SECOND
@@ -278,7 +279,7 @@ def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> 
     run_frame(lm.coreloop, [dup], trigger=FrameTrigger.EVENT)
     after_dup = lm.state.load()
     assert after_dup.u == after_first.u  # satiated EXACTLY once (the retry was deduped)
-    assert after_dup.last_exchange_at == _NOW.isoformat()  # last_exchange_at stamped once
+    assert after_dup.last_exchange_at == to_iso(_NOW)  # last_exchange_at stamped once
     assert lm.state.get("desire", "contact:owner").state == "satisfied"  # resolved once
     assert "m-dup" in after_dup.processed_external_event_ids  # remembered in the ring
 
@@ -286,14 +287,14 @@ def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> 
 def test_scenario_6_different_origin_id_after_first_still_satiates(tmp_path: Path) -> None:
     clock = FakeClock(_NOW)
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
-    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
 
     run_frame(
         lm.coreloop,
         [contact_observed_signal(origin_id="m-1", actor="user", label="two_way", timestamp=None)],
         trigger=FrameTrigger.EVENT,
     )
-    assert lm.state.load().last_exchange_at == _NOW.isoformat()
+    assert lm.state.load().last_exchange_at == to_iso(_NOW)
 
     # A DIFFERENT inbound 30 min later: the ring dedups by id, not blanket-suppress,
     # so this genuine new contact satiates normally and re-stamps last_exchange_at.
@@ -305,7 +306,7 @@ def test_scenario_6_different_origin_id_after_first_still_satiates(tmp_path: Pat
         trigger=FrameTrigger.EVENT,
     )
     final = lm.state.load()
-    assert final.last_exchange_at == later.isoformat()  # the new id satiated normally
+    assert final.last_exchange_at == to_iso(later)  # the new id satiated normally
     assert set(final.processed_external_event_ids) == {"m-1", "m-2"}  # both remembered
 
 
@@ -318,7 +319,7 @@ def test_scenario_6_contact_sensor_failure_does_not_record_id(tmp_path: Path, mo
     from lifemodel.core.contact_sensor import ContactSensor
 
     lm = _build(tmp_path)
-    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
 
     def _boom(self, ctx):  # ContactSensor faults this frame
         raise RuntimeError("sensor down")
@@ -350,7 +351,7 @@ def test_scenario_6_circuit_broken_contact_sensor_does_not_record_id(tmp_path: P
     # gate must key on POSITIVE success (``in ran``), not absence-of-failure: the id
     # must NOT be recorded, so a retry after the sensor recovers re-fires.
     lm = _build(tmp_path)
-    lm.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
     lm.coreloop._broken.add(CONTACT_SENSOR_ID)  # simulate the tripped breaker
 
     dup = contact_observed_signal(
@@ -371,7 +372,7 @@ def test_scenario_6_ring_is_durable_across_restart(tmp_path: Path) -> None:
     # Unlike the ephemeral bus, the ring is durable (spec §8): a duplicate that
     # arrives AFTER a restart is still deduped.
     lm1 = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
-    lm1.state.commit(State(u=5.0, last_tick_at=_NOW.isoformat()))
+    lm1.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
     dup = contact_observed_signal(
         origin_id="m-restart", actor="user", label="two_way", timestamp=None
     )
@@ -386,7 +387,7 @@ def test_scenario_6_ring_is_durable_across_restart(tmp_path: Path) -> None:
     run_frame(lm2.coreloop, [dup], trigger=FrameTrigger.EVENT)
     after_restart = lm2.state.load()
     assert after_restart.u == after_first.u  # the durable ring deduped the post-restart retry
-    assert after_restart.last_exchange_at == _NOW.isoformat()  # not re-stamped
+    assert after_restart.last_exchange_at == to_iso(_NOW)  # not re-stamped
 
 
 # --- (7) an async-completion frame commits the outcome IMMEDIATELY -----------
@@ -400,7 +401,7 @@ def test_scenario_7_async_completion_commits_immediately_no_heartbeat(tmp_path: 
             pending_proactive_id="p-async",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
             pending_proactive_origin_traceparent=_ORIGIN_TP,
-            last_tick_at=_NOW.isoformat(),
+            last_tick_at=to_iso(_NOW),
         )
     )
     _seed_active_desire(lm)
@@ -436,7 +437,7 @@ def test_scenario_8_restart_has_empty_bus_and_intact_durable_state(tmp_path: Pat
     # fresh graph over the SAME base_dir. There is no durable signal log to replay
     # ("lost consciousness → don't replay stale impulses"); AgentState + Memory persist.
     lm1 = _build(tmp_path)
-    lm1.state.commit(State(u=2.0, decline_count=2, last_tick_at=_NOW.isoformat()))
+    lm1.state.commit(State(u=2.0, decline_count=2, last_tick_at=to_iso(_NOW)))
     _seed_active_desire(lm1)
     run_frame(
         lm1.coreloop,

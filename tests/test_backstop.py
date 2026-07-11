@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from lifemodel.core.backstop import allow_send, record_send
+from lifemodel.core.timeutil import to_iso
 
 NOW = datetime(2026, 7, 6, 20, 0, tzinfo=UTC)
 
 
 def _ago(minutes: float) -> str:
-    return (NOW - timedelta(minutes=minutes)).isoformat()
+    return to_iso(NOW - timedelta(minutes=minutes))
 
 
 def test_allows_when_log_empty() -> None:
@@ -44,4 +45,4 @@ def test_record_send_appends_and_bounds() -> None:
     log = [_ago(1000 + i) for i in range(25)]
     new = record_send(log, NOW, keep=20)
     assert len(new) == 20
-    assert new[-1] == NOW.isoformat()  # newest last
+    assert new[-1] == to_iso(NOW)  # newest last

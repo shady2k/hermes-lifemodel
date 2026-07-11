@@ -59,7 +59,7 @@ from .taxonomy import (
     read_proactive_outcome_correlation,
 )
 from .tick_metrics import INTAKE_COALESCED, INTAKE_SHED_SENSOR, SIGNALS_INTAKE
-from .timeutil import minutes_between
+from .timeutil import minutes_between, to_iso
 from .trace import creation_provenance
 
 #: The logical "no live desire" sentinel — the old ``desire_status == "none"``.
@@ -197,7 +197,7 @@ class ContactAggregation:
             for sig in signals
         )
         if had_exchange:
-            last_exchange_at = now.isoformat()
+            last_exchange_at = to_iso(now)
             silence_anchor_at = None  # a real exchange re-anchors the gate on itself
             declined_at = None
             decline_count = 0
@@ -241,8 +241,8 @@ class ContactAggregation:
                 po = read_proactive_outcome(sig)
                 if po is ProactiveOutcome.SENT:
                     transition_to = DesireState.SATISFIED
-                    action_pending_since = now.isoformat()  # send -> inhibition starts
-                    last_contact_at = now.isoformat()
+                    action_pending_since = to_iso(now)  # send -> inhibition starts
+                    last_contact_at = to_iso(now)
                     send_log = record_send(send_log, now)  # backstop counter (spec §14)
                     # Pure-longing outreach counter: a SENT drive-only outreach (the
                     # only kind now, T3) is a repeat longing bid -> bump. A legacy
@@ -252,7 +252,7 @@ class ContactAggregation:
                         unanswered_outbound_count += 1
                 elif po is ProactiveOutcome.SILENT:
                     transition_to = DesireState.DROPPED
-                    declined_at = now.isoformat()
+                    declined_at = to_iso(now)
                     decline_count += 1
                 else:  # FAILED / STALE — the attempt ended with nothing to reinforce:
                     # clear the pending + drop the desire, but no decline backoff and no
@@ -423,7 +423,7 @@ class ContactAggregation:
             and ctx.tracer is not None
             and ctx.event_ring is not None
         ):
-            resolved_at = now.isoformat()
+            resolved_at = to_iso(now)
             outcome_value = resolved_outcome.value if resolved_outcome is not None else None
             bridge = open_correlated_span(
                 tracer=ctx.tracer,
@@ -432,7 +432,7 @@ class ContactAggregation:
                 origin_traceparent=resolved_origin,
                 component=self.id,
                 tick=state.tick_count + 1,
-                started_at=now.isoformat(),
+                started_at=to_iso(now),
             )
             bridge.span.set(
                 correlation_id=resolved_correlation,

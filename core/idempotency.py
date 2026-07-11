@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 
 from ..domain.signal import Signal
 from .taxonomy import KIND_CONTACT_OBSERVED
+from .timeutil import from_iso, to_iso
 
 #: The ring's cap: at most this many recently-processed external ids are kept.
 #: The spec names no specific number ("with one sensor, MAX_INTAKE is almost
@@ -57,10 +58,8 @@ def _is_live(recorded_at: str, now: datetime, ttl: timedelta) -> bool:
     expired so it is swept out rather than pinned forever or crashing the frame.
     """
     try:
-        ts = datetime.fromisoformat(recorded_at)
+        ts = from_iso(recorded_at)  # strict: malformed/naive both raise -> swept out
     except ValueError:
-        return False
-    if ts.tzinfo is None or ts.utcoffset() is None:
         return False
     return (now - ts) <= ttl
 
@@ -124,7 +123,7 @@ def record_external_events(
     # Start from the live (within-TTL) subset, preserving oldest-first order.
     live: dict[str, str] = {eid: at for eid, at in ring.items() if _is_live(at, now, ttl)}
     for eid in fresh_ids:
-        live[eid] = now.isoformat()  # remember each fresh id at the moment processed
+        live[eid] = to_iso(now)  # remember each fresh id at the moment processed
 
     # Bound the ring: evict oldest (front of insertion order) beyond the cap.
     while len(live) > cap:

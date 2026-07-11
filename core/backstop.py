@@ -13,13 +13,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 
+from .timeutil import from_iso, to_iso
+
 
 def _parse(ts: str) -> datetime | None:
+    # The canonical strict parser (spec §5): rejects malformed AND tz-naive (both
+    # raise ValueError), so a naive stamp never counts as "no recent send".
     try:
-        value = datetime.fromisoformat(ts)
+        return from_iso(ts)
     except (ValueError, TypeError):
         return None
-    return value if value.tzinfo is not None else None
 
 
 def allow_send(
@@ -43,4 +46,4 @@ def allow_send(
 
 def record_send(send_log: Sequence[str], now: datetime, *, keep: int = 20) -> list[str]:
     """Append this send and keep the most recent ``keep`` entries."""
-    return [*send_log, now.isoformat()][-keep:]
+    return [*send_log, to_iso(now)][-keep:]

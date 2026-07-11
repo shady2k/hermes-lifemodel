@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final, Generic, TypeVar
 
+from ...core.timeutil import from_iso
 from ..memory import JsonObject, JsonValue
 from .base import opt_float, opt_str, req_float, req_int_tuple, req_str, req_str_tuple
 from .errors import InvalidPayload
@@ -58,7 +59,7 @@ class InferredField(Generic[T]):
         """``True`` iff this is a time-boxed inference whose TTL has elapsed by *now*."""
         if self.inferred_at is None or self.ttl_seconds is None:
             return False
-        deadline = datetime.fromisoformat(self.inferred_at) + timedelta(seconds=self.ttl_seconds)
+        deadline = from_iso(self.inferred_at) + timedelta(seconds=self.ttl_seconds)
         return now >= deadline
 
     def resolve(self, now: datetime) -> T | _Unknown:

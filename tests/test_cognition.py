@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from lifemodel.core.cognition import CognitionLauncher
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import LaunchProactive, PutRecord, UpdateState
+from lifemodel.core.timeutil import to_iso
 from lifemodel.core.wake_packet import RECENT_THOUGHTS_HEADER, build_wake_packet
 from lifemodel.domain.memory import MemoryRecord
 from lifemodel.domain.objects import default_registry
@@ -70,11 +71,11 @@ def test_active_desire_launches_proactive_turn(tmp_path) -> None:
     intents = _cog().step(_ctx(state, objects=ACTIVE, tmp_path=tmp_path))
     launch = _launch(intents)
     assert launch is not None
-    assert launch.correlation_id == f"proactive-{NOW.isoformat()}"
+    assert launch.correlation_id == f"proactive-{to_iso(NOW)}"
     assert launch.prompt  # carries the wake-packet prompt
     upd = _update(intents)
     assert upd.changes["pending_proactive_id"] == launch.correlation_id
-    assert upd.changes["pending_proactive_since"] == NOW.isoformat()
+    assert upd.changes["pending_proactive_since"] == to_iso(NOW)
     assert upd.changes["energy"] < 1.0  # reserved
 
 
@@ -120,7 +121,7 @@ def test_launch_submits_correlation_index_row(tmp_path) -> None:
     )
     _cog().step(ctx)
     assert len(submitted) == 1
-    assert submitted[0]["correlation_id"] == f"proactive-{NOW.isoformat()}"
+    assert submitted[0]["correlation_id"] == f"proactive-{to_iso(NOW)}"
     assert submitted[0]["origin_trace_id"] == _TRACE.trace_id
     assert submitted[0]["origin_traceparent"] == format_traceparent(_TRACE)
     assert submitted[0]["kind"] == "proactive"

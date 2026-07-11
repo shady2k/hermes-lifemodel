@@ -34,6 +34,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from ..core.timeutil import from_iso, to_iso
+
+
+def _now_iso() -> str:
+    """Canonical UTC-ISO "now" for the boot/connected audit stamps (spec §5).
+
+    Sources system time through the ONE sanctioned read
+    (:class:`~lifemodel.adapters.clock.SystemClock`, imported lazily so this leaf
+    state module never eagerly pulls the adapters package) and serializes it with
+    :func:`~lifemodel.core.timeutil.to_iso` — never ``datetime.now``. Callers that
+    already hold an explicit stamp (e.g. ``BeingAdapter.connect``) pass it instead.
+    """
+    from ..adapters.clock import SystemClock
+
+    return to_iso(SystemClock().now())
+
+
 #: The closed set of brain states (spec §4.2). ``never_started`` and ``connecting``
 #: are the pre-connect *transients*; the rest are terminal-ish readouts.
 BrainState = Literal["never_started", "connecting", "connected", "loop_dead", "boot_failed"]
@@ -90,7 +107,7 @@ def _parse_iso(value: str | None) -> datetime | None:
     if value is None:
         return None
     try:
-        return datetime.fromisoformat(value)
+        return from_iso(value)  # canonical strict parser (spec §5)
     except (ValueError, TypeError):
         return None
 
@@ -176,7 +193,7 @@ class BrainHealth:
         """The brain loop is up. Clears a prior ``loop_dead`` / ``boot_failed`` and
         the durable boot record — a clean (re)connect means we are healthy now
         (spec §4.3). *at* anchors the staleness grace; defaults to real now."""
-        stamp = at if at is not None else datetime.now().astimezone().isoformat()
+        stamp = at if at is not None else _now_iso()
         with self._lock:
             self.state = "connected"
             self.connected_at = stamp
@@ -288,7 +305,7 @@ class BrainHealth:
         record = {
             "state": "boot_failed",
             "boot_error": error,
-            "written_at": datetime.now().astimezone().isoformat(),
+            "written_at": _now_iso(),
         }
         path = brain_boot_path(self.base_dir)
         try:

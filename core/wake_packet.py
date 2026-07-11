@@ -58,6 +58,7 @@ from datetime import UTC, datetime, tzinfo
 
 from ..domain.objects import Thought
 from .projection import project_contact
+from .timeutil import from_iso
 
 #: The impulse's opening TAG — a STRUCTURAL signal the model reads far more
 #: reliably than prose: "this whole block is an internal impulse, not a line of
@@ -200,7 +201,7 @@ def render_temporal_facts(
         last_fact = "We have no record of an earlier exchange."
     else:
         try:
-            last_dt = datetime.fromisoformat(last_exchange_at)
+            last_dt = from_iso(last_exchange_at)  # canonical strict parser (spec §5)
         except ValueError:
             last_fact = f"Our last exchange is on record as {last_exchange_at}."
         else:

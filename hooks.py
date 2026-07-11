@@ -36,6 +36,7 @@ from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from .core.tick_metrics import OBSERVER_ERRORS
+from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
 from .domain.objects import DesireState
@@ -257,7 +258,7 @@ def _emit_async_outcome(
     ring = lm.event_ring
     if tracer is None or ring is None:
         return
-    now = lm.clock.now().isoformat()
+    now = to_iso(lm.clock.now())
 
     if origin_traceparent is None:
         orphan = open_correlated_span(
@@ -378,7 +379,7 @@ def make_post_llm_observer(
                     proactive_outcome_signal(
                         origin_id=f"outcome-{correlation_id}",
                         outcome=outcome,
-                        timestamp=now.isoformat(),
+                        timestamp=to_iso(now),
                         correlation_id=correlation_id,
                     )
                 ],
@@ -438,7 +439,7 @@ def make_inbound_observer(
             origin = (
                 getattr(event, "id", None)
                 or getattr(event, "message_id", None)
-                or f"contact-{now.isoformat()}"
+                or f"contact-{to_iso(now)}"
             )
             # A genuine inbound → its OWN EVENT frame, processed at the moment of the
             # event (spec §3): the frame satiates u, stamps last_exchange_at, and
@@ -450,7 +451,7 @@ def make_inbound_observer(
                         origin_id=str(origin),
                         actor="user",
                         label="two_way",
-                        timestamp=now.isoformat(),
+                        timestamp=to_iso(now),
                     )
                 ],
                 trigger=FrameTrigger.EVENT,

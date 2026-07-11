@@ -49,7 +49,7 @@ from lifemodel.core.thought_view import (
     read_thought,
     seed_thought_id,
 )
-from lifemodel.core.timeutil import minutes_between
+from lifemodel.core.timeutil import minutes_between, to_iso
 from lifemodel.core.user_model_view import EXPLICIT_CONFIDENCE, read_owner_user_model
 from lifemodel.core.wake_packet import build_wake_packet
 from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
@@ -139,8 +139,12 @@ def test_command_echoes_round_floats_and_leave_no_long_tails() -> None:
         satiate(dirty, NOW)[1],
         set_field(dirty, NOW, "energy 0.777777")[1],
     ]
+    # Normalized ISO stamps carry a 6-digit µs (``...T11:40:00.000000+00:00``) that
+    # is NOT float noise — strip them before the un-rounded-float-tail check so the
+    # regex still catches "u: 1.419954456041666" but not a canonical timestamp.
+    ts_re = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00")
     for echo in echoes:
-        assert re.search(r"\d\.\d{3,}", echo) is None, echo  # no long float tail
+        assert re.search(r"\d\.\d{3,}", ts_re.sub("", echo)) is None, echo  # no long float tail
     assert "u: 1.42 -> " in nudge(dirty, NOW, "")[1]  # the rounded value is what shows
 
 
@@ -286,8 +290,8 @@ def test_satiate_zeroes_u_stamps_contact_and_opens_the_silence_window() -> None:
     after, message = satiate(before, NOW)
     assert after is not None
     assert after.u == 0.0
-    assert after.last_contact_at == NOW.isoformat()
-    assert after.silence_anchor_at == NOW.isoformat()  # silence window opened
+    assert after.last_contact_at == to_iso(NOW)
+    assert after.silence_anchor_at == to_iso(NOW)  # silence window opened
     assert after.last_exchange_at == _ago(999)  # immune: the real record is untouched
     assert "(mutating)" in message
 
@@ -362,7 +366,7 @@ def test_satiate_opens_the_silence_window_without_forging_the_exchange_record() 
     assert after is not None
     assert after.u == 0.0  # the drive is reset
     assert after.last_exchange_at == real_last  # immune: the real record is untouched
-    assert after.silence_anchor_at == NOW.isoformat()  # the window is opened instead
+    assert after.silence_anchor_at == to_iso(NOW)  # the window is opened instead
 
 
 def test_set_field_rejects_last_exchange_at_as_immune() -> None:
@@ -452,7 +456,7 @@ def test_set_field_rejects_removed_desire_status_field() -> None:
 def test_set_field_resolves_now_literal_for_timestamps() -> None:
     after, _ = set_field(State(), NOW, "silence_anchor_at now")
     assert after is not None
-    assert after.silence_anchor_at == NOW.isoformat()
+    assert after.silence_anchor_at == to_iso(NOW)
 
 
 def test_set_field_accepts_an_explicit_iso_timestamp() -> None:

@@ -43,6 +43,7 @@ from datetime import datetime
 
 from ..domain.objects import UserModel
 from ..state.model import State
+from .timeutil import from_iso
 from .user_model_view import EXPLICIT_CONFIDENCE
 
 
@@ -266,10 +267,8 @@ def _minutes_since_last_send(send_log: list[str], now: datetime) -> float | None
     latest_gap: float | None = None
     for ts in send_log:
         try:
-            sent = datetime.fromisoformat(ts)
+            sent = from_iso(ts)  # strict: malformed/naive both raise -> skipped
         except (ValueError, TypeError):
-            continue
-        if sent.tzinfo is None or sent.utcoffset() is None:
             continue
         gap = (now - sent).total_seconds() / 60.0
         if gap < 0.0:

@@ -20,6 +20,7 @@ from lifemodel.core.desire_view import (
 )
 from lifemodel.core.intention_view import read_live_contact_intention
 from lifemodel.core.proactive import proactive_tick
+from lifemodel.core.timeutil import to_iso
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
@@ -205,7 +206,7 @@ def test_does_not_stamp_egress_service_alive_at(tmp_path) -> None:
     proactive_tick(lm, FakeEgress(), TARGET)
     # liveness is NOT a separate stamp anymore; last_tick_at (dt clock) carries it
     assert getattr(lm.state.load(), "egress_service_alive_at", None) is None
-    assert lm.state.load().last_tick_at == NOW.isoformat()  # coreloop stamped the tick
+    assert lm.state.load().last_tick_at == to_iso(NOW)  # coreloop stamped the tick
 
 
 # --- B3 (lm-j2w): the FULL assembled prompt, durable under the origin trace --

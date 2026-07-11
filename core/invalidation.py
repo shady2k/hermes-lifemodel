@@ -13,15 +13,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from .timeutil import from_iso
+
 
 def _parse(ts: str | None) -> datetime | None:
     if ts is None:
         return None
     try:
-        value = datetime.fromisoformat(ts)
+        return from_iso(ts)  # strict: malformed/naive both raise -> None
     except (ValueError, TypeError):
         return None
-    return value if value.tzinfo is not None else None
 
 
 def is_proactive_outcome_stale(

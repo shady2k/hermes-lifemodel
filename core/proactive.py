@@ -47,6 +47,7 @@ from .intention_view import read_live_contact_intention
 from .intents import Intent, LaunchProactive, TransitionRecord, UpdateState
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
+from .timeutil import to_iso
 
 
 def proactive_tick(
@@ -154,7 +155,7 @@ def _emit_egress_suppression(
     tracer = lm.tracer
     if tracer is None:
         return
-    now = lm.clock.now().isoformat()
+    now = to_iso(lm.clock.now())
     bridge = open_correlated_span(
         tracer=tracer,
         writer=lm.trace_writer,
@@ -181,7 +182,7 @@ def _emit_delivery_span(lm: LifeModel, *, launch: LaunchProactive, tick: int, pr
     tracer = lm.tracer
     if tracer is None:
         return
-    now = lm.clock.now().isoformat()
+    now = to_iso(lm.clock.now())
     bridge = open_correlated_span(
         tracer=tracer,
         writer=lm.trace_writer,
@@ -263,7 +264,7 @@ def _rollback(lm: LifeModel, actor: StateActor, launch: LaunchProactive, *, defe
     # Best-effort/fail-open like all trace writes.
     with contextlib.suppress(ValueError):
         origin_trace_id = parse_traceparent(launch.origin_traceparent).trace_id
-        resolved_at = lm.clock.now().isoformat()
+        resolved_at = to_iso(lm.clock.now())
         lm.trace_writer.submit_correlation(
             correlation_id=launch.correlation_id,
             origin_trace_id=origin_trace_id,

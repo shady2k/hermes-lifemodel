@@ -21,6 +21,7 @@ from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
 from lifemodel.core.tick_metrics import BRAIN_HEARTBEAT, BRAIN_LAST_TICK_EPOCH
+from lifemodel.core.timeutil import to_iso
 from lifemodel.state.model import State
 from lifemodel.testing import FakeTracer
 
@@ -98,7 +99,7 @@ def test_tick_advances_durable_liveness_AND_emits_heartbeat() -> None:
     # --- durable, primary ---
     assert report.tick == 1
     assert store.load().tick_count == 1
-    assert store.load().last_tick_at == _NOW.isoformat()
+    assert store.load().last_tick_at == to_iso(_NOW)
 
     # --- heartbeat, supporting ---
     heartbeat = metrics.get(BRAIN_HEARTBEAT)
@@ -149,4 +150,4 @@ def test_heartbeat_metrics_are_declared_and_exported_to_metrics_sqlite() -> None
         monotonic=Ticking(),
     ).tick()
     assert report.tick == 1
-    assert store.load().last_tick_at == _NOW.isoformat()
+    assert store.load().last_tick_at == to_iso(_NOW)

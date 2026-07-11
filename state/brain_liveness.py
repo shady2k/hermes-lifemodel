@@ -28,7 +28,7 @@ All stdlib.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from .brain_health import (
@@ -40,6 +40,19 @@ from .brain_health import (
 )
 
 _LOG = logging.getLogger("lifemodel.brain_health")
+
+
+def _system_now() -> datetime:
+    """The default render "now" — the ONE sanctioned system-time read (spec §5).
+
+    Sources through :class:`~lifemodel.adapters.clock.SystemClock` (imported lazily
+    so this leaf view module never eagerly pulls the adapters package) rather than
+    ``datetime.now`` directly; tests inject ``now`` for determinism.
+    """
+    from ..adapters.clock import SystemClock
+
+    return SystemClock().now()
+
 
 _BOOT_FAILED = "boot_failed"
 
@@ -138,7 +151,7 @@ def brain_liveness_lines(base_dir: Path, *, now: datetime | None = None) -> list
     flaky read degrades (a clear ``unknown`` state / ``ticks_total: ?``) and is logged,
     never raised. ``now`` is injectable for deterministic tests; it defaults to real UTC.
     """
-    now = now if now is not None else datetime.now(UTC)
+    now = now if now is not None else _system_now()
 
     snapshot: BrainHealthSnapshot | None
     try:

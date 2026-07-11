@@ -48,6 +48,7 @@ from .intention_view import (
 )
 from .intents import Intent, LaunchProactive, PutRecord, UpdateState
 from .suppression import SuppressionReason, emit_suppression_span
+from .timeutil import to_iso
 from .trace import creation_provenance
 from .wake_packet import build_wake_packet
 
@@ -101,7 +102,7 @@ class CognitionLauncher:
             return []
         energy_after, _reservation = reserved
 
-        correlation_id = f"proactive-{ctx.now.isoformat()}"
+        correlation_id = f"proactive-{to_iso(ctx.now)}"
         # T6: thoughts are no longer born in the tick (the thought machinery moved
         # to Phase 6 in T7), so the launcher passes no thoughts — build_wake_packet
         # renders no "Recent Thoughts" block when none are supplied (empty-safe).
@@ -168,7 +169,7 @@ class CognitionLauncher:
             origin_trace_id=ctx.trace.trace_id,
             origin_traceparent=origin_traceparent,
             kind="proactive",
-            created_at=ctx.now.isoformat(),
+            created_at=to_iso(ctx.now),
         )
         return [
             PutRecord(op=PutOp(draft=encode_contact_intention(intention))),
@@ -182,7 +183,7 @@ class CognitionLauncher:
                 {
                     "energy": energy_after,
                     "pending_proactive_id": correlation_id,
-                    "pending_proactive_since": ctx.now.isoformat(),
+                    "pending_proactive_since": to_iso(ctx.now),
                     "pending_proactive_origin_traceparent": origin_traceparent,
                 }
             ),

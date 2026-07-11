@@ -25,6 +25,7 @@ from lifemodel.core.taxonomy import (
     in_flight_signal,
     proactive_outcome_signal,
 )
+from lifemodel.core.timeutil import to_iso
 from lifemodel.domain.egress import ProactiveOutcome
 from lifemodel.domain.objects import DesireSpring
 from lifemodel.ports.tracer import TraceContext
@@ -213,7 +214,7 @@ def test_exchange_clears_the_silence_anchor(tmp_path) -> None:
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path)))
-    assert changes["last_exchange_at"] == now.isoformat()
+    assert changes["last_exchange_at"] == to_iso(now)
     assert changes["silence_anchor_at"] is None  # override cleared by the real exchange
 
 
@@ -271,7 +272,7 @@ def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
     assert _transition(intents) == ("active", "satisfied")  # exchange terminalizes the desire
     assert changes["decline_count"] == 0
     assert changes["declined_at"] is None
-    assert changes["last_exchange_at"] == now.isoformat()
+    assert changes["last_exchange_at"] == to_iso(now)
 
 
 def test_exchange_this_tick_suppresses_wake(tmp_path) -> None:
@@ -306,9 +307,9 @@ def test_fulfill_starts_action_pending_and_clears_pending(tmp_path) -> None:
     intents = _agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path))
     changes = _changes(intents)
     assert _transition(intents) == ("active", "satisfied")
-    assert changes["action_pending_since"] == now.isoformat()  # send -> ActionPending
+    assert changes["action_pending_since"] == to_iso(now)  # send -> ActionPending
     assert "u" not in changes  # not satiated (send != contact)
-    assert changes["last_contact_at"] == now.isoformat()
+    assert changes["last_contact_at"] == to_iso(now)
     assert changes["pending_proactive_id"] is None  # turn resolved
     # §4.4: the async anchor is cleared in lockstep with pending_id at resolution.
     assert changes["pending_proactive_origin_traceparent"] is None
@@ -343,7 +344,7 @@ def test_reject_records_backoff_and_clears_pending(tmp_path) -> None:
     changes = _changes(intents)
     assert _transition(intents) == ("active", "dropped")
     assert changes["decline_count"] == 2
-    assert changes["declined_at"] == now.isoformat()
+    assert changes["declined_at"] == to_iso(now)
     assert changes["pending_proactive_id"] is None
     # §4.4: the async anchor is cleared in lockstep with pending_id at resolution.
     assert changes["pending_proactive_origin_traceparent"] is None
@@ -435,7 +436,7 @@ def test_exchange_dominates_same_tick_verdict(tmp_path) -> None:
     changes = _changes(intents)
     assert _transition(intents) == ("active", "satisfied")  # exchange terminalized it
     assert changes["action_pending_since"] is None  # fulfill was dropped (desire resolved)
-    assert changes["last_exchange_at"] == now.isoformat()
+    assert changes["last_exchange_at"] == to_iso(now)
 
 
 # --- Phase C1: effective pressure gates ---
@@ -494,7 +495,7 @@ def test_fulfill_records_a_send(tmp_path) -> None:
     )
     changes = _changes(_agg().step(_ctx(state, now, [c, v], objects=ACTIVE, tmp_path=tmp_path)))
     log = changes["proactive_send_log"]
-    assert log[-1] == now.isoformat()  # this send recorded
+    assert log[-1] == to_iso(now)  # this send recorded
     assert len(log) == 2  # appended to the prior one
 
 
@@ -902,7 +903,7 @@ def test_contact_observed_survives_a_best_effort_flood(tmp_path) -> None:
     observed = contact_observed_signal(origin_id="e", actor="user", label="two_way", timestamp=None)
     signals = [observed, *(_noise(i) for i in range(200))]
     intents = _agg().step(_ctx(state, now, signals, objects=ACTIVE, tmp_path=tmp_path))
-    assert _changes(intents)["last_exchange_at"] == now.isoformat()  # contact processed
+    assert _changes(intents)["last_exchange_at"] == to_iso(now)  # contact processed
     assert _transition(intents) == ("active", "satisfied")  # live desire resolved
 
 

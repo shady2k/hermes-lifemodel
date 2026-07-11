@@ -55,6 +55,7 @@ from .core.thought_view import (
     encode_thought,
     seed_thought_id,
 )
+from .core.timeutil import to_iso
 from .core.user_model_view import (
     EXPLICIT_CONFIDENCE,
     build_owner_user_model,
@@ -177,7 +178,7 @@ def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
     # NOT the real last_exchange_at, which the wake packet renders and which is immune
     # to all admin commands (lm-md6.1). The gate reads this anchor; the model still
     # sees the genuine last exchange.
-    silence_anchor_at = (now - timedelta(minutes=backdate_min)).isoformat()
+    silence_anchor_at = to_iso(now - timedelta(minutes=backdate_min))
 
     send_log = before.proactive_send_log
     backstop_was_blocking = not allow_send(send_log, now)
@@ -245,7 +246,7 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
     only by an actual two-way exchange. "Reset the drive" is decoupled from "record of
     a real conversation", so a satiated being still tells the model the true last-exchange
     time, not a fabricated "just now"."""
-    now_iso = now.isoformat()
+    now_iso = to_iso(now)
     after = dataclasses.replace(
         before,
         u=0.0,
@@ -314,7 +315,7 @@ def set_field(before: State, now: datetime, raw_args: str) -> tuple[State | None
         except ValueError:
             return None, f"error: field {field_name!r} expects an integer, got {raw_value!r}\n"
     else:  # _KIND_TIMESTAMP
-        value = now.isoformat() if raw_value == "now" else raw_value
+        value = to_iso(now) if raw_value == "now" else raw_value
 
     changes: dict[str, Any] = {field_name: value}
     after = dataclasses.replace(before, **changes)
@@ -528,7 +529,7 @@ def _mark_pending_correlation_resolved(base_dir: Path, before: State, now: datet
     if writer is None:
         return
     with contextlib.suppress(ValueError):
-        stamp = now.isoformat()
+        stamp = to_iso(now)
         writer.submit_correlation(
             correlation_id=correlation_id,
             origin_trace_id=parse_traceparent(origin).trace_id,

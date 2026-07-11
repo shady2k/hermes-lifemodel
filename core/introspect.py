@@ -21,7 +21,7 @@ from .backstop import allow_send
 from .circadian import circadian
 from .pressure import effective_pressure, inhibition_at
 from .receptivity import appraise_receptivity
-from .timeutil import minutes_between
+from .timeutil import from_iso, minutes_between
 from .user_model_view import DEFAULT_USER_MODEL
 from .why_graph import WhyNode, display_id
 
@@ -214,10 +214,10 @@ def _sends_today(send_log: list[str], now: datetime) -> int:
     count = 0
     for ts in send_log:
         try:
-            t = datetime.fromisoformat(ts)
+            t = from_iso(ts)  # strict: malformed/naive both raise -> skipped
         except (ValueError, TypeError):
             continue
-        if t.tzinfo is not None and t >= day_ago:
+        if t >= day_ago:
             count += 1
     return count
 
