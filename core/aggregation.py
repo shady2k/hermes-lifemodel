@@ -43,6 +43,7 @@ from .backstop import record_send
 from .component import TickContext
 from .correlate import open_correlated_span
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
+from .intake import apply_backpressure
 from .intention_view import live_contact_intention
 from .intents import Intent, PutRecord, TransitionRecord, UpdateState
 from .invalidation import is_proactive_outcome_stale
@@ -57,6 +58,7 @@ from .taxonomy import (
     read_proactive_outcome,
     read_proactive_outcome_correlation,
 )
+from .tick_metrics import INTAKE_COALESCED, INTAKE_SHED_SENSOR, SIGNALS_INTAKE
 from .timeutil import minutes_between
 from .trace import creation_provenance
 
@@ -114,10 +116,24 @@ class ContactAggregation:
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
         now = ctx.now
+        # Priority-class backpressure (spec §7): the gate is the DEFENSIVE layer. The
+        # ephemeral bus carried every seed through (frame is a dumb blackboard); HERE
+        # the thalamic gate classifies must_process vs best_effort and coalesces the
+        # best_effort sensor noise to a bounded count BEFORE reducing — a flood can't
+        # each drive a step. must_process (contact_observed / proactive_outcome /
+        # in_flight / the drive's contact_pressure) is NEVER shed. Every read below is
+        # off ``signals`` (the gated view), so the load-bearing signals are intact and
+        # only the noise is bounded. A real backpressure event (overflow) is counted
+        # on the intake counter (shed/coalesced), so the shedding is observable.
+        intake = apply_backpressure(ctx.signals)
+        signals = intake.signals
+        if ctx.metrics is not None and intake.overflowed:
+            ctx.metrics.inc(SIGNALS_INTAKE, intake.best_effort_shed, outcome=INTAKE_SHED_SENSOR)
+            ctx.metrics.inc(SIGNALS_INTAKE, intake.best_effort_kept, outcome=INTAKE_COALESCED)
         # The drive's FRESH u from its transient contact_pressure signal (T3): the
         # drive's UpdateState is only visible AFTER commit, so aggregation reads the
         # same-tick u here, falling back to the start-of-tick ctx.state.u baseline.
-        u_now = contact_pressure_value(ctx.signals, default=state.u)
+        u_now = contact_pressure_value(signals, default=state.u)
 
         # The live desire from the start-of-tick snapshot (active/deferred), and
         # its logical state threaded through the reducer — the old ``agg.status``.
@@ -178,7 +194,7 @@ class ContactAggregation:
         had_exchange = any(
             sig.kind == KIND_CONTACT_OBSERVED
             and read_contact_observed(sig)[0] != "proactive_internal"
-            for sig in ctx.signals
+            for sig in signals
         )
         if had_exchange:
             last_exchange_at = now.isoformat()
@@ -195,7 +211,7 @@ class ContactAggregation:
         #    invalidation §7.3). Only reached when no contact dominated this frame
         #    (contact_observed-dominates-proactive_outcome).
         if not had_exchange:
-            for sig in ctx.signals:
+            for sig in signals:
                 if sig.kind != KIND_PROACTIVE_OUTCOME:
                     continue
                 stale, _reason = is_proactive_outcome_stale(
@@ -264,7 +280,7 @@ class ContactAggregation:
         decl_min = -minutes_between(declined_at, now) if declined_at is not None else None
         lane = LaneState(
             last_exchange_at=exch_min,
-            in_flight=is_in_flight(ctx.signals),
+            in_flight=is_in_flight(signals),
             declined_at=decl_min,
             decline_count=decline_count,
         )

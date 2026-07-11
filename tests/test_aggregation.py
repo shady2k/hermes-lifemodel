@@ -877,3 +877,63 @@ def test_born_desire_carries_the_tick_trace(tmp_path) -> None:
     assert prov.trace_id == trace.trace_id  # logs and durable provenance JOIN on this
     assert prov.creation_span_id == trace.span_id
     assert prov.component == "aggregation"
+
+
+# --- lm-fib.8.2: priority-class backpressure in the AGGREGATION gate (spec §7) ---
+#
+# The gate classifies each frame signal into must_process vs best_effort and
+# coalesces the best_effort class to a bounded count BEFORE reducing. must_process
+# (contact_observed / proactive_outcome / in_flight / the drive's contact_pressure)
+# is never shed; best_effort sensor noise is folded so it can't each drive a step.
+
+
+def _noise(i: int):
+    from lifemodel.domain.signal import Signal
+
+    return Signal(origin_id=f"n{i}", kind="sensor_noise")
+
+
+def test_contact_observed_survives_a_best_effort_flood(tmp_path) -> None:
+    # 1 real contact_observed + 200 best_effort sensor-noise signals: the
+    # contact_observed is ALWAYS processed — it resets the exchange clocks and
+    # terminalizes the live desire — no matter how full the frame is (spec §7).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    observed = contact_observed_signal(origin_id="e", actor="user", label="two_way", timestamp=None)
+    signals = [observed, *(_noise(i) for i in range(200))]
+    intents = _agg().step(_ctx(state, now, signals, objects=ACTIVE, tmp_path=tmp_path))
+    assert _changes(intents)["last_exchange_at"] == now.isoformat()  # contact processed
+    assert _transition(intents) == ("active", "satisfied")  # live desire resolved
+
+
+def test_best_effort_flood_is_coalesced_to_a_bounded_count(tmp_path) -> None:
+    # The 200 best_effort signals are coalesced to the bounded cap: the gate emits
+    # the intake shed/coalesced counters so the backpressure is observable (spec §7).
+    from lifemodel.core.intake import MAX_BEST_EFFORT
+    from lifemodel.core.metrics import MetricRegistry
+    from lifemodel.core.tick_metrics import SIGNALS_INTAKE, register_universal_metrics
+    from lifemodel.domain.signal import Signal
+
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    reg = MetricRegistry()
+    register_universal_metrics(reg)
+    observed = contact_observed_signal(origin_id="e", actor="user", label="two_way", timestamp=None)
+    signals = (observed, *(Signal(origin_id=f"n{i}", kind="sensor_noise") for i in range(200)))
+    ctx = TickContext(
+        state=state, now=now, signals=signals, objects=ACTIVE, trace=_TRACE, metrics=reg
+    )
+    _agg().step(ctx)
+    intake = reg.get(SIGNALS_INTAKE)
+    assert intake is not None
+    assert intake.value(outcome="shed_sensor") == float(200 - MAX_BEST_EFFORT)  # type: ignore[attr-defined]
+    assert intake.value(outcome="coalesced") == float(MAX_BEST_EFFORT)  # type: ignore[attr-defined]
+
+
+def test_only_best_effort_noise_no_spurious_launch(tmp_path) -> None:
+    # A frame of ONLY sensor noise (no must_process, u below theta) behaves sanely:
+    # coalesced, no crash, NO desire born / no cognition launch (spec §7).
+    now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
+    state = State(u=0.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    intents = _agg().step(_ctx(state, now, [_noise(i) for i in range(200)], tmp_path=tmp_path))
+    assert _desire_intent(intents) is None  # no spurious desire / launch
