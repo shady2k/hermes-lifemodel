@@ -40,7 +40,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, overload
+
+from ..core.timeutil import from_iso, to_iso
+from ..ports.clock import ClockPort
 
 #: The trace DB's filename, a sibling of ``lifemodel.sqlite`` in the state dir.
 _DB_FILENAME: Final = "observability.sqlite"
@@ -161,8 +164,32 @@ def _dumps(value: Mapping[str, Any] | None) -> str | None:
         return json.dumps({"_unserializable": True})
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+@overload
+def _normalize_ts(value: str) -> str: ...
+@overload
+def _normalize_ts(value: None) -> None: ...
+def _normalize_ts(value: str | None) -> str | None:
+    """Canonicalize a trace timestamp at the write boundary (spec §4 codex #9).
+
+    Every ``started_at``/``ended_at``/``ts``/``created_at``/``resolved_at`` is run
+    through :func:`~lifemodel.core.timeutil.to_iso` at the ``submit_*`` (enqueue)
+    boundary, so ``observability.sqlite`` only ever holds normalized, fixed-width
+    ISO — which is what makes retention's lexical ``MIN(ts)`` / ``< cutoff`` a
+    correct chronological compare.
+
+    A tz-*aware* value is re-serialized to canonical UTC. A tz-naive or malformed
+    value is NOT silently coerced to UTC on the write path (the reader's
+    :func:`_parse_ts` stays defensive for *legacy* rows, but a NEW write never
+    relies on that): because this store is disposable and fail-open (§4.2), such a
+    value is kept raw and a WARNING is logged, never dropped and never guessed-UTC.
+    """
+    if value is None:
+        return None
+    try:
+        return to_iso(from_iso(value))
+    except ValueError:
+        _module_logger.warning("trace_ts_not_normalized value=%r; storing raw", value)
+        return value
 
 
 # --------------------------------------------------------------------------- #
@@ -240,6 +267,13 @@ class RetentionPolicy:
 
 
 def _parse_ts(value: str) -> datetime | None:
+    """Defensively parse a stored timestamp for retention (spec §4 codex #9).
+
+    New writes are normalized at ingress (:func:`_normalize_ts`), so this is only
+    ever tz-naive for a *legacy* row written before that; for those the reader
+    stays tolerant (assume UTC) rather than dropping the row from the retention
+    scan. The write path never relies on this coercion.
+    """
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
@@ -394,6 +428,7 @@ class TraceWriter:
         retention: RetentionPolicy | None = None,
         protected_trace_ids: Callable[[], set[str]] | None = None,
         prune_every_commits: int = _DEFAULT_PRUNE_EVERY_COMMITS,
+        clock: ClockPort | None = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=max_queue)
@@ -401,6 +436,11 @@ class TraceWriter:
         self._retention = retention or RetentionPolicy()
         self._protected = protected_trace_ids
         self._prune_every_commits = max(1, prune_every_commits)
+        # The ONE source of "now" for the writer thread's retention pass (spec §3.1):
+        # the injected clock, never ``datetime.now``. The live being injects the SAME
+        # ``SystemClock`` the tick/stores use; a bare test/CLI writer with no clock
+        # simply skips the periodic prune (fail-open — the store is disposable).
+        self._clock = clock
         self._thread: threading.Thread | None = None
         self._started = False
         self._lifecycle_lock = threading.Lock()
@@ -464,9 +504,15 @@ class TraceWriter:
         ts: str,
         fields: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Enqueue one ``trace_events`` row. Returns ``False`` (dropped) if full."""
+        """Enqueue one ``trace_events`` row. Returns ``False`` (dropped) if full.
+
+        ``ts`` is normalized to canonical ISO here at the enqueue boundary (§4
+        codex #9), so the DB only ever holds normalized time.
+        """
         return self._submit(
-            _EventWrite(record_id, trace_id, span_id, tick, event, ts, _dumps(fields))
+            _EventWrite(
+                record_id, trace_id, span_id, tick, event, _normalize_ts(ts), _dumps(fields)
+            )
         )
 
     def submit_span(
@@ -482,7 +528,11 @@ class TraceWriter:
         status: str | None = None,
         attrs: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Enqueue one ``trace_spans`` upsert. Returns ``False`` (dropped) if full."""
+        """Enqueue one ``trace_spans`` upsert. Returns ``False`` (dropped) if full.
+
+        ``started_at``/``ended_at`` are normalized to canonical ISO here at the
+        enqueue boundary (§4 codex #9), so the DB only ever holds normalized time.
+        """
         return self._submit(
             _SpanWrite(
                 trace_id,
@@ -490,8 +540,8 @@ class TraceWriter:
                 parent_span_id,
                 component,
                 tick,
-                started_at,
-                ended_at,
+                _normalize_ts(started_at),
+                _normalize_ts(ended_at),
                 status,
                 _dumps(attrs),
             )
@@ -507,10 +557,19 @@ class TraceWriter:
         kind: str | None = None,
         resolved_at: str | None = None,
     ) -> bool:
-        """Enqueue one ``trace_correlations`` upsert (index only — §4.4)."""
+        """Enqueue one ``trace_correlations`` upsert (index only — §4.4).
+
+        ``created_at``/``resolved_at`` are normalized to canonical ISO here at the
+        enqueue boundary (§4 codex #9), so the DB only ever holds normalized time.
+        """
         return self._submit(
             _CorrelationWrite(
-                correlation_id, origin_trace_id, origin_traceparent, kind, created_at, resolved_at
+                correlation_id,
+                origin_trace_id,
+                origin_traceparent,
+                kind,
+                _normalize_ts(created_at),
+                _normalize_ts(resolved_at),
             )
         )
 
@@ -594,12 +653,17 @@ class TraceWriter:
             self._maybe_prune(conn)
 
     def _maybe_prune(self, conn: sqlite3.Connection) -> None:
+        if self._clock is None:
+            # No injected clock (a bare test/CLI writer): retention needs a "now" and
+            # must NOT self-source wall time (spec §3.1), so skip the periodic prune.
+            # The disposable store simply grows until a clock-backed writer reopens it.
+            return
         extra: set[str] = set()
         if self._protected is not None:
             with contextlib.suppress(Exception):
                 extra = set(self._protected())
         try:
-            prune_traces(conn, policy=self._retention, protected_ids=extra, now=_utcnow())
+            prune_traces(conn, policy=self._retention, protected_ids=extra, now=self._clock.now())
         except sqlite3.Error:
             self._write_errors += 1
 
@@ -809,6 +873,7 @@ def acquire_trace_writer(
     retention: RetentionPolicy | None = None,
     protected_trace_ids: Callable[[], set[str]] | None = None,
     prune_every_commits: int = _DEFAULT_PRUNE_EVERY_COMMITS,
+    clock: ClockPort | None = None,
 ) -> TraceWriter:
     """Return the started :class:`TraceWriter` for *db_path*, refcounted (§4.2).
 
@@ -817,7 +882,8 @@ def acquire_trace_writer(
     :func:`release_trace_writer` calls drop the count to zero the writer is
     stopped and forgotten, so a subsequent acquire is reconnect-safe — it spins
     a brand-new thread + connection. Construction options are honoured only on
-    the first acquire of a path.
+    the first acquire of a path. *clock* is the writer thread's injected source of
+    "now" for retention (spec §3.1) — the thread never reads system time.
     """
     key = _registry_key(db_path)
     with _registry_lock:
@@ -830,6 +896,7 @@ def acquire_trace_writer(
                 retention=retention,
                 protected_trace_ids=protected_trace_ids,
                 prune_every_commits=prune_every_commits,
+                clock=clock,
             )
             writer.start()
             _registry[key] = _WriterHandle(writer, 1)

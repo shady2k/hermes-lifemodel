@@ -14,10 +14,13 @@ Stdlib only; every test uses ``tmp_path`` and stops any writer it starts.
 
 from __future__ import annotations
 
+import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from lifemodel.core.timeutil import from_iso, to_iso
 from lifemodel.state.trace_store import (
     RetentionPolicy,
     TraceWriter,
@@ -31,8 +34,18 @@ from lifemodel.state.trace_store import (
     prune_traces,
     release_trace_writer,
 )
+from lifemodel.testing.fakes import FakeClock
 
 _NOW = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+
+#: The canonical, fixed-width normalized-ISO shape every stored trace timestamp
+#: must take (spec §3 invariant): always 6-digit µs, always ``+00:00``.
+_CANONICAL_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
+
+#: A tz-aware but DELIBERATELY non-normalized instant (a ``+03:00`` offset, whole
+#: second, no fractional part) — its canonical UTC form is 12:00:00.000000+00:00.
+_UNNORMALIZED_PLUS3 = "2026-07-09T15:00:00+03:00"
+_UNNORMALIZED_PLUS3_CANONICAL = "2026-07-09T12:00:00.000000+00:00"
 
 
 def _db(tmp_path: Path) -> Path:
@@ -438,3 +451,153 @@ def test_retention_protects_live_state_anchor(tmp_path: Path) -> None:
         assert _remaining(conn) == {"anchored"}
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# ingress normalization (spec §4 codex #9): every trace timestamp is serialized
+# via ``to_iso`` at the ``submit_*`` boundary, so the DB only ever holds
+# normalized ISO and retention's lexical ``MIN(ts)`` / ``< cutoff`` is correct.
+# --------------------------------------------------------------------------- #
+
+
+def test_submit_event_normalizes_ts_to_canonical_iso(tmp_path: Path) -> None:
+    # A tz-aware but non-normalized ``ts`` (+03:00 offset, no µs) must be stored as
+    # its canonical UTC form, not verbatim — so TEXT order == chronological order.
+    path = _db(tmp_path)
+    writer = TraceWriter(path, batch_size=1)
+    writer.start()
+    try:
+        assert writer.submit_event(
+            record_id=next_record_id(),
+            trace_id="t",
+            span_id="s",
+            tick=1,
+            event="e",
+            ts=_UNNORMALIZED_PLUS3,
+        )
+        assert writer.flush(timeout=5.0)
+        (stored,) = _read(path, "SELECT ts FROM trace_events WHERE trace_id='t'")[0]
+        assert _CANONICAL_ISO_RE.match(str(stored))
+        assert stored == _UNNORMALIZED_PLUS3_CANONICAL
+        assert stored == to_iso(from_iso(_UNNORMALIZED_PLUS3))
+    finally:
+        writer.stop()
+
+
+def test_submit_span_normalizes_started_and_ended(tmp_path: Path) -> None:
+    path = _db(tmp_path)
+    writer = TraceWriter(path, batch_size=1)
+    writer.start()
+    try:
+        assert writer.submit_span(
+            trace_id="t",
+            span_id="s",
+            component="cognition",
+            tick=1,
+            started_at=_UNNORMALIZED_PLUS3,
+            ended_at="2026-07-09T15:00:01+03:00",
+            status="ok",
+        )
+        assert writer.flush(timeout=5.0)
+        (started, ended) = _read(
+            path, "SELECT started_at, ended_at FROM trace_spans WHERE trace_id='t'"
+        )[0]
+        assert _CANONICAL_ISO_RE.match(str(started))
+        assert _CANONICAL_ISO_RE.match(str(ended))
+        assert started == _UNNORMALIZED_PLUS3_CANONICAL
+        assert ended == "2026-07-09T12:00:01.000000+00:00"
+    finally:
+        writer.stop()
+
+
+def test_submit_correlation_normalizes_created_and_resolved(tmp_path: Path) -> None:
+    path = _db(tmp_path)
+    writer = TraceWriter(path, batch_size=1)
+    writer.start()
+    try:
+        assert writer.submit_correlation(
+            correlation_id="c",
+            origin_trace_id="t",
+            created_at=_UNNORMALIZED_PLUS3,
+            resolved_at="2026-07-09T18:00:00+03:00",
+        )
+        assert writer.flush(timeout=5.0)
+        (created, resolved) = _read(
+            path,
+            "SELECT created_at, resolved_at FROM trace_correlations WHERE correlation_id='c'",
+        )[0]
+        assert _CANONICAL_ISO_RE.match(str(created))
+        assert _CANONICAL_ISO_RE.match(str(resolved))
+        assert created == _UNNORMALIZED_PLUS3_CANONICAL
+        assert resolved == "2026-07-09T15:00:00.000000+00:00"
+    finally:
+        writer.stop()
+
+
+def test_writer_thread_retention_uses_injected_clock(tmp_path: Path) -> None:
+    # The writer thread must source retention's "now" from the INJECTED clock, not
+    # wall time. Pin the clock far from real now (2020) and seed traces relative to
+    # it: 'old' is >14d before the injected now, 'fresh' is 1d before. If the writer
+    # (wrongly) used wall-clock now (2026) both would be ancient and BOTH pruned;
+    # sourcing the injected clock keeps 'fresh'.
+    injected = datetime(2020, 1, 1, 12, 0, 0, tzinfo=UTC)
+    path = _db(tmp_path)
+    conn = connect(path)
+    try:
+        _seed_trace(conn, "old", injected - timedelta(days=31))
+        _seed_trace(conn, "fresh", injected - timedelta(days=1))
+    finally:
+        conn.close()
+    writer = TraceWriter(
+        path,
+        clock=FakeClock(injected),
+        batch_size=1,
+        prune_every_commits=1,
+        retention=RetentionPolicy(max_age_days=14, max_traces=None, max_bytes=None),
+    )
+    writer.start()
+    try:
+        assert writer.submit_event(
+            record_id=next_record_id(),
+            trace_id="new",
+            span_id="s",
+            tick=1,
+            event="e",
+            ts=to_iso(injected),
+        )
+        assert writer.flush(timeout=5.0)
+    finally:
+        writer.stop()
+    remaining = {r[0] for r in _read(path, "SELECT DISTINCT trace_id FROM trace_spans")}
+    assert "old" not in remaining  # >14d before the injected now -> pruned
+    assert "fresh" in remaining  # 1d before the injected now -> kept
+
+
+def test_submit_does_not_silently_coerce_naive_ts(tmp_path: Path, caplog: object) -> None:
+    # A tz-naive ``ts`` must NEVER be silently coerced to an aware +00:00 form on the
+    # write path (spec §4: normalize at ingress, don't naive->UTC on writes). The
+    # disposable store is fail-open, so the record is kept (raw) + a WARNING logged,
+    # never dropped and never silently coerced.
+    import pytest  # local: keep the module's top imports minimal
+
+    assert isinstance(caplog, pytest.LogCaptureFixture)
+    path = _db(tmp_path)
+    writer = TraceWriter(path, batch_size=1)
+    writer.start()
+    try:
+        with caplog.at_level(logging.WARNING, logger="lifemodel.trace_store"):
+            assert writer.submit_event(
+                record_id=next_record_id(),
+                trace_id="t",
+                span_id="s",
+                tick=1,
+                event="e",
+                ts="2026-07-09T12:00:00",  # naive — no offset
+            )
+        assert writer.flush(timeout=5.0)
+        (stored,) = _read(path, "SELECT ts FROM trace_events WHERE trace_id='t'")[0]
+        assert stored == "2026-07-09T12:00:00"  # kept raw, NOT coerced to +00:00
+        assert not _CANONICAL_ISO_RE.match(str(stored))
+        assert any("trace_ts_not_normalized" in r.getMessage() for r in caplog.records)
+    finally:
+        writer.stop()

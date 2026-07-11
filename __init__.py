@@ -17,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from .adapters.clock import SystemClock
 from .adapters.origin import resolve_home_origin
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
@@ -311,7 +312,7 @@ def register(ctx: Any) -> None:
         # attempt, one ``trace_id``. This refcount is held for the plugin's lifetime
         # (register has no teardown), independent of the platform connect/disconnect
         # cycle, so the hook can always write regardless of loop state.
-        _outcome_writer = acquire_trace_writer(observability_db_path(sdir))
+        _outcome_writer = acquire_trace_writer(observability_db_path(sdir), clock=SystemClock())
         _outcome_ring = EventRing()
         ctx.register_hook(
             "post_llm_call",

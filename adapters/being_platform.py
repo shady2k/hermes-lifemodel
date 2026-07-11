@@ -25,7 +25,6 @@ import asyncio
 import contextlib
 import logging
 import traceback
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +35,7 @@ from ..composition import build_lifemodel
 from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
+from ..core.timeutil import to_iso
 from ..events import EventRing
 from ..state.brain_health import (
     DEFAULT_TICK_INTERVAL_SECONDS,
@@ -179,7 +179,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # skipped disconnect never double-refcounts.
         with wire("trace_writer", required=True, health=health, logger=_LOG):
             if self._trace_writer is None:
-                self._trace_writer = acquire_trace_writer(observability_db_path(self._base_dir))
+                # The writer thread's retention sources "now" from the injected clock
+                # (spec §3.1) — the SAME ``SystemClock`` the tick/stores use, never
+                # system time — so its prune cutoffs are stamped through one clock.
+                self._trace_writer = acquire_trace_writer(
+                    observability_db_path(self._base_dir), clock=SystemClock()
+                )
 
         # The metrics sampler is OPTIONAL/DEGRADED (spec §4.3/MAJOR-6): ``metrics.sqlite``
         # is supporting evidence only (the primary liveness is the durable
@@ -204,7 +209,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         self._mark_connected()
         # The loop is up → clear any prior boot_failed / loop_dead + the durable
         # boot record (a clean (re)connect means we are healthy now, spec §4.3).
-        health.mark_connected(at=datetime.now(UTC).isoformat())
+        health.mark_connected(at=to_iso(SystemClock().now()))
         _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
         return True
 
@@ -283,7 +288,7 @@ def make_check_fn(base_dir: Path, health: BrainHealth) -> Any:
         # /lifemodel status + this log, not by refusing enablement.
         ok, reason = health.check(
             last_tick_at=_read_last_tick_at(base_dir),
-            now=datetime.now(UTC),
+            now=SystemClock().now(),
             stale_after_seconds=STALE_AFTER_SECONDS,
         )
         _LOG.debug("being_check enablement=True liveness_ok=%s reason=%s", ok, reason)

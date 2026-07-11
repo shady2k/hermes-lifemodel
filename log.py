@@ -26,13 +26,28 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
+from .core.timeutil import to_iso
 from .state.trace_store import next_record_id
 
 if TYPE_CHECKING:
     from .ports.tracer import ActiveSpan
+
+
+def _system_now() -> datetime:
+    """Fallback "now" when a :class:`SpanLogger` is built without an injected clock.
+
+    Routes through the ONE sanctioned system-time read
+    (:class:`~lifemodel.adapters.clock.SystemClock`) rather than ``datetime.now``
+    directly (spec §3.1) — imported lazily so core's import graph never eagerly
+    pulls the adapters package. The live tick injects its clock; only bare
+    test/CLI construction falls here.
+    """
+    from .adapters.clock import SystemClock
+
+    return SystemClock().now()
 
 
 #: The full standard Python logging level name set, in ascending severity order.
@@ -169,7 +184,7 @@ class SpanLogger:
         self._span = span
         self._writer = writer
         self._ring = ring
-        self._now = now or (lambda: datetime.now(UTC))
+        self._now = now or _system_now
         self._human = human_logger or _HUMAN_LOGGER
 
     @property
@@ -181,7 +196,7 @@ class SpanLogger:
         ctx = self._span.context
         tick = self._span.tick
         record_id = next_record_id()
-        ts = self._now().isoformat()
+        ts = to_iso(self._now())
         enqueued = self._writer.submit_event(
             record_id=record_id,
             trace_id=ctx.trace_id,
