@@ -89,12 +89,15 @@ def _offenders_in(path: Path) -> list[tuple[int, str]]:
             continue
         func = node.func
         receiver = func.value
-        # `datetime.now(` / `datetime.utcnow(` / `datetime.fromtimestamp(` /
-        # `datetime.timestamp(` — a call on the `datetime` class itself.
-        if (
-            isinstance(receiver, ast.Name)
-            and receiver.id == "datetime"
-            and func.attr in _BANNED_DATETIME_ATTRS
+        # `datetime.now(` / `.utcnow(` / `.fromtimestamp(` / `.timestamp(` — a call on
+        # the `datetime` class. Catches both the `from datetime import datetime` form
+        # (receiver is the bare Name `datetime`) AND the module-qualified /aliased forms
+        # `import datetime; datetime.datetime.now()` / `import datetime as d; d.datetime.now()`
+        # (receiver is an Attribute whose own attr is `datetime`). A chained Call receiver
+        # like `self._clock.now()` / `SystemClock().now()` is neither, so it stays clean.
+        if func.attr in _BANNED_DATETIME_ATTRS and (
+            (isinstance(receiver, ast.Name) and receiver.id == "datetime")
+            or (isinstance(receiver, ast.Attribute) and receiver.attr == "datetime")
         ):
             found.append((node.lineno, f"datetime.{func.attr}(...)"))
             continue
@@ -144,6 +147,11 @@ _BANNED = [
     "datetime.utcnow()",
     "datetime.fromtimestamp(0)",
     "datetime.timestamp(dt)",
+    # module-qualified (`import datetime`) and aliased (`import datetime as d`):
+    "datetime.datetime.now()",
+    "datetime.datetime.now(UTC)",
+    "d.datetime.now(UTC)",
+    "datetime.datetime.fromtimestamp(0)",
     "x = now.isoformat()",
     "x = ctx.now.isoformat()",  # attribute receiver named `now`
     "x = created_at.isoformat()",  # *_at suffix
