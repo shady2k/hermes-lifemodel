@@ -9,10 +9,19 @@ from datetime import UTC, datetime, timedelta, timezone
 
 from lifemodel import debug as debug_mod
 from lifemodel.adapters.clock import SystemClock
-from lifemodel.debug import render_dump_for_dir
+from lifemodel.core.introspect import compute_readings
+from lifemodel.debug import render_debug_dump, render_dump_for_dir
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
+from lifemodel.trace_view import LastWakeOutcome
+
+
+def _readings():
+    """A minimal :class:`Readings` for the pure ``render_debug_dump`` tests."""
+    return compute_readings(
+        State(), now=datetime(2026, 7, 11, 10, 0, tzinfo=UTC), cfg=debug_mod._cfg()
+    )
 
 
 def test_dump_renders_the_sections(tmp_path) -> None:
@@ -305,3 +314,40 @@ def test_dump_contact_chain_is_no_outreach_when_absent(tmp_path) -> None:
     )
     out = render_dump_for_dir(tmp_path)
     assert "**why:** no current outreach" in out
+
+
+# --------------------------------------------------------------------------- #
+# LAST WAKE OUTCOME section (lm-9zj)
+# --------------------------------------------------------------------------- #
+
+
+def test_debug_shows_last_wake_outcome_line() -> None:
+    lw = LastWakeOutcome(
+        outcome="act_gate_silent", ts="2026-07-11T10:05:00+00:00", trace_id="abc123"
+    )
+    out = render_debug_dump(readings=_readings(), last_wake=lw)
+    assert "LAST WAKE OUTCOME" in out
+    assert "act_gate_silent" in out
+    assert "abc123" in out  # trace_id, so the owner can /lifemodel trace abc123 for reasoning
+
+
+def test_debug_last_wake_none_shows_friendly_line() -> None:
+    out = render_debug_dump(readings=_readings(), last_wake=None)
+    assert "LAST WAKE OUTCOME" in out
+    assert "no wake outcome recorded yet" in out
+
+
+def test_debug_never_renders_reasoning_text() -> None:
+    lw = LastWakeOutcome(
+        outcome="act_gate_silent", ts="2026-07-11T10:05:00+00:00", trace_id="abc123"
+    )
+    out = render_debug_dump(readings=_readings(), last_wake=lw)
+    assert "reasoning" not in out.lower()  # reasoning stays in /lifemodel trace only
+
+
+def test_render_dump_for_dir_no_trace_store_does_not_crash(tmp_path) -> None:
+    # A fresh base_dir with no observability.sqlite: the dump renders with the
+    # friendly line, never raises.
+    out = render_dump_for_dir(tmp_path)
+    assert "LAST WAKE OUTCOME" in out
+    assert "no wake outcome recorded yet" in out

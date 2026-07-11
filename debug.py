@@ -22,6 +22,7 @@ from .core.why_graph import why_contact_intention
 from .ports.clock import ClockPort
 from .ports.memory import MemoryPort
 from .state.errors import StateError
+from .trace_view import LastWakeOutcome, read_last_wake_outcome
 
 #: How many live thoughts the debug audit lists (most-salient first). Bounded so
 #: a large open-loop set never floods the read-only dump.
@@ -142,6 +143,7 @@ def render_dump_for_dir(base_dir: Path, *, clock: ClockPort | None = None) -> st
     contact_chain = contact_chain_summary(
         why_contact_intention(memory) if memory is not None else None
     )
+    last_wake = read_last_wake_outcome(base_dir)  # fail-soft: None when no/unreadable trace store
     return render_debug_dump(
         readings=compute_readings(
             state,
@@ -154,7 +156,8 @@ def render_dump_for_dir(base_dir: Path, *, clock: ClockPort | None = None) -> st
             user_model=user_model,
             thoughts=thoughts,
             contact_chain=contact_chain,
-        )
+        ),
+        last_wake=last_wake,
     )
 
 
@@ -175,7 +178,7 @@ def _metrics(pairs: list[tuple[str, str]]) -> list[str]:
     return [f"**{label}:** {value}" for label, value in pairs]
 
 
-def render_debug_dump(*, readings: Readings) -> str:
+def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None = None) -> str:
     r = readings
     lines: list[str] = ["🫀 **lifemodel debug** (read-only)", ""]
 
@@ -280,4 +283,19 @@ def render_debug_dump(*, readings: Readings) -> str:
             ("tick", str(r.tick_count)),
         ]
     )
+    lines.append("")
+
+    lines.append("**LAST WAKE OUTCOME**")
+    if last_wake is None:
+        lines.append("  (no wake outcome recorded yet)")
+    else:
+        lines += _metrics(
+            [
+                ("outcome", last_wake.outcome),
+                ("when", _local(last_wake.ts)),
+                ("trace", f"`{last_wake.trace_id}`  (→ /lifemodel trace {last_wake.trace_id})"),
+            ]
+        )
+    lines.append("")
+
     return "\n".join(lines) + "\n"

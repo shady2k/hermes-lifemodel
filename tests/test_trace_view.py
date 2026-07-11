@@ -32,7 +32,14 @@ from lifemodel.state.trace_store import (
 )
 from lifemodel.testing.fakes import FakeClock
 from lifemodel.testing.harness import RecordingEgress
-from lifemodel.trace_view import _Event, _merge_events, trace_for_dir
+from lifemodel.trace_view import (
+    LastWakeOutcome,
+    _Event,
+    _merge_events,
+    pick_last_wake_outcome,
+    read_last_wake_outcome,
+    trace_for_dir,
+)
 
 T0 = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
 
@@ -61,6 +68,101 @@ def test_merge_events_dedups_by_record_id() -> None:
 def test_merge_events_ignores_ring_records_for_other_traces() -> None:
     ring = [{"record_id": 9, "trace_id": "OTHER", "event": "x", "ts": "t"}]
     assert _merge_events([_evt(1, "a")], ring, "T") == [_evt(1, "a")]
+
+
+# --------------------------------------------------------------------------- #
+# Last-wake-outcome selector (lm-9zj)
+# --------------------------------------------------------------------------- #
+
+
+def _ev(record_id: int, event: str, ts: str, **fields) -> _Event:
+    return _Event(
+        record_id=record_id,
+        trace_id=f"t{record_id}",
+        span_id="s",
+        tick=record_id,
+        event=event,
+        ts=ts,
+        fields=fields,
+    )
+
+
+def test_pick_last_wake_prefers_newest_post_wake_marker() -> None:
+    events = [
+        _ev(1, "suppression", "2026-07-11T10:00:00+00:00", reason="below_threshold"),
+        _ev(2, "proactive_delivery", "2026-07-11T10:03:00+00:00", outcome="delivered"),
+        _ev(3, "suppression", "2026-07-11T10:05:00+00:00", reason="act_gate_silent"),
+    ]
+    result = pick_last_wake_outcome(events)
+    assert result == LastWakeOutcome(
+        outcome="act_gate_silent", ts="2026-07-11T10:05:00+00:00", trace_id="t3"
+    )
+
+
+def test_pick_last_wake_ignores_pre_wake_gates() -> None:
+    events = [
+        _ev(1, "proactive_delivery", "2026-07-11T09:00:00+00:00", outcome="delivered"),
+        _ev(2, "suppression", "2026-07-11T10:00:00+00:00", reason="below_threshold"),
+        _ev(3, "suppression", "2026-07-11T10:01:00+00:00", reason="silence_window"),
+    ]
+    result = pick_last_wake_outcome(events)
+    assert result is not None
+    assert result.outcome == "delivered"  # newest *wake* marker, not the later resting gates
+
+
+def test_pick_last_wake_none_when_only_resting_gates() -> None:
+    events = [_ev(1, "suppression", "2026-07-11T10:00:00+00:00", reason="below_threshold")]
+    assert pick_last_wake_outcome(events) is None
+
+
+def test_pick_last_wake_skips_suppression_without_reason() -> None:
+    events = [_ev(1, "suppression", "2026-07-11T10:00:00+00:00")]  # malformed: no reason
+    assert pick_last_wake_outcome(events) is None
+
+
+def test_read_last_wake_outcome_from_store(tmp_path) -> None:
+    db = observability_db_path(tmp_path)
+    writer = acquire_trace_writer(db)
+    try:
+        writer.submit_event(
+            record_id=1,
+            trace_id="t1",
+            span_id="s",
+            tick=1,
+            event="suppression",
+            ts="2026-07-11T10:00:00+00:00",
+            fields={"reason": "below_threshold"},
+        )
+        writer.submit_event(
+            record_id=2,
+            trace_id="t2",
+            span_id="s",
+            tick=2,
+            event="proactive_delivery",
+            ts="2026-07-11T10:03:00+00:00",
+            fields={"outcome": "delivered"},
+        )
+        writer.submit_event(
+            record_id=3,
+            trace_id="t3",
+            span_id="s",
+            tick=3,
+            event="suppression",
+            ts="2026-07-11T10:05:00+00:00",
+            fields={"reason": "act_gate_silent"},
+        )
+        writer.flush(timeout=5.0)
+        result = read_last_wake_outcome(tmp_path)
+    finally:
+        release_trace_writer(db)
+    assert result is not None
+    assert result.outcome == "act_gate_silent"
+    assert result.trace_id == "t3"
+
+
+def test_read_last_wake_outcome_missing_store_is_none(tmp_path) -> None:
+    # No observability.sqlite created → fail-soft None, never raise.
+    assert read_last_wake_outcome(tmp_path) is None
 
 
 # --------------------------------------------------------------------------- #

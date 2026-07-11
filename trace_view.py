@@ -66,6 +66,58 @@ class _Event:
     fields: dict[str, Any]
 
 
+#: Suppression reasons that mean the being actually WOKE cognition and then held
+#: back — the "why silent" cases. The pre-wake resting gates (below_threshold,
+#: silence_window, in_flight, pending_proactive, decline_backoff) are deliberately
+#: excluded: the DRIVE section of /lifemodel debug already explains the resting state.
+POST_WAKE_REASONS: frozenset[str] = frozenset(
+    {
+        "act_gate_silent",
+        "backstop_rate_limited",
+        "egress_unavailable",
+        "egress_failed",
+        "energy_unaffordable",
+        "repeat_pure_longing",
+    }
+)
+
+
+@dataclass(frozen=True)
+class LastWakeOutcome:
+    """The most recent proactive terminal decision, for the /lifemodel debug dump."""
+
+    outcome: str
+    ts: str
+    trace_id: str
+
+
+def pick_last_wake_outcome(events: Sequence[_Event]) -> LastWakeOutcome | None:
+    """The newest delivery / post-wake-suppression among *events*, or ``None``.
+
+    A delivery is ``event == "proactive_delivery"`` (outcome ``"delivered"``); a
+    post-wake suppression is ``event == "suppression"`` whose ``fields["reason"]``
+    is in :data:`POST_WAKE_REASONS`. ``ts`` is fixed-width ISO-8601 UTC, so the
+    lexical ``(ts, record_id)`` max is the chronological latest.
+    """
+    best: LastWakeOutcome | None = None
+    best_key: tuple[str, int] = ("", -1)
+    for e in events:
+        if e.event == "proactive_delivery":
+            outcome = "delivered"
+        elif e.event == "suppression":
+            reason = e.fields.get("reason")
+            if not isinstance(reason, str) or reason not in POST_WAKE_REASONS:
+                continue
+            outcome = reason
+        else:
+            continue
+        key = (e.ts, e.record_id)
+        if key > best_key:
+            best_key = key
+            best = LastWakeOutcome(outcome=outcome, ts=e.ts, trace_id=e.trace_id)
+    return best
+
+
 @dataclass
 class _Node:
     """A span plus its child spans and attached events (the render tree)."""
@@ -359,3 +411,33 @@ def trace_for_dir(base_dir: Path, raw_args: str, *, ring: Sequence[Mapping[str, 
         return f"lifemodel trace: trace store unreadable ({exc}).\n"
 
     return "\n".join(header + body) + "\n"
+
+
+#: Bounded scan for the last-wake reader: enough to span days of every-tick
+#: below_threshold rows so a genuine recent wake is still found, cheap to decode.
+_LAST_WAKE_SCAN_LIMIT = 5000
+
+
+def read_last_wake_outcome(base_dir: Path) -> LastWakeOutcome | None:
+    """The being's most recent proactive terminal decision, or ``None``.
+
+    Read-only + fail-soft (invariant law 3): a missing/locked/corrupt trace DB
+    degrades to ``None`` (the debug dump then shows a friendly line), never raises.
+    Flushes the live singleton writer first for read-your-writes (§4.2).
+    """
+    db_path = observability_db_path(base_dir)
+    if not db_path.exists():
+        return None
+    _live_ring_flush(base_dir)
+    try:
+        with closing(connect(db_path, create_parent=False)) as conn:
+            rows = conn.execute(
+                "SELECT record_id, trace_id, span_id, tick, event, ts, fields_json "
+                "FROM trace_events WHERE event IN ('proactive_delivery', 'suppression') "
+                "ORDER BY ts DESC, record_id DESC LIMIT ?",
+                (_LAST_WAKE_SCAN_LIMIT,),
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+    events = [_Event(r[0], r[1], r[2], r[3], r[4], r[5], _loads(r[6])) for r in rows]
+    return pick_last_wake_outcome(events)
