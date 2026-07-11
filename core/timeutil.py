@@ -1,6 +1,18 @@
-"""Defensive clock arithmetic shared by the pipeline (spec §17).
+"""The one canonical time helper — pure format/parse/display (spec §3, lm-fib.10).
 
-``minutes_between`` returns elapsed minutes from an ISO-8601 timestamp to a
+Hermes-free, stdlib only, no I/O and no ``datetime.now`` (reading "now" is the
+ClockPort's job, ``adapters/clock.py``). This is the single place the codebase
+serializes, parses, or renders time strings:
+
+* :func:`to_iso` — the canonical serializer: reject tz-naive, normalize to UTC,
+  emit fixed-width ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00`` (always 6-digit µs) so
+  TEXT order == chronological order (the load-bearing ordering/expiry invariant).
+* :func:`from_iso` — the one strict storage parser (aware UTC, raise on bad).
+* :func:`to_epoch_seconds` — epoch seconds for a legitimately epoch-VALUED metric.
+* :func:`to_display` — owner-local render for human surfaces; the ONE fail-open
+  path (a bad stored row is shown raw + logged, never blanks the view).
+
+``minutes_between`` (kept) returns elapsed minutes from an ISO-8601 timestamp to a
 ``datetime``, and — like ``core/decision.py``'s private helper it generalises —
 returns ``0.0`` ("no elapsed rise") for ``None``, an unparseable string, or a
 tz-naive value, so a malformed ``last_tick_at`` never crashes a tick.
