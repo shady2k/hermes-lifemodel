@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from .core.component import LAYER_BY_TYPE
 from .core.metrics import Counter, Gauge, Histogram, MetricRegistry, get_metric_registry
+from .core.timeutil import from_iso
 
 if TYPE_CHECKING:
     # Imported lazily at call time inside ``_safe_window`` (NOT at module load):
@@ -230,11 +231,13 @@ class _Window:
         run_samples = [s for s in samples if s.run_id == run]
         self.run_id = run
 
-        self._ts: dict[tuple[str, str], list[int]] = {}
+        # ``ts`` is normalized ISO TEXT (spec §4): lexical order == chronological, so
+        # sort/bisect on the strings directly; only the window WIDTH needs real time.
+        self._ts: dict[tuple[str, str], list[str]] = {}
         self._val: dict[tuple[str, str], list[float]] = {}
         self.labels: dict[tuple[str, str], dict[str, str]] = {}
-        by_key: dict[tuple[str, str], list[tuple[int, float]]] = {}
-        ts_seen: set[int] = set()
+        by_key: dict[tuple[str, str], list[tuple[str, float]]] = {}
+        ts_seen: set[str] = set()
         for s in run_samples:
             key = (s.name, s.label_key)
             by_key.setdefault(key, []).append((s.ts, s.value))
@@ -248,12 +251,14 @@ class _Window:
         ts_list = sorted(ts_seen)
         self.t1 = ts_list[-1]
         self.t0 = ts_list[max(0, len(ts_list) - 1 - last_n)]
-        self.dt = self.t1 - self.t0
+        # The window width in SECONDS — real ``datetime`` arithmetic on the two ISO
+        # borders (a plain string subtraction is meaningless), for the per-minute rate.
+        self.dt = (from_iso(self.t1) - from_iso(self.t0)).total_seconds()
 
     def keys_named(self, name: str) -> list[tuple[str, str]]:
         return [key for key in self._ts if key[0] == name]
 
-    def _value_at(self, key: tuple[str, str], border: int) -> float | None:
+    def _value_at(self, key: tuple[str, str], border: str) -> float | None:
         stamps = self._ts.get(key)
         if not stamps:
             return None

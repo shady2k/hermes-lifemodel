@@ -7,9 +7,11 @@ registry → ``n/a`` rather than a crash), mirroring ``tests/test_trace_view.py`
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from lifemodel.core.metrics import MetricRegistry, get_metric_registry
+from lifemodel.core.timeutil import to_iso
 from lifemodel.state.metrics_store import MetricSample, MetricsSampler, metrics_db_path
 from lifemodel.stats_view import (
     approx_quantile,
@@ -19,11 +21,23 @@ from lifemodel.stats_view import (
     stats_for_dir,
 )
 
+#: Time is ISO-8601 UTC TEXT (spec §4). A fixed aware-UTC anchor lets a test name an
+#: instant by "seconds since anchor" and keep the old 60s window spacing intact.
+_ANCHOR = datetime(2026, 7, 11, 0, 0, 0, tzinfo=UTC)
 
-def _sample(ts: int, name: str, value: float, run_id: str = "R", **labels: str) -> MetricSample:
+
+def _dt(offset_seconds: float) -> datetime:
+    return _ANCHOR + timedelta(seconds=offset_seconds)
+
+
+def _ts(offset_seconds: float) -> str:
+    return to_iso(_dt(offset_seconds))
+
+
+def _sample(ts: float, name: str, value: float, run_id: str = "R", **labels: str) -> MetricSample:
     label_key = ",".join(f"{k}={labels[k]}" for k in sorted(labels))
     return MetricSample(
-        ts=ts, run_id=run_id, name=name, label_key=label_key, value=value, labels=dict(labels)
+        ts=_ts(ts), run_id=run_id, name=name, label_key=label_key, value=value, labels=dict(labels)
     )
 
 
@@ -220,9 +234,9 @@ def test_stats_end_to_end_registry_now_plus_sqlite_window(tmp_path: Path) -> Non
 
     sampler = MetricsSampler(reg, metrics_db_path(tmp_path), run_id="R", heartbeat_every=1)
     sup.inc(2.0, reason="quiet_hours")
-    sampler.sample_once(ts=1000)
+    sampler.sample_once(now=_dt(1000))
     sup.inc(10.0, reason="quiet_hours")  # total 12; +10 over 60s = 10/min
-    sampler.sample_once(ts=1060)
+    sampler.sample_once(now=_dt(1060))
     sampler.close()
 
     out = stats_for_dir(tmp_path, "last 30")
