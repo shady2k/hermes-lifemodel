@@ -286,3 +286,50 @@ def test_processed_external_event_ids_rejects_non_string_values() -> None:
     # is corruption caught loud at load, not a mid-frame surprise.
     with pytest.raises(StateCorruptError):
         State.from_dict({"processed_external_event_ids": {"m-1": 123}})
+
+
+def test_affect_defaults_neutral_and_roundtrips() -> None:
+    # Core affect on Russell's circumplex (lm-ukc.1): valence in [-1, 1] (good/bad),
+    # arousal in [0, 1] (calm→activated). Both default to a neutral cold-start, and
+    # affect_updated_at (the "when affect last moved" stamp, sibling to last_tick_at)
+    # defaults absent. Additive: an older runtime_state file without the affect keys
+    # loads clean — so the live being poses up neutral and KEEPS its accumulated
+    # u/energy/bookkeeping (no reset, no migration).
+    s = State()
+    assert s.affect_valence == 0.0
+    assert s.affect_arousal == 0.0
+    assert s.affect_updated_at is None
+    assert State.from_dict({}).affect_valence == 0.0  # additive: missing key → default
+    assert State.from_dict({}).affect_arousal == 0.0
+    assert State.from_dict({}).affect_updated_at is None
+    round_tripped = State(
+        affect_valence=-0.6,
+        affect_arousal=0.3,
+        affect_updated_at="2026-07-12T10:00:00+00:00",
+    )
+    assert State.from_dict(round_tripped.to_dict()) == round_tripped
+
+
+@pytest.mark.parametrize("field", ["affect_valence", "affect_arousal"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_affect_axes_reject_non_finite(field: str, bad: float) -> None:
+    # Like u/energy, the affect coordinates must be finite numbers — a non-finite
+    # value is not valid JSON and would poison downstream comparisons/rendering.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, field: bad})
+
+
+@pytest.mark.parametrize("field", ["affect_valence", "affect_arousal"])
+@pytest.mark.parametrize("bad", ["x", None, True])
+def test_affect_axes_reject_non_number(field: str, bad: object) -> None:
+    # A string, null, or bool (int subclass) is corruption, not a coordinate —
+    # mirrors u/energy's numeric validation.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, field: bad})
+
+
+def test_affect_updated_at_rejects_non_string() -> None:
+    # The affect stamp is an opaque string (sibling to last_tick_at, defensively
+    # consumed by the deriver); a non-string value is corruption caught loud at load.
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "affect_updated_at": 123})

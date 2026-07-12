@@ -68,6 +68,27 @@ class State:
     #: ``θ`` (spec §5/§7). Reset to zero whenever ``u`` dips back under ``θ`` or
     #: a desire resolves; feeds the wake-decision's duration gate.
     duration_over_theta: float = 0.0
+    #: Core-affect VALENCE (lm-ukc.1) — the being's hedonic background on Russell's
+    #: circumplex, in ``[-1, 1]`` (unpleasant … pleasant), 0 = neutral. A cheap 0-LLM
+    #: projection of the body (loneliness/rejection pull it down; a fresh genuine
+    #: exchange lifts it), eased toward its target with inertia each tick (the deriver,
+    #: a later task). The range is the deriver's discipline, not enforced here — like
+    #: ``energy``/``u`` the field only validates *finite*. **One-way invariant:** affect
+    #: colors the voice and is NEVER read by the wake/contact decision. Additive:
+    #: ``from_dict`` defaults it when absent, so an older file loads neutral (no reset).
+    affect_valence: float = 0.0
+    #: Core-affect AROUSAL (lm-ukc.1) — activation on Russell's circumplex, in
+    #: ``[0, 1]`` (calm … keyed-up), 0 = calm cold-start. Driven by energy/fatigue,
+    #: circadian alertness, and the urgency of the pull; eased with inertia. Same
+    #: one-way invariant and finite-only validation as :attr:`affect_valence`.
+    #: Additive default 0.0.
+    affect_arousal: float = 0.0
+    #: ISO-8601 UTC timestamp of the last affect update (lm-ukc.1) — the affect
+    #: sibling of :attr:`last_tick_at` for the leaky-integrator's elapsed-time step.
+    #: Kept as an OPAQUE string (the deriver parses it defensively, like
+    #: ``last_tick_at``), so it is validated only as opt-str, not a tz-aware instant.
+    #: ``None`` before the first affect update; additive (defaults absent).
+    affect_updated_at: str | None = None
     #: ISO-8601 UTC timestamp of the last genuine (non-internal) exchange with
     #: the user (spec §4/§6). This is the real EXCHANGE RECORD the wake-packet
     #: temporal fact renders ("The last time we exchanged messages was X",
@@ -175,6 +196,14 @@ class State:
             duration_over_theta=_as_float(
                 data.get("duration_over_theta", 0.0), "duration_over_theta"
             ),
+            # Core affect (lm-ukc.1): two finite coordinates on Russell's circumplex.
+            # Range discipline ([-1,1] valence / [0,1] arousal) is the deriver's, so —
+            # like u/energy — from_dict validates only that they are finite numbers.
+            affect_valence=_as_float(data.get("affect_valence", 0.0), "affect_valence"),
+            affect_arousal=_as_float(data.get("affect_arousal", 0.0), "affect_arousal"),
+            # The affect stamp is an opaque string (sibling of last_tick_at, parsed
+            # defensively by the deriver), so it is validated only as opt-str.
+            affect_updated_at=_as_opt_str(data.get("affect_updated_at"), "affect_updated_at"),
             # last_exchange_at, declined_at, and pending_proactive_since are
             # compared against the clock's aware ``now`` by ``core/decision.py``
             # (the live adapter), so — like last_contact_at below — they are
