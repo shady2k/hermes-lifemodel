@@ -29,7 +29,8 @@ so ``NoopDelivery`` remains the default.
 **The nervous flow is ephemeral (spec §2/§3).** There is no durable signal bus:
 a frame is seeded with its trigger's ``initial_signals`` into an in-memory
 :class:`~lifemodel.core.frame.SignalFrame`, and the registered pipeline (personality
-→ contact sensor → drive → aggregation → cognition launcher) folds them into intents
+→ affect-sense → contact sensor → drive → aggregation → cognition launcher) folds them
+into intents
 that the single :class:`~lifemodel.core.state_actor.StateActor` commits at end of
 frame. The live decision path IS this registered pipeline — there is no separate
 aggregator/neuron seam.
@@ -49,6 +50,7 @@ from .adapters.clock import SystemClock
 from .adapters.delivery import NoopDelivery
 from .adapters.trace_export import make_trace_exporter
 from .adapters.tracer import StdlibTracer
+from .core.affect import AFFECT_AROUSAL_SPEC, AFFECT_VALENCE_SPEC, AffectParams, AffectSense
 from .core.aggregation import ContactAggregation
 from .core.cognition import CognitionLauncher
 from .core.component import layer_for_type
@@ -86,6 +88,8 @@ ENERGY_RECOVERY_PER_MIN = 0.01
 NIGHT_RECOVERY_BOOST = 0.5
 FATIGUE_DECAY_PER_MIN = 0.002
 CIRCADIAN_PEAK_UTC_HOUR = 13.0  # peak alertness 16:00 MSK, trough 04:00 MSK
+
+AFFECT_PARAMS = AffectParams()
 
 COGNITION_FAST_COST = 0.02
 COGNITION_SEND_COST = 0.03
@@ -237,6 +241,23 @@ def build_lifemodel(
         resolved_registry.register(
             personality,
             _component_manifest(personality.id, "personality", accepts_signals=False),
+        )
+    try:
+        resolved_registry.manifest("affect-sense")
+    except UnknownComponent:
+        # The AUTONOMIC self-model integrator that owns and eases core affect
+        # (valence/arousal). Reads the start-of-tick snapshot and emits ONLY an
+        # UpdateState — NO signal — so affect can never feed the wake decision (the
+        # one-way invariant, structural). Declares its two affect gauges.
+        affect_sense = AffectSense(params=AFFECT_PARAMS, peak_hour_utc=CIRCADIAN_PEAK_UTC_HOUR)
+        resolved_registry.register(
+            affect_sense,
+            _component_manifest(
+                affect_sense.id,
+                "affect",
+                accepts_signals=False,
+                metric_surface=(AFFECT_VALENCE_SPEC, AFFECT_AROUSAL_SPEC),
+            ),
         )
     try:
         resolved_registry.manifest("contact")

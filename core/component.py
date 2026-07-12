@@ -57,6 +57,7 @@ LAYER_BY_TYPE: Final[dict[str, ComponentLayer]] = {
     "personality": ComponentLayer.AUTONOMIC,
     "neuron": ComponentLayer.AUTONOMIC,
     "drive": ComponentLayer.AUTONOMIC,
+    "affect": ComponentLayer.AUTONOMIC,
     "aggregation": ComponentLayer.AGGREGATION,
     "launcher": ComponentLayer.COGNITION,
     "cognition": ComponentLayer.COGNITION,
