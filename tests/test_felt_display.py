@@ -270,16 +270,37 @@ def test_decide_has_no_repeat_throttle_so_a_mood_lasts() -> None:
 # --- compose_light_cue (ambient envelope) ----------------------------------
 
 
-def test_light_cue_mirrors_memory_envelope_and_is_prose_only() -> None:
-    s = _warmed_state(affect_valence=-0.3, affect_arousal=0.4)  # texture "tender and settled"
+def test_light_cue_is_a_directive_envelope_of_prose_only() -> None:
+    s = _warmed_state(affect_valence=-0.3, affect_arousal=0.4)  # "wistful — tender and settled"
     block = compose_light_cue(s)
+
+    # The ENVELOPE mirrors the memory context block (semantic tag + bracketed note + prose),
+    # which is the uniformity that matters. The literal "[System note:" prefix is
+    # deliberately NOT reused: it frames the block as service METADATA, which is precisely
+    # why the first live cue was ignored. Its real job — "this is not the user speaking" —
+    # is carried by better words.
     assert block.startswith("<felt-state>")
     assert block.rstrip().endswith("</felt-state>")
-    assert "[System note:" in block
-    assert "Do not mention or explain it unless the user" in block
-    assert "focused work" in block  # the task let-it-pass line
+    assert "not a message from anyone, not a request" in block
+
+    # DIRECTIVE, not hedged. The first version was four prohibitions against one softened
+    # positive ("color the manner *when appropriate*"), and the cheapest way to obey a block
+    # that is mostly "do not" is to do nothing — which is what the being did. So: a concrete
+    # bridge from feeling to speech, and no escape hatch.
+    assert "HOW you speak this turn" in block
+    assert "rhythm" in block and "warmth" in block and "length" in block
+    assert "when appropriate" not in block  # the escape hatch is gone
+    assert "focused work" not in block  # redundant — is_task_context already gates those turns
+
+    # The ONE prohibition that carries the invariant: manner, never subject (§4a).
+    assert "Speak FROM it, not ABOUT it" in block
+
+    # Both the felt WORD and the TEXTURE — a texture alone is evocative but abstract; the
+    # word is the recognisable handle the model can actually speak from.
+    assert "wistful" in block
     assert "tender and settled" in block
-    # NO raw axes — never a number, never the axis names.
+
+    # NO raw axes — never a number, never the axis names (the §4b guarantee).
     assert not any(ch.isdigit() for ch in block)
     assert "valence" not in block.lower()
     assert "arousal" not in block.lower()

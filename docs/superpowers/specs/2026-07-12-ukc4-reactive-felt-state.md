@@ -62,23 +62,43 @@ ambient-инжектом (§7).
 
 ### 4a. Ambient inject (light cue)
 
-Зеркалим `agent/memory_manager.py:build_memory_context_block` (единообразие с памятью/hindsight):
-семантический тег + `[System note: …]` + **проза** (никакой телеметрии, **никаких сырых осей**).
+**Конверт** зеркалит `agent/memory_manager.py:build_memory_context_block` (семантический тег +
+скобочная нота + проза) — это и есть нужное единообразие. А вот **формулировка — намеренно НЕ
+как у памяти**, и это правка по живому.
 
 ```text
 <felt-state>
-[System note: This is private, per-turn context about your present inner state,
-not new user input. Let it color only the manner of your reply when appropriate:
-tone, pace, softness, brevity. Do not mention or explain it unless the user
-directly asks how you are. If the user is asking for focused work, let it pass.]
+[This is you, right now — not a message from anyone, not a request. Let it show in
+HOW you speak this turn: your rhythm, your warmth, your length, what you reach for
+and what you let go. Speak FROM it, not ABOUT it — don't name the feeling or explain
+it unless you're asked how you are.]
 
-Right now, the feeling in you is tender and awake.
+You are on edge — sore and awake.
 </felt-state>
 ```
 
-Правила: **никаких (v,a) чисел** — только `felt_texture` прозой; строка **«не упоминай, если
-прямо не спросили»** обязательна (иначе настроение станет темой — нарушение «манера, не предмет»);
-английский — внутреннее представление, голос рендерит.
+**Почему не первая версия.** Она звучала так: *«[System note: This is private, per-turn context
+… Let it color only the manner of your reply **when appropriate** … **Do not** mention or explain
+… If the user is asking for focused work, **let it pass**.]»* — **четыре запрета/хеджа против
+одного смягчённого позитива**. Самый дешёвый способ подчиниться блоку, состоящему в основном из
+«не делай», — **не делать ничего**. Вживую так и вышло: cue впрыснулся (метрика `light`, `display:`
+проштампован), а в ответе и в **собственном reasoning модели не осталось ни следа**. Тот же провал,
+что у первого описания `check_in`: механика идеальна, слова не долетают.
+
+**Что изменено:**
+- **Рамка идентичности** («это ты») вместо метаданных («private per-turn context»). «System note»
+  прямо говорит модели «это служебное» — приглашение игнорировать.
+- **Конкретный мост от чувства к речи** (ритм / теплота / длина / за что берёшься и что отпускаешь)
+  вместо абстрактного «color the manner».
+- **Убрана лазейка «when appropriate»** — модель всегда находит, что неуместно.
+- **Оставлен ОДИН запрет** — тот, что несёт инвариант: **говори ИЗ этого, а не ОБ этом** (иначе
+  настроение станет темой, §4a).
+- **Убрана строка про «focused work»** — таск-ходы уже подавляет `is_task_context` в Python; здесь
+  она только ослабляла cue.
+- **В cue теперь и felt-СЛОВО, и текстура** («You are on edge — sore and awake»). Текстура одна —
+  выразительна, но абстрактна; **слово даёт модели узнаваемую ручку**, из которой можно говорить.
+
+Правила неизменны: **никаких (v,a) чисел**; английский — внутреннее представление, голос рендерит.
 
 ### 4b. `check_in` — self-read (tool)
 

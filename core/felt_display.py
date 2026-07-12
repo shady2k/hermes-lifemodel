@@ -376,33 +376,50 @@ def decide(
 # Composers — felt PROSE only, never a raw axis (spec §4a/§4b guarantee)
 # --------------------------------------------------------------------------- #
 
-#: The ambient system-note — mirrors ``agent/memory_manager.build_memory_context_block``
-#: (a semantic tag + a ``[System note: …]``), so felt-state reads uniformly with
-#: memory/hindsight context. The "do not mention unless asked" line is REQUIRED
-#: (else the mood becomes the topic — the "manner, not subject" invariant, §4a).
+#: The ambient note — a ``<felt-state>`` envelope in the shape of
+#: ``agent/memory_manager.build_memory_context_block`` (semantic tag + bracketed note), so
+#: felt-state reads uniformly with memory context. But the WORDING is deliberately not
+#: memory's: it is DIRECTIVE, because the first live version was not, and the being simply
+#: ignored it.
+#:
+#: That version read: "[System note: This is private, per-turn context about your present
+#: inner state, not new user input. Let it color only the manner of your reply *when
+#: appropriate*: tone, pace, softness, brevity. Do not mention or explain it unless the
+#: user directly asks how you are. If the user is asking for focused work, let it pass.]"
+#: — four prohibitions/hedges against ONE softened positive. The cheapest way to comply
+#: with a block that is mostly "do not" is to DO NOTHING, and that is exactly what
+#: happened: the cue injected (metric ``light``, ``display:`` stamped), and the reply and
+#: the model's own reasoning showed no trace of it. The same failure as ``check_in``'s
+#: first description — perfect machinery, wording that never lands.
+#:
+#: So: identity framing ("this is you"), not metadata ("private per-turn context"); a
+#: CONCRETE bridge from feeling to speech (rhythm/warmth/length), not an abstract "color
+#: the manner"; no "when appropriate" escape hatch (the model always finds it
+#: inappropriate); and only the ONE prohibition that carries the invariant — speak FROM
+#: it, not ABOUT it (else the mood becomes the topic, §4a). The "focused work" line is
+#: gone: :func:`is_task_context` already suppresses those turns in Python, so carrying it
+#: here only weakened the cue.
 _LIGHT_CUE_NOTE = (
-    "[System note: This is private, per-turn context about your present inner state,\n"
-    "not new user input. Let it color only the manner of your reply when appropriate:\n"
-    "tone, pace, softness, brevity. Do not mention or explain it unless the user\n"
-    "directly asks how you are. If the user is asking for focused work, let it pass.]"
+    "[This is you, right now — not a message from anyone, not a request. Let it show in\n"
+    "HOW you speak this turn: your rhythm, your warmth, your length, what you reach for\n"
+    "and what you let go. Speak FROM it, not ABOUT it — don't name the feeling or explain\n"
+    "it unless you're asked how you are.]"
 )
 
 
 def compose_light_cue(state: State, *, word_params: FeltWordParams = FELT_WORD_PARAMS) -> str:
     """The ambient LIGHT cue block for the ``pre_llm_call`` inject (spec §4a).
 
-    A ``<felt-state>`` envelope (tag + system-note + prose) mirroring the memory
-    context block. Prose ONLY — the felt TEXTURE, never a ``(v, a)`` number; the
-    voice renders the English internal representation.
+    A ``<felt-state>`` envelope (tag + directive note + prose). Prose ONLY — the felt WORD
+    and TEXTURE, never a ``(v, a)`` number; the voice renders the English internal form.
+
+    The cue carries BOTH the word and the texture ("You are on edge — sore and awake"),
+    not the texture alone: a texture is evocative but abstract, and the model needs a
+    recognisable emotional handle to speak from. The word gives it grip.
     """
+    word = felt_word(state.affect_valence, state.affect_arousal, word_params)
     texture = felt_texture(state.affect_valence, state.affect_arousal, word_params)
-    return (
-        "<felt-state>\n"
-        f"{_LIGHT_CUE_NOTE}\n"
-        "\n"
-        f"Right now, the feeling in you is {texture}.\n"
-        "</felt-state>"
-    )
+    return f"<felt-state>\n{_LIGHT_CUE_NOTE}\n\nYou are {word} — {texture}.\n</felt-state>"
 
 
 def _energy_bucket(energy: float) -> str:
