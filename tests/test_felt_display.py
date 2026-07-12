@@ -133,6 +133,17 @@ def test_task_context_long_paste() -> None:
     assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
 
 
+def test_task_context_long_paste_in_prior_turn_then_short_followup() -> None:
+    # A big paste last turn, then a short "continue" — still focused work, so the
+    # long-paste check must span the whole window, not just the current message.
+    big = "x" * (DEFAULT_FELT_DISPLAY_PARAMS.long_paste_chars + 1)
+    turn = TurnSignals(
+        user_message="what about part 2?",
+        recent_messages=(RecentMessage(role="user", text=big, has_tool_calls=False),),
+    )
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+
+
 def test_task_context_json_block() -> None:
     turn = TurnSignals(user_message='{"status": "failed", "code": "boom"}')
     assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True

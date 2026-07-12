@@ -271,6 +271,35 @@ def test_load_forward_compat_missing_new_field_defaults_and_restamps(tmp_path: P
     assert loaded.u == 1.5
 
 
+def test_stamp_affect_display_merges_only_the_two_display_fields(tmp_path: Path) -> None:
+    # lm-ukc.4 finding #1: the reactive display stamp is a field-level merge — it
+    # updates ONLY the two display fields and preserves every drive/affect field at
+    # its latest committed value (no full-State round-trip that could roll back u).
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.commit(State(u=5.0, affect_valence=-0.6, affect_arousal=0.3, energy=0.4))
+
+    store.stamp_affect_display(word="lonely", at="2026-07-06T12:00:00+00:00")
+
+    after = store.load()
+    assert after.affect_display_last_word == "lonely"
+    assert after.affect_display_last_at == "2026-07-06T12:00:00+00:00"
+    # everything else is untouched — the display path never writes the drive (§1).
+    assert after.u == 5.0
+    assert after.affect_valence == -0.6
+    assert after.affect_arousal == 0.3
+    assert after.energy == 0.4
+
+
+def test_stamp_affect_display_is_a_noop_when_no_row_yet(tmp_path: Path) -> None:
+    # A fresh being with no committed state: nothing to merge into → no-op, no row
+    # created (the injector only ever stamps once affect has warmed, i.e. a tick has
+    # already created the row).
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.stamp_affect_display(word="wistful", at="2026-07-06T12:00:00+00:00")
+    # load() returns the documented default (no row) — the stamp did not persist.
+    assert store.load().affect_display_last_word is None
+
+
 def test_load_forward_compat_then_commit_persists_upgraded_schema_version(
     tmp_path: Path,
 ) -> None:

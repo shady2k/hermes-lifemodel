@@ -12,10 +12,12 @@ Two adapter seams over the pure gate/composers in ``core.felt_display``:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,6 +35,7 @@ from lifemodel.hooks import make_check_in_tool, make_felt_state_injector
 from lifemodel.ports.memory import MemoryPort
 from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
+from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
 
 _NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
@@ -130,6 +133,49 @@ def test_injector_body_throw_is_loud_and_returns_none(
     assert reg.get(OBSERVER_ERRORS).value(component="pre_llm_call") == 1.0
 
 
+class _RacingStore:
+    """Delegates to the real store but, right AFTER the injector reads state for its
+    decision, simulates the ~60s tick committing a fresh drive value on the SAME db —
+    the exact interleave the atomic display stamp must survive (review finding #1)."""
+
+    def __init__(self, real: SQLiteRuntimeStore, on_load) -> None:
+        self._real = real
+        self._on_load = on_load
+        self._raced = False
+
+    def load(self) -> State:
+        state = self._real.load()
+        if not self._raced:  # fire the "tick" exactly once, between read and stamp
+            self._raced = True
+            self._on_load()
+        return state
+
+    def __getattr__(self, name: str):  # delegate stamp_affect_display, isinstance shims, etc.
+        return getattr(self._real, name)
+
+
+def test_injector_stamp_does_not_clobber_concurrent_drive_change(tmp_path: Path) -> None:
+    # THE finding-1 guarantee: the display stamp is a field-level atomic merge, so a
+    # tick that advances `u` between the injector's read and its stamp is NOT rolled
+    # back — the display path never writes the drive/wake state (one-way invariant §1).
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(_NOW))
+    store.commit(State(**{**vars(_warmed_salient()), "u": 5.0}))
+
+    def _tick_advances_u() -> None:
+        other = SQLiteRuntimeStore(tmp_path, clock=FakeClock(_NOW))
+        other.commit(dataclasses.replace(other.load(), u=6.0))
+
+    racing = _RacingStore(store, _tick_advances_u)
+    lm = SimpleNamespace(state=racing, clock=FakeClock(_NOW))
+    injector = make_felt_state_injector(lambda: lm)  # type: ignore[arg-type]
+
+    assert injector(user_message="how are you?", conversation_history=[]) is not None  # LIGHT
+    after = store.load()
+    assert after.u == 6.0, "the tick's drive advance must survive the display stamp"
+    assert after.affect_display_last_word == "lonely"  # the display hint still landed
+    assert after.affect_display_last_at is not None
+
+
 # --------------------------------------------------------------------------- #
 # make_check_in_tool
 # --------------------------------------------------------------------------- #
@@ -183,3 +229,19 @@ def test_check_in_error_returns_error_json_without_throwing(tmp_path: Path) -> N
     payload = json.loads(handler({}))
     assert "error" in payload
     assert reg.get(CHECK_IN_TOTAL).value(outcome="error") == 1.0
+
+
+def test_check_in_error_never_leaks_field_or_axis_names(tmp_path: Path) -> None:
+    # Finding #3: a state-load error may name a raw axis field (e.g. affect_valence);
+    # the tool RESULT (which persists in model context) must stay felt-safe — the
+    # detail belongs only in the ERROR log, never the returned {"error": …}.
+    def _boom_with_axis() -> object:
+        raise RuntimeError("field 'affect_valence' must be finite, got nan (arousal=0.7)")
+
+    payload = json.loads(make_check_in_tool(_boom_with_axis)({}))
+    assert "error" in payload
+    leaked = payload["error"].lower()
+    assert "valence" not in leaked
+    assert "arousal" not in leaked
+    assert "affect_" not in leaked
+    assert not any(ch.isdigit() for ch in payload["error"])

@@ -24,7 +24,6 @@ state-actor lock — no cached ``State`` can drift between frames.
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
 import logging
 from collections.abc import Callable
@@ -507,10 +506,13 @@ def make_felt_state_injector(
     traceback, recorded on *health* + *metrics*, and swallowed with a ``None`` return
     — the host's hot dispatch path is never crashed, and the failure is observable.
 
-    The last-shown stamp is a load→replace→commit (last-writer-wins, like the
-    ``/lifemodel`` admin mutations): the two display fields are written ONLY here and
-    are gate hints (self-healing next turn), so a rare race with the tick's affect
-    write is harmless (spec §6).
+    The last-shown stamp is an ATOMIC field-level merge (:func:`_stamp_display` →
+    the store's ``stamp_affect_display``, a ``BEGIN IMMEDIATE`` read-modify-write of
+    JUST the two display fields), NEVER a ``commit`` of a stale full ``State``: so a
+    concurrent tick that advanced ``u``/affect/pending is never rolled back — the
+    display path stays strictly one-directional (it colours manner, never touches
+    the drive/wake path, spec §1). The two hint fields self-heal, so the reverse
+    (a tick round-trip clobbering them) is harmless.
     """
 
     def _injector(
@@ -532,14 +534,13 @@ def make_felt_state_injector(
             if not decision.shows:
                 return None
             block = compose_light_cue(state)
-            # Stamp the last ambient show so the gate throttles repeats — written
-            # ONLY on the reactive path, never by the tick (spec §6).
-            lm.state.commit(
-                dataclasses.replace(
-                    state,
-                    affect_display_last_word=felt_word(state.affect_valence, state.affect_arousal),
-                    affect_display_last_at=to_iso(now),
-                )
+            # Stamp the last ambient show so the gate throttles repeats — an ATOMIC
+            # merge of JUST the display fields, never a stale full-State commit that
+            # would roll back the tick's drive/affect (the one-way invariant, §1).
+            _stamp_display(
+                lm,
+                word=felt_word(state.affect_valence, state.affect_arousal),
+                at=to_iso(now),
             )
             return {"context": block}
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
@@ -549,6 +550,21 @@ def make_felt_state_injector(
             return None
 
     return _injector
+
+
+def _stamp_display(lm: LifeModel, *, word: str | None, at: str | None) -> None:
+    """Atomically merge the reactive felt-display hints into committed state.
+
+    Reaches the concrete store's ``stamp_affect_display`` (a field-level
+    ``BEGIN IMMEDIATE`` merge) the same duck-typed way the reset path reaches
+    ``purge_memory_records`` — so ``StatePort`` stays narrow and its fakes need no
+    new method. A store without it (a minimal fake) simply skips the stamp: the
+    cue still shows, only the cooldown throttle degrades — never a stale full-State
+    commit that could roll back the drive.
+    """
+    stamp = getattr(lm.state, "stamp_affect_display", None)
+    if callable(stamp):
+        stamp(word=word, at=at)
 
 
 def make_check_in_tool(
@@ -584,11 +600,16 @@ def make_check_in_tool(
                 metrics.inc(CHECK_IN_TOTAL, outcome=outcome)
             return json.dumps({"state": read, "note": _CHECK_IN_NOTE}, ensure_ascii=False)
         except Exception as exc:  # Hermes tool contract: return {"error": …}, never raise
+            # The full detail (which may name a raw axis field, e.g. a State-load
+            # error mentioning ``affect_valence``) goes to the ERROR log ONLY. The
+            # tool RESULT persists in the model's context, so it must stay felt-safe:
+            # a generic message, never a leaked field/axis name (the §4b guarantee
+            # holds on the error path too).
             _LOG.error(
                 "check_in_tool_failed error=%s", f"{type(exc).__name__}: {exc}", exc_info=True
             )
             if metrics is not None:
                 metrics.inc(CHECK_IN_TOTAL, outcome="error")
-            return json.dumps({"error": f"check_in failed: {exc}"}, ensure_ascii=False)
+            return json.dumps({"error": "check_in is unavailable right now"}, ensure_ascii=False)
 
     return _handler

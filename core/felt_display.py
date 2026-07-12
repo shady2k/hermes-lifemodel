@@ -256,18 +256,19 @@ def is_task_context(turn: TurnSignals, params: FeltDisplayParams) -> bool:
 
     Robust behavioral signals ONLY — never keywords, never a language-biased
     work-intent classifier (which would wrongly mute the mood on a relational
-    reply): a recent assistant turn with ``tool_calls``; a long paste (the
-    current message); or structural markers (code fences, unified diffs, stack
-    traces, shell sessions, log lines, JSON blocks) anywhere in the window. A
-    warm reply that merely NAMES a file carries none of these, so it is not task.
+    reply): a recent assistant turn with ``tool_calls``; a long paste (a
+    code/log/doc dump anywhere in the window, so a paste followed by a short
+    "continue"/"what about part 2" still reads as task); or structural markers
+    (code fences, unified diffs, stack traces, shell sessions, log lines, JSON
+    blocks) anywhere in the window. A warm reply that merely NAMES a file carries
+    none of these, so it is not task.
     """
     if any(msg.has_tool_calls for msg in turn.recent_messages):
         return True
-    if len(turn.user_message) > params.long_paste_chars:
+    texts = [turn.user_message, *(msg.text for msg in turn.recent_messages)]
+    if any(len(text) > params.long_paste_chars for text in texts):
         return True
-    if _has_work_markers(turn.user_message):
-        return True
-    return any(_has_work_markers(msg.text) for msg in turn.recent_messages)
+    return any(_has_work_markers(text) for text in texts)
 
 
 def felt_changed(state: State) -> bool:

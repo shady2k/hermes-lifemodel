@@ -722,6 +722,56 @@ class SQLiteRuntimeStore:
         if state is not None:
             _LOG.info("state_commit schema_version=%s", state.schema_version)
 
+    def stamp_affect_display(self, *, word: str | None, at: str | None) -> None:
+        """Atomically merge ONLY the two reactive felt-display fields (lm-ukc.4).
+
+        The ``pre_llm_call`` injector stamps "which felt word it last surfaced,
+        and when" so the ambient gate can throttle a repeat. It must do so
+        WITHOUT rolling back the drive: a plain ``load()`` → ``commit(state)``
+        would write back a whole ``State`` snapshot that could be stale by the
+        time it commits (the ~60s tick may have advanced ``u``/affect/pending in
+        between), overwriting the tick's work — a collateral rollback that would
+        make the display path affect the wake/drive path (the one-directional
+        invariant, spec §1). So this is a field-level read-modify-write of just
+        ``affect_display_last_word``/``affect_display_last_at`` inside ONE
+        ``BEGIN IMMEDIATE`` write transaction (same discipline as
+        :meth:`commit_tick`): the latest committed ``state_json`` is read under
+        the write lock and only those two keys are replaced, so no concurrent
+        writer can interleave between the read and the write. Every other field
+        keeps its latest committed value. A missing row (a being with no
+        committed state yet) is a no-op — the injector only stamps after a
+        ``warmed`` affect exists, so a tick has already created the row; the next
+        tick would anyway. The two fields are hint-only, so the *reverse*
+        direction (a stale tick round-trip clobbering them) is harmless — the
+        gate self-heals next turn (only the semantic drive state is protected).
+        """
+        conn = self._connect()
+        conn.isolation_level = None  # autocommit: we drive the transaction ourselves
+        try:
+            conn.execute("BEGIN IMMEDIATE")  # write-lock BEFORE the read → no interleave
+            row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
+            if row is None:
+                conn.rollback()  # nothing committed yet → nothing to merge into
+                return
+            data = json.loads(row[0])
+            if not isinstance(data, dict):  # pragma: no cover - defensive
+                conn.rollback()
+                return
+            data["affect_display_last_word"] = word
+            data["affect_display_last_at"] = at
+            payload = json.dumps(data, allow_nan=False)
+            now_iso = stamp_iso_utc(self._clock.now())
+            conn.execute(
+                "UPDATE runtime_state SET state_json = ?, updated_at = ? WHERE id = 1",
+                (payload, now_iso),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def reset(self) -> State:
         """Factory-wipe the ``runtime_state`` row to a fresh ``State()``.
 
