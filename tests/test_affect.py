@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from lifemodel.core.affect import AffectParams, AffectSense, affect_target, ease
+from lifemodel.core.affect import AffectBody, AffectParams, AffectSense, affect_target, ease
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import EmitSignal, UpdateState
 from lifemodel.core.timeutil import to_iso
@@ -26,7 +26,7 @@ P = AffectParams()
 
 def _target(**over: float) -> tuple[float, float]:
     """affect_target for a resting body, overriding only the named scalars."""
-    body = dict(
+    fields: dict[str, object] = dict(
         u=0.0,
         decline_count=0,
         minutes_since_declined=None,
@@ -37,8 +37,8 @@ def _target(**over: float) -> tuple[float, float]:
         circadian=0.5,
         duration_over_theta=0.0,
     )
-    body.update(over)
-    v, a, _contrib = affect_target(params=P, **body)  # type: ignore[arg-type]
+    fields.update(over)
+    v, a, _contrib = affect_target(AffectBody(**fields), P)  # type: ignore[arg-type]
     return v, a
 
 

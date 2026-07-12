@@ -24,7 +24,9 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 
+from ..state.model import State
 from .circadian import circadian
 from .component import TickContext
 from .intents import Intent, UpdateState
@@ -76,6 +78,49 @@ class AffectContributions:
     arousal: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class AffectBody:
+    """The interoceptive INPUT the affect organ reads — its 'organ facade' (lm-ukc.2).
+
+    Groups the slice of ``AgentState`` the derivation is a pure function of, plus the
+    clock-derived readings (elapsed minutes, circadian phase). :meth:`from_state` is
+    the ONE place that knows WHICH state fields feed affect and how the clock turns
+    them into inputs, so the kernel below takes one cohesive value (not ten scalars)
+    and the component step stays tiny. Storage stays flat + atomic — this is a read
+    facade over the snapshot, it owns no mutation (the frame committer does)."""
+
+    u: float
+    decline_count: int
+    minutes_since_declined: float | None
+    unanswered_outbound_count: int
+    fatigue: float
+    minutes_since_exchange: float | None
+    energy: float
+    circadian: float
+    duration_over_theta: float
+
+    @classmethod
+    def from_state(cls, state: State, *, now: datetime, peak_hour_utc: float) -> AffectBody:
+        """Read the affect organ's inputs from the start-of-tick snapshot + clock."""
+        return cls(
+            u=state.u,
+            decline_count=state.decline_count,
+            minutes_since_declined=(
+                minutes_between(state.declined_at, now) if state.declined_at is not None else None
+            ),
+            unanswered_outbound_count=state.unanswered_outbound_count,
+            fatigue=state.fatigue,
+            minutes_since_exchange=(
+                minutes_between(state.last_exchange_at, now)
+                if state.last_exchange_at is not None
+                else None
+            ),
+            energy=state.energy,
+            circadian=circadian(now, peak_hour_utc=peak_hour_utc),
+            duration_over_theta=state.duration_over_theta,
+        )
+
+
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -96,44 +141,36 @@ def _smoothstep(x: float) -> float:
 
 
 def affect_target(
-    *,
-    params: AffectParams,
-    u: float,
-    decline_count: int,
-    minutes_since_declined: float | None,
-    unanswered_outbound_count: int,
-    fatigue: float,
-    minutes_since_exchange: float | None,
-    energy: float,
-    circadian: float,
-    duration_over_theta: float,
+    body: AffectBody, params: AffectParams
 ) -> tuple[float, float, AffectContributions]:
-    """Project the body scalars onto (valence, arousal), with the breakdown.
+    """Project the organ's :class:`AffectBody` onto (valence, arousal), with the breakdown.
 
-    Pure and clock-free: elapsed minutes (``minutes_since_declined`` /
-    ``minutes_since_exchange``) are computed by the caller against the clock, so
-    this kernel is fully unit-testable. ``None`` means "no such event on record"
-    → that recency term contributes nothing. Ranges are enforced here only by the
-    final clamp; individual contributions are capped by their weights."""
+    Pure and clock-free: the body already carries the elapsed minutes (computed by
+    :meth:`AffectBody.from_state` against the clock), so this kernel is fully
+    unit-testable. A ``None`` recency means "no such event on record" → that term
+    contributes nothing. Ranges are enforced here only by the final clamp;
+    individual contributions are capped by their weights."""
     # --- valence: capped, separately-returned contributions (sum → clamp) ---
-    u_v = -params.u_valence_cap * math.sqrt(_sat01(u / params.u_ref))
+    u_v = -params.u_valence_cap * math.sqrt(_sat01(body.u / params.u_ref))
 
     reject_recent = (
-        _decay(minutes_since_declined, params.reject_half_life_min)
-        if minutes_since_declined is not None
+        _decay(body.minutes_since_declined, params.reject_half_life_min)
+        if body.minutes_since_declined is not None
         else 0.0
     )
-    reject_v = -params.reject_cap * _sat01(decline_count / params.reject_count_ref) * reject_recent
-
-    unanswered_v = -params.unanswered_cap * _sat01(
-        unanswered_outbound_count / params.unanswered_ref
+    reject_v = (
+        -params.reject_cap * _sat01(body.decline_count / params.reject_count_ref) * reject_recent
     )
 
-    fatigue_v = -params.fatigue_valence_cap * _sat01(fatigue)
+    unanswered_v = -params.unanswered_cap * _sat01(
+        body.unanswered_outbound_count / params.unanswered_ref
+    )
+
+    fatigue_v = -params.fatigue_valence_cap * _sat01(body.fatigue)
 
     exchange_recent = (
-        _decay(minutes_since_exchange, params.exchange_half_life_min)
-        if minutes_since_exchange is not None
+        _decay(body.minutes_since_exchange, params.exchange_half_life_min)
+        if body.minutes_since_exchange is not None
         else 0.0
     )
     exchange_v = params.exchange_cap * exchange_recent
@@ -141,12 +178,12 @@ def affect_target(
     valence = _clamp(u_v + reject_v + unanswered_v + fatigue_v + exchange_v, -1.0, 1.0)
 
     # --- arousal: baseline + alertness/energy − fatigue + sustained-pull urgency ---
-    alertness = _clamp(circadian - _sat01(fatigue), 0.0, 1.0)
+    alertness = _clamp(body.circadian - _sat01(body.fatigue), 0.0, 1.0)
     alertness_a = params.arousal_alertness_w * alertness
-    energy_a = params.arousal_energy_w * _sat01(energy)
-    fatigue_a = -params.arousal_fatigue_w * _sat01(fatigue)
+    energy_a = params.arousal_energy_w * _sat01(body.energy)
+    fatigue_a = -params.arousal_fatigue_w * _sat01(body.fatigue)
     pull_a = params.arousal_urgency_w * _smoothstep(
-        duration_over_theta / params.urgency_duration_ref_min
+        body.duration_over_theta / params.urgency_duration_ref_min
     )
     arousal = _clamp(params.arousal_base + alertness_a + energy_a + fatigue_a + pull_a, 0.0, 1.0)
 
@@ -200,6 +237,27 @@ AFFECT_AROUSAL_SPEC = MetricSpec(
 )
 
 
+@dataclass(frozen=True)
+class AffectState:
+    """The affect organ's OUTPUT slice — the eased affect this tick commits.
+
+    :meth:`to_state_patch` is the ONE place that knows WHICH ``AgentState`` fields
+    affect writes, mirroring :meth:`AffectBody.from_state` on the input side. It
+    returns a patch for an ``UpdateState`` intent — the organ proposes, only the
+    frame committer mutates."""
+
+    valence: float
+    arousal: float
+    updated_at: str
+
+    def to_state_patch(self) -> dict[str, object]:
+        return {
+            "affect_valence": self.valence,
+            "affect_arousal": self.arousal,
+            "affect_updated_at": self.updated_at,
+        }
+
+
 class AffectSense:
     """AUTONOMIC integrator that owns and eases the being's core affect.
 
@@ -224,27 +282,12 @@ class AffectSense:
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
         p = self._params
+        # Read the organ's inputs (state slice + clock readings) through the facade,
+        # project to a target, then ease the stored affect toward it. dt comes from
+        # last_tick_at (the physiology clock), so the first tick (dt 0) makes no move.
+        body = AffectBody.from_state(state, now=ctx.now, peak_hour_utc=self._peak_hour_utc)
+        target_valence, target_arousal, _contributions = affect_target(body, p)
         dt = minutes_between(state.last_tick_at, ctx.now)
-        mins_declined = (
-            minutes_between(state.declined_at, ctx.now) if state.declined_at is not None else None
-        )
-        mins_exchange = (
-            minutes_between(state.last_exchange_at, ctx.now)
-            if state.last_exchange_at is not None
-            else None
-        )
-        target_valence, target_arousal, _contributions = affect_target(
-            params=p,
-            u=state.u,
-            decline_count=state.decline_count,
-            minutes_since_declined=mins_declined,
-            unanswered_outbound_count=state.unanswered_outbound_count,
-            fatigue=state.fatigue,
-            minutes_since_exchange=mins_exchange,
-            energy=state.energy,
-            circadian=circadian(ctx.now, peak_hour_utc=self._peak_hour_utc),
-            duration_over_theta=state.duration_over_theta,
-        )
         valence = ease(
             current=state.affect_valence,
             target=target_valence,
@@ -264,12 +307,5 @@ class AffectSense:
         if ctx.observe is not None:
             ctx.observe.set(AFFECT_VALENCE, valence)
             ctx.observe.set(AFFECT_AROUSAL, arousal)
-        return [
-            UpdateState(
-                {
-                    "affect_valence": valence,
-                    "affect_arousal": arousal,
-                    "affect_updated_at": to_iso(ctx.now),
-                }
-            )
-        ]
+        eased = AffectState(valence=valence, arousal=arousal, updated_at=to_iso(ctx.now))
+        return [UpdateState(eased.to_state_patch())]
