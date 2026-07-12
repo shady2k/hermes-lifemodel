@@ -61,6 +61,7 @@ from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.solitude_drive import CONTACT_DRIVE_U_SPEC, SolitudeDrive
 from .core.state_actor import StateActor
+from .core.wake import GateParams
 from .domain.objects import default_registry
 from .events import EventRing
 from .ports.clock import ClockPort
@@ -70,7 +71,6 @@ from .ports.pressure import PressureSensorPort
 from .ports.tick_commit import TickCommitPort
 from .ports.trace_export import TraceExportPort
 from .ports.tracer import TracerPort
-from .sim.wake import GateParams
 from .state.port import StatePort
 from .state.sqlite_store import SQLiteRuntimeStore
 from .state.trace_store import NULL_TRACE_SINK, TraceSink

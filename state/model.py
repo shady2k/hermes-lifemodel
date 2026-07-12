@@ -61,8 +61,9 @@ class State:
     #: The contact-desire drive's continuous urge variable (certified sim
     #: ``Drive.u``, spec §5). Rises with genuine silence, satiated by a positive
     #: exchange, drained when a wake-eligible urge is consumed — see
-    #: ``lifemodel.core.decision`` (the live adapter) and ``lifemodel.sim.drive``
-    #: (the certified source of truth this reconstructs each tick).
+    #: ``lifemodel.core.decision`` (the live adapter) and
+    #: ``lifemodel.core.solitude_drive.Drive`` (the certified source of truth
+    #: this reconstructs each tick).
     u: float = 0.0
     #: Elapsed minutes ``u`` has continuously sat at/over the wake threshold
     #: ``θ`` (spec §5/§7). Reset to zero whenever ``u`` dips back under ``θ`` or
@@ -99,7 +100,7 @@ class State:
     #: before the first exchange.
     last_exchange_at: str | None = None
     #: ISO-8601 UTC timestamp anchoring the active-silence WINDOW gate
-    #: (``sim.wake`` gate 3 — suppress a wake for ``w`` minutes after contact),
+    #: (``core.wake`` gate 3 — suppress a wake for ``w`` minutes after contact),
     #: DECOUPLED from :attr:`last_exchange_at` (lm-md6.1). ``None`` means "no admin
     #: override" and the gate falls back to the real :attr:`last_exchange_at`; a
     #: genuine exchange clears it back to ``None``. Admin/control commands that

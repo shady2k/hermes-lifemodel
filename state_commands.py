@@ -28,7 +28,7 @@ mutation lands cleanly on the *next* tick, and no coordination is built for it.
 ``force_wake`` derives its gate values from the SAME constants the live
 pipeline reads (``composition.CONTACT_PARAMS``, ``core.backstop.allow_send``'s
 defaults), so it can never drift from the real wake decision
-(:mod:`lifemodel.sim.wake`, :mod:`lifemodel.core.aggregation`). It only makes
+(:mod:`lifemodel.core.wake`, :mod:`lifemodel.core.aggregation`). It only makes
 the state wake-*eligible* for cognition (spec §7: an urge merely *wakes*
 cognition, it never sends) — whether a turn is actually launched and delivered
 is a separate, energy-gated cognition-layer decision on a later tick that this
@@ -168,7 +168,7 @@ def nudge(before: State, now: datetime, raw_amount: str) -> tuple[State | None, 
 
 
 def force_wake(before: State, now: datetime) -> tuple[State | None, str]:
-    """Satisfy every wake gate (``sim.wake.evaluate_wake``) so the NEXT real
+    """Satisfy every wake gate (``core.wake.evaluate_wake``) so the NEXT real
     adapter tick's aggregation pass wakes cognition — never runs a tick itself."""
     theta = composition.CONTACT_PARAMS.theta_u
     w = composition.CONTACT_PARAMS.w

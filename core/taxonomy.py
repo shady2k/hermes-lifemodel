@@ -5,7 +5,7 @@ A signal is an ephemeral afferent reading that lives ``<=`` one ExecutionFrame
 - ``contact`` — the drive's *transient* intra-frame output: the unipolar urge
   value ``[0..u_max]`` plus its per-frame ``delta``.
 - ``contact_observed`` — an external contact reading: a real lane event
-  (actor + label, per :mod:`lifemodel.sim.quality`) the sensor transduces so the
+  (actor + label, per :mod:`lifemodel.core.quality`) the sensor transduces so the
   drive satiates. (Renamed from ``exchange`` — the fact is "contact observed", spec §10.)
 - ``proactive_outcome`` — the efference copy of a finished proactive turn
   (``sent``/``silent``/``failed``/``stale``, spec §5/§6). (Renamed from ``verdict``.)
@@ -21,7 +21,7 @@ from typing import Literal, cast
 
 from ..domain.egress import ProactiveOutcome
 from ..domain.signal import Signal
-from ..sim.quality import Actor, Label
+from .quality import Actor, Label
 
 KIND_CONTACT = "contact"
 KIND_CONTACT_OBSERVED = "contact_observed"

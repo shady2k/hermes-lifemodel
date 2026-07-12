@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ..domain.objects import Thought, ThoughtState, UserModel
-from ..sim.wake import GateParams, LaneState, backoff_interval, evaluate_wake
 from ..state.model import State
 from .backstop import allow_send
 from .circadian import circadian
@@ -23,6 +22,7 @@ from .pressure import effective_pressure, inhibition_at
 from .receptivity import appraise_receptivity
 from .timeutil import from_iso, minutes_between
 from .user_model_view import DEFAULT_USER_MODEL
+from .wake import GateParams, LaneState, backoff_interval, evaluate_wake
 from .why_graph import WhyNode, display_id
 
 #: Max age (minutes) of ``last_tick_at`` before the brain reads as STALE. The loop

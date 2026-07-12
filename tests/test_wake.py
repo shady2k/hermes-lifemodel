@@ -10,7 +10,7 @@ that wakes cognition.
 
 from __future__ import annotations
 
-from lifemodel.sim.wake import (
+from lifemodel.core.wake import (
     GateParams,
     LaneState,
     WakeOutcome,

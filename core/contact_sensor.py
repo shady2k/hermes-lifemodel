@@ -2,7 +2,7 @@
 
 A dumb, stateless afferent transducer: it measures the contact channel RIGHT NOW —
 elapsed silence (``dt``) plus the quality of each contact observed this frame
-(:func:`lifemodel.sim.quality.quality_of`) — and emits that raw, unintegrated
+(:func:`lifemodel.core.quality.quality_of`) — and emits that raw, unintegrated
 reading as a transient ``contact_presence`` signal. It does NOT accumulate, does
 NOT own or write ``u``, holds no durable state. Integrating the drive deficit into
 ``u`` is the NEXT component's job (:class:`lifemodel.core.solitude_drive.SolitudeDrive`)
@@ -18,9 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..sim.quality import quality_of
 from .component import TickContext
 from .intents import EmitSignal, Intent
+from .quality import quality_of
 from .taxonomy import (
     KIND_CONTACT_OBSERVED,
     contact_presence_signal,

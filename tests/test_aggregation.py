@@ -26,10 +26,10 @@ from lifemodel.core.taxonomy import (
     proactive_outcome_signal,
 )
 from lifemodel.core.timeutil import to_iso
+from lifemodel.core.wake import GateParams
 from lifemodel.domain.egress import ProactiveOutcome
 from lifemodel.domain.objects import DesireSpring
 from lifemodel.ports.tracer import TraceContext
-from lifemodel.sim.wake import GateParams
 from lifemodel.state.model import State
 from lifemodel.testing import (
     FakeActiveSpan,

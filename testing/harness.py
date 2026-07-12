@@ -29,12 +29,12 @@ from ..composition import build_lifemodel
 from ..core.desire_view import read_live_contact_desire
 from ..core.frame import FrameTrigger
 from ..core.proactive import proactive_tick
+from ..core.quality import Actor, Label
 from ..core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from ..domain.egress import ProactiveOutcome, ReachOutcome
 from ..domain.signal import Signal
 from ..events import EventRing
 from ..ports.memory import MemoryPort
-from ..sim.quality import Actor, Label
 from ..state.model import State
 from .fakes import FakeClock
 

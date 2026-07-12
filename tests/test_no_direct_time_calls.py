@@ -37,7 +37,7 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent
 
 #: Runtime source dirs — the Hermes-free engine + the adapter boundary. Scanned
 #: recursively (``domain/objects/`` etc. count).
-_RUNTIME_DIRS = ("core", "domain", "state", "adapters", "ports", "sim")
+_RUNTIME_DIRS = ("core", "domain", "state", "adapters", "ports")
 
 #: Files under the package root that are runtime code, scanned non-recursively.
 #: ``conftest.py`` is a pytest harness file, not runtime, so it is exempt.

@@ -51,9 +51,9 @@ from lifemodel.core.thought_view import (
 )
 from lifemodel.core.timeutil import minutes_between, to_iso
 from lifemodel.core.user_model_view import EXPLICIT_CONFIDENCE, read_owner_user_model
+from lifemodel.core.wake import LaneState, evaluate_wake
 from lifemodel.core.wake_packet import build_wake_packet
 from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
-from lifemodel.sim.wake import LaneState, evaluate_wake
 from lifemodel.state.errors import StateCorruptError
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore

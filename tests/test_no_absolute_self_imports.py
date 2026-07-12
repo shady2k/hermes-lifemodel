@@ -10,7 +10,7 @@ the real Hermes loader the package is imported as ``hermes_plugins.lifemodel``
 ``make check`` stayed GREEN because ``conftest.py`` inserts the package parent on
 ``sys.path``, so ``lifemodel`` resolves *in tests* — the exact thing fatal in
 prod. This AST linter closes that gap: runtime code (``core domain state adapters
-ports sim`` + package-root ``*.py``) must use **relative** imports
+ports`` + package-root ``*.py``) must use **relative** imports
 (``from ..core.metrics``), never ``lifemodel.…`` nor the loader namespace
 ``hermes_plugins.lifemodel.…``. Tests / ``conftest.py`` / ``testing/`` are exempt
 (test-only, run under the harness shim).
@@ -31,7 +31,7 @@ _PKG_ROOT = Path(__file__).resolve().parent.parent
 
 #: Runtime source dirs — Hermes-free engine + the adapter boundary. Scanned
 #: recursively (``domain/objects/`` etc. count).
-_RUNTIME_DIRS = ("core", "domain", "state", "adapters", "ports", "sim")
+_RUNTIME_DIRS = ("core", "domain", "state", "adapters", "ports")
 
 #: Files under the package root that are runtime code, scanned non-recursively.
 #: ``conftest.py`` is a pytest harness file, not runtime, so it is exempt.

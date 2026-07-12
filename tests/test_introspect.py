@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from lifemodel.core.introspect import DebugConfig, Readings, compute_readings
-from lifemodel.sim.wake import GateParams
+from lifemodel.core.wake import GateParams
 from lifemodel.state.model import State
 
 CFG = DebugConfig(

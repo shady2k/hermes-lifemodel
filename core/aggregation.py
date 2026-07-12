@@ -38,7 +38,6 @@ from collections.abc import Sequence
 from ..domain.egress import ProactiveOutcome
 from ..domain.memory import PutOp, TransitionOp
 from ..domain.objects import DesireSpring, DesireState, IntentionState
-from ..sim.wake import GateParams, LaneState, WakeOutcome, evaluate_wake
 from .backstop import record_send
 from .component import TickContext
 from .correlate import open_correlated_span
@@ -61,6 +60,7 @@ from .taxonomy import (
 from .tick_metrics import INTAKE_COALESCED, INTAKE_SHED_SENSOR, SIGNALS_INTAKE
 from .timeutil import minutes_between, to_iso
 from .trace import creation_provenance
+from .wake import GateParams, LaneState, WakeOutcome, evaluate_wake
 
 #: The logical "no live desire" sentinel — the old ``desire_status == "none"``.
 _NONE = "none"

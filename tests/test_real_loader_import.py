@@ -43,7 +43,7 @@ _CHECKOUT_PARENT = _PKG_ROOT.parent
 #: Runtime source dirs (Hermes-free engine + the adapter boundary), scanned
 #: recursively. Curated on purpose — a blind ``rglob`` of the package root would
 #: descend into ``.venv``/``docs``/``.git``. Mirrors the linter's scan set.
-_RUNTIME_DIRS = ("core", "domain", "state", "adapters", "ports", "sim")
+_RUNTIME_DIRS = ("core", "domain", "state", "adapters", "ports")
 
 # The one runtime module that imports gateway.* at load — excluded (see docstring).
 _SKIP_REL = {Path("adapters/being_platform.py")}

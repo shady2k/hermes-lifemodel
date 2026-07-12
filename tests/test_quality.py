@@ -8,7 +8,7 @@ is exactly what stops the being from satiating its own urge with its own nudges.
 
 from __future__ import annotations
 
-from lifemodel.sim.quality import quality_of
+from lifemodel.core.quality import quality_of
 
 
 def test_genuine_two_way_exchange_has_quality_one() -> None:
