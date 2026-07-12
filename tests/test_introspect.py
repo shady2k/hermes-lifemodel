@@ -168,3 +168,24 @@ def test_contact_chain_summary_marks_a_cycle() -> None:
         edges=(WhyEdge(label="parent_thought", cycle=True),),
     )
     assert contact_chain_summary(node) == "thought:a <- [cycle] (parent_thought)"
+
+
+def test_reads_core_affect_current_and_recomputed_target() -> None:
+    # lm-ukc.6: the debug readings surface the being's felt state — the CURRENT eased
+    # axes come straight from stored state, while the this-tick TARGET is recomputed
+    # from the snapshot (like drive u is), with contributors ranked so the reader sees
+    # what tugs valence/arousal hardest.
+    state = State(
+        u=6.0,  # ~a day of silence → loneliness dominates the valence target
+        affect_valence=-0.12,
+        affect_arousal=0.40,
+        affect_updated_at="2026-07-06T03:59:00+00:00",
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    r = compute_readings(state, now=NOW, cfg=CFG)
+    assert r.affect_valence == -0.12  # stored eased value, NOT recomputed
+    assert r.affect_arousal == 0.40
+    assert r.affect_updated_at == "2026-07-06T03:59:00+00:00"
+    assert r.affect_target_valence < 0.0  # loneliness pulls the target negative
+    assert r.affect_valence_contributions[0][0] == "u"  # ranked: loneliness leads
+    assert r.affect_arousal_contributions  # arousal always carries a baseline term

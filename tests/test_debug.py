@@ -351,3 +351,15 @@ def test_render_dump_for_dir_no_trace_store_does_not_crash(tmp_path) -> None:
     out = render_dump_for_dir(tmp_path)
     assert "LAST WAKE OUTCOME" in out
     assert "no wake outcome recorded yet" in out
+
+
+def test_dump_renders_the_affect_section() -> None:
+    # lm-ukc.6: the read-only dump shows the being's felt state — the current axes,
+    # this-tick target, and what tugs each axis (the felt WORD is lm-ukc.3's slot).
+    out = render_debug_dump(readings=_readings())
+    assert "**AFFECT" in out
+    assert "**valence(v):**" in out
+    assert "**arousal(a):**" in out
+    assert "**target:**" in out
+    assert "**tugging v:**" in out
+    assert "**tugging a:**" in out

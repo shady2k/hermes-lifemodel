@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from . import composition
+from .core.affect import CONTRIBUTION_DISPLAY_DEADBAND
 from .core.desire_view import read_live_contact_desire
 from .core.intention_view import read_live_contact_intention
 from .core.introspect import DebugConfig, Readings, compute_readings, contact_chain_summary
@@ -44,6 +45,7 @@ def _cfg() -> DebugConfig:
         min_interval_min=60.0,
         alpha=composition.CONTACT_ALPHA,
         u_max=composition.CONTACT_U_MAX,
+        affect_params=composition.AFFECT_PARAMS,
     )
 
 
@@ -60,6 +62,18 @@ def _n(x: float) -> str:
 
 def _opt(x: float | None, unit: str = "") -> str:
     return "n/a" if x is None else f"{x:.1f}{unit}"
+
+
+def _contribs(pairs: tuple[tuple[str, float], ...], top: int = 3) -> str:
+    """Render the strongest signed pushes on an affect axis as one scannable line.
+
+    Magnitude-ranked pairs in (from :class:`Readings`), the top few with a
+    non-trivial push out — e.g. ``"u -0.33; exchange +0.05"``. All sub-deadband →
+    ``"—"`` (nothing is moving the axis). 2-decimal like the rest of the dump."""
+    ranked = [(name, v) for name, v in pairs if abs(v) >= CONTRIBUTION_DISPLAY_DEADBAND][:top]
+    if not ranked:
+        return "—"
+    return "; ".join(f"{name} {v:+.2f}" for name, v in ranked)
 
 
 def _reasons(reasons: tuple[str, ...]) -> str:
@@ -197,6 +211,21 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
             ("fatigue(S)", _n(r.fatigue)),
             ("circadian(C)", _n(r.circadian)),
             ("alertness", f"~{_n(r.alertness)} (higher C, lower S = sharper)"),
+        ]
+    )
+    lines.append("")
+
+    # AFFECT (lm-ukc.6): the being's felt state — current eased axes, this-tick target,
+    # and what tugs each axis most. The felt WORD is lm-ukc.3's slot (a line here).
+    lines.append("**AFFECT (self-model)**")
+    lines += _metrics(
+        [
+            ("valence(v)", _n(r.affect_valence)),
+            ("arousal(a)", _n(r.affect_arousal)),
+            ("target", f"v {_n(r.affect_target_valence)} / a {_n(r.affect_target_arousal)}"),
+            ("tugging v", _contribs(r.affect_valence_contributions)),
+            ("tugging a", _contribs(r.affect_arousal_contributions)),
+            ("updated", _local(r.affect_updated_at)),
         ]
     )
     lines.append("")

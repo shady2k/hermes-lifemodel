@@ -206,6 +206,27 @@ def affect_target(
     return valence, arousal, contributions
 
 
+#: Below this magnitude a contribution rounds to ``+0.00`` at the 2-decimal display
+#: precision — so it is not really "moving the axis". Both the trace's dominant term
+#: and the debug view's ``tugging`` line suppress it, so neither shows a fake push.
+CONTRIBUTION_DISPLAY_DEADBAND = 0.005
+
+
+def dominant_contribution(contribs: dict[str, float]) -> str:
+    """The single strongest push on an axis, formatted ``"name +v.vv"`` (lm-ukc.6).
+
+    For the trace head-line: the reader wants the one term pulling valence/arousal
+    hardest, not the whole vector. Ranked by magnitude; an empty axis, or one whose
+    strongest term rounds to ``+0.00`` at display precision (nothing meaningfully
+    moving it), reads ``"none"`` — no misleading ``"name +0.00"``."""
+    if not contribs:
+        return "none"
+    name, val = max(contribs.items(), key=lambda kv: abs(kv[1]))
+    if abs(val) < CONTRIBUTION_DISPLAY_DEADBAND:
+        return "none"
+    return f"{name} {val:+.2f}"
+
+
 def ease(*, current: float, target: float, dt_min: float, tau_min: float, deadband: float) -> float:
     """One leaky-integrator step toward *target* over *dt_min* with time-constant *tau_min*.
 
@@ -286,7 +307,7 @@ class AffectSense:
         # project to a target, then ease the stored affect toward it. dt comes from
         # last_tick_at (the physiology clock), so the first tick (dt 0) makes no move.
         body = AffectBody.from_state(state, now=ctx.now, peak_hour_utc=self._peak_hour_utc)
-        target_valence, target_arousal, _contributions = affect_target(body, p)
+        target_valence, target_arousal, contributions = affect_target(body, p)
         dt = minutes_between(state.last_tick_at, ctx.now)
         valence = ease(
             current=state.affect_valence,
@@ -307,5 +328,17 @@ class AffectSense:
         if ctx.observe is not None:
             ctx.observe.set(AFFECT_VALENCE, valence)
             ctx.observe.set(AFFECT_AROUSAL, arousal)
+        # Stamp the felt state onto this component's span (guarded, fail-open): the
+        # eased axes, this-tick target, and the dominant contributor per axis, so
+        # /lifemodel trace shows WHY the being feels so (lm-ukc.6). Still no signal.
+        if ctx.logger is not None:
+            ctx.logger.span.set(
+                affect_valence=valence,
+                affect_arousal=arousal,
+                affect_target_valence=target_valence,
+                affect_target_arousal=target_arousal,
+                affect_top_valence=dominant_contribution(contributions.valence),
+                affect_top_arousal=dominant_contribution(contributions.arousal),
+            )
         eased = AffectState(valence=valence, arousal=arousal, updated_at=to_iso(ctx.now))
         return [UpdateState(eased.to_state_patch())]

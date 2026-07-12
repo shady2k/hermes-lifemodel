@@ -16,6 +16,7 @@ from datetime import datetime
 
 from ..domain.objects import Thought, ThoughtState, UserModel
 from ..state.model import State
+from .affect import AffectBody, AffectParams, affect_target
 from .backstop import allow_send
 from .circadian import circadian
 from .pressure import effective_pressure, inhibition_at
@@ -46,6 +47,10 @@ class DebugConfig:
     min_interval_min: float
     alpha: float
     u_max: float
+    #: The core-affect derivation seeds (lm-ukc.6): the debug view recomputes the
+    #: affect target/contributions from the snapshot with these, mirroring the live
+    #: ``AffectSense``. Defaulted so a config built without them still reads affect.
+    affect_params: AffectParams = AffectParams()
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,18 @@ class Readings:
     #: (source)``. ``"no current outreach"`` when there is no live/recent intention.
     #: The FULL graph lives behind ``/lifemodel why`` (not re-walked into every dump).
     contact_chain: str = "no current outreach"
+    # affect (core-affect self-model — lm-ukc.6). CURRENT axes are the stored eased
+    # values; TARGET + contributions are recomputed from the snapshot (like ``u``).
+    #: A slot for the felt WORD stays open here for lm-ukc.3 (point→word).
+    affect_valence: float = 0.0
+    affect_arousal: float = 0.0
+    affect_updated_at: str | None = None
+    affect_target_valence: float = 0.0
+    affect_target_arousal: float = 0.0
+    #: Per-signal signed pushes behind each target, ranked by magnitude (strongest
+    #: first) so the dump shows "what tugs valence/arousal most" (lm-ukc.6).
+    affect_valence_contributions: tuple[tuple[str, float], ...] = ()
+    affect_arousal_contributions: tuple[tuple[str, float], ...] = ()
 
 
 #: How many links the COMPACT contact-chain line follows down its primary lineage —
@@ -267,6 +284,19 @@ def compute_readings(
     )
     outcome = evaluate_wake(u=effective, now=0.0, state=lane, params=cfg.params)
 
+    # Core affect (lm-ukc.6): recompute this-tick target + contributions from the
+    # snapshot with the live seeds, mirroring AffectSense (which reads state.u at the
+    # start of the tick, before the drive integrates) — so the "target" the dump shows
+    # is exactly what the being would ease toward. Current axes stay the stored values.
+    affect_body = AffectBody.from_state(state, now=now, peak_hour_utc=cfg.peak_hour_utc)
+    affect_tv, affect_ta, affect_contribs = affect_target(affect_body, cfg.affect_params)
+    affect_v_ranked = tuple(
+        sorted(affect_contribs.valence.items(), key=lambda kv: abs(kv[1]), reverse=True)
+    )
+    affect_a_ranked = tuple(
+        sorted(affect_contribs.arousal.items(), key=lambda kv: abs(kv[1]), reverse=True)
+    )
+
     return Readings(
         schema_version=state.schema_version,
         tick_count=state.tick_count,
@@ -316,4 +346,11 @@ def compute_readings(
         last_tick_ago_min=last_tick_ago,
         brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,
         contact_chain=contact_chain,
+        affect_valence=state.affect_valence,
+        affect_arousal=state.affect_arousal,
+        affect_updated_at=state.affect_updated_at,
+        affect_target_valence=affect_tv,
+        affect_target_arousal=affect_ta,
+        affect_valence_contributions=affect_v_ranked,
+        affect_arousal_contributions=affect_a_ranked,
     )

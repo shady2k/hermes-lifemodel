@@ -14,12 +14,20 @@ from datetime import UTC, datetime
 
 import pytest
 
-from lifemodel.core.affect import AffectBody, AffectParams, AffectSense, affect_target, ease
+from lifemodel.core.affect import (
+    AffectBody,
+    AffectParams,
+    AffectSense,
+    affect_target,
+    dominant_contribution,
+    ease,
+)
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import EmitSignal, UpdateState
 from lifemodel.core.timeutil import to_iso
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
+from lifemodel.testing.fakes import FakeActiveSpan, FakeSpanLogger, FakeTracer
 
 P = AffectParams()
 
@@ -197,3 +205,51 @@ def test_affect_sense_emits_no_signal() -> None:
     intents = _sense().step(_ctx(state, now))
     assert any(isinstance(i, UpdateState) for i in intents)
     assert all(not isinstance(i, EmitSignal) for i in intents)
+
+
+def _logged_ctx(state: State, now: datetime) -> tuple[TickContext, FakeSpanLogger]:
+    # The live tick hands AffectSense a span-bound logger over its child span; the
+    # FakeActiveSpan records .set(...) attrs so the trace surfacing reads back.
+    trace = FakeTracer().start_root()
+    logger = FakeSpanLogger(FakeActiveSpan(trace, component="affect", tick=state.tick_count + 1))
+    ctx = TickContext(state=state, now=now, signals=(), trace=trace, logger=logger)
+    return ctx, logger
+
+
+def test_affect_sense_stamps_felt_state_on_its_span() -> None:
+    # lm-ukc.6: the being's felt state must be legible in the trace. AffectSense stamps
+    # its component span with the eased axes, this-tick target, and the dominant
+    # contributor per axis — so /lifemodel trace shows "why it feels so".
+    state = State(u=P.u_ref, affect_valence=0.0, last_tick_at="2026-07-12T12:00:00+00:00")
+    now = datetime(2026, 7, 12, 13, 0, tzinfo=UTC)  # +60 min
+    ctx, logger = _logged_ctx(state, now)
+    _sense().step(ctx)
+    attrs = logger.span.attrs
+    assert {
+        "affect_valence",
+        "affect_arousal",
+        "affect_target_valence",
+        "affect_target_arousal",
+        "affect_top_valence",
+        "affect_top_arousal",
+    } <= set(attrs)
+    # a day of silence with no other pull → loneliness ('u') dominates valence
+    assert attrs["affect_target_valence"] < 0.0
+    assert attrs["affect_top_valence"].startswith("u ")
+
+
+def test_affect_sense_span_surfacing_is_optional() -> None:
+    # ctx.logger is None in a bare context (no graph): step must not crash, mirroring
+    # the ctx.observe guard — surfacing is fail-open, never a tick crash.
+    state = State(u=P.u_ref, last_tick_at="2026-07-12T12:00:00+00:00")
+    now = datetime(2026, 7, 12, 13, 0, tzinfo=UTC)
+    intents = _sense().step(_ctx(state, now))  # _ctx has no logger
+    assert any(isinstance(i, UpdateState) for i in intents)
+
+
+def test_dominant_contribution_suppresses_sub_deadband_as_none() -> None:
+    # A push that rounds to +0.00 at display precision is not "moving the axis": it
+    # reads "none", matching the debug view's deadband filter — no misleading "x +0.00".
+    assert dominant_contribution({"u": -0.002, "exchange": 0.001}) == "none"
+    assert dominant_contribution({}) == "none"
+    assert dominant_contribution({"u": -0.30, "exchange": 0.01}).startswith("u ")
