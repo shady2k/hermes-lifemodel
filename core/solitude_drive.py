@@ -3,7 +3,7 @@
 Owns and writes the vital ``u`` (``runtime_state``): it consumes the fresh
 ``contact_presence`` reading from :class:`ContactSensor` (elapsed silence ``dt`` +
 this tick's exchange qualities) and integrates the CERTIFIED drive
-(:class:`lifemodel.sim.drive.Drive`) — ``rise`` over genuine silence, ``satiate``
+(:class:`Drive`, below) — ``rise`` over genuine silence, ``satiate``
 ONLY on a real exchange — then emits the fresh ``u`` as the transient
 ``contact_pressure`` signal :class:`~lifemodel.core.aggregation.ContactAggregation`
 reads (T3: the drive-output kind, replacing the legacy ``contact`` kind).
@@ -14,19 +14,55 @@ must read the fresh ``u`` from this transient signal, not from ``ctx.state.u``.
 
 Satiation is ONLY on a real (positive-quality) exchange — the being's own proactive
 impulse carries ``q = 0`` (computed upstream by ContactSensor via ``quality_of``)
-and never self-satiates. The drive math is the certified ``sim`` model, unchanged.
+and never self-satiates. The drive math is the certified :class:`Drive` (above), unchanged.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
-from ..sim.drive import Drive
 from .component import TickContext
 from .intents import EmitSignal, Intent, UpdateState
 from .metrics import MetricSpec
 from .taxonomy import contact_pressure_signal, read_contact_presence
 from .timeutil import to_iso
+
+
+@dataclass
+class Drive:
+    """The certified contact-urge math (moved here from the retired ``sim`` package).
+
+    Holds the one continuous state variable ``u`` and its three moves; knows nothing
+    of gates/thresholds/cognition (those live in the wake-decision layer). Constants
+    normalised so ``θ_u = 1`` and ``β = 1``. Built in beside :class:`SolitudeDrive`,
+    the component that integrates it — a directly-simulatable, unit-regressed kernel.
+
+    - ``rise(dt)``   — accumulate in genuine silence: ``u ← min(u_max, u + dt·α)``.
+    - ``satiate(q)`` — a positive exchange drains ``β·q``: ``u ← max(0, u − β·q)``.
+    - ``drain(f)``   — the wake-decision consumed an URGE: ``u ← (1 − f)·u``.
+    """
+
+    alpha: float
+    beta: float = 1.0
+    u_max: float = math.inf
+    u: float = 0.0
+
+    def rise(self, *, dt: float) -> None:
+        """Accumulate the urge over ``dt`` of genuine silence, capped at ``u_max``."""
+        self.u = min(self.u_max, self.u + dt * self.alpha)
+
+    def satiate(self, *, q: float) -> None:
+        """Reduce the urge on a positive exchange. Non-positive ``q`` does nothing."""
+        if q <= 0.0:
+            return
+        self.u = max(0.0, self.u - self.beta * q)
+
+    def drain(self, *, fraction: float = 1.0) -> None:
+        """Consume the urge by ``fraction`` (default full drain to zero)."""
+        self.u = max(0.0, self.u * (1.0 - fraction))
+
 
 #: The being's current contact-solitude drive level ``u`` — the first live domain
 #: metric emitted through ``ctx.observe`` (telemetry-core §4.3). This is genuine

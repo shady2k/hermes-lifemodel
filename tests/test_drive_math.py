@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 
-from lifemodel.sim.drive import Drive
+from lifemodel.core.solitude_drive import Drive
 
 
 def test_rises_by_alpha_times_dt_in_silence() -> None:
