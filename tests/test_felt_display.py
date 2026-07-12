@@ -277,7 +277,9 @@ def test_self_read_energy_buckets() -> None:
     d = build_contact_desire(state=DesireState.ACTIVE, salience=1.0)
     assert "Energy is low." in compose_self_read(_warmed_state(energy=0.1), desire=d)
     assert "Energy is steady." in compose_self_read(_warmed_state(energy=0.5), desire=d)
-    assert "Energy is bright." in compose_self_read(_warmed_state(energy=0.95), desire=d)
+    # Top bucket is "full", not "bright" — `bright` is already a felt WORD, and the two
+    # collided in the read ("You feel bright: … Energy is bright.").
+    assert "Energy is full." in compose_self_read(_warmed_state(energy=0.95), desire=d)
 
 
 def test_self_read_no_live_desire_reads_calm_pull() -> None:

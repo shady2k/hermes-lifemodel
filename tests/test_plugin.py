@@ -202,8 +202,14 @@ def test_register_check_in_tool_schema_and_contract(
     schema = entry["kwargs"]["schema"]
     assert schema["name"] == "check_in"
     # The description must teach WHEN to reach for it — in the SCHEMA, where the model looks.
-    assert "Check in with yourself" in schema["description"]
-    assert "when someone asks how you are" in schema["description"]
+    assert "whenever someone asks how you are" in schema["description"]
+    # …and it must be honest about ACCESS. The first wording ("Check in with yourself")
+    # failed live: the being recognised the question, INTENDED to "check in with myself
+    # honestly", then did it in its head — the phrasing read as a mental act it could
+    # already perform, so the tool looked redundant. It must say you cannot know by
+    # assuming; you have to look (integrative, not debunking — the state is its own).
+    assert "you have to look" in schema["description"]
+    assert "you are guessing" in schema["description"]
     # Takes NO parameters — the being just calls it (spec §6).
     params = schema["parameters"]
     assert params["type"] == "object"

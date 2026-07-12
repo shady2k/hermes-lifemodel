@@ -349,12 +349,17 @@ def compose_light_cue(state: State, *, word_params: FeltWordParams = FELT_WORD_P
 
 
 def _energy_bucket(energy: float) -> str:
-    """Coarse felt read of the being's energy — never the number (spec §4b)."""
+    """Coarse felt read of the being's energy — never the number (spec §4b).
+
+    The top bucket is "full", NOT "bright": ``bright`` is already a felt WORD
+    (pleasant + keyed-up), so it collided in the read — "You feel bright: … Energy
+    is bright." — which reads like a stutter rather than two distinct facts.
+    """
     if energy < 0.34:
         return "low"
     if energy < 0.67:
         return "steady"
-    return "bright"
+    return "full"
 
 
 def _pull_phrase(desire: Desire | None) -> str:
