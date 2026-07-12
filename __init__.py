@@ -57,11 +57,6 @@ __version__ = "0.0.0"
 #: ``agent.log``. Tick-path events go through SpanLogger, never this.
 _LOG = logging.getLogger("lifemodel")
 
-#: The ``check_in`` self-read tool (lm-ukc.4.1) takes NO parameters — the being just
-#: calls it (spec §6). Its NAME is validated with the live being: it reads as "a
-#: check-in with myself" (warm/social), not a sensor like ``get_mood_metrics``.
-_CHECK_IN_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
-
 #: The tool description (spec §4b) — it teaches the being WHEN to reach for it and
 #: locks the reading as "I check on myself" (a self-read, not a system probe).
 _CHECK_IN_DESCRIPTION = (
@@ -70,6 +65,22 @@ _CHECK_IN_DESCRIPTION = (
     "when someone asks how you are, or before you speak about yourself instead of "
     "guessing."
 )
+
+#: The ``check_in`` self-read tool (lm-ukc.4.1). The schema IS the model-facing FUNCTION
+#: DEFINITION, not just a parameter object: Hermes exposes a registered tool as
+#: ``{"type": "function", "function": {**schema, "name": name}}`` (``tools/registry.py``),
+#: so the model reads ``description`` and ``parameters`` from HERE. The
+#: ``register_tool(description=…)`` kwarg is registry metadata ONLY and never reaches the
+#: model — passing the description there alone leaves the being staring at a nameless,
+#: undocumented tool it will never call (caught live: "пустое описание, не знаю что делает").
+#: Takes NO parameters — the being just calls it (spec §6). Its NAME is validated with the
+#: live being: it reads as "a check-in with myself" (warm/social), not a sensor like
+#: ``get_mood_metrics``.
+_CHECK_IN_SCHEMA: dict[str, Any] = {
+    "name": "check_in",
+    "description": _CHECK_IN_DESCRIPTION,
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
 
 
 class _Subcommand(NamedTuple):

@@ -192,13 +192,23 @@ def test_register_check_in_tool_schema_and_contract(
     lifemodel.register(ctx)
     entry = ctx.tools["check_in"]
 
-    # Schema takes NO parameters — the being just calls it (spec §6).
+    # The schema IS the model-facing FUNCTION DEFINITION, not a bare parameter object:
+    # Hermes exposes a registered tool as {"type": "function", "function": {**schema,
+    # "name": name}} (tools/registry.py), so the model reads `description` and
+    # `parameters` from the SCHEMA. Passing the description only through the
+    # register_tool(description=…) kwarg (registry metadata) leaves the being staring at
+    # a blank, undocumented tool it will never call — caught on the LIVE being ("пустое
+    # описание, даже не знаю, что он делает"), which the old shape-only asserts missed.
     schema = entry["kwargs"]["schema"]
-    assert schema["type"] == "object"
-    assert schema["properties"] == {}
-    assert schema["required"] == []
-    # Name validated with the live being; description teaches WHEN to reach for it.
-    assert "Check in with yourself" in entry["kwargs"]["description"]
+    assert schema["name"] == "check_in"
+    # The description must teach WHEN to reach for it — in the SCHEMA, where the model looks.
+    assert "Check in with yourself" in schema["description"]
+    assert "when someone asks how you are" in schema["description"]
+    # Takes NO parameters — the being just calls it (spec §6).
+    params = schema["parameters"]
+    assert params["type"] == "object"
+    assert params["properties"] == {}
+    assert params["required"] == []
     assert entry["kwargs"]["toolset"] == "lifemodel"
     # The handler honours the Hermes contract: a JSON string, felt prose, no throw.
     payload = _json.loads(entry["kwargs"]["handler"]({}))
