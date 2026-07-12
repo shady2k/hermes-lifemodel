@@ -19,6 +19,7 @@ gate satisfaction proven through the real pipeline, not reimplemented here.
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -58,6 +59,7 @@ from lifemodel.state.errors import StateCorruptError
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.state_commands import (
+    _SET_PROTECTED,
     force_wake,
     force_wake_for_dir,
     nudge,
@@ -70,6 +72,7 @@ from lifemodel.state_commands import (
     set_field_for_dir,
     set_user_model_prefs,
     set_user_model_prefs_for_dir,
+    settable_fields,
     think_for_dir,
     transition_thought_for_dir,
     why_for_dir,
@@ -372,9 +375,36 @@ def test_satiate_opens_the_silence_window_without_forging_the_exchange_record() 
 def test_set_field_rejects_last_exchange_at_as_immune() -> None:
     # The real last-exchange record is immune to ALL admin commands — `set` can no
     # longer write it. The silence window is tuned through silence_anchor_at instead.
+    # A PROTECTED field answers with its REASON (and the alternative), not a bare refusal.
     after, message = set_field(State(), NOW, "last_exchange_at now")
     assert after is None
-    assert "not writable" in message
+    assert "protected" in message
+    assert "silence_anchor_at" in message
+
+
+def test_set_field_writes_the_affect_axes() -> None:
+    # lm-ukc.4: the affect axes must be settable — they are the ONLY lever that can drive
+    # the being to a salient mood on demand, so the ambient felt-state cue can be exercised
+    # without waiting hours for loneliness to build. They drifted out of the old
+    # hand-maintained whitelist (added to State in lm-ukc.6, never listed), which is exactly
+    # why `set` now DERIVES its surface from State instead.
+    after, _ = set_field(State(), NOW, "affect_valence -0.5")
+    assert after is not None and after.affect_valence == -0.5
+    after, _ = set_field(State(), NOW, "affect_arousal 0.8")
+    assert after is not None and after.affect_arousal == 0.8
+
+
+def test_every_state_field_is_settable_or_protected() -> None:
+    # The anti-drift guard. A new State field must be CONSCIOUSLY classified: either it has
+    # a settable scalar type (and is writable by default), or it is listed in _SET_PROTECTED
+    # with a reason. Nothing may sit in between, silently unreachable — that is the failure
+    # that hid the affect axes from `set` for a whole phase.
+    names = {f.name for f in dataclasses.fields(State)}
+    classified = set(settable_fields()) | set(_SET_PROTECTED)
+    assert names == classified, (
+        f"unclassified State field(s): {sorted(names - classified)} — give it a settable "
+        "scalar type, or add it to _SET_PROTECTED with the reason it must not be hand-written"
+    )
 
 
 # --- reset -----------------------------------------------------------------
@@ -408,11 +438,17 @@ def test_reset_notes_when_state_was_already_fresh() -> None:
 # --- set_field ---------------------------------------------------------------
 
 
-def test_set_field_rejects_unknown_field() -> None:
+def test_set_field_rejects_a_protected_field_with_its_reason() -> None:
+    # tick_count is a REAL State field, deliberately PROTECTED: it is brain-liveness
+    # evidence, and hand-faking it would lie about whether the brain ticks. A protected
+    # field is refused WITH its reason (the owner learns why, and what to use instead) —
+    # never silently splatted. (A field that isn't in State at all takes the plain
+    # "not writable" path — see test_set_field_rejects_removed_desire_status_field.)
     after, message = set_field(State(), NOW, "tick_count 5")
     assert after is None
-    assert "not writable" in message
+    assert "protected" in message
     assert "tick_count" in message
+    assert "liveness" in message
 
 
 def test_set_field_rejects_missing_value() -> None:
@@ -596,7 +632,7 @@ def test_set_field_for_dir_rejects_without_writing(tmp_path) -> None:
     original = State(u=1.0)
     _store(tmp_path).commit(original)
     message = set_field_for_dir(tmp_path, "tick_count 5")
-    assert "not writable" in message
+    assert "protected" in message  # a real-but-protected field, refused with its reason
     assert _store(tmp_path).load() == original  # untouched
 
 

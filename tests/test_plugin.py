@@ -405,7 +405,7 @@ def test_register_lifemodel_reset_subcommand_writes_a_fresh_state(
     assert persisted.proactive_send_log == []
 
 
-def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
+def test_register_lifemodel_set_subcommand_rejects_protected_field(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
@@ -415,7 +415,9 @@ def test_register_lifemodel_set_subcommand_rejects_unwhitelisted_field(
 
     out = handler("set tick_count 99")
 
-    assert "not writable" in out
+    # `set` derives its surface from State minus _SET_PROTECTED; tick_count is protected
+    # (brain-liveness evidence) and is refused end-to-end, WITH its reason, writing nothing.
+    assert "protected" in out
     # Rejected before ever committing: unlike JsonStateStore (which never
     # touched the filesystem until commit), constructing SQLiteRuntimeStore
     # always creates lifemodel.sqlite (recovery/migration need the file) —

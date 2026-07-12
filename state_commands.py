@@ -99,25 +99,65 @@ _FORCE_WAKE_U_MARGIN = 1.0
 #: grazed by a clock-resolution wobble.
 _FORCE_WAKE_SILENCE_MARGIN_MIN = 5.0
 
-# --- the `set` whitelist -----------------------------------------------------
-# Every field `set` may write, with its coercion kind. This IS the whole safety
-# boundary for a generic setter over the being's persisted soul — anything not
-# listed here is rejected with a clear message, never silently splatted.
+# --- the `set` field surface -------------------------------------------------
+# `set` DERIVES its writable fields from the ``State`` dataclass (by field type), minus an
+# explicit PROTECTED set. This inverts the old hand-maintained whitelist, which DRIFTED:
+# lm-ukc.6 added ``affect_valence``/``affect_arousal`` to ``State`` and nobody added them
+# to the list, so the owner could not calibrate the very axes the affect work is about
+# (found live: the ambient cue could not be exercised at all). Now a new scalar field is
+# settable BY DEFAULT and *protection* is the thing you must state on purpose, with a
+# reason. ``test_every_state_field_is_settable_or_protected`` enforces that every field is
+# consciously classified, so this cannot drift again.
 _KIND_FLOAT = "float"
 _KIND_INT = "int"
 _KIND_TIMESTAMP = "timestamp"
-_SET_WHITELIST: dict[str, str] = {
-    "u": _KIND_FLOAT,
-    "energy": _KIND_FLOAT,
-    "fatigue": _KIND_FLOAT,
-    "duration_over_theta": _KIND_FLOAT,
-    "decline_count": _KIND_INT,
-    # last_exchange_at is deliberately ABSENT (lm-md6.1): the real exchange record the
-    # wake packet renders is immune to admin commands. Tune the silence-window gate via
-    # silence_anchor_at instead.
-    "silence_anchor_at": _KIND_TIMESTAMP,
-    "last_contact_at": _KIND_TIMESTAMP,
+
+#: Fields ``set`` must NEVER write, each with WHY. These are load-bearing invariants —
+#: this is the real safety boundary, not bureaucracy.
+_SET_PROTECTED: dict[str, str] = {
+    "schema_version": "the store's migrations own it — hand-writing it corrupts load/upgrade",
+    "last_exchange_at": (
+        "lm-md6.1: the REAL exchange record the wake packet renders stays immune to admin "
+        "commands — tune the silence-window gate via silence_anchor_at instead"
+    ),
+    "proactive_send_log": (
+        "the hard send backstop that protects the OWNER from a spamming being — never hand-edit"
+    ),
+    "pending_proactive_id": (
+        "in-flight proactive correlation — hand-setting desyncs outcome resolution"
+    ),
+    "pending_proactive_since": "in-flight proactive correlation (see pending_proactive_id)",
+    "pending_proactive_origin_traceparent": (
+        "in-flight proactive correlation (see pending_proactive_id)"
+    ),
+    "tick_count": "brain-liveness evidence — faking it would lie about whether the brain ticks",
+    "last_tick_at": "brain-liveness evidence (see tick_count)",
+    "processed_external_event_ids": "the idempotency ledger — hand-editing replays or drops events",
+    "affect_display_last_word": (
+        "reactive-display hint — written atomically by the injector (lm-ukc.4), never by hand"
+    ),
+    "affect_display_last_at": "reactive-display hint (see affect_display_last_word)",
 }
+
+#: Field TYPE -> coercion kind. A field whose type is absent here (``list``/``dict``) has no
+#: safe scalar coercion and is therefore never settable.
+_TYPE_KINDS: dict[str, str] = {
+    "float": _KIND_FLOAT,
+    "int": _KIND_INT,
+    "str | None": _KIND_TIMESTAMP,
+}
+
+
+def settable_fields() -> dict[str, str]:
+    """The fields ``set`` may write: derived from ``State`` by type, minus ``_SET_PROTECTED``."""
+    out: dict[str, str] = {}
+    for f in dataclasses.fields(State):
+        if f.name in _SET_PROTECTED:
+            continue
+        kind = _TYPE_KINDS.get(str(f.type).strip())
+        if kind is not None:
+            out[f.name] = kind
+    return out
 
 
 def _fmt_value(value: object) -> str:
@@ -290,17 +330,26 @@ def reset(before: State, now: datetime) -> tuple[State | None, str]:
 
 
 def set_field(before: State, now: datetime, raw_args: str) -> tuple[State | None, str]:
-    """``set <field> <value>`` over the safe-field whitelist (see ``_SET_WHITELIST``)."""
+    """``set <field> <value>`` over the derived settable surface (see :func:`settable_fields`)."""
     parts = raw_args.strip().split(None, 1)
-    whitelist = ", ".join(_SET_WHITELIST)
+    settable = settable_fields()
+    names = ", ".join(sorted(settable))
     if len(parts) < 2:
-        return None, f"usage: /lifemodel set <field> <value>\nwhitelisted fields: {whitelist}\n"
+        return None, f"usage: /lifemodel set <field> <value>\nsettable fields: {names}\n"
     field_name, raw_value = parts[0], parts[1].strip()
 
-    kind = _SET_WHITELIST.get(field_name)
+    kind = settable.get(field_name)
     if kind is None:
+        # A PROTECTED field gets its REASON back, not a bare rejection — the owner should
+        # learn why the being's soul refuses that particular hand (and what to use instead).
+        reason = _SET_PROTECTED.get(field_name)
+        if reason is not None:
+            return None, (
+                f"error: 'set' field {field_name!r} is protected — {reason}.\n"
+                f"settable fields: {names}\n"
+            )
         return None, (
-            f"error: 'set' field {field_name!r} is not writable. Whitelisted fields: {whitelist}\n"
+            f"error: 'set' field {field_name!r} is not writable. Settable fields: {names}\n"
         )
 
     value: object
