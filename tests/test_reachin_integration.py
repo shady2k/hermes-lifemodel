@@ -22,10 +22,12 @@ import pytest
 from _hermes_probe import find_hermes_python
 
 _DRIVER = Path(__file__).resolve().parent / "hermes_reachin_integration.py"
-# Flat root-layout: the repo dir IS the `lifemodel` package, so its *parent*
-# (not a `src/` dir — there isn't one anymore) must go on the driver's
-# sys.path for `import lifemodel` to resolve, mirroring the root conftest.py.
-_SRC = Path(__file__).resolve().parent.parent.parent
+# Flat root-layout: the repo dir IS the `lifemodel` package. The out-of-process
+# driver does `import lifemodel`, so it needs a directory that CONTAINS a `lifemodel`
+# package on its sys.path. The checkout dir may be named anything (dev worktrees), so
+# the test hands the driver a per-test symlink dir (`<tmp>/src/lifemodel -> repo root`)
+# instead of the repo's parent — see the LIFEMODEL_SRC setup below.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_reachin_builds_real_message_event(tmp_path: Path) -> None:
@@ -38,10 +40,16 @@ def test_reachin_builds_real_message_event(tmp_path: Path) -> None:
     # Sanity: never the user's live being.
     assert home.resolve() != (Path.home() / ".hermes").resolve()
 
+    # Present the flat-layout package under its canonical name for the driver's
+    # `import lifemodel`, independent of the checkout dir's name (dev worktrees).
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "lifemodel").symlink_to(_REPO_ROOT, target_is_directory=True)
+
     env = {
         **os.environ,
         "HERMES_HOME": str(home),
-        "LIFEMODEL_SRC": str(_SRC),
+        "LIFEMODEL_SRC": str(src),
     }
     result = subprocess.run(
         [hermes_py, str(_DRIVER)],

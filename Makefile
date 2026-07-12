@@ -5,7 +5,7 @@
 # Override if your being lives elsewhere: `make smoke HERMES_VENV_PY=/path/to/python`.
 HERMES_VENV_PY ?= $(HOME)/.hermes/hermes-agent/venv/bin/python
 
-.PHONY: help check fmt test smoke deploy
+.PHONY: help check fmt test mypy smoke deploy
 
 help:  ## List the available commands
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -14,8 +14,15 @@ help:  ## List the available commands
 check:  ## Run the full quality gate: format check, lint, types, tests
 	uv run ruff format --check .
 	uv run ruff check .
-	uv run mypy -p lifemodel
+	$(MAKE) mypy
 	uv run pytest
+
+mypy:  ## Type-check the package (dir-name independent — works from any worktree name)
+	@tmp="$$(mktemp -d)"; \
+		ln -s "$(CURDIR)" "$$tmp/lifemodel"; \
+		MYPYPATH="$$tmp" uv run mypy -p lifemodel; status=$$?; \
+		rm -rf "$$tmp"; \
+		exit $$status
 
 fmt:  ## Auto-format the code with ruff
 	uv run ruff format .

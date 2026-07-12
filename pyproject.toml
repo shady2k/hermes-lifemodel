@@ -53,14 +53,11 @@ known-first-party = ["lifemodel"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-# Flat root-layout: the repo directory itself IS the `lifemodel` package. Its
-# own `__init__.py` (moved to the repo root) is enough for mypy to find the
-# package root by walking up from any file until it hits a directory WITHOUT
-# an `__init__.py` — that's the repo's parent, one level up. `mypy_path = ".."`
-# tells `-p lifemodel` where to look for a top-level package named `lifemodel`
-# (the repo dir itself doesn't contain a `lifemodel/` subdir, so without this
-# it can't be located by name).
-mypy_path = ".."
+# Flat root-layout: the repo directory itself IS the `lifemodel` package. `-p lifemodel`
+# must locate a top-level package named `lifemodel`, but the checkout dir may be named
+# anything (dev worktrees). Rather than a leaf-name-dependent `mypy_path = ".."`, the
+# `make mypy` target presents a canonical view via a temporary `lifemodel` symlink on
+# MYPYPATH (see Makefile) — so type-checking never depends on the checkout dir name.
 # `--explicit-package-bases` requires `--namespace-packages` and is only
 # needed when a package root lacks `__init__.py`; ours doesn't, so it's left
 # off. `tests/` sits directly under the repo root (== the package dir) and has
