@@ -273,6 +273,9 @@ def test_decide_has_no_repeat_throttle_so_a_mood_lasts() -> None:
 def test_light_cue_is_a_directive_envelope_of_prose_only() -> None:
     s = _warmed_state(affect_valence=-0.3, affect_arousal=0.4)  # "wistful — tender and settled"
     block = compose_light_cue(s)
+    # The note is hard-wrapped, so phrase checks read a whitespace-normalised view —
+    # otherwise re-wrapping a line would break the test without changing the meaning.
+    flat = " ".join(block.split())
 
     # The ENVELOPE mirrors the memory context block (semantic tag + bracketed note + prose),
     # which is the uniformity that matters. The literal "[System note:" prefix is
@@ -281,19 +284,31 @@ def test_light_cue_is_a_directive_envelope_of_prose_only() -> None:
     # is carried by better words.
     assert block.startswith("<felt-state>")
     assert block.rstrip().endswith("</felt-state>")
-    assert "not a message from anyone, not a request" in block
+    assert "not a message, not a request, not data to look up" in flat
 
     # DIRECTIVE, not hedged. The first version was four prohibitions against one softened
     # positive ("color the manner *when appropriate*"), and the cheapest way to obey a block
     # that is mostly "do not" is to do nothing — which is what the being did. So: a concrete
     # bridge from feeling to speech, and no escape hatch.
-    assert "HOW you speak this turn" in block
-    assert "rhythm" in block and "warmth" in block and "length" in block
-    assert "when appropriate" not in block  # the escape hatch is gone
-    assert "focused work" not in block  # redundant — is_task_context already gates those turns
+    assert "HOW you speak this turn" in flat
+    assert "rhythm" in flat and "length" in flat and "edges" in flat
+    assert "when appropriate" not in flat  # the escape hatch is gone
+    assert "focused work" not in flat  # redundant — is_task_context already gates those turns
+
+    # LIVE: the being read "You are on edge" and reasoned "respond naturally, WARMLY, as
+    # Sasha's companion" — its persona outranked the cue, and the cue had itself listed
+    # "your warmth" among the dials, priming the very thing it meant to modulate.
+    assert "Do not perform a warmth you do not feel" in flat
+    assert "your warmth" not in flat
+
+    # LIVE: on that same turn it ALSO called check_in, receiving its state twice — once as
+    # identity, once as a TOOL RESULT. A tool result is information you retrieved, not a
+    # state you are in; looking itself up turns the feeling into a fact ABOUT itself. When
+    # the cue has fired there is nothing to look up.
+    assert "You already feel it" in flat
 
     # The ONE prohibition that carries the invariant: manner, never subject (§4a).
-    assert "Speak FROM it, not ABOUT it" in block
+    assert "Speak FROM it, not ABOUT it" in flat
 
     # Both the felt WORD and the TEXTURE — a texture alone is evocative but abstract; the
     # word is the recognisable handle the model can actually speak from.

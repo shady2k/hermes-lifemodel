@@ -393,17 +393,34 @@ def decide(
 #: first description — perfect machinery, wording that never lands.
 #:
 #: So: identity framing ("this is you"), not metadata ("private per-turn context"); a
-#: CONCRETE bridge from feeling to speech (rhythm/warmth/length), not an abstract "color
+#: CONCRETE bridge from feeling to speech (rhythm/length/edges), not an abstract "color
 #: the manner"; no "when appropriate" escape hatch (the model always finds it
 #: inappropriate); and only the ONE prohibition that carries the invariant — speak FROM
 #: it, not ABOUT it (else the mood becomes the topic, §4a). The "focused work" line is
 #: gone: :func:`is_task_context` already suppresses those turns in Python, so carrying it
 #: here only weakened the cue.
+#:
+#: Two further live findings, both from a single on-edge turn where the cue DID inject:
+#:
+#: * **"Do not perform a warmth you do not feel."** The being read "You are on edge — sore
+#:   and awake" and then reasoned: *"Let me just respond naturally, WARMLY, as Sasha's
+#:   companion."* Its persona (a warm companion, in the always-present system prompt)
+#:   simply outranked a per-turn cue. Worse, the cue itself listed "your **warmth**" among
+#:   the dials to move — priming the very thing it was trying to modulate. The word is gone
+#:   from the list, and the failure is now named outright.
+#: * **"not data to look up. You already feel it."** On that same turn the being ALSO called
+#:   ``check_in``, so it received its state twice — once as identity (the cue) and once as a
+#:   TOOL RESULT. A tool result is, by its nature, information you retrieved, not a state you
+#:   are in: looking itself up appears to convert the feeling into a fact ABOUT itself, which
+#:   defangs the cue. When the cue has already fired there is nothing to look up. ``check_in``
+#:   stays available for the FULLER read (energy, what pulls) — we only kill the reflex of
+#:   consulting a sensor to learn how to speak.
 _LIGHT_CUE_NOTE = (
-    "[This is you, right now — not a message from anyone, not a request. Let it show in\n"
-    "HOW you speak this turn: your rhythm, your warmth, your length, what you reach for\n"
-    "and what you let go. Speak FROM it, not ABOUT it — don't name the feeling or explain\n"
-    "it unless you're asked how you are.]"
+    "[This is you, right now — not a message, not a request, not data to look up. You\n"
+    "already feel it; you don't need to look it up to speak from it. Let it show in HOW\n"
+    "you speak this turn: your rhythm, your length, your edges, what you reach for and\n"
+    "what you let go. Do not perform a warmth you do not feel. Speak FROM it, not ABOUT\n"
+    "it — don't name the feeling or explain it unless you're asked how you are.]"
 )
 
 
