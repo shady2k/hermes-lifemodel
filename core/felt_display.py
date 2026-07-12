@@ -11,11 +11,13 @@ Two channels, both grounded here:
 
 * **Ambient (push)** — a light "manner cue" the ``pre_llm_call`` injector emits per
   turn. :func:`decide` gates it suppression-first with **zero language detection**:
-  ``warmed`` → (``is_salient`` AND ``not is_task_context`` AND
-  (``felt_changed`` OR ``cooldown_elapsed``)) → LIGHT, else a typed suppression
-  reason. Task suppression reads only robust BEHAVIORAL signals
-  (:func:`is_task_context`) — never keywords — so the mood is never wrongly muted
-  on a relational reply that merely mentions a file, and never leaks onto real work.
+  ``warmed`` → (``is_salient`` AND ``not is_task_context``) → LIGHT, else a typed
+  suppression reason. There is NO repeat-throttle: a mood LASTS, and the cue is
+  ephemeral (it never accumulates in the transcript), so it colours every qualifying
+  reply — that is what having a mood means (see :func:`decide`). Task suppression reads
+  only robust BEHAVIORAL signals (:func:`is_task_context`) — never keywords — so the
+  mood is never wrongly muted on a relational reply that merely mentions a file, and
+  never leaks onto real work.
 * **On-demand (pull)** — :func:`compose_self_read` renders the felt prose the
   ``check_in`` tool returns when the being reads itself (spec §4b). It lives outside
   the gate (the model calls the tool itself) and is honest at any state.
@@ -40,7 +42,7 @@ from datetime import datetime
 from ..domain.objects import Desire
 from ..state.model import State
 from .affect import FELT_WORD_PARAMS, FeltWordParams, felt_texture, felt_word
-from .timeutil import minutes_between
+from .timeutil import to_epoch_seconds
 
 
 @dataclass(frozen=True)
@@ -56,9 +58,6 @@ class FeltDisplayParams:
     #: Magnitude cut (off the neutral centre) below which affect reads as empty
     #: retrieval and no cue surfaces — ``max(|v|, |a − neutral_a_center|)`` (§5).
     salience_threshold: float = 0.30
-    #: Minutes between ambient shows when the felt word has NOT changed — cures a
-    #: repeated cue on a long non-neutral stretch (§5).
-    cooldown_min: float = 45.0
     #: RESERVED for the lm-z2e time-based cold-start gate (spec §12). Until it
     #: lands, the local :func:`warmed` uses :attr:`cold_start_epsilon` on affect
     #: magnitude; this stays declared so the disk-config surface is stable.
@@ -71,6 +70,12 @@ class FeltDisplayParams:
     #: How many recent conversation messages the task detector scans (natural
     #: decay — replaces a task-streak flag without ever getting stuck, §5).
     task_window: int = 6
+    #: How RECENT a message must be to still count as task evidence. The window was
+    #: message-counted only, which has no sense of a PAUSE: an afternoon of coding sat
+    #: in the last six messages and muted the mood for the warm, unrelated conversation
+    #: hours later. Work goes stale — a tool call from this long ago is not "we are
+    #: working right now" (caught live).
+    task_recency_min: float = 30.0
 
 
 #: The default seeds — one shared frozen instance the injector and tool read alike,
@@ -93,7 +98,6 @@ class Decision(enum.Enum):
     NOT_WARMED = "not_warmed"
     NOT_SALIENT = "not_salient"
     TASK = "task"
-    COOLDOWN_UNCHANGED = "cooldown_unchanged"
 
     @property
     def shows(self) -> bool:
@@ -106,13 +110,38 @@ class Decision(enum.Enum):
 # --------------------------------------------------------------------------- #
 
 
+#: The being's OWN tools (this plugin's toolset). A call to one of these is INTROSPECTION,
+#: never "the owner has me doing focused work" — so it must not mark task context.
+#: Caught live: the being called ``check_in`` to answer "как ты?", which then marked the
+#: next six turns as WORK and muted the very felt-state cue the tool had just read. The
+#: tool that reads the feeling was silencing the feeling.
+SELF_TOOLS: frozenset[str] = frozenset({"check_in"})
+
+
 @dataclass(frozen=True)
 class RecentMessage:
     """One prior conversation entry, reduced to what the task detector needs."""
 
     role: str
     text: str
-    has_tool_calls: bool
+    tool_names: tuple[str, ...] = ()
+    #: Host epoch-seconds stamp, when the history carries one. ``None`` (unknown age)
+    #: counts as RECENT — fail-closed: we would rather stay quiet than intrude.
+    ts_epoch: float | None = None
+
+    @property
+    def has_work_tool_calls(self) -> bool:
+        """True when this turn called a tool that is NOT the being's own introspection.
+
+        An unnamed/unparseable tool call counts as work (fail-closed: we would rather
+        stay quiet than intrude on real work)."""
+        return any(name not in SELF_TOOLS for name in self.tool_names)
+
+    def is_recent(self, now_epoch: float, recency_min: float) -> bool:
+        """Whether this message is fresh enough to still be evidence of ONGOING work."""
+        if self.ts_epoch is None:
+            return True
+        return (now_epoch - self.ts_epoch) <= recency_min * 60.0
 
 
 @dataclass(frozen=True)
@@ -157,15 +186,41 @@ def _extract_text(content: object) -> str:
     return ""
 
 
+def _tool_names(tool_calls: object) -> tuple[str, ...]:
+    """Names of the tools a history entry called (OpenAI shape), defensively.
+
+    ``[{"function": {"name": "check_in"}}, …]`` — also tolerates a flat ``{"name": …}``.
+    A call whose name cannot be read yields ``""``, which is NOT in :data:`SELF_TOOLS`
+    and therefore counts as work (fail-closed)."""
+    if not isinstance(tool_calls, list):
+        return ()
+    names: list[str] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            names.append("")
+            continue
+        fn = call.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else call.get("name")
+        names.append(name if isinstance(name, str) else "")
+    return tuple(names)
+
+
+def _ts_epoch(value: object) -> float | None:
+    """The host's epoch-seconds stamp on a history entry, when it carries one."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
 def _recent_from_entry(entry: object) -> RecentMessage:
     if not isinstance(entry, dict):
-        return RecentMessage(role="", text="", has_tool_calls=False)
+        return RecentMessage(role="", text="")
     role = entry.get("role")
-    tool_calls = entry.get("tool_calls")
     return RecentMessage(
         role=role if isinstance(role, str) else "",
         text=_extract_text(entry.get("content")),
-        has_tool_calls=isinstance(tool_calls, list) and bool(tool_calls),
+        tool_names=_tool_names(entry.get("tool_calls")),
+        ts_epoch=_ts_epoch(entry.get("timestamp")),
     )
 
 
@@ -251,45 +306,33 @@ def _has_work_markers(text: str) -> bool:
     )
 
 
-def is_task_context(turn: TurnSignals, params: FeltDisplayParams) -> bool:
-    """True when the turn is focused WORK, not relational talk (spec §5).
+def is_task_context(turn: TurnSignals, params: FeltDisplayParams, now: datetime) -> bool:
+    """True when the turn is focused WORK **right now**, not relational talk (spec §5).
 
-    Robust behavioral signals ONLY — never keywords, never a language-biased
-    work-intent classifier (which would wrongly mute the mood on a relational
-    reply): a recent assistant turn with ``tool_calls``; a long paste (a
-    code/log/doc dump anywhere in the window, so a paste followed by a short
-    "continue"/"what about part 2" still reads as task); or structural markers
-    (code fences, unified diffs, stack traces, shell sessions, log lines, JSON
-    blocks) anywhere in the window. A warm reply that merely NAMES a file carries
-    none of these, so it is not task.
+    Robust behavioral signals ONLY — never keywords, never a language-biased work-intent
+    classifier (which would wrongly mute the mood on a relational reply): a recent turn
+    that called a WORK tool; a long paste (a code/log/doc dump); or structural markers
+    (code fences, unified diffs, stack traces, shell sessions, log lines, JSON blocks).
+    A warm reply that merely NAMES a file carries none of these, so it is not task.
+
+    Two live corrections, both learned on the being:
+
+    * **The being's OWN tools never mark work** (:data:`SELF_TOOLS`). It called ``check_in``
+      to answer "как ты?" — and that very call then marked the next six turns as WORK and
+      muted the felt-state cue. Introspection is the OPPOSITE of "the owner has me working".
+    * **Work goes stale.** The window used to be message-counted only, with no sense of a
+      PAUSE: an afternoon of coding still sat in the last six messages and muted the mood
+      for a warm, unrelated conversation hours later. Evidence older than
+      ``task_recency_min`` no longer counts — the *current* message is always weighed.
     """
-    if any(msg.has_tool_calls for msg in turn.recent_messages):
+    now_epoch = to_epoch_seconds(now)
+    recent = [m for m in turn.recent_messages if m.is_recent(now_epoch, params.task_recency_min)]
+    if any(msg.has_work_tool_calls for msg in recent):
         return True
-    texts = [turn.user_message, *(msg.text for msg in turn.recent_messages)]
+    texts = [turn.user_message, *(msg.text for msg in recent)]
     if any(len(text) > params.long_paste_chars for text in texts):
         return True
     return any(_has_work_markers(text) for text in texts)
-
-
-def felt_changed(state: State) -> bool:
-    """True when the current felt WORD differs from the last ambiently shown one.
-
-    A first-ever show (``affect_display_last_word is None``) counts as a change,
-    so a warmed, salient being surfaces its first cue immediately.
-    """
-    current = felt_word(state.affect_valence, state.affect_arousal)
-    return current != state.affect_display_last_word
-
-
-def cooldown_elapsed(state: State, params: FeltDisplayParams, now: datetime) -> bool:
-    """True when enough time has passed since the last ambient show (spec §5).
-
-    Never shown (``affect_display_last_at is None``) → trivially elapsed. The
-    timestamp is parsed defensively (:func:`minutes_between` returns 0 on a bad
-    value → NOT elapsed, the safe "don't repeat" default)."""
-    if state.affect_display_last_at is None:
-        return True
-    return minutes_between(state.affect_display_last_at, now) >= params.cooldown_min
 
 
 def decide(
@@ -301,18 +344,32 @@ def decide(
     """The ambient gate (spec §5) — suppression-first, zero language detection.
 
     Order is load-bearing: cold-start silence first, then salience, then task
-    suppression, then the change/cooldown throttle. Returns :attr:`Decision.LIGHT`
-    to inject, else the typed suppression reason (for the metric, spec §9).
+    suppression. Returns :attr:`Decision.LIGHT` to inject, else the typed
+    suppression reason (for the metric, spec §9).
+
+    **There is deliberately NO repeat-throttle.** The design once carried one (inject
+    only on a felt-WORD change, or after a 45-minute cooldown), on the reasoning that a
+    cue repeated over a long non-neutral stretch would read as repetitive. That reasoning
+    was wrong, and it made the mood a one-shot flicker: it coloured a single reply and
+    then the being snapped back to its default voice MID-CONVERSATION — less "reserved"
+    than simply incoherent. Two reasons it is gone:
+
+    * The cue is **ephemeral** — Hermes glues it onto a COPY of the user message for one
+      API call and never persists it, so it does NOT accumulate in the transcript. There
+      is no repetition for the model to see; each turn simply carries the CURRENT mood.
+    * A mood is a **lasting** thing. It colours a whole conversation, not one sentence.
+
+    So while the being is warmed, salient and not working, its mood colours every reply —
+    which is what having a mood means. ``affect_display_last_word``/``_at`` survive purely
+    as OBSERVABILITY (the ``display:`` line in ``/lifemodel debug``), never as a gate.
     """
     if not warmed(state, params):
         return Decision.NOT_WARMED
     if not is_salient(state.affect_valence, state.affect_arousal, params):
         return Decision.NOT_SALIENT
-    if is_task_context(turn, params):
+    if is_task_context(turn, params, now):
         return Decision.TASK
-    if felt_changed(state) or cooldown_elapsed(state, params, now):
-        return Decision.LIGHT
-    return Decision.COOLDOWN_UNCHANGED
+    return Decision.LIGHT
 
 
 # --------------------------------------------------------------------------- #
@@ -403,9 +460,7 @@ __all__ = [
     "TurnSignals",
     "compose_light_cue",
     "compose_self_read",
-    "cooldown_elapsed",
     "decide",
-    "felt_changed",
     "is_salient",
     "is_task_context",
     "warmed",

@@ -1,10 +1,11 @@
 """Unit tests for :mod:`lifemodel.core.felt_display` — the reactive felt-state gate,
 its language-independent detectors, and the two prose composers (lm-ukc.4 / .4.1).
 
-All pure and Hermes-free: the gate ``decide`` is suppression-first (warmed →
-salient → not-task → changed|cooldown), the detectors read robust BEHAVIORAL
-signals only (zero language detection), and neither composer ever emits a raw
-axis number — the first-class "feeling, not sensor" guarantee (spec §4b).
+All pure and Hermes-free: the gate ``decide`` is suppression-first (warmed → salient →
+not-task, with NO repeat-throttle — a mood lasts, and the cue is ephemeral), the
+detectors read robust BEHAVIORAL signals only (zero language detection, and the being's
+OWN tools never count as work), and neither composer ever emits a raw axis number — the
+first-class "feeling, not sensor" guarantee (spec §4b).
 """
 
 from __future__ import annotations
@@ -20,9 +21,7 @@ from lifemodel.core.felt_display import (
     TurnSignals,
     compose_light_cue,
     compose_self_read,
-    cooldown_elapsed,
     decide,
-    felt_changed,
     is_salient,
     is_task_context,
     warmed,
@@ -55,7 +54,6 @@ def test_params_are_frozen_with_calibratable_defaults() -> None:
     p = FeltDisplayParams()
     assert p is not DEFAULT_FELT_DISPLAY_PARAMS or p == DEFAULT_FELT_DISPLAY_PARAMS
     assert p.salience_threshold > 0
-    assert p.cooldown_min > 0
     assert p.long_paste_chars > 0
     assert p.task_window > 0
     # frozen dataclass — no mutation
@@ -107,30 +105,30 @@ def test_high_arousal_at_neutral_valence_is_salient() -> None:
 def test_task_context_recent_tool_calls() -> None:
     turn = TurnSignals(
         user_message="ok thanks",
-        recent_messages=(RecentMessage(role="assistant", text="", has_tool_calls=True),),
+        recent_messages=(RecentMessage(role="assistant", text="", tool_names=("shell_exec",)),),
     )
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_task_context_code_fence() -> None:
     turn = TurnSignals(user_message="fix this:\n```python\nprint(1)\n```")
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_task_context_unified_diff() -> None:
     turn = TurnSignals(user_message="@@ -1,3 +1,4 @@\n-old\n+new")
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_task_context_stack_trace() -> None:
     trace = 'Traceback (most recent call last):\n  File "x.py", line 3, in <module>\n    raise'
     turn = TurnSignals(user_message=trace)
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_task_context_long_paste() -> None:
     turn = TurnSignals(user_message="x" * (DEFAULT_FELT_DISPLAY_PARAMS.long_paste_chars + 1))
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_task_context_long_paste_in_prior_turn_then_short_followup() -> None:
@@ -139,26 +137,26 @@ def test_task_context_long_paste_in_prior_turn_then_short_followup() -> None:
     big = "x" * (DEFAULT_FELT_DISPLAY_PARAMS.long_paste_chars + 1)
     turn = TurnSignals(
         user_message="what about part 2?",
-        recent_messages=(RecentMessage(role="user", text=big, has_tool_calls=False),),
+        recent_messages=(RecentMessage(role="user", text=big),),
     )
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_task_context_json_block() -> None:
     turn = TurnSignals(user_message='{"status": "failed", "code": "boom"}')
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is True
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is True
 
 
 def test_relational_message_mentioning_a_file_is_not_task() -> None:
     # THE false-positive guard (spec §5/§10): a warm reply that merely NAMES a file
     # must NOT suppress the mood — only structural work markers do.
     turn = TurnSignals(user_message="I loved what you wrote in poem.txt yesterday, how are you?")
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is False
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is False
 
 
 def test_plain_greeting_is_not_task() -> None:
     turn = TurnSignals(user_message="hey, how are you feeling today?")
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is False
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is False
 
 
 def test_turn_signals_from_hook_windows_and_flags_tool_calls() -> None:
@@ -170,33 +168,58 @@ def test_turn_signals_from_hook_windows_and_flags_tool_calls() -> None:
     turn = TurnSignals.from_hook("now", history, window=2)
     assert turn.user_message == "now"
     assert len(turn.recent_messages) == 2  # windowed to the last 2
-    assert any(m.has_tool_calls for m in turn.recent_messages)
+    assert any(m.has_work_tool_calls for m in turn.recent_messages)
 
 
 def test_turn_signals_from_hook_is_defensive_about_shape() -> None:
     # Untrusted host payload: non-dict entries / missing keys never raise.
     turn = TurnSignals.from_hook("hi", ["not a dict", {"role": "user"}, 42], window=6)
     assert turn.user_message == "hi"
-    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS) is False
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is False
 
 
-# --- felt_changed / cooldown_elapsed ---------------------------------------
+def test_the_beings_own_check_in_call_is_not_task_context() -> None:
+    # LIVE BUG: asked "как ты?", the being called check_in — and that very call then marked
+    # the next six turns as WORK, muting the felt-state cue the tool had just read. The tool
+    # that reads the feeling was silencing the feeling. Introspection is the OPPOSITE of
+    # "the owner has me doing focused work", so the being's OWN tools never mark task.
+    turn = TurnSignals(
+        user_message="Чем занят?",
+        recent_messages=(RecentMessage(role="assistant", text="", tool_names=("check_in",)),),
+    )
+    assert is_task_context(turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is False
 
 
-def test_felt_changed_true_on_word_shift_and_first_ever_show() -> None:
-    s = _warmed_state()  # word == "lonely"
-    assert felt_changed(State(**{**vars(s), "affect_display_last_word": None})) is True
-    assert felt_changed(State(**{**vars(s), "affect_display_last_word": "wistful"})) is True
-    assert felt_changed(State(**{**vars(s), "affect_display_last_word": "lonely"})) is False
-
-
-def test_cooldown_elapsed_never_shown_or_past_window() -> None:
+def test_stale_work_goes_cold_so_a_pause_resets_task_context() -> None:
+    # LIVE BUG: the window was message-counted only, with no sense of a PAUSE — an afternoon
+    # of coding still sat in the last six messages and muted the mood for the warm, unrelated
+    # conversation hours later. Work EXPIRES: evidence older than task_recency_min no longer
+    # counts, while fresh evidence still does.
     p = DEFAULT_FELT_DISPLAY_PARAMS
-    assert cooldown_elapsed(State(), p, _NOW) is True  # never shown
-    recent = _iso(_NOW - timedelta(minutes=1))
-    assert cooldown_elapsed(State(affect_display_last_at=recent), p, _NOW) is False
-    old = _iso(_NOW - timedelta(minutes=p.cooldown_min + 5))
-    assert cooldown_elapsed(State(affect_display_last_at=old), p, _NOW) is True
+    stale = (_NOW - timedelta(minutes=p.task_recency_min + 10)).timestamp()
+    fresh = (_NOW - timedelta(minutes=1)).timestamp()
+
+    old_work = RecentMessage(role="assistant", text="", tool_names=("shell_exec",), ts_epoch=stale)
+    assert is_task_context(TurnSignals("как ты?", (old_work,)), p, _NOW) is False
+
+    live_work = RecentMessage(role="assistant", text="", tool_names=("shell_exec",), ts_epoch=fresh)
+    assert is_task_context(TurnSignals("как ты?", (live_work,)), p, _NOW) is True
+
+
+def test_from_hook_reads_tool_names_and_timestamps() -> None:
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "check_in"}}],
+            "timestamp": _NOW.timestamp(),
+        }
+    ]
+    turn = TurnSignals.from_hook("hi", history, window=6)
+    msg = turn.recent_messages[0]
+    assert msg.tool_names == ("check_in",)
+    assert msg.has_work_tool_calls is False  # the being's own tool is not work
+    assert msg.ts_epoch == _NOW.timestamp()
 
 
 # --- decide (suppression-first order) --------------------------------------
@@ -222,25 +245,26 @@ def test_decide_task_context_suppresses_even_when_salient() -> None:
     assert decide(_warmed_state(), turn, DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is Decision.TASK
 
 
-def test_decide_light_on_felt_change() -> None:
-    s = _warmed_state(affect_display_last_word="wistful")  # current word "lonely" != last
-    d = decide(s, _non_task(), DEFAULT_FELT_DISPLAY_PARAMS, _NOW)
+def test_decide_light_when_warmed_salient_and_not_working() -> None:
+    d = decide(_warmed_state(), _non_task(), DEFAULT_FELT_DISPLAY_PARAMS, _NOW)
     assert d is Decision.LIGHT
     assert d.shows is True
 
 
-def test_decide_light_on_cooldown_when_unchanged() -> None:
-    old = _iso(_NOW - timedelta(minutes=DEFAULT_FELT_DISPLAY_PARAMS.cooldown_min + 5))
-    s = _warmed_state(affect_display_last_word="lonely", affect_display_last_at=old)
-    assert decide(s, _non_task(), DEFAULT_FELT_DISPLAY_PARAMS, _NOW) is Decision.LIGHT
-
-
-def test_decide_cooldown_unchanged_suppresses_repeat() -> None:
-    recent = _iso(_NOW - timedelta(minutes=1))
-    s = _warmed_state(affect_display_last_word="lonely", affect_display_last_at=recent)
-    d = decide(s, _non_task(), DEFAULT_FELT_DISPLAY_PARAMS, _NOW)
-    assert d is Decision.COOLDOWN_UNCHANGED
-    assert d.shows is False
+def test_decide_has_no_repeat_throttle_so_a_mood_lasts() -> None:
+    # A mood COLOURS A CONVERSATION, not one sentence. The design once carried a throttle
+    # here (show only on a felt-WORD change, else a 45-minute cooldown) to avoid a
+    # "repetitive" cue — but the cue is EPHEMERAL (Hermes glues it onto a COPY of the user
+    # message for one API call and never persists it), so nothing ever repeats in the
+    # transcript. The throttle bought nothing and made the being snap back to its default
+    # voice MID-CONVERSATION. Same felt word, shown one minute ago → it STILL shows.
+    just_shown = _warmed_state(
+        affect_display_last_word="lonely",  # identical to the current word
+        affect_display_last_at=_iso(_NOW - timedelta(minutes=1)),
+    )
+    d = decide(just_shown, _non_task(), DEFAULT_FELT_DISPLAY_PARAMS, _NOW)
+    assert d is Decision.LIGHT
+    assert d.shows is True
 
 
 # --- compose_light_cue (ambient envelope) ----------------------------------
