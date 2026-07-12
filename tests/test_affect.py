@@ -21,6 +21,7 @@ from lifemodel.core.affect import (
     affect_target,
     dominant_contribution,
     ease,
+    felt_texture,
     felt_word,
 )
 from lifemodel.core.component import TickContext
@@ -321,3 +322,34 @@ def test_felt_word_has_no_sharp_quiet_to_lonely_jump_at_the_valence_edge() -> No
     # arousal alone. The near-neutral, low-arousal state stays quiet/wistful.
     assert felt_word(-0.119, 0.10) == "quiet"
     assert felt_word(-0.121, 0.10) == "wistful"  # NOT "lonely"
+
+
+# --- felt_texture: axes → first-person two-slot texture for the impulse (lm-ukc.5) ---
+
+
+@pytest.mark.parametrize(
+    ("v", "a", "texture"),
+    [
+        (-0.60, 0.10, "sore and very quiet"),  # deep unpleasant, deactivated
+        (-0.30, 0.50, "tender and awake"),  # mild unpleasant, keyed
+        (0.00, 0.35, "even and settled"),  # neutral valence, calm baseline
+        (0.30, 0.50, "warm and awake"),  # pleasant, keyed
+        (0.60, 0.75, "open and charged"),  # pleasant, strongly mobilized
+        (0.00, 0.00, "even and very quiet"),  # the numeric default (no affect yet)
+    ],
+)
+def test_felt_texture_renders_axes_as_two_slot_phenomenology(
+    v: float, a: float, texture: str
+) -> None:
+    assert felt_texture(v, a) == texture
+
+
+def test_felt_texture_never_uses_a_forbidden_mechanism_or_pressure_word() -> None:
+    # It goes into the wake-packet's felt block, which BANS mechanism/pressure words —
+    # so no texture word may be one (else the [SILENT]-regression guard test would trip).
+    banned = {"pressure", "urgent", "need", "should", "must", "anxious", "happy"}
+    words = set()
+    for v in (-0.9, -0.3, 0.0, 0.3, 0.9):
+        for a in (0.0, 0.3, 0.5, 0.9):
+            words.update(felt_texture(v, a).replace(" and ", " ").split())
+    assert words & banned == set()

@@ -278,6 +278,40 @@ def felt_word(valence: float, arousal: float, params: FeltWordParams = FELT_WORD
     return "buoyant" if (v >= p.strong_v or a >= p.a_high) else "bright"
 
 
+def felt_texture(valence: float, arousal: float, params: FeltWordParams = FELT_WORD_PARAMS) -> str:
+    """The circumplex point as a two-slot first-person TEXTURE (lm-ukc.5).
+
+    Unlike :func:`felt_word` (the debug/tool LABEL), this is the phenomenology the being
+    carries into a PROACTIVE reach: valence → sore/tender/even/warm/open, arousal →
+    "very quiet"/settled/awake/charged, joined "``<valence>`` and ``<arousal>``". Same
+    region thresholds as :func:`felt_word` (ONE shared source — the impulse and the tool
+    read it alike). The words are chosen so the wake-packet stays FELT, never a machine
+    label (the [SILENT] guardrail): none names a mechanism or implies decision-pressure
+    (no "urgent"/"need"; "charged" not "anxious"), and a positive texture is "warm"/"open"
+    — never "happy" — so it never contradicts the longing body it colours (codex)."""
+    p = params
+    v, a = valence, arousal
+    if v <= -p.strong_v:
+        valence_texture = "sore"
+    elif v < -p.neutral_v:
+        valence_texture = "tender"
+    elif v <= p.neutral_v:
+        valence_texture = "even"
+    elif v < p.strong_v:
+        valence_texture = "warm"
+    else:
+        valence_texture = "open"
+    if a <= p.a_quiet:
+        arousal_texture = "very quiet"
+    elif a < p.a_keyed:
+        arousal_texture = "settled"
+    elif a < p.a_high:
+        arousal_texture = "awake"
+    else:
+        arousal_texture = "charged"
+    return f"{valence_texture} and {arousal_texture}"
+
+
 def ease(*, current: float, target: float, dt_min: float, tau_min: float, deadband: float) -> float:
     """One leaky-integrator step toward *target* over *dt_min* with time-constant *tau_min*.
 

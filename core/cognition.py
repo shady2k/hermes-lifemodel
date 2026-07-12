@@ -119,6 +119,10 @@ class CognitionLauncher:
             now=ctx.now,
             last_exchange_at=state.last_exchange_at,
             tz=self._display_tz,
+            # The being's CURRENT felt state colours the reach as first-person texture
+            # (lm-ukc.5) — the mood shapes the manner, the longing stays the reason.
+            affect_valence=state.affect_valence,
+            affect_arousal=state.affect_arousal,
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits
