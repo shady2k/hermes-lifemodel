@@ -74,6 +74,9 @@ class _FakeCtx:
     def register_hook(self, name: str, cb: object) -> None:
         self.calls.append(("hook", name))
 
+    def register_tool(self, name: str, **k: object) -> None:
+        self.calls.append(("tool", name))
+
     def register_platform(self, name: str, **k: object) -> None:
         if self._platform_raises:
             raise RuntimeError("platform registration boom")
@@ -111,6 +114,10 @@ def test_command_wired_first_and_all_required_wiring_succeeds(tmp_path: Path) ->
         assert ctx.calls[0] == ("command", "lifemodel"), "the /lifemodel lever must be FIRST"
         assert ("hook", "post_llm_call") in ctx.calls
         assert ("hook", "pre_gateway_dispatch") in ctx.calls
+        # The reactive felt-state surface (lm-ukc.4/.4.1): the ambient injector hook
+        # and the being's first LLM tool.
+        assert ("hook", "pre_llm_call") in ctx.calls
+        assert ("tool", "check_in") in ctx.calls
         assert ("platform", "lifemodel") in ctx.calls
         # command before platform (both-strategy ordering).
         assert kinds.index("command") < kinds.index("platform")

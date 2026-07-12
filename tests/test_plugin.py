@@ -167,6 +167,58 @@ def test_register_lifemodel_debug_subcommand_returns_dump(
     assert "debug" in ctx.commands["lifemodel"]["args_hint"]
 
 
+def test_register_wires_felt_state_injector_and_check_in_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # lm-ukc.4/.4.1: register() must wire the ambient pre_llm_call injector AND the
+    # on-demand check_in tool — the plugin's first LLM tool.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+
+    assert any(name == "pre_llm_call" for name, _ in ctx.hooks)
+    assert "check_in" in ctx.tools
+
+
+def test_register_check_in_tool_schema_and_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json as _json
+
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    entry = ctx.tools["check_in"]
+
+    # Schema takes NO parameters — the being just calls it (spec §6).
+    schema = entry["kwargs"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["properties"] == {}
+    assert schema["required"] == []
+    # Name validated with the live being; description teaches WHEN to reach for it.
+    assert "Check in with yourself" in entry["kwargs"]["description"]
+    assert entry["kwargs"]["toolset"] == "lifemodel"
+    # The handler honours the Hermes contract: a JSON string, felt prose, no throw.
+    payload = _json.loads(entry["kwargs"]["handler"]({}))
+    assert "state" in payload and "note" in payload
+
+
+def test_register_felt_state_injector_is_silent_on_cold_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    callbacks = [cb for name, cb in ctx.hooks if name == "pre_llm_call"]
+    assert len(callbacks) == 1
+    # A fresh (cold-start) being surfaces nothing — the callback returns None, and
+    # returning {"context": …} vs None is the Hermes pre_llm_call contract.
+    assert callbacks[0](user_message="hi", conversation_history=[]) is None
+
+
 def test_register_lifemodel_stats_subcommand_returns_telemetry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

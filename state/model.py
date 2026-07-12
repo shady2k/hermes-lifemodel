@@ -31,7 +31,7 @@ from .errors import StateCorruptError
 #: way old readers cannot understand. Reading a *different* version is a Phase-7
 #: concern (migrations / back-compat, HLA §9 / FR16); this build fails loud on
 #: any mismatch (see :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.load`).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -90,6 +90,20 @@ class State:
     #: ``last_tick_at``), so it is validated only as opt-str, not a tz-aware instant.
     #: ``None`` before the first affect update; additive (defaults absent).
     affect_updated_at: str | None = None
+    #: The felt WORD (lm-ukc.3, e.g. ``"wistful"``/``"restless"``) last surfaced
+    #: AMBIENTLY into an ordinary reactive turn by the ``pre_llm_call`` felt-state
+    #: injector (lm-ukc.4). Persisted so the gate can suppress a repeated cue on a
+    #: long non-neutral stretch — it re-injects on a felt-word CHANGE, else only
+    #: after cooldown. Written ONLY by the reactive display path; it never conflicts
+    #: with the affect axes the tick writes. ``None`` before the first ambient show;
+    #: additive (``from_dict`` defaults it absent, so an older file loads cleanly).
+    affect_display_last_word: str | None = None
+    #: ISO-8601 UTC timestamp of the last ambient felt-state show (lm-ukc.4), the
+    #: cooldown anchor its gate reads. Kept as an OPAQUE string (parsed defensively
+    #: by :func:`~lifemodel.core.timeutil.minutes_between`, like
+    #: :attr:`affect_updated_at`/:attr:`last_tick_at`), so it is validated only as
+    #: opt-str. ``None`` before the first ambient show; additive (defaults absent).
+    affect_display_last_at: str | None = None
     #: ISO-8601 UTC timestamp of the last genuine (non-internal) exchange with
     #: the user (spec §4/§6). This is the real EXCHANGE RECORD the wake-packet
     #: temporal fact renders ("The last time we exchanged messages was X",
@@ -205,6 +219,15 @@ class State:
             # The affect stamp is an opaque string (sibling of last_tick_at, parsed
             # defensively by the deriver), so it is validated only as opt-str.
             affect_updated_at=_as_opt_str(data.get("affect_updated_at"), "affect_updated_at"),
+            # The reactive felt-display bookkeeping (lm-ukc.4): the last ambiently
+            # shown felt word + when. Both opaque strings (the display gate parses
+            # the timestamp defensively, like affect_updated_at), so opt-str only.
+            affect_display_last_word=_as_opt_str(
+                data.get("affect_display_last_word"), "affect_display_last_word"
+            ),
+            affect_display_last_at=_as_opt_str(
+                data.get("affect_display_last_at"), "affect_display_last_at"
+            ),
             # last_exchange_at, declined_at, and pending_proactive_since are
             # compared against the clock's aware ``now`` by ``core/decision.py``
             # (the live adapter), so — like last_contact_at below — they are

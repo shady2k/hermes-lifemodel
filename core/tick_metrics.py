@@ -46,6 +46,18 @@ SUPPRESSIONS_TOTAL = "lifemodel_suppressions_total"
 #: ``pre_gateway_dispatch`` — a runtime observer failure is plugin-owned + counted,
 #: never left to Hermes' hook wrapper.
 OBSERVER_ERRORS = "lifemodel_observer_errors_total"
+#: Reactive felt-state ambient shows + suppressions (lm-ukc.4, spec §9). The
+#: ``outcome`` label carries the gate verdict — ``light`` (a cue surfaced) or a
+#: suppression reason (``not_warmed``/``not_salient``/``task``/``cooldown_unchanged``,
+#: the :class:`~lifemodel.core.felt_display.Decision` values) — so the owner sees how
+#: often the mood proves itself in ordinary talk and WHY it stays quiet → tunes the
+#: thresholds. Emitted from the ``pre_llm_call`` injector, fail-open.
+FELT_DISPLAY_TOTAL = "lifemodel_felt_display_total"
+#: The on-demand self-read tool (lm-ukc.4.1, spec §9): how often the being reaches
+#: for ``check_in`` itself. ``outcome`` ∈ ``read`` (a warmed self-read) /
+#: ``cold_start`` (the soft "still settling" read) / ``error`` (a failed handler
+#: returned ``{"error": …}``). Emitted from the tool handler, fail-open.
+CHECK_IN_TOTAL = "lifemodel_check_in_total"
 #: The brain HEARTBEAT (spec §4.4, codex MAJOR-8): a monotonic counter advanced once
 #: per completed tick, plus a gauge holding the last tick's wall-clock epoch. These
 #: are SUPPORTING evidence only — the PRIMARY liveness stays the durable
@@ -131,6 +143,18 @@ UNIVERSAL_SPECS: tuple[MetricSpec, ...] = (
         kind="counter",
         help="Afferent observer bodies that raised, by observer name (component label).",
         label_keys=("component",),
+    ),
+    MetricSpec(
+        name=FELT_DISPLAY_TOTAL,
+        kind="counter",
+        help="Ambient felt-state gate verdicts by outcome (light / suppression reason).",
+        label_keys=("outcome",),
+    ),
+    MetricSpec(
+        name=CHECK_IN_TOTAL,
+        kind="counter",
+        help="check_in self-read tool calls by outcome (read / cold_start / error).",
+        label_keys=("outcome",),
     ),
     MetricSpec(
         name=BRAIN_HEARTBEAT,

@@ -34,6 +34,23 @@ def test_dump_renders_the_sections(tmp_path) -> None:
     assert "effective" in out.lower()
 
 
+def test_dump_shows_reactive_felt_display_line(tmp_path) -> None:
+    # lm-ukc.4 §9: the AFFECT section has a `display:` line for the last ambient show.
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    store.commit(State())  # fresh being — never shown yet
+    assert "display" in render_dump_for_dir(tmp_path)
+    assert "never shown" in render_dump_for_dir(tmp_path)
+
+    store.commit(
+        State(
+            affect_display_last_word="wistful",
+            affect_display_last_at="2026-07-12T09:00:00+00:00",
+        )
+    )
+    out = render_dump_for_dir(tmp_path)
+    assert "wistful" in out
+
+
 def test_dump_rounds_floats_and_leaves_no_long_tails(tmp_path) -> None:
     # lm-25t: the read-only dump shows numbers at a readable precision — no raw
     # tails like "0.4199544..." or "u=5.250034172361112". DISPLAY ONLY: the

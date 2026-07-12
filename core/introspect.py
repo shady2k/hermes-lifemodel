@@ -128,6 +128,13 @@ class Readings:
     #: first) so the dump shows "what tugs valence/arousal most" (lm-ukc.6).
     affect_valence_contributions: tuple[tuple[str, float], ...] = ()
     affect_arousal_contributions: tuple[tuple[str, float], ...] = ()
+    #: The last felt WORD surfaced AMBIENTLY into a reactive turn, and WHEN
+    #: (lm-ukc.4) — the reactive-display bookkeeping the ``pre_llm_call`` injector
+    #: stamps. ``None`` until the mood first proves itself in ordinary talk; the
+    #: debug view's ``display:`` line reads them so the owner can see when the being
+    #: last let its mood show (calibration surface, spec §9).
+    affect_display_last_word: str | None = None
+    affect_display_last_at: str | None = None
 
 
 #: How many links the COMPACT contact-chain line follows down its primary lineage —
@@ -355,4 +362,6 @@ def compute_readings(
         affect_target_arousal=affect_ta,
         affect_valence_contributions=affect_v_ranked,
         affect_arousal_contributions=affect_a_ranked,
+        affect_display_last_word=state.affect_display_last_word,
+        affect_display_last_at=state.affect_display_last_at,
     )

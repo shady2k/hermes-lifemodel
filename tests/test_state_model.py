@@ -14,11 +14,38 @@ from lifemodel.state import SCHEMA_VERSION, State, StateCorruptError
 
 def test_defaults_are_documented_and_current_schema() -> None:
     state = State()
-    assert state.schema_version == SCHEMA_VERSION == 2
+    assert state.schema_version == SCHEMA_VERSION == 3
     assert state.tick_count == 0
     assert state.energy == 1.0
     assert state.last_tick_at is None
     assert state.last_contact_at is None
+
+
+def test_affect_display_fields_are_additive_and_default_none() -> None:
+    # The reactive felt-display bookkeeping (lm-ukc.4) — the felt WORD last surfaced
+    # ambiently and WHEN — is written only by the pre_llm_call injector, never the
+    # tick. A file written before these fields existed still loads (they default to
+    # None), the additive-forward-compat contract the SQLite store re-stamps.
+    state = State()
+    assert state.affect_display_last_word is None
+    assert state.affect_display_last_at is None
+    legacy = {"schema_version": 2, "tick_count": 4}
+    loaded = State.from_dict(legacy)
+    assert loaded.affect_display_last_word is None
+    assert loaded.affect_display_last_at is None
+    assert loaded.tick_count == 4
+
+
+def test_affect_display_fields_round_trip_and_validate_type() -> None:
+    state = State(
+        affect_display_last_word="wistful",
+        affect_display_last_at="2026-07-12T12:00:00+00:00",
+    )
+    assert State.from_dict(state.to_dict()) == state
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "affect_display_last_word": 123})
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"schema_version": SCHEMA_VERSION, "affect_display_last_at": 5})
 
 
 def test_no_processed_signal_ids_field() -> None:

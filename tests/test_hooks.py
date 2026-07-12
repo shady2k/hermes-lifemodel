@@ -420,6 +420,7 @@ class _FakeCtx:
     def __init__(self) -> None:
         self.commands: dict[str, Any] = {}
         self.hooks: list[tuple[str, Any]] = []
+        self.tools: dict[str, Any] = {}
         self.platforms: dict[str, Any] = {}
 
     def register_command(
@@ -429,6 +430,9 @@ class _FakeCtx:
 
     def register_hook(self, hook_name: str, callback: Any) -> None:
         self.hooks.append((hook_name, callback))
+
+    def register_tool(self, name: str, **kwargs: Any) -> None:
+        self.tools[name] = kwargs
 
     def register_platform(self, name: str, **kwargs: Any) -> None:
         self.platforms[name] = kwargs

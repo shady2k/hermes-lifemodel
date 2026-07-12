@@ -25,7 +25,12 @@ from .core.metrics import get_metric_registry
 from .core.tick_metrics import register_universal_metrics
 from .debug import render_dump_for_dir
 from .events import EventRing
-from .hooks import make_inbound_observer, make_post_llm_observer
+from .hooks import (
+    make_check_in_tool,
+    make_felt_state_injector,
+    make_inbound_observer,
+    make_post_llm_observer,
+)
 from .log import apply_log_level, parse_log_level
 from .paths import state_dir
 from .state.brain_health import get_brain_health
@@ -51,6 +56,20 @@ __version__ = "0.0.0"
 #: native stdlib logger (spec §4.5 allowlist); Hermes routes ``lifemodel.*`` into
 #: ``agent.log``. Tick-path events go through SpanLogger, never this.
 _LOG = logging.getLogger("lifemodel")
+
+#: The ``check_in`` self-read tool (lm-ukc.4.1) takes NO parameters — the being just
+#: calls it (spec §6). Its NAME is validated with the live being: it reads as "a
+#: check-in with myself" (warm/social), not a sensor like ``get_mood_metrics``.
+_CHECK_IN_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}, "required": []}
+
+#: The tool description (spec §4b) — it teaches the being WHEN to reach for it and
+#: locks the reading as "I check on myself" (a self-read, not a system probe).
+_CHECK_IN_DESCRIPTION = (
+    "Check in with yourself — an honest read of how you actually are right now: "
+    "your feeling, your energy, what's pulling at you or on your mind. Reach for it "
+    "when someone asks how you are, or before you speak about yourself instead of "
+    "guessing."
+)
 
 
 class _Subcommand(NamedTuple):
@@ -337,6 +356,34 @@ def register(ctx: Any) -> None:
             make_inbound_observer(
                 lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
             ),
+        )
+
+    # --- Reactive felt-state display wiring (lm-ukc.4/.4.1) — REQUIRED --------
+    # Two read-only channels that let the being's core-affect prove through its
+    # MANNER in ordinary conversation (never in the wake/drive path — the one-way
+    # invariant, spec §1). (a) The ambient pre_llm_call injector: per turn it runs
+    # the suppression-first gate and, on LIGHT, returns {"context": <felt-state>}
+    # (ephemeral — Hermes glues it onto a COPY of the user message for one call,
+    # never persisted). (b) The being's FIRST LLM tool, check_in: the on-demand
+    # honest self-read the model calls itself (the only reliable "how are you"
+    # detector, any language). REQUIRED like the observers above: register_hook /
+    # register_tool don't fail on the host side, so a throw here is OUR bug. The
+    # injector is fail-soft at RUNTIME (spec §8) so a live hiccup never crashes a
+    # turn; the tool honours the Hermes contract (JSON string, {"error": …}, no throw).
+    with wire("felt_state_injector", required=True, health=health, logger=_LOG):
+        ctx.register_hook(
+            "pre_llm_call",
+            make_felt_state_injector(
+                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
+            ),
+        )
+    with wire("check_in_tool", required=True, health=health, logger=_LOG):
+        ctx.register_tool(
+            "check_in",
+            toolset="lifemodel",
+            schema=_CHECK_IN_SCHEMA,
+            handler=make_check_in_tool(lambda: build_lifemodel(base_dir=sdir), metrics=metrics),
+            description=_CHECK_IN_DESCRIPTION,
         )
 
     # --- Proactive brain wiring (the being as a gateway platform) — REQUIRED --

@@ -24,18 +24,30 @@ state-actor lock — no cached ``State`` can drift between frames.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import json
 import logging
 from collections.abc import Callable
 from typing import Any
 
 from .composition import LifeModel
+from .core.affect import felt_word
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
+from .core.felt_display import (
+    DEFAULT_FELT_DISPLAY_PARAMS,
+    FeltDisplayParams,
+    TurnSignals,
+    compose_light_cue,
+    compose_self_read,
+    decide,
+    warmed,
+)
 from .core.frame import FrameTrigger, run_frame
 from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
-from .core.tick_metrics import OBSERVER_ERRORS
+from .core.tick_metrics import CHECK_IN_TOTAL, FELT_DISPLAY_TOTAL, OBSERVER_ERRORS
 from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
@@ -48,6 +60,15 @@ from .state.brain_health import BrainHealth
 #: :attr:`BrainHealth.last_observer_error` when a body raises (spec §4.3).
 POST_LLM_OBSERVER = "post_llm_call"
 INBOUND_OBSERVER = "pre_gateway_dispatch"
+#: The reactive felt-state injector's observer name (lm-ukc.4) — its metric
+#: ``component`` label + BrainHealth key when its body raises (fail-soft, spec §8).
+PRE_LLM_OBSERVER = "pre_llm_call"
+
+#: The ``check_in`` tool's first-person "as of now" note (spec §4b) — it teaches
+#: the being to OWN the read in its own voice, not report it back as telemetry.
+_CHECK_IN_NOTE = (
+    "This is you right now, as of this moment — speak it in your own voice, don't report it."
+)
 
 _LOG = logging.getLogger("lifemodel.hooks")
 
@@ -462,3 +483,112 @@ def make_inbound_observer(
             )
 
     return _observer
+
+
+def make_felt_state_injector(
+    build_lm: Callable[[], LifeModel],
+    *,
+    params: FeltDisplayParams = DEFAULT_FELT_DISPLAY_PARAMS,
+    health: BrainHealth | None = None,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., dict[str, str] | None]:
+    """Return a ``pre_llm_call`` hook that ambiently colours the being's manner (lm-ukc.4).
+
+    Once per user turn, BEFORE the model is called, it reads committed state, runs
+    the pure suppression-first gate (:func:`~lifemodel.core.felt_display.decide`,
+    zero language detection), and on LIGHT returns ``{"context": <felt-state block>}``
+    — which Hermes glues onto a COPY of the user message for this ONE API call
+    (ephemeral: never persisted, never in rolling history, gone next turn). It also
+    stamps the last-shown word/time so the gate can throttle a repeat (cooldown /
+    felt-change). Every verdict bumps the felt-display metric by outcome (spec §9).
+
+    On any suppression it returns ``None`` (no cue). The whole body is plugin-owned
+    fail-soft (spec §8): a throw anywhere (even in ``build_lm``) is logged ERROR +
+    traceback, recorded on *health* + *metrics*, and swallowed with a ``None`` return
+    — the host's hot dispatch path is never crashed, and the failure is observable.
+
+    The last-shown stamp is a load→replace→commit (last-writer-wins, like the
+    ``/lifemodel`` admin mutations): the two display fields are written ONLY here and
+    are gate hints (self-healing next turn), so a rare race with the tick's affect
+    write is harmless (spec §6).
+    """
+
+    def _injector(
+        *,
+        user_message: str = "",
+        conversation_history: Any = None,
+        **_ignored: Any,
+    ) -> dict[str, str] | None:
+        try:
+            lm = build_lm()
+            state = lm.state.load()
+            now = lm.clock.now()
+            turn = TurnSignals.from_hook(
+                user_message, conversation_history, window=params.task_window
+            )
+            decision = decide(state, turn, params, now)
+            if metrics is not None:
+                metrics.inc(FELT_DISPLAY_TOTAL, outcome=decision.value)
+            if not decision.shows:
+                return None
+            block = compose_light_cue(state)
+            # Stamp the last ambient show so the gate throttles repeats — written
+            # ONLY on the reactive path, never by the tick (spec §6).
+            lm.state.commit(
+                dataclasses.replace(
+                    state,
+                    affect_display_last_word=felt_word(state.affect_valence, state.affect_arousal),
+                    affect_display_last_at=to_iso(now),
+                )
+            )
+            return {"context": block}
+        except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
+            _record_observer_failure(
+                observer_name=PRE_LLM_OBSERVER, exc=exc, health=health, metrics=metrics
+            )
+            return None
+
+    return _injector
+
+
+def make_check_in_tool(
+    build_lm: Callable[[], LifeModel],
+    *,
+    params: FeltDisplayParams = DEFAULT_FELT_DISPLAY_PARAMS,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., str]:
+    """Return the ``check_in`` LLM tool handler — the being's honest self-read (lm-ukc.4.1).
+
+    The being calls this ITSELF (the model is the only reliable detector of a
+    "how are you", in any language, spec §5). It reads committed state + the
+    strongest live desire and returns the felt prose from
+    :func:`~lifemodel.core.felt_display.compose_self_read`, as the Hermes tool
+    contract requires: a ``json.dumps`` STRING, errors as ``{"error": …}``, and
+    it NEVER raises (spec §4b). Cold-start yields a soft "still settling" read.
+
+    First-class guarantee (spec §4b, risk #1): the read is felt prose only — it
+    NEVER returns a raw axis (valence/arousal number). That lives in the pure
+    ``compose_self_read``; this handler only wraps it in the tool envelope.
+    Read-only: the result feeds the being's SPEECH, never aggregation/wake (§1).
+    """
+
+    def _handler(args: Any = None, **_ignored: Any) -> str:
+        try:
+            lm = build_lm()
+            state = lm.state.load()
+            memory = lm.state if isinstance(lm.state, MemoryPort) else None
+            desire = read_live_contact_desire(memory) if memory is not None else None
+            read = compose_self_read(state, desire=desire, params=params)
+            if metrics is not None:
+                outcome = "read" if warmed(state, params) else "cold_start"
+                metrics.inc(CHECK_IN_TOTAL, outcome=outcome)
+            return json.dumps({"state": read, "note": _CHECK_IN_NOTE}, ensure_ascii=False)
+        except Exception as exc:  # Hermes tool contract: return {"error": …}, never raise
+            _LOG.error(
+                "check_in_tool_failed error=%s", f"{type(exc).__name__}: {exc}", exc_info=True
+            )
+            if metrics is not None:
+                metrics.inc(CHECK_IN_TOTAL, outcome="error")
+            return json.dumps({"error": f"check_in failed: {exc}"}, ensure_ascii=False)
+
+    return _handler

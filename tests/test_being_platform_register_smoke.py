@@ -40,6 +40,7 @@ class _FakeCtx:
         self.profile_name = "smoke-profile"
         self.commands: list[tuple[str, object]] = []
         self.hooks: list[tuple[str, object]] = []
+        self.tools: list[tuple[str, dict]] = []
         self.platforms: list[tuple[str, dict]] = []
 
     def register_command(self, name: str, fn: object, **kwargs: object) -> None:
@@ -47,6 +48,9 @@ class _FakeCtx:
 
     def register_hook(self, name: str, cb: object) -> None:
         self.hooks.append((name, cb))
+
+    def register_tool(self, name: str, **kwargs: object) -> None:
+        self.tools.append((name, kwargs))
 
     def register_platform(self, name: str, **kwargs: object) -> None:
         self.platforms.append((name, kwargs))

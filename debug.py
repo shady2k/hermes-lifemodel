@@ -64,6 +64,15 @@ def _opt(x: float | None, unit: str = "") -> str:
     return "n/a" if x is None else f"{x:.1f}{unit}"
 
 
+def _display_line(last_word: str | None, local_at: str) -> str:
+    """The AFFECT ``display:`` value (lm-ukc.4): the felt word last surfaced
+    ambiently + when, or ``"never shown"`` before the mood first proves itself.
+    *local_at* is already the owner-local render (``"n/a"`` when unset)."""
+    if last_word is None:
+        return "never shown"
+    return f"{last_word} @ {local_at}"
+
+
 def _contribs(pairs: tuple[tuple[str, float], ...], top: int = 3) -> str:
     """Render the strongest signed pushes on an affect axis as one scannable line.
 
@@ -227,6 +236,13 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
             ("tugging v", _contribs(r.affect_valence_contributions)),
             ("tugging a", _contribs(r.affect_arousal_contributions)),
             ("updated", _local(r.affect_updated_at)),
+            # The reactive show (lm-ukc.4): the felt word last surfaced AMBIENTLY
+            # into ordinary talk + when, so the owner sees whether/when the mood
+            # proves itself (calibration, spec §9). "never shown" until it first does.
+            (
+                "display",
+                _display_line(r.affect_display_last_word, _local(r.affect_display_last_at)),
+            ),
         ]
     )
     lines.append("")
