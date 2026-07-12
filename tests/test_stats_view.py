@@ -97,6 +97,8 @@ def test_now_on_bare_registry_is_all_na_not_a_crash() -> None:
     assert "tick_lag" in text
     assert "tick_duration" in text
     assert "accepts_signals" in text
+    assert "felt_display" in text  # the reactive display degrades to n/a, never vanishes
+    assert "check_in" in text
 
 
 def test_now_renders_seeded_registry() -> None:
@@ -117,6 +119,8 @@ def test_now_renders_seeded_registry() -> None:
         3.0, reason="quiet_hours"
     )
     reg.counter("lifemodel_signals_intake_total", label_keys=("outcome",)).inc(9.0, outcome="kept")
+    reg.counter("lifemodel_felt_display_total", label_keys=("outcome",)).inc(1.0, outcome="light")
+    reg.counter("lifemodel_check_in_total", label_keys=("outcome",)).inc(2.0, outcome="read")
 
     text = "\n".join(render_now(reg))
 
@@ -127,6 +131,27 @@ def test_now_renders_seeded_registry() -> None:
     assert "3" in text  # writer dropped
     assert "7" in text  # component runs total
     assert "n/a" not in text  # every field had data
+
+
+def test_now_shows_the_felt_display_outcome_split() -> None:
+    # lm-ukc.4 (spec §9): the ambient gate CHOOSES silence, so a quiet mood is
+    # indistinguishable from a broken one unless the owner can see WHY it stayed quiet.
+    # These counters were being recorded but never surfaced, which is why the first live
+    # runs had to be diagnosed by reading metrics.sqlite by hand.
+    reg = MetricRegistry()
+    felt = reg.counter("lifemodel_felt_display_total", label_keys=("outcome",))
+    felt.inc(2.0, outcome="light")
+    felt.inc(9.0, outcome="not_salient")
+    felt.inc(1.0, outcome="task")
+    reg.counter("lifemodel_check_in_total", label_keys=("outcome",)).inc(3.0, outcome="read")
+
+    text = "\n".join(render_now(reg))
+
+    assert "felt_display" in text
+    assert "shown 2" in text  # the mood surfaced twice
+    assert "not_salient 9" in text  # …and stayed quiet for these reasons
+    assert "task 1" in text
+    assert "check_in" in text and "read 3" in text
 
 
 # --------------------------------------------------------------------------- #

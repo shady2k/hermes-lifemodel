@@ -35,6 +35,12 @@ from typing import TYPE_CHECKING
 
 from .core.component import LAYER_BY_TYPE
 from .core.metrics import Counter, Gauge, Histogram, MetricRegistry, get_metric_registry
+
+# Imported, NOT re-declared as another local string: the felt-state metric names have ONE
+# source (``core.tick_metrics``, where they are registered). A second hand-kept copy is
+# exactly the kind of parallel list that rots — see the `set` whitelist that silently lost
+# the affect axes for a whole phase.
+from .core.tick_metrics import CHECK_IN_TOTAL, FELT_DISPLAY_TOTAL
 from .core.timeutil import from_iso
 
 if TYPE_CHECKING:
@@ -144,6 +150,22 @@ def _read_scalar(registry: MetricRegistry, name: str) -> float | None:
     return sum(value for _lk, _labels, value in items)
 
 
+def _read_by_label(registry: MetricRegistry, name: str, label: str) -> dict[str, float]:
+    """Per-label-value totals of counter *name* (e.g. felt_display split by ``outcome``).
+
+    Empty when the metric is unregistered or never emitted — the caller renders ``n/a``
+    rather than asserting a zero telemetry does not actually have.
+    """
+    metric = registry.get(name)
+    if not isinstance(metric, (Counter, Gauge)):
+        return {}
+    totals: dict[str, float] = {}
+    for _lk, labels, value in metric.items():
+        key = labels.get(label) or "?"
+        totals[key] = totals.get(key, 0.0) + value
+    return totals
+
+
 def _read_histogram_agg(registry: MetricRegistry, name: str) -> tuple[float, int] | None:
     """Aggregate ``(sum, count)`` over every series of histogram *name*, or ``None``."""
     metric = registry.get(name)
@@ -208,6 +230,31 @@ def render_now(registry: MetricRegistry) -> list[str]:
     lines.append(f"**component_runs:** {_NA if runs is None else _fmt_num(runs)}")
     lines.append(f"**signals_intake:** {_NA if intake is None else _fmt_num(intake)}")
     lines.append(f"**suppressions:** {_NA if suppressions is None else _fmt_num(suppressions)}")
+
+    # FELT-STATE (lm-ukc.4/.4.1) — the reactive display, split by its typed outcome. This is
+    # the owner's ONLY in-chat window onto the ambient gate: without it a mood that stayed
+    # quiet is indistinguishable from one that is broken, and the whole point of the gate is
+    # that it *chooses* silence. The metrics were being recorded and never surfaced (spec §9
+    # asked for them here) — which is why the first live runs had to be diagnosed by reading
+    # metrics.sqlite by hand.
+    shows = _read_by_label(registry, FELT_DISPLAY_TOTAL, "outcome")
+    if not shows:
+        lines.append(f"**felt_display:** {_NA}")
+    else:
+        shown = shows.pop("light", 0.0)
+        silent = " · ".join(f"{why} {_fmt_num(n)}" for why, n in sorted(shows.items()))
+        lines.append(
+            f"**felt_display:** shown {_fmt_num(shown)}"
+            + (f" · silent: {silent}" if silent else "")
+        )
+
+    checks = _read_by_label(registry, CHECK_IN_TOTAL, "outcome")
+    if not checks:
+        lines.append(f"**check_in:** {_NA}")
+    else:
+        lines.append(
+            "**check_in:** " + " · ".join(f"{k} {_fmt_num(v)}" for k, v in sorted(checks.items()))
+        )
 
     return lines
 
