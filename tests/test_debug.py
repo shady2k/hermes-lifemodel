@@ -363,3 +363,9 @@ def test_dump_renders_the_affect_section() -> None:
     assert "**target:**" in out
     assert "**tugging v:**" in out
     assert "**tugging a:**" in out
+
+
+def test_dump_affect_section_shows_the_felt_word() -> None:
+    # lm-ukc.3: the felt WORD leads the AFFECT section (the slot lm-ukc.6 left open).
+    out = render_debug_dump(readings=_readings())
+    assert "**felt:**" in out

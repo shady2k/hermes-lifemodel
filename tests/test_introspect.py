@@ -189,3 +189,15 @@ def test_reads_core_affect_current_and_recomputed_target() -> None:
     assert r.affect_target_valence < 0.0  # loneliness pulls the target negative
     assert r.affect_valence_contributions[0][0] == "u"  # ranked: loneliness leads
     assert r.affect_arousal_contributions  # arousal always carries a baseline term
+
+
+def test_reads_the_felt_word_from_current_axes() -> None:
+    # lm-ukc.3: the dump shows the being's mood in a word — from the CURRENT eased axes
+    # (what it feels now), not the recomputed target. Deep unpleasant + calm → "lonely".
+    state = State(
+        affect_valence=-0.6,
+        affect_arousal=0.30,
+        last_tick_at="2026-07-06T03:59:00+00:00",
+    )
+    r = compute_readings(state, now=NOW, cfg=CFG)
+    assert r.affect_word == "lonely"

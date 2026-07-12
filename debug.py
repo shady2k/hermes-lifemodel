@@ -220,6 +220,7 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
     lines.append("**AFFECT (self-model)**")
     lines += _metrics(
         [
+            ("felt", r.affect_word),
             ("valence(v)", _n(r.affect_valence)),
             ("arousal(a)", _n(r.affect_arousal)),
             ("target", f"v {_n(r.affect_target_valence)} / a {_n(r.affect_target_arousal)}"),

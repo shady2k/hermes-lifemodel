@@ -21,6 +21,7 @@ from lifemodel.core.affect import (
     affect_target,
     dominant_contribution,
     ease,
+    felt_word,
 )
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import EmitSignal, UpdateState
@@ -253,3 +254,70 @@ def test_dominant_contribution_suppresses_sub_deadband_as_none() -> None:
     assert dominant_contribution({"u": -0.002, "exchange": 0.001}) == "none"
     assert dominant_contribution({}) == "none"
     assert dominant_contribution({"u": -0.30, "exchange": 0.01}).startswith("u ")
+
+
+# --- felt_word: the lossy, serviceable label over the circumplex point (lm-ukc.3) ---
+
+
+@pytest.mark.parametrize(
+    ("v", "a", "word"),
+    [
+        (0.0, 0.35, "steady"),  # neutral centre
+        (-0.20, 0.35, "wistful"),  # low-valence, calm, mild
+        (-0.60, 0.30, "lonely"),  # low-valence, calm, strong (deep unpleasant)
+        (-0.20, 0.55, "restless"),  # low-valence, keyed-up, mild
+        (-0.60, 0.55, "on edge"),  # low-valence, keyed-up, strong
+        (0.20, 0.35, "content"),  # pleasant, calm, mild
+        (0.60, 0.25, "serene"),  # pleasant, calm, strong (settled)
+        (0.20, 0.55, "bright"),  # pleasant, keyed-up, mild
+        (0.60, 0.55, "buoyant"),  # pleasant, keyed-up, strong
+        (0.05, 0.75, "restless"),  # ~zero valence, extreme arousal dominates → mobilized
+        (0.05, 0.10, "quiet"),  # ~zero valence, very low arousal dominates → deactivated
+    ],
+)
+def test_felt_word_maps_circumplex_regions_to_words(v: float, a: float, word: str) -> None:
+    assert felt_word(v, a) == word
+
+
+def test_affect_sense_stamps_felt_word_on_its_span() -> None:
+    # lm-ukc.3: the being's mood-in-a-word is legible in the trace too. From a
+    # low-valence start eased toward a lonely target, the word stays low-valence.
+    state = State(
+        u=P.u_ref, affect_valence=-0.3, affect_arousal=0.3, last_tick_at="2026-07-12T12:00:00+00:00"
+    )
+    now = datetime(2026, 7, 12, 13, 0, tzinfo=UTC)
+    ctx, logger = _logged_ctx(state, now)
+    _sense().step(ctx)
+    assert logger.span.attrs["affect_word"] in {"wistful", "lonely", "restless", "on edge"}
+
+
+def test_affect_sense_logs_when_the_felt_word_changes() -> None:
+    # Observability (lm-ukc.3): a mood SHIFT earns one log line — the region crossing,
+    # not every tick. Start 'content', ease toward a lonely/keyed target → word flips.
+    state = State(
+        u=P.u_ref, affect_valence=0.2, affect_arousal=0.35, last_tick_at="2026-07-12T12:00:00+00:00"
+    )
+    now = datetime(2026, 7, 12, 13, 0, tzinfo=UTC)
+    ctx, logger = _logged_ctx(state, now)
+    _sense().step(ctx)
+    shifts = [e for e in logger.events if e["event"] == "affect_shifted"]
+    assert len(shifts) == 1
+    assert shifts[0]["from_word"] == "content"
+    assert shifts[0]["to_word"] != "content"
+
+
+def test_affect_sense_does_not_log_when_the_felt_word_holds() -> None:
+    # No shift → no noise: the first tick (dt=0 → no move) keeps the word, emits no log.
+    state = State(u=P.u_ref, affect_valence=-0.3, affect_arousal=0.3, last_tick_at=None)
+    now = datetime(2026, 7, 12, 13, 0, tzinfo=UTC)
+    ctx, logger = _logged_ctx(state, now)
+    _sense().step(ctx)
+    assert not [e for e in logger.events if e["event"] == "affect_shifted"]
+
+
+def test_felt_word_has_no_sharp_quiet_to_lonely_jump_at_the_valence_edge() -> None:
+    # A hair's-width valence change near the neutral edge must not flip a CALM mood from
+    # "quiet" straight to "lonely" (codex): "lonely" needs DEEP negative valence, not low
+    # arousal alone. The near-neutral, low-arousal state stays quiet/wistful.
+    assert felt_word(-0.119, 0.10) == "quiet"
+    assert felt_word(-0.121, 0.10) == "wistful"  # NOT "lonely"

@@ -16,7 +16,7 @@ from datetime import datetime
 
 from ..domain.objects import Thought, ThoughtState, UserModel
 from ..state.model import State
-from .affect import AffectBody, AffectParams, affect_target
+from .affect import AffectBody, AffectParams, affect_target, felt_word
 from .backstop import allow_send
 from .circadian import circadian
 from .pressure import effective_pressure, inhibition_at
@@ -117,7 +117,8 @@ class Readings:
     contact_chain: str = "no current outreach"
     # affect (core-affect self-model — lm-ukc.6). CURRENT axes are the stored eased
     # values; TARGET + contributions are recomputed from the snapshot (like ``u``).
-    #: A slot for the felt WORD stays open here for lm-ukc.3 (point→word).
+    #: The felt WORD (lm-ukc.3) — a lossy label over the CURRENT eased axes.
+    affect_word: str = "steady"
     affect_valence: float = 0.0
     affect_arousal: float = 0.0
     affect_updated_at: str | None = None
@@ -346,6 +347,7 @@ def compute_readings(
         last_tick_ago_min=last_tick_ago,
         brain_alive=last_tick_ago is not None and last_tick_ago <= BRAIN_STALE_MIN,
         contact_chain=contact_chain,
+        affect_word=felt_word(state.affect_valence, state.affect_arousal),
         affect_valence=state.affect_valence,
         affect_arousal=state.affect_arousal,
         affect_updated_at=state.affect_updated_at,

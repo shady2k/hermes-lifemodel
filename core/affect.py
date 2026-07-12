@@ -227,6 +227,57 @@ def dominant_contribution(contribs: dict[str, float]) -> str:
     return f"{name} {val:+.2f}"
 
 
+@dataclass(frozen=True)
+class FeltWordParams:
+    """Thresholds cutting the circumplex into felt-word regions (lm-ukc.3 seeds).
+
+    The word is a LOSSY, serviceable label — the truth lives in the axes (Barrett),
+    so this is ONE shared, tunable view (the tool and the proactive impulse read the
+    same source), not an ontology. Quadrants + intensity around a neutral centre;
+    when valence is ~zero, extreme arousal owns the label. Calibratable later."""
+
+    a_keyed: float = 0.45  # arousal: calm | keyed-up boundary (baseline rests ~0.15–0.4)
+    a_high: float = 0.70  # strongly mobilized
+    a_quiet: float = 0.15  # strongly deactivated (near-zero valence → "quiet")
+    a_serene: float = 0.30  # settled-pleasant intensity cut (high-valence, low-arousal)
+    neutral_v: float = 0.12  # |valence| within this (+ rest arousal) reads neutral
+    neutral_a_center: float = 0.35  # resting-arousal centre of the neutral band
+    neutral_a_radius: float = 0.10  # neutral-arousal band half-width
+    strong_v: float = 0.45  # |valence| beyond this earns the strong word
+
+
+#: The default felt-word seeds — one shared instance (frozen, so sharing is safe) the
+#: tool and the proactive impulse both read, calibratable on disk later (spec NFR5).
+FELT_WORD_PARAMS = FeltWordParams()
+
+
+def felt_word(valence: float, arousal: float, params: FeltWordParams = FELT_WORD_PARAMS) -> str:
+    """Map a circumplex point (valence ∈ [-1,1], arousal ∈ [0,1]) to ONE felt word.
+
+    A lossy label the being colours its speech with (lm-ukc.3) — English is the
+    internal representation; the voice renders it. Precedence: the neutral centre
+    first, then near-zero valence lets an extreme arousal own the word, then the
+    quadrant with an intensity step (mild vs strong)."""
+    p = params
+    v, a = valence, arousal
+    if abs(v) <= p.neutral_v and abs(a - p.neutral_a_center) <= p.neutral_a_radius:
+        return "steady"
+    if abs(v) < p.neutral_v:
+        if a >= p.a_high:
+            return "restless"
+        if a <= p.a_quiet:
+            return "quiet"
+    if v < 0:
+        if a < p.a_keyed:
+            # "lonely" is the DEEP-unpleasant word — earned by valence depth, not low
+            # arousal alone (else a hair past the neutral edge would jump quiet→lonely).
+            return "lonely" if v <= -p.strong_v else "wistful"
+        return "on edge" if (v <= -p.strong_v or a >= p.a_high) else "restless"
+    if a < p.a_keyed:
+        return "serene" if (v >= p.strong_v and a <= p.a_serene) else "content"
+    return "buoyant" if (v >= p.strong_v or a >= p.a_high) else "bright"
+
+
 def ease(*, current: float, target: float, dt_min: float, tau_min: float, deadband: float) -> float:
     """One leaky-integrator step toward *target* over *dt_min* with time-constant *tau_min*.
 
@@ -329,16 +380,29 @@ class AffectSense:
             ctx.observe.set(AFFECT_VALENCE, valence)
             ctx.observe.set(AFFECT_AROUSAL, arousal)
         # Stamp the felt state onto this component's span (guarded, fail-open): the
-        # eased axes, this-tick target, and the dominant contributor per axis, so
-        # /lifemodel trace shows WHY the being feels so (lm-ukc.6). Still no signal.
+        # eased axes, this-tick target, the felt WORD, and the dominant contributor per
+        # axis, so /lifemodel trace shows WHY the being feels so (lm-ukc.6/.3). No signal.
+        word = felt_word(valence, arousal)
         if ctx.logger is not None:
             ctx.logger.span.set(
                 affect_valence=valence,
                 affect_arousal=arousal,
                 affect_target_valence=target_valence,
                 affect_target_arousal=target_arousal,
+                affect_word=word,
                 affect_top_valence=dominant_contribution(contributions.valence),
                 affect_top_arousal=dominant_contribution(contributions.arousal),
             )
+            # A mood SHIFT (the felt word crossing a region) earns ONE log line —
+            # observability without per-tick noise, since the word holds most ticks.
+            prior_word = felt_word(state.affect_valence, state.affect_arousal)
+            if word != prior_word:
+                ctx.logger.info(
+                    "affect_shifted",
+                    from_word=prior_word,
+                    to_word=word,
+                    valence=round(valence, 3),
+                    arousal=round(arousal, 3),
+                )
         eased = AffectState(valence=valence, arousal=arousal, updated_at=to_iso(ctx.now))
         return [UpdateState(eased.to_state_patch())]
