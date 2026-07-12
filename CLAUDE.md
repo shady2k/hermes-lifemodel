@@ -105,6 +105,8 @@ Proactive contact fires only when the drive `u` organically crosses `θ` — tha
 
 Docs live under `docs/` — product [`business-requirements.md`](docs/business-requirements.md), architecture [`hla.md`](docs/hla.md), delivery [`roadmap.md`](docs/roadmap.md) (phases = bd epics). Hexagonal layout: `core/` (Hermes-free layered engine: AUTONOMIC → AGGREGATION → COGNITION), `domain/`, `ports/`, `adapters/` (the only Hermes boundary; `being_platform.py` hosts the being as a supervised platform adapter), `state/`.
 
+**Hermes host API** (hooks, tools, skills, platform adapters, `ctx`): see [`docs/hermes-references.md`](docs/hermes-references.md) for the developer-guide doc links and the local source paths (`~/.hermes/hermes-agent/` — the source of truth). Consult it before wiring anything new into the host boundary.
+
 ## Conventions & Patterns
 
 _Add your project-specific conventions here_
