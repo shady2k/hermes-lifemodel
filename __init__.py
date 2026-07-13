@@ -29,6 +29,7 @@ from .events import EventRing
 from .hooks import (
     make_check_in_tool,
     make_felt_state_injector,
+    make_genesis_injector,
     make_inbound_observer,
     make_post_llm_observer,
     make_write_soul_tool,
@@ -214,6 +215,30 @@ def _hermes_home() -> Path:
     # get_hermes_home() already returns a Path; re-wrap so the host module's
     # untyped (Any) return narrows to Path for the strict type checker.
     return Path(get_hermes_home())
+
+
+def _default_soul_text() -> str:
+    """Hermes's untouched seed ``SOUL.md`` text — the genesis ritual's veteran-branch
+    comparator (spec §6.4): a stranger's soul reads back as this exactly; a veteran's
+    does not.
+
+    Lazy-imported like :func:`_hermes_home` so this module stays importable without
+    Hermes on ``sys.path``. Unlike that import, ``hermes_cli.default_soul`` may
+    genuinely be missing on an older host build — so this one degrades instead of
+    propagating: an unmatchable ``""`` default means EVERY soul on disk compares as a
+    veteran's, which is the safe direction (:meth:`SoulFile.is_pristine_default`'s
+    caller never overwrites the veteran branch; the only cost of guessing wrong here
+    is a stranger's blank soul getting the veteran's "is it still true?" opening
+    instead of the blank-page one — never data loss).
+    """
+    try:
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+    except ImportError:
+        return ""
+    # The host module is untyped from mypy's view (no stubs) — re-wrap so its
+    # untyped (Any) value narrows to str for the strict type checker, matching
+    # _hermes_home()'s Path(...) re-wrap of get_hermes_home() just above.
+    return str(DEFAULT_SOUL_MD)
 
 
 def _status_line(profile: str, sdir: Path) -> str:
@@ -449,16 +474,46 @@ def register(ctx: Any) -> None:
             description=_CHECK_IN_DESCRIPTION,
         )
 
+    # One SoulFile instance, shared by every wiring below that touches SOUL.md (the
+    # genesis injector's read, write_soul's write) — home/SOUL.md is the plugin's ONLY
+    # touchpoint on the identity file (adapters/soul_file.py), reached via the SAME
+    # `home` this register() already resolved from get_hermes_home(), never a fresh
+    # env-var read. Built ONCE (not per call) so its write-lock is actually shared
+    # across every call this process handles.
+    soul = SoulFile(home / "SOUL.md")
+
+    # --- Genesis wiring (Phase 4, spec §6.3) — REQUIRED -----------------------
+    # The being's birth ritual is not an engine or a step machine — it is ONE block of
+    # prose (core.genesis.genesis_block), injected on pre_llm_call EXACTLY ONCE
+    # (should_launch: unborn AND the being has not yet spoken in THIS conversation).
+    # Registered as a SECOND pre_llm_call hook beside the felt-state injector above:
+    # Hermes calls every registered callback for a hook name and concatenates their
+    # non-None returns (invoke_hook), so the two coexist safely. default_soul_text
+    # resolves Hermes's untouched seed soul lazily (_default_soul_text, same lazy-host-
+    # import shape as _hermes_home) — an unmatchable "" default simply means every soul
+    # on disk reads as a veteran's, which is the SAFE direction: we never overwrite.
+    # REQUIRED like every other register_hook/register_tool call here: the host never
+    # fails on an unknown hook, so a throw during THIS wiring is our bug; the hook body
+    # itself stays fail-soft at RUNTIME (spec §8), same shape as felt_state_injector.
+    with wire("genesis_injector", required=True, health=health, logger=_LOG):
+        ctx.register_hook(
+            "pre_llm_call",
+            make_genesis_injector(
+                lambda: build_lifemodel(base_dir=sdir),
+                soul=soul,
+                default_soul_text=_default_soul_text(),
+                health=health,
+                metrics=metrics,
+            ),
+        )
+
     # --- write_soul wiring (Phase 4 genesis, spec §6.5) — REQUIRED ------------
     # The being's SECOND LLM tool: it writes who it is, and that IS the act of birth.
     # There is no ritual engine anywhere in this phase — the instruction to call it
     # lives entirely in _WRITE_SOUL_DESCRIPTION, which rides the tool definition into
     # every prompt for free. REQUIRED like check_in above: register_tool doesn't fail
-    # on the host side, so a throw here is our bug. One SoulFile instance is built
-    # HERE (not per call) so its write-lock is actually shared across every call this
-    # process handles — home/SOUL.md is the plugin's ONLY touchpoint on the identity
-    # file (adapters/soul_file.py), reached via the SAME `home` this register() already
-    # resolved from get_hermes_home(), never a fresh env-var read.
+    # on the host side, so a throw here is our bug. Reuses the SAME `soul` instance
+    # the genesis injector above reads, for the write-lock sharing reasoning given there.
     with wire("write_soul_tool", required=True, health=health, logger=_LOG):
         ctx.register_tool(
             "write_soul",
@@ -466,7 +521,7 @@ def register(ctx: Any) -> None:
             schema=_WRITE_SOUL_SCHEMA,
             handler=make_write_soul_tool(
                 lambda: build_lifemodel(base_dir=sdir),
-                soul=SoulFile(home / "SOUL.md"),
+                soul=soul,
                 metrics=metrics,
             ),
             description=_WRITE_SOUL_DESCRIPTION,

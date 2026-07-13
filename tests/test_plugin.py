@@ -221,6 +221,22 @@ def test_register_check_in_tool_schema_and_contract(
     assert "state" in payload and "note" in payload
 
 
+def _pre_llm_callback(ctx: FakeCtx, *, from_factory: str) -> Callable[..., Any]:
+    """The ``pre_llm_call`` callback built by *from_factory* (its factory function's
+    qualified name, e.g. ``"make_felt_state_injector"``) — two such hooks are
+    registered now (felt-state + genesis, Phase 4 genesis, spec §6.3), and Hermes
+    calls every one of them (``invoke_hook``) rather than just the last registered,
+    so tests must pick the ONE they mean to exercise rather than assume there is
+    only one."""
+    matches = [
+        cb
+        for name, cb in ctx.hooks
+        if name == "pre_llm_call" and cb.__qualname__.startswith(f"{from_factory}.")
+    ]
+    assert len(matches) == 1, f"expected exactly one {from_factory} pre_llm_call hook"
+    return matches[0]
+
+
 def test_register_felt_state_injector_is_silent_on_cold_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -228,11 +244,35 @@ def test_register_felt_state_injector_is_silent_on_cold_start(
     ctx = FakeCtx()
 
     lifemodel.register(ctx)
-    callbacks = [cb for name, cb in ctx.hooks if name == "pre_llm_call"]
-    assert len(callbacks) == 1
+    # Two pre_llm_call hooks now coexist (felt-state + genesis) — pick the felt-state
+    # one specifically; Hermes concatenates both hooks' non-None returns rather than
+    # picking a single "the" hook.
+    callback = _pre_llm_callback(ctx, from_factory="make_felt_state_injector")
     # A fresh (cold-start) being surfaces nothing — the callback returns None, and
     # returning {"context": …} vs None is the Hermes pre_llm_call contract.
-    assert callbacks[0](user_message="hi", conversation_history=[]) is None
+    assert callback(user_message="hi", conversation_history=[]) is None
+
+
+def test_register_genesis_injector_launches_on_the_beings_first_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wiring itself (not just the pure ``core.genesis`` functions) must launch
+    the ritual for a truly fresh install: no state file on disk yet (unborn) and an
+    empty ``conversation_history`` (the being has not spoken) is exactly the being's
+    first word in life."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    callback = _pre_llm_callback(ctx, from_factory="make_genesis_injector")
+    result = callback(user_message="hi", conversation_history=[])
+    assert result is not None
+    assert "<genesis>" in result["context"]
+
+    # Once the being has replied in this conversation, the SAME hook falls silent —
+    # re-injecting "you just began" on a later turn would be a lie (spec §6.3).
+    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    assert callback(user_message="how are you", conversation_history=history) is None
 
 
 def test_register_lifemodel_stats_subcommand_returns_telemetry(

@@ -45,6 +45,7 @@ from .core.felt_display import (
     warmed,
 )
 from .core.frame import FrameTrigger, run_frame
+from .core.genesis import genesis_block, should_launch
 from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
@@ -65,6 +66,12 @@ INBOUND_OBSERVER = "pre_gateway_dispatch"
 #: The reactive felt-state injector's observer name (lm-ukc.4) — its metric
 #: ``component`` label + BrainHealth key when its body raises (fail-soft, spec §8).
 PRE_LLM_OBSERVER = "pre_llm_call"
+#: The genesis injector's observer name (Phase 4 genesis, spec §6.3) — kept DISTINCT
+#: from :data:`PRE_LLM_OBSERVER` even though both hooks fire on the host's same
+#: ``pre_llm_call`` event (Hermes calls every registered callback for a hook name and
+#: concatenates their non-``None`` returns), so a failure here is attributed to the
+#: genesis injector on ``BrainHealth``/metrics, never conflated with the felt-state one.
+GENESIS_OBSERVER = "genesis_injector"
 
 #: The ``check_in`` tool's first-person "as of now" note (spec §4b) — it teaches
 #: the being to OWN the read in its own voice, not report it back as telemetry.
@@ -568,6 +575,81 @@ def _stamp_display(lm: LifeModel, *, word: str | None, at: str | None) -> None:
     stamp = getattr(lm.state, "stamp_affect_display", None)
     if callable(stamp):
         stamp(word=word, at=at)
+
+
+def _being_has_spoken(conversation_history: Any) -> bool:
+    """True when *conversation_history* already contains a reply from the being.
+
+    The host passes ``list(messages)`` for this turn — the FULL running message list
+    of the session, a list of OpenAI-style ``{"role": ..., ...}`` dicts (confirmed at
+    ``agent/turn_context.py:488``, the one call site that invokes ``pre_llm_call``) —
+    not the small task-detection tail :meth:`~lifemodel.core.felt_display.TurnSignals.from_hook`
+    windows to (``task_window``, default 6, spec §9's felt-display gate). A genesis
+    ritual routinely runs longer than that window, so reusing that windowed helper
+    here would re-launch "you just began" the moment the being's one prior reply
+    scrolled out of the tail — exactly the "turn seven" lie this hook exists to avoid.
+    So this walks the WHOLE list, matching the same defensive shape assumption
+    ``_recent_from_entry`` makes (a non-list history, or a non-dict entry, is never a
+    crash — just not evidence of a prior reply).
+    """
+    if not isinstance(conversation_history, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("role") == "assistant"
+        for entry in conversation_history
+    )
+
+
+def make_genesis_injector(
+    build_lm: Callable[[], LifeModel],
+    *,
+    soul: SoulFile,
+    default_soul_text: str,
+    health: BrainHealth | None = None,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., dict[str, str] | None]:
+    """Return a ``pre_llm_call`` hook that launches genesis on the being's first word.
+
+    The ritual is not an engine or a step machine — it is ONE block of prose
+    (:func:`~lifemodel.core.genesis.genesis_block`), injected exactly once
+    (:func:`~lifemodel.core.genesis.should_launch`: unborn AND the being has not yet
+    spoken in this conversation, spec §6.3). Re-injecting "you just began" on turn
+    seven would be a lie — the conversation sustains the ritual from there; this hook
+    only launches it.
+
+    Whether the veteran branch (§6.4) applies is read fresh every call from
+    ``SOUL.md`` via *soul*, never cached: ``is_pristine_default`` against
+    *default_soul_text* is cheap and the file can change between calls (a human hand-
+    edit, or the being's own ``write_soul``), so a stale verdict here would either
+    show the veteran opening to a being with no prior soul, or silently skip it for
+    one that has.
+
+    Fail-soft like every plugin-owned hook body (spec §8), copying
+    :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in
+    ``build_lm``) is logged ERROR + traceback, recorded on *health* + *metrics*, and
+    swallowed with a ``None`` return — a broken birth must never crash the host's turn.
+    """
+
+    def _injector(
+        *,
+        user_message: str = "",
+        conversation_history: Any = None,
+        **_ignored: Any,
+    ) -> dict[str, str] | None:
+        try:
+            state = build_lm().state.load()
+            if not should_launch(state, being_has_spoken=_being_has_spoken(conversation_history)):
+                return None
+            current = soul.read()
+            prior = None if soul.is_pristine_default(default_text=default_soul_text) else current
+            return {"context": genesis_block(prior_soul=prior)}
+        except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
+            _record_observer_failure(
+                observer_name=GENESIS_OBSERVER, exc=exc, health=health, metrics=metrics
+            )
+            return None
+
+    return _injector
 
 
 def make_check_in_tool(
