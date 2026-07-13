@@ -4,7 +4,8 @@ from datetime import UTC, datetime
 
 from lifemodel.composition import AFFECT_PARAMS, CIRCADIAN_PEAK_UTC_HOUR
 from lifemodel.core.affect import felt_word
-from lifemodel.core.genesis import newborn
+from lifemodel.core.genesis import needs_adoption, newborn
+from lifemodel.state.model import State
 
 NOON = datetime(2026, 7, 13, 13, 0, tzinfo=UTC)  # the circadian peak
 NIGHT = datetime(2026, 7, 13, 1, 0, tzinfo=UTC)  # the trough
@@ -49,3 +50,26 @@ def test_a_newborn_has_no_relationship_and_therefore_no_deficit() -> None:
     state = _born_at(NOON)
     assert state.u == 0.0  # there is nobody to miss yet
     assert state.genesis_completed_at is None  # being alive is not being born
+
+
+# --- needs_adoption (startup reconciliation, spec §4.4) ----------------------
+
+
+def test_a_soul_edited_while_we_were_down_is_ADOPTED() -> None:
+    # There is no transaction spanning a filesystem rename and a SQLite commit, so the
+    # two can fall out of step: we crashed mid-write, or the human edited the file while
+    # the gateway was down. Both are the SAME situation and have the same answer — the
+    # file is the base. Adopt it.
+    state = State(soul_sha="what_we_last_wrote")
+    assert needs_adoption(state, disk_sha="something_else") is True
+
+
+def test_an_unchanged_soul_is_not_re_adopted_on_every_restart() -> None:
+    state = State(soul_sha="same")
+    assert needs_adoption(state, disk_sha="same") is False
+
+
+def test_a_being_that_has_never_written_a_soul_adopts_nothing() -> None:
+    # Before the first write there is no "our" version to differ from — the DEFAULT_SOUL_MD
+    # on disk is not a revision of anything, and recording it as one would forge a history.
+    assert needs_adoption(State(soul_sha=None), disk_sha="anything") is False

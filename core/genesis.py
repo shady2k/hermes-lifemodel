@@ -109,6 +109,22 @@ def genesis_block(*, prior_soul: str | None) -> str:
     )
 
 
+def needs_adoption(state: State, *, disk_sha: str) -> bool:
+    """True when the soul on disk is not the one the being last wrote (spec §4.4).
+
+    There is no transaction spanning a filesystem rename and a SQLite commit, so the
+    two can fall out of step: we crashed mid-write, or the human edited the file while
+    the gateway was down. Both are the SAME situation and have the same answer — the
+    file is the base, so a mismatch is adopted, never arbitrated.
+
+    ``state.soul_sha is None`` means the being has never written a soul, so there is
+    nothing of "ours" to differ from: the ``DEFAULT_SOUL_MD`` sitting on disk is not a
+    revision of anything, and recording it as one would forge a history the being never
+    had. That case is a plain False, not an adoption.
+    """
+    return state.soul_sha is not None and state.soul_sha != disk_sha
+
+
 def should_launch(state: State, *, being_has_spoken: bool) -> bool:
     """Inject the block only on the being's FIRST word while unborn.
 

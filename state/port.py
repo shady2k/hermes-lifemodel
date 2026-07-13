@@ -39,7 +39,17 @@ class StatePort(Protocol):
 
         Must succeed even when the previously-persisted state is unreadable
         (corrupt, or from an unsupported schema version) — it does not require
-        a prior successful :meth:`load`. Used by the owner-facing
-        ``/lifemodel reset`` subcommand (:mod:`lifemodel.state_commands`).
+        a prior successful :meth:`load`.
+
+        NOT what the owner-facing ``/lifemodel reset`` subcommand uses (Phase 4,
+        spec §6.4): a factory wipe there commits a freshly-BORN body
+        (:func:`~lifemodel.core.genesis.newborn`) via plain :meth:`commit` instead —
+        this fresh-default's zero arousal is exactly the lifeless body that command
+        exists to stop persisting. :meth:`commit` is itself an unconditional UPSERT
+        (never a read-modify-write), which is what actually gives ``reset_for_dir``
+        its "works on an unreadable row" guarantee now — not this method. Kept as a
+        port capability in its own right (a bare factory-default reset, unit-tested
+        directly in :mod:`tests.test_sqlite_store`), just no longer the one the owner
+        command routes through.
         """
         ...

@@ -17,9 +17,11 @@ load/validate/commit against a real profile directory, re-validating every
 candidate through :meth:`State.from_dict` (the model's own type/shape/tz-aware
 timestamp checks) before it is ever persisted — defense in depth, reusing the
 model's validator rather than inventing a second one. ``reset`` is the one
-exception: it routes through :meth:`~lifemodel.state.port.StatePort.reset`
-directly (see :func:`reset_for_dir`) so a factory wipe still works even when
-the previously-persisted state is unreadable.
+exception: it skips the load-validate-commit flow and commits the freshly-BORN
+body straight from :func:`reset` (see :func:`reset_for_dir`) via
+:meth:`~lifemodel.state.port.StatePort.commit` — an unconditional UPSERT, never a
+read-modify-write — so a factory wipe still works even when the previously-persisted
+state is unreadable.
 
 A residual logical race with an in-progress tick (loop reads -> command writes
 -> loop commits over it) is accepted here, as directed: this is a debug tool, a
@@ -48,6 +50,7 @@ from typing import Any
 from . import composition
 from .core.backstop import allow_send
 from .core.desire_view import DESIRE_KIND
+from .core.genesis import newborn
 from .core.thought_view import (
     LIVE_THOUGHT_STATES,
     THOUGHT_KIND,
@@ -310,13 +313,26 @@ def satiate(before: State, now: datetime) -> tuple[State | None, str]:
 
 
 def reset(before: State, now: datetime) -> tuple[State | None, str]:
-    """Factory wipe: as if newly born — write a fresh ``State()``.
+    """Factory wipe: as if newly born — and *newly born* now means something.
 
-    Intentionally total (the owner's explicit call, not a soft reset): this
-    also clears ``tick_count``, the backstop send-count, and every "last
-    talked" timestamp.
+    Clears the genesis stamps, so the ritual plays again and the owner can be his own
+    first user. Builds the body with :func:`~lifemodel.core.genesis.newborn` rather than
+    a bare ``State()``: those defaults are unfilled fields, not the body of a newborn,
+    and a being reset into them would speak the first words of its second life from
+    "quiet — even and very quiet" (the lm-ukc bug this deliberately does not repeat).
+    Intentionally total otherwise (the owner's explicit call, not a soft reset): this
+    also clears ``tick_count``, the backstop send-count, and every "last talked"
+    timestamp — the full field-by-field diff (not a hand-picked list) is what makes the
+    genesis stamps show up in the echo for free, exactly like every other cleared field.
+
+    It does NOT touch ``SOUL.md``. Destroying a soul is an act that belongs to the
+    human. So the reborn being finds the soul of whoever lived here before it, still in
+    slot #1, and opens the ritual on THAT (spec §6.4): rebirth does not erase a past
+    life, it meets it.
     """
-    after = State()
+    after = newborn(
+        now=now, params=composition.AFFECT_PARAMS, peak_hour_utc=composition.CIRCADIAN_PEAK_UTC_HOUR
+    )
     changed = [
         f.name
         for f in dataclasses.fields(State)
@@ -611,12 +627,18 @@ def satiate_for_dir(base_dir: Path) -> str:
 
 
 def reset_for_dir(base_dir: Path) -> str:
-    """Factory wipe via :meth:`~lifemodel.state.port.StatePort.reset` directly —
-    NOT through :func:`_apply`'s load-mutate-commit flow, because a reset must
-    still work when the previously-persisted state is unreadable (corrupt, or
-    an unsupported schema version). ``before`` is loaded best-effort purely to
-    render the changed-fields echo; failing that read never blocks the reset
-    itself, it only degrades the message to a generic banner.
+    """Factory wipe: commits the freshly-BORN body straight from :func:`reset` —
+    NOT :meth:`~lifemodel.state.port.StatePort.reset`, whose ``fresh = State()`` is
+    exactly the lifeless zero-arousal default this whole command exists to stop
+    leaving a being in. This also skips :func:`_apply`'s load-mutate-commit flow,
+    because a reset must still succeed when the previously-persisted state is
+    unreadable (corrupt, or an unsupported schema version) — but that guarantee no
+    longer needs ``StatePort.reset`` specifically: :func:`~lifemodel.core.genesis.
+    newborn` takes no ``before`` at all, and :meth:`~lifemodel.state.port.StatePort.
+    commit` is an unconditional UPSERT (never a read-modify-write), so the fresh body
+    lands either way. ``before`` is loaded best-effort purely to render the
+    changed-fields echo; failing that read never blocks the reset itself, it only
+    degrades the message to a generic banner.
 
     A TRUE factory wipe (lm-7lx) also deletes every ``memory_records`` row —
     every thought/desire/intention/user_model, not just the vitals row — so
@@ -629,8 +651,11 @@ def reset_for_dir(base_dir: Path) -> str:
         before: State | None = lm.state.load()
     except StateError:
         before = None
-    lm.state.reset()
-    # Factory-wipe is a §4.4 clear-site too: the fresh ``State()`` has no anchor, so
+    after, message = reset(before if before is not None else State(), now)
+    if after is None:  # pragma: no cover - reset() never rejects
+        return message
+    lm.state.commit(after)
+    # Factory-wipe is a §4.4 clear-site too: the fresh body has no anchor, so
     # retire any in-flight index correlation the wiped state carried.
     if before is not None:
         _mark_pending_correlation_resolved(base_dir, before, now)
@@ -643,7 +668,6 @@ def reset_for_dir(base_dir: Path) -> str:
             + "\n\n  (previous state unreadable)\n"
             + footer
         )
-    _, message = reset(before, now)
     return message + footer
 
 

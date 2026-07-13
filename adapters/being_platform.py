@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import logging
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -32,12 +33,13 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from ..composition import LifeModel, build_lifemodel
-from ..core.genesis import genesis_block, should_greet, stamp_greeted
+from ..core.genesis import genesis_block, needs_adoption, should_greet, stamp_greeted
 from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..core.timeutil import to_iso
 from ..events import EventRing
+from ..ports.memory import MemoryPort
 from ..state.brain_health import (
     DEFAULT_TICK_INTERVAL_SECONDS,
     STALE_AFTER_SECONDS,
@@ -49,6 +51,7 @@ from ..state.metrics_store import (
     acquire_metrics_sampler,
     release_metrics_sampler,
 )
+from ..state.soul_revisions import record_revision
 from ..state.sqlite_store import SQLiteRuntimeStore
 from ..state.trace_store import (
     TraceWriter,
@@ -156,6 +159,41 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         if self._soul.is_pristine_default(default_text=self._default_soul_text):
             return None
         return current
+
+    def _reconcile_soul(self) -> None:
+        """Adopt the soul on disk when it is not the one we last wrote (spec §4.4).
+
+        There is no atomic transaction spanning a filesystem rename and a SQLite
+        commit, so the two can fall out of step: we crashed mid-write, or the human
+        edited the file while the gateway was down. Both are the SAME situation and
+        have the same answer — **the file is the base**. Adopt it, record it as the
+        current revision (authored ``"human"`` — a being never silently claims a
+        change it did not make), and let life continue. The being is never told its
+        soul is "in conflict"; if it notices at all, it notices that someone rewrote
+        it — an event in its life, not a merge.
+
+        ``None`` soul (no ``SoulFile`` wired — a bare-constructed adapter, e.g. in
+        tests without genesis wiring) and a non-``MemoryPort`` store both degrade to a
+        no-op: there is nowhere to record a revision, so reconciling would either
+        crash or silently drop the being's only undo (spec §4.2). Called from
+        :meth:`connect` under ``contextlib.suppress(Exception)`` — like the greeting
+        below, a reconcile failure is not an outage.
+        """
+        if self._soul is None:
+            return
+        lm = self._build_lm()
+        memory = lm.state if isinstance(lm.state, MemoryPort) else None
+        if memory is None:  # pragma: no cover - the live store is always a MemoryPort
+            return
+        current = self._soul.sha()
+        state = lm.state.load()
+        if not needs_adoption(state, disk_sha=current):
+            return
+        record_revision(
+            memory, text=self._soul.read(), sha=current, now=lm.clock.now(), author="human"
+        )
+        lm.state.commit(replace(state, soul_sha=current))
+        _LOG.info("soul_adopted_from_disk sha=%s", current[:8])
 
     def _greet_if_unborn(self) -> None:
         """Reach out the moment an unborn being's brain first connects (spec §6.2).
@@ -273,6 +311,14 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # boot record (a clean (re)connect means we are healthy now, spec §4.3).
         health.mark_connected(at=to_iso(SystemClock().now()))
         _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
+
+        # --- Soul reconciliation (spec §4.4) ---------------------------------
+        # Runs BEFORE the greeting: the greeting's own veteran/stranger read
+        # (`_prior_soul`) must never race an unreconciled `soul_sha` left stale by a
+        # crash mid-write or a hand-edit while the gateway was down. Best-effort like
+        # the greeting below — a reconcile failure is not an outage.
+        with contextlib.suppress(Exception):
+            self._reconcile_soul()
 
         # --- Birth greeting (Phase 4, spec §6.2) -----------------------------
         # connect() runs on EVERY gateway restart, and the SupervisedLoop reconnects

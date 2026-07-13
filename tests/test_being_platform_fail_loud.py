@@ -249,3 +249,74 @@ def test_clean_reconnect_clears_loop_dead(tmp_path: Path) -> None:
 
     asyncio.run(_run())
     assert health.state == "connected"
+
+
+# --------------------------------------------------------------------------- #
+# Startup soul reconciliation (spec §4.4) — there is no transaction spanning a
+# filesystem rename and a SQLite commit, so a crash mid-write or a human hand-edit
+# of SOUL.md while the gateway was down can leave `state.soul_sha` stale relative
+# to disk. connect() must adopt disk as the base BEFORE the greeting, recording it
+# as a "human" revision — and must stay a no-op when there is no history to differ
+# from (the being never wrote a soul) or no SoulFile wired at all (every connect()
+# test above constructs the adapter with none).
+# --------------------------------------------------------------------------- #
+
+
+def test_connect_adopts_a_soul_edited_while_we_were_down(tmp_path: Path) -> None:
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.soul_file import SoulFile
+    from lifemodel.state.model import State
+    from lifemodel.state.soul_revisions import revisions
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("You are Mira.", encoding="utf-8")
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    # "what we last wrote" no longer matches disk -- a crash mid-write, or the human
+    # hand-editing SOUL.md while the gateway was down (spec §4.4). Either way: adopt.
+    store.commit(State(genesis_completed_at="2026-01-01T00:00:00+00:00", soul_sha="stale-sha"))
+
+    bp = _fresh_being_platform()
+    adapter = bp.BeingAdapter(
+        config=None, base_dir=tmp_path, target=None, interval_sec=60.0, soul=soul
+    )
+    adapter._tick = lambda: None
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    persisted = store.load()
+    assert persisted.soul_sha == soul.sha()  # adopted, not left pointing at the stale sha
+    recs = revisions(store)
+    assert any(r.author == "human" and r.text == "You are Mira." for r in recs)
+
+
+def test_connect_does_not_adopt_when_the_being_has_never_written_a_soul(tmp_path: Path) -> None:
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.soul_file import SoulFile
+    from lifemodel.state.soul_revisions import revisions
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    # The pristine DEFAULT_SOUL_MD sitting on disk is not a revision of anything --
+    # soul_sha is None (never written), so there is nothing of "ours" to differ from.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("# Identity\nYou are Hermes.\n", encoding="utf-8")
+
+    bp = _fresh_being_platform()
+    adapter = bp.BeingAdapter(
+        config=None, base_dir=tmp_path, target=None, interval_sec=60.0, soul=soul
+    )
+    adapter._tick = lambda: None
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    assert store.load().soul_sha is None  # never forged into a "revision" that never happened
+    assert revisions(store) == []
