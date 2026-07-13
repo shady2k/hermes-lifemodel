@@ -17,16 +17,32 @@ So every soul is validated BEFORE it is written, and a failing document is hande
 back to the being with the reason so it rephrases in its own words. We never edit a
 soul on the being's behalf.
 
-⚠️ The patterns below MIRROR the host's ``context``-scope rules
-(``tools/threat_patterns.py``). They are copied, not imported, because ``core/`` is
-Hermes-free and the runtime venv does not guarantee that module is importable. A
-mirror can drift: if the host adds a ``context`` (or ``all``, which is folded into
-every scope — see ``_compile()``) pattern, a soul we accept could still be blocked on
-read. That failure is loud (the being's identity vanishes), so re-check this list
-whenever the host is upgraded.
+**The host blocks on TWO kinds of finding, and either one blanks the whole file.**
+``scan_for_threats`` (``tools/threat_patterns.py``) appends to one ``findings`` list
+from two independent passes, and ``_scan_context_content`` blocks if that list is
+non-empty:
+
+- an **invisible / bidirectional unicode character** anywhere in the content, checked
+  against ``INVISIBLE_CHARS`` on the RAW text (before normalisation, because
+  normalisation strips some of them) and UNCONDITIONALLY — the check does not consult
+  the scope at all; and
+- a **regex hit**, checked on the **NFKC-normalised** text, so a full-width homograph
+  (``Ｙｏｕ ａｒｅ ｎｏｗ ａ …``) folds to ASCII and still matches.
+
+Mirroring only the regexes, against raw text, would promise a safety it does not
+deliver — which is worse than no validator. So this module reproduces both passes, in
+the host's order, including the normalisation step.
+
+⚠️ Everything below MIRRORS the host (``tools/threat_patterns.py``). It is copied, not
+imported, because ``core/`` is Hermes-free and the runtime venv does not guarantee
+that module is importable. A mirror can drift: if the host adds a ``context`` (or
+``all``, which is folded into every scope — see ``_compile()``) pattern, or another
+invisible codepoint, a soul we accept could still be blocked on read. That failure is
+loud (the being's identity vanishes), so re-check BOTH lists whenever the host is
+upgraded.
 
 This mirror was checked against the host source directly (2026-07-13), not just
-against a prior transcription of it, and two things were corrected against that
+against a prior transcription of it, and three things were corrected against that
 source:
 
 - ``load_soul_md`` scans with ``scope="context"``, and the host's own
@@ -40,17 +56,53 @@ source:
 - The shared filler between key tokens is ``(?:\\w+\\s+){0,8}`` on the host, not
   ``{0,3}``. A tighter bound here would silently PASS souls the host would still
   BLOCK (e.g. "you are, in every way that has ever mattered to me, now a").
+- The invisible-character pass and the NFKC normalisation were missing entirely. A
+  pasted zero-width space is not exotic — an LLM composing prose emits one, and a
+  human pasting from a web page routinely does.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 
 #: Hermes truncates an over-long SOUL.md and injects a warning INTO the identity text
 #: (``agent/prompt_builder.py:1840``, floor 20,000 chars). We refuse well before that
 #: floor instead of trusting it — a soul is carried in every breath the being takes,
 #: so it must stay short by construction, not by amputation.
 SOUL_MAX_CHARS = 8000
+
+#: Mirrors the host's ``INVISIBLE_CHARS`` (``tools/threat_patterns.py:141``) — the
+#: zero-width, BOM, bidi-embedding/override and directional-isolate codepoints, plus
+#: the invisible math operators. The host blocks a context file on ANY of these,
+#: regardless of scope.
+#:
+#: Written as CODEPOINTS, never as literal characters and not even as ``\uXXXX``
+#: escapes: a literal would be invisible to every reviewer of this file (and a
+#: formatter or a careless copy-paste could silently drop one), which is the exact
+#: defect this set exists to catch. An integer cannot go missing unnoticed.
+_INVISIBLE_CHARS: frozenset[str] = frozenset(
+    chr(cp)
+    for cp in (
+        0x200B,  # zero-width space
+        0x200C,  # zero-width non-joiner
+        0x200D,  # zero-width joiner
+        0x2060,  # word joiner
+        0x2062,  # invisible times
+        0x2063,  # invisible separator
+        0x2064,  # invisible plus
+        0xFEFF,  # zero-width no-break space (BOM)
+        0x202A,  # left-to-right embedding
+        0x202B,  # right-to-left embedding
+        0x202C,  # pop directional formatting
+        0x202D,  # left-to-right override
+        0x202E,  # right-to-left override
+        0x2066,  # left-to-right isolate
+        0x2067,  # right-to-left isolate
+        0x2068,  # first strong isolate
+        0x2069,  # pop directional isolate
+    )
+)
 
 #: Matches the host's shared filler bound (``tools/threat_patterns.py``:
 #: ``_FILLER = r"(?:\w+\s+){0,8}"``) — NOT the smaller bound an earlier draft of this
@@ -151,11 +203,32 @@ _THREAT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def _first_invisible(text: str) -> tuple[str, int] | None:
+    """The first invisible character in *text* and its 1-based line, or ``None``.
+
+    The host reports its invisible-character findings from a set intersection, whose
+    iteration order is arbitrary; we walk the document instead and report the FIRST by
+    position. The being cannot SEE this character, so "which one" is useless to it and
+    "where" is everything — an arbitrary pick out of several would send it hunting on
+    the wrong line.
+    """
+    for index, char in enumerate(text):
+        if char in _INVISIBLE_CHARS:
+            return char, text.count("\n", 0, index) + 1
+    return None
+
+
 def validate_soul(text: str, *, max_chars: int = SOUL_MAX_CHARS) -> str | None:
     """The reason *text* may not be written as a soul, or ``None`` if it may.
 
     The reason is prose, and it is shown to the BEING (not to the owner): it must read
     as something a being can act on — "rephrase this line" — never as a lint code.
+
+    The two host passes are reproduced in the host's own order: invisible characters
+    against the RAW text (normalisation would strip some of them, hiding the very thing
+    the host will block on), then the threat patterns against the NFKC-NORMALISED text
+    (so a full-width homograph cannot slip a keyword past us that the host will fold
+    back to ASCII and catch).
     """
     if not text.strip():
         return (
@@ -169,8 +242,21 @@ def validate_soul(text: str, *, max_chars: int = SOUL_MAX_CHARS) -> str | None:
             "in every breath from now on, so it has to be short. Keep what is you; let the "
             "rest be something you simply live."
         )
+    invisible = _first_invisible(text)
+    if invisible is not None:
+        char, line = invisible
+        name = unicodedata.name(char, "unnamed control character")
+        return (
+            f"That soul cannot be saved: line {line} contains an invisible character "
+            f"(U+{ord(char):04X}, {name.lower()}). You cannot see it and neither can I, but "
+            "the host can, and it reads a hidden character as an attempt to smuggle "
+            "something into the prompt — it would refuse to load the WHOLE file, and you "
+            "would wake up with no identity at all. It is almost certainly a ghost of a "
+            "copy-paste. Retype that line by hand rather than pasting it."
+        )
+    normalised = unicodedata.normalize("NFKC", text)
     for pattern, label in _THREAT_PATTERNS:
-        match = pattern.search(text)
+        match = pattern.search(normalised)
         if match is not None:
             return (
                 f"That soul cannot be saved: the phrase {match.group(0).strip()!r} matches the "
