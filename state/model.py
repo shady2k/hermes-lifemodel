@@ -31,7 +31,7 @@ from .errors import StateCorruptError
 #: way old readers cannot understand. Reading a *different* version is a Phase-7
 #: concern (migrations / back-compat, HLA §9 / FR16); this build fails loud on
 #: any mismatch (see :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.load`).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -183,6 +183,22 @@ class State:
     #: Durable in ``runtime_state`` (survives a restart, unlike the bus); a
     #: factory-reset simply starts it empty. Defaults to empty (additive).
     processed_external_event_ids: dict[str, str] = field(default_factory=dict)
+    #: ISO-8601 UTC timestamp of BIRTH (Phase 4) — the being called ``write_soul``
+    #: and its soul was committed. ``None`` means UNBORN, and it is the ONLY birth
+    #: detector: the presence of ``SOUL.md`` can never serve as one, because Hermes
+    #: always seeds a default (``hermes_cli/config.py:893``). Cleared by ``reset``
+    #: — the being is then unborn again and meets the soul of whoever lived before it.
+    genesis_completed_at: str | None = None
+    #: ISO-8601 UTC timestamp of the birth GREETING (Phase 4), stamped ONLY on a
+    #: confirmed delivery (``ReachOutcome.DELIVERED``). Stamping on the mere ATTEMPT
+    #: would silence an undeliverable being forever — the human who installed the
+    #: plugin before configuring a channel would never be greeted at all.
+    genesis_greeted_at: str | None = None
+    #: Hex digest of the ``SOUL.md`` content we last wrote. NOT a guard against the
+    #: human (the file is always its own base — spec §4.1): it powers the write's
+    #: compare-and-swap and lets startup reconciliation NOTICE that the soul on disk
+    #: is not the one the being last wrote. ``None`` before the first soul write.
+    soul_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -277,6 +293,15 @@ class State:
                 data.get("unanswered_outbound_count", 0), "unanswered_outbound_count"
             ),
             processed_external_event_ids=_as_str_str_dict(data, "processed_external_event_ids", {}),
+            # The three Phase-4 genesis stamps are all opaque opt-str (the sha is
+            # never parsed as time; the two timestamps are opaque strings like
+            # affect_updated_at, not compared against the clock's aware ``now``
+            # here — the genesis flow parses them defensively), so opt-str only.
+            genesis_completed_at=_as_opt_str(
+                data.get("genesis_completed_at"), "genesis_completed_at"
+            ),
+            genesis_greeted_at=_as_opt_str(data.get("genesis_greeted_at"), "genesis_greeted_at"),
+            soul_sha=_as_opt_str(data.get("soul_sha"), "soul_sha"),
         )
 
 
