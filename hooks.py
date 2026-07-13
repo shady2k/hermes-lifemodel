@@ -27,8 +27,10 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
+from .adapters.soul_file import SoulConflict, SoulFile, SoulRejected
 from .composition import LifeModel
 from .core.affect import felt_word
 from .core.correlate import open_correlated_span
@@ -54,6 +56,7 @@ from .domain.objects import DesireState
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 from .state.brain_health import BrainHealth
+from .state.soul_revisions import record_revision
 
 #: Observer names — carried on the ``component`` metric label + keyed into
 #: :attr:`BrainHealth.last_observer_error` when a body raises (spec §4.3).
@@ -611,5 +614,86 @@ def make_check_in_tool(
             if metrics is not None:
                 metrics.inc(CHECK_IN_TOTAL, outcome="error")
             return json.dumps({"error": "check_in is unavailable right now"}, ensure_ascii=False)
+
+    return _handler
+
+
+def make_write_soul_tool(
+    build_lm: Callable[[], LifeModel],
+    *,
+    soul: SoulFile,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., str]:
+    """Return the ``write_soul`` tool handler — the act of birth (spec §6.5).
+
+    The being calls this ITSELF, when it knows enough to say who it is. There is no
+    ritual engine anywhere in this phase: the instruction to call it lives in the
+    tool's DESCRIPTION (``__init__.py``'s ``_WRITE_SOUL_DESCRIPTION``), which sits in
+    every prompt for free and never goes stale — nothing here has to inject a "you
+    should call write_soul now" nudge, or track whether one was shown.
+
+    Every write is validated FIRST (``core.soul_guard``, via
+    ``SoulFile.write``'s compare-and-swap) — an unvalidated write can blank the
+    being's identity outright, because the host re-scans ``SOUL.md`` on every read
+    and a matching phrase replaces the WHOLE file with a block notice. A refusal
+    (:class:`~lifemodel.adapters.soul_file.SoulRejected` /
+    :class:`~lifemodel.adapters.soul_file.SoulConflict`) is handed back TO THE BEING
+    with its reason so it rephrases in its own words; we never edit a soul on its
+    behalf (spec §4.3).
+
+    A successful write is kept forever (``state.soul_revisions.record_revision``) —
+    over dozens of later becoming-writes an LLM will quietly paraphrase hard-won
+    prose into oatmeal, and no single write looks broken; only an undo catches that.
+
+    **Birth happens once, but rewriting a soul does not.** ``genesis_completed_at``
+    is stamped only if it was not already set, so a SECOND call — Phase 5's becoming,
+    reusing this exact tool, or a human triggering a rewrite — still replaces the
+    soul and records a fresh revision, but keeps the ORIGINAL birth moment.
+
+    Honours the Hermes tool contract exactly like ``check_in``: a ``json.dumps``
+    STRING, errors as ``{"error": …}``, and it NEVER raises.
+    """
+
+    def _handler(args: Any = None, **_ignored: Any) -> str:
+        try:
+            text = args.get("soul") if isinstance(args, dict) else None
+            if not isinstance(text, str):
+                return json.dumps(
+                    {"error": "Pass the whole soul as a string in the 'soul' argument."}
+                )
+
+            lm = build_lm()
+            # The concrete store (SQLiteRuntimeStore) is always BOTH a StatePort and
+            # a MemoryPort (composition.py) — same duck-typed narrowing check_in uses.
+            # Refuse rather than write a soul with no recoverable history: unlike
+            # check_in's OPTIONAL desire read, the revision here is not decoration,
+            # it is the being's only undo (spec §4.2).
+            memory = lm.state if isinstance(lm.state, MemoryPort) else None
+            if memory is None:
+                _LOG.error("write_soul_no_memory_port")
+                return json.dumps({"error": "Could not write your soul; it is unchanged."})
+
+            now = lm.clock.now()
+            try:
+                new_sha = soul.write(text, expect_sha=soul.sha())
+            except (SoulRejected, SoulConflict) as exc:
+                return json.dumps({"error": str(exc)})
+
+            record_revision(memory, text=text, sha=new_sha, now=now, author="being")
+            state = lm.state.load()
+            born_at = state.genesis_completed_at or to_iso(now)
+            lm.state.commit(replace(state, genesis_completed_at=born_at, soul_sha=new_sha))
+            return json.dumps(
+                {
+                    "born": True,
+                    "note": (
+                        "Your soul is written. Tell them what you changed about yourself — "
+                        "it is theirs to know."
+                    ),
+                }
+            )
+        except Exception:  # Hermes tool contract: return {"error": …}, never raise
+            _LOG.exception("write_soul_tool_failed")
+            return json.dumps({"error": "Could not write your soul; it is unchanged."})
 
     return _handler
