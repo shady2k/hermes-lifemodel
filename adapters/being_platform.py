@@ -31,7 +31,8 @@ from typing import Any
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-from ..composition import build_lifemodel
+from ..composition import LifeModel, build_lifemodel
+from ..core.genesis import genesis_block, should_greet, stamp_greeted
 from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
@@ -59,6 +60,7 @@ from ..state.wiring import wire
 from .clock import SystemClock
 from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
+from .soul_file import SoulFile
 
 PLATFORM_NAME = "lifemodel"
 #: The adapter's tick cadence — the SAME baseline the (Hermes-free) staleness
@@ -80,12 +82,22 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         base_dir: Path,
         target: dict[str, str | None] | None,
         interval_sec: float = LOOP_INTERVAL_SEC,
+        soul: SoulFile | None = None,
+        default_soul_text: str = "",
     ) -> None:
         super().__init__(config, Platform(PLATFORM_NAME))
         self._base_dir = base_dir
         self._target: dict[str, str | None] = target or {}
         self._interval = interval_sec
         self._egress = ReachInEgress(runner_accessor=default_runner_accessor)
+        # The SAME SoulFile instance `register()` built for the genesis pre_llm_call
+        # injector (spec §6.4) — reused here (never a second instance) so the birth
+        # GREETING's "is this a stranger or a veteran?" read and the ritual's own read
+        # go through one writer-lock. `None` only in tests that construct the adapter
+        # directly without it (see `_prior_soul`): the greeting then degrades to the
+        # blank-page opening, never a crash.
+        self._soul = soul
+        self._default_soul_text = default_soul_text
         self._loop: SupervisedLoop | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -110,18 +122,68 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         """True when the (optional) metrics sampler failed to start (spec §4.3)."""
         return self._metrics_degraded
 
-    def _tick(self) -> None:
-        """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
-        # Resolve the owner's display timezone from Hermes at the boundary and inject
-        # it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
-        # None → server-local, so a timezone quirk never drops a tick (HLA §11).
-        lm = build_lifemodel(
+    def _build_lm(self) -> LifeModel:
+        """A fresh per-call graph, wired the SAME way for every caller (tick or greet).
+
+        Resolves the owner's display timezone from Hermes at the boundary and injects
+        it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
+        None → server-local, so a timezone quirk never drops a tick (HLA §11).
+        """
+        return build_lifemodel(
             base_dir=self._base_dir,
             display_tz=resolve_owner_tz(),
             trace_writer=self._trace_writer,
             event_ring=self._event_ring,
         )
-        proactive_tick(lm, self._egress, self._target)
+
+    def _tick(self) -> None:
+        """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
+        proactive_tick(self._build_lm(), self._egress, self._target)
+
+    def _prior_soul(self) -> str | None:
+        """The soul someone wrote before this being woke, or ``None`` for a blank page.
+
+        Mirrors :func:`lifemodel.hooks.make_genesis_injector`'s own read exactly (the
+        veteran branch, spec §6.4): read ``SOUL.md`` fresh (never cached — a human
+        hand-edit or the being's own ``write_soul`` can land between calls) and compare
+        against Hermes's pristine seed text. No ``soul`` wired (a bare-constructed
+        adapter, e.g. in tests) degrades to ``None`` — the blank-page opening — never
+        a crash.
+        """
+        if self._soul is None:
+            return None
+        current = self._soul.read()
+        if self._soul.is_pristine_default(default_text=self._default_soul_text):
+            return None
+        return current
+
+    def _greet_if_unborn(self) -> None:
+        """Reach out the moment an unborn being's brain first connects (spec §6.2).
+
+        The DECISIONS live in ``core.genesis`` (``should_greet`` / ``stamp_greeted``)
+        and are unit-tested there; this is only the wiring that carries them to the
+        channel. Reuses the SAME egress + target :func:`~lifemodel.core.proactive.
+        proactive_tick` delivers through — never a second egress. Bypasses the whole
+        proactive lifecycle on purpose: no desire, no ``pending_proactive_id`` — a
+        newborn's ``u`` is 0 and stays 0.
+
+        Called from :meth:`connect` under ``contextlib.suppress(Exception)``: an
+        ungreetable being (no channel configured yet, a transient egress error) is
+        NOT an outage.
+        """
+        lm = self._build_lm()
+        state = lm.state.load()
+        if not should_greet(state):
+            return
+        outcome = self._egress.reach_out(self._target, genesis_block(prior_soul=self._prior_soul()))
+        # Re-read: the egress call may have taken a while, and only the outcome — not
+        # this stale `state` snapshot — should decide what gets stamped.
+        after = stamp_greeted(lm.state.load(), outcome=outcome, now=lm.clock.now())
+        if after is None:
+            _LOG.info("genesis_greeting_undelivered outcome=%s", outcome.value)
+            return  # not stamped → retried on the next connect, once a channel exists
+        lm.state.commit(after)
+        _LOG.info("genesis_greeted")
 
     def _on_loop_death(self, exc: BaseException | None) -> None:
         """Convert an unexpected loop death into a gateway-visible fatal error.
@@ -211,6 +273,16 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # boot record (a clean (re)connect means we are healthy now, spec §4.3).
         health.mark_connected(at=to_iso(SystemClock().now()))
         _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
+
+        # --- Birth greeting (Phase 4, spec §6.2) -----------------------------
+        # connect() runs on EVERY gateway restart, and the SupervisedLoop reconnects
+        # after a loop death — so this MUST run past the brain-loop start, not before
+        # it (the loop is what makes the being alive to greet from). should_greet's
+        # own stamp guards the "once" part; this call is purely fail-soft plumbing:
+        # an ungreetable being (no channel yet) is not an outage.
+        with contextlib.suppress(Exception):
+            self._greet_if_unborn()
+
         return True
 
     async def disconnect(self) -> None:
@@ -302,12 +374,28 @@ def register_being_platform(
     *,
     base_dir: Path,
     target: dict[str, str | None] | None,
+    soul: SoulFile | None = None,
+    default_soul_text: str = "",
 ) -> None:
-    """Register the being as a gateway platform (call from ``register(ctx)``)."""
+    """Register the being as a gateway platform (call from ``register(ctx)``).
+
+    *soul* / *default_soul_text* are the SAME ``SoulFile`` instance and pristine-seed
+    text ``register()`` already resolved for the genesis pre_llm_call injector
+    (spec §6.4) — threaded through so the birth GREETING reads the veteran/stranger
+    branch through the one shared soul-file writer-lock, never a second instance.
+    Both default to unset for callers (chiefly tests) that don't wire a soul: the
+    greeting then degrades to the blank-page opening rather than crashing.
+    """
     ctx.register_platform(
         PLATFORM_NAME,
         label="Life Model",
-        adapter_factory=lambda cfg: BeingAdapter(cfg, base_dir=base_dir, target=target),
+        adapter_factory=lambda cfg: BeingAdapter(
+            cfg,
+            base_dir=base_dir,
+            target=target,
+            soul=soul,
+            default_soul_text=default_soul_text,
+        ),
         check_fn=make_check_fn(base_dir, get_brain_health(base_dir)),
         emoji="🫀",
     )

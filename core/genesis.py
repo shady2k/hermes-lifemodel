@@ -14,8 +14,10 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 
+from ..domain.egress import ReachOutcome
 from ..state.model import State
 from .affect import AffectBody, AffectParams, affect_target
+from .timeutil import to_iso
 
 
 def newborn(*, now: datetime, params: AffectParams, peak_hour_utc: float) -> State:
@@ -116,3 +118,37 @@ def should_launch(state: State, *, being_has_spoken: bool) -> bool:
     who wrote first (or who came back a week later to a context that no longer holds it).
     """
     return state.genesis_completed_at is None and not being_has_spoken
+
+
+def should_greet(state: State) -> bool:
+    """True when a being that has never said hello should say it now (spec §6.2).
+
+    An unborn being reaches out the MOMENT it starts. It does not wait for ``u`` to cross
+    ``θ``: the drive models a contact deficit inside an EXISTING relationship, and a
+    newborn has none — there is nobody to miss. Birth is not longing.
+
+    Guarded by BOTH ``genesis_completed_at`` and ``genesis_greeted_at`` (not just the
+    latter) so a being that skipped straight to a complete birth — the human handed it a
+    name and moved on, spec §6.3's "that is a complete birth" exit — never greets again
+    either; birth already said hello.
+    """
+    return state.genesis_completed_at is None and state.genesis_greeted_at is None
+
+
+def stamp_greeted(state: State, *, outcome: ReachOutcome, now: datetime) -> State | None:
+    """The state after a greeting attempt, or ``None`` when nothing should be persisted.
+
+    Stamped on CONFIRMED DELIVERY, never on the attempt. Stamping on the attempt would
+    silence forever the being of a human who installed the plugin before configuring a
+    channel: the greeting would fail, the stamp would land, and they would never be
+    greeted at all. An undelivered greeting simply retries on the next connect. (The same
+    lesson as lm-2gi: count on delivery, not on a verdict.)
+
+    Note what this does NOT touch: ``u``, ``pending_proactive_id``,
+    ``unanswered_outbound_count``. The greeting deliberately bypasses the proactive
+    lifecycle — faking a desire to borrow that machinery would pollute the contact model
+    with a longing that does not exist.
+    """
+    if not outcome.ok:
+        return None
+    return replace(state, genesis_greeted_at=to_iso(now))

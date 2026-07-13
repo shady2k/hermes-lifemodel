@@ -538,7 +538,17 @@ def register(ctx: Any) -> None:
     with wire("register_being_platform", required=True, health=health, logger=_LOG):
         from .adapters.being_platform import register_being_platform
 
-        register_being_platform(ctx, base_dir=sdir, target=resolve_home_origin())
+        # Same `soul` / `_default_soul_text()` the genesis pre_llm_call injector
+        # above already reads (spec §6.4) — threaded through so the birth GREETING
+        # (spec §6.2, connect()) uses the identical veteran/stranger read, never a
+        # second SoulFile instance.
+        register_being_platform(
+            ctx,
+            base_dir=sdir,
+            target=resolve_home_origin(),
+            soul=soul,
+            default_soul_text=_default_soul_text(),
+        )
 
     # All REQUIRED wiring for this process succeeded → wipe any stale durable
     # boot-failure record from a previously-broken deploy (a fixed deploy is healthy).
