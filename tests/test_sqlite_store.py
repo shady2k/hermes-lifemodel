@@ -782,6 +782,22 @@ def test_commit_tick_applies_mutations_in_list_order(tmp_path: Path) -> None:
     assert record.state == "archived"
 
 
+def test_decline_record_survives_a_gateway_restart(tmp_path: Path) -> None:
+    # A restart mid-backoff must not hand the being a clean slate: were the decline
+    # record lost on reload, every gateway restart would silently reset the growing
+    # backoff to r0 and the being would re-wake within the half-hour (lm-d59).
+    clock = FakeClock(BASE_TIME)
+    deep_in_backoff = State(
+        u=1.6, decline_count=4, declined_at=to_iso(BASE_TIME - timedelta(minutes=10))
+    )
+    SQLiteRuntimeStore(tmp_path, clock=clock).commit(deep_in_backoff)
+
+    reloaded = SQLiteRuntimeStore(tmp_path, clock=clock).load()  # a fresh process
+
+    assert reloaded.decline_count == deep_in_backoff.decline_count
+    assert reloaded.declined_at == deep_in_backoff.declined_at
+
+
 def test_commit_tick_state_only_matches_old_commit(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
