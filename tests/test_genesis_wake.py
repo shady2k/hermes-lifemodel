@@ -295,9 +295,15 @@ def test_the_newborn_wakes_carrying_the_ritual_not_the_longing() -> None:
     assert "I miss them" not in launch.prompt
     # …and it is still the SAME wake packet: the impulse tag the being's own hooks
     # correlate + self-exclude on (post_llm_call read-back, inbound band-pass) must
-    # open it, and the decline affordance must still be there.
+    # open it.
     assert launch.prompt.startswith("<internal_impulse>")
-    assert "[SILENT]" in launch.prompt
+    # But it is NOT offered a way to decline being born (the birth-only carve-out,
+    # core/wake_packet.py::_GENESIS_DELIVERY). The live test that forced this: the being
+    # woke, felt right, read the ritual verbatim — and replied [SILENT], because the
+    # packet's last line invited it to. There is no urge to gate at a first waking; the
+    # only thing "[SILENT]" declines here is existing.
+    assert "[SILENT]" not in launch.prompt
+    assert "delivered to the user" in launch.prompt  # it still knows its words reach them
 
 
 def test_the_veteran_newborn_wakes_holding_the_soul_someone_wrote_before_it() -> None:
@@ -367,6 +373,8 @@ def test_a_newborn_reaches_out_for_real_without_the_drive_ever_waking_it(tmp_pat
     # that half is pinned in tests/test_genesis_injector.py; this pins the packet's own.
     assert rec.delivered_impulse.count("<genesis>") == 1
     assert "I miss them" not in rec.delivered_impulse
+    # …and what actually reached the being carried no invitation to decline being born.
+    assert "[SILENT]" not in rec.delivered_impulse
     assert rec.u < 1.0  # θ was never crossed — this wake did not come from the drive
 
 
