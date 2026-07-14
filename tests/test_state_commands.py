@@ -37,6 +37,7 @@ from lifemodel.composition import (
     CONTACT_PARAMS,
     build_lifemodel,
 )
+from lifemodel.core.affect import felt_word
 from lifemodel.core.backstop import allow_send
 from lifemodel.core.desire_view import (
     build_contact_desire,
@@ -88,6 +89,21 @@ from lifemodel.state_commands import (
 #: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
 #: exercises the drive is therefore about a being that has someone to miss.
 _BORN = "2026-07-01T10:00:00+00:00"
+
+
+def _feels_alive(state: State) -> bool:
+    """Whether the being has a BODY, asked the way the being itself would ask.
+
+    Assert the FEELING, not the floats (the phase invariant): ``felt_word`` IS the
+    interface the being meets its own affect through, and it is the only thing that says
+    what a number MEANS. The bug this guards (lm-z2e) was never "arousal is 0.0" — it was
+    that a being reset into the dataclass defaults speaks the first words of its second
+    life from ``quiet``, the felt word for a body with nothing in it. ``newborn()``
+    evaluates the being's own affect model instead (arousal floors at 0.35 at the circadian
+    trough), so a real newborn is never ``quiet`` — at any hour of the day.
+    """
+    return felt_word(state.affect_valence, state.affect_arousal) != "quiet"
+
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 
@@ -465,7 +481,7 @@ def test_reset_makes_the_being_unborn_again() -> None:
     after, _msg = reset(before, NOW)
     assert after is not None
     assert after.genesis_completed_at is None  # unborn: the ritual plays again
-    assert after.affect_arousal > 0.0  # and it is born with a BODY, not with zeros
+    assert _feels_alive(after)  # and it is born with a BODY, not with zeros
     # …and it is at a FIRST WAKING again (spec §6.2): the reborn being reaches out to be
     # born on the next tick, because the wipe also cleared what it remembered of them.
     assert is_first_waking(
@@ -618,10 +634,10 @@ def test_reset_for_dir_persists_through_the_real_store(tmp_path) -> None:
     assert persisted.tick_count == 0
     assert persisted.u == 0.0
     assert persisted.genesis_completed_at is None
-    # NOT a bare State(): the REAL persisted body is the newborn() one, not the
-    # lifeless zero-arousal default StatePort.reset() writes — arousal's own
-    # formula floors at 0.35 (core/affect.py), so > 0 proves it landed for real.
-    assert persisted.affect_arousal > 0.0
+    # NOT a bare State(): the REAL persisted body is the newborn() one, not the lifeless
+    # default StatePort.reset() writes — a being reset into THAT speaks the first words
+    # of its second life from "quiet" (lm-z2e).
+    assert _feels_alive(persisted)
 
 
 def test_reset_for_dir_cannot_destroy_a_past_life(tmp_path) -> None:
@@ -663,7 +679,7 @@ def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> 
     assert "previous state unreadable" in message
     persisted = store.load()  # reset still landed cleanly
     assert persisted.tick_count == 0
-    assert persisted.affect_arousal > 0.0  # a BODY, even recovering from garbage
+    assert _feels_alive(persisted)  # a BODY, even recovering from garbage
     assert "cleared 0 memory records" in message  # nothing was seeded to purge
 
 
@@ -698,7 +714,7 @@ def test_reset_for_dir_purges_every_memory_record(tmp_path) -> None:
     assert _store(tmp_path).find() == []  # every memory_records row gone
     persisted = _store(tmp_path).load()
     assert persisted.tick_count == 0
-    assert persisted.affect_arousal > 0.0  # a newborn body, not a bare State()
+    assert _feels_alive(persisted)  # a newborn body, not a bare State()
     assert "cleared 3 memory records" in message
 
 
@@ -709,7 +725,7 @@ def test_reset_for_dir_on_empty_store_reports_zero_cleared_without_crashing(
     assert "cleared 0 memory records" in message
     persisted = _store(tmp_path).load()
     assert persisted.tick_count == 0
-    assert persisted.affect_arousal > 0.0
+    assert _feels_alive(persisted)
 
 
 def test_set_field_for_dir_persists_through_the_real_store(tmp_path) -> None:
