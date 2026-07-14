@@ -362,7 +362,10 @@ def test_a_newborn_reaches_out_for_real_without_the_drive_ever_waking_it(tmp_pat
     assert rec.launched
     assert rec.outcome is ReachOutcome.DELIVERED
     assert rec.delivered_impulse is not None
-    assert "<genesis>" in rec.delivered_impulse
+    # ONE block (M2): the packet is the single source of the ritual on this entrance. The
+    # pre_llm_call injector fires for this injected turn too and must not add a second —
+    # that half is pinned in tests/test_genesis_injector.py; this pins the packet's own.
+    assert rec.delivered_impulse.count("<genesis>") == 1
     assert "I miss them" not in rec.delivered_impulse
     assert rec.u < 1.0  # θ was never crossed — this wake did not come from the drive
 
