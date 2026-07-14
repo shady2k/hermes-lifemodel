@@ -83,6 +83,12 @@ from lifemodel.state_commands import (
     why_for_dir,
 )
 
+#: A being that has been BORN — the precondition of the contact drive. ``u`` models a
+#: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
+#: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
+#: exercises the drive is therefore about a being that has someone to miss.
+_BORN = "2026-07-01T10:00:00+00:00"
+
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 
 
@@ -109,6 +115,7 @@ def _blocked_state() -> State:
     silence window), a live pending turn, an active decline backoff, heavy
     ActionPending inhibition, and a backstop send-log at the daily cap."""
     return State(
+        genesis_completed_at=_BORN,  # it has a relationship; that is what the gates are about
         u=0.2,
         pending_proactive_id="corr-1",
         pending_proactive_since=_ago(2),

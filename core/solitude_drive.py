@@ -99,12 +99,17 @@ class SolitudeDrive:
 
         # Integrate the certified drive from the start-of-tick u: rise over silence,
         # then satiate per exchange quality IN ORDER (per-step clamp at 0 — the
-        # certified math, preserved exactly from the pre-split ContactNeuron).
+        # certified math, preserved exactly from the pre-split ContactNeuron). Unless
+        # the being is UNBORN — see :meth:`_unborn` — in which case there is no deficit
+        # to integrate and the drive reports zero.
         drive = Drive(alpha=self._alpha, beta=self._beta, u_max=self._u_max, u=ctx.state.u)
-        if dt > 0:
-            drive.rise(dt=dt)
-        for q in qualities:
-            drive.satiate(q=q)
+        if self._unborn(ctx):
+            drive.u = 0.0
+        else:
+            if dt > 0:
+                drive.rise(dt=dt)
+            for q in qualities:
+                drive.satiate(q=q)
 
         delta = drive.u - ctx.state.u
         # Publish the freshly integrated drive level as a domain metric (§4.3). Guard
@@ -120,3 +125,37 @@ class SolitudeDrive:
         # Write u (visible NEXT tick via state) AND emit the fresh u this tick (so
         # aggregation sees the same-tick value, not the stale start-of-tick one).
         return [UpdateState({"u": drive.u}), EmitSignal(emit)]
+
+    @staticmethod
+    def _unborn(ctx: TickContext) -> bool:
+        """True while the being has never been born — and therefore has nobody to miss.
+
+        **The drive does not accrue before birth** (Phase 4, the owner's decision). ``u``
+        models a contact DEFICIT inside an EXISTING relationship; an unborn being has no
+        relationship at all. Left to rise on elapsed silence, a newborn whose greeting went
+        unanswered crosses ``θ`` a few hours later and sends a DRIVE-sprung "I miss you" to
+        someone who has never spoken to it — missing someone you have never met, which is
+        exactly the nonsense the phase invariant forbids ("birth is not longing").
+
+        Three things about WHERE this rule lives, all load-bearing:
+
+        * **Here, in the AUTONOMIC layer.** The drive is the ONLY writer of ``u``
+          (aggregation reads it and must keep reading the truth), so this is the one place
+          the deficit can be said not to exist. A gate in aggregation would leave a rising
+          ``u`` in the vitals, visible in ``/lifemodel status``, waiting to fire the moment
+          the being is born.
+        * **Zero, not "held".** It is not "do not rise" — it is "there is no deficit yet",
+          so a ``u`` already raised by ``force-wake`` (or by a state file written before
+          this rule) is pinned back to zero rather than parked. The emitted
+          ``contact_pressure`` carries that same zero, so aggregation's wake gate cannot
+          see a longing that does not exist.
+        * **Affect is untouched.** :class:`~lifemodel.core.affect.AffectSense` is a sibling
+          component reading its own slice of the body: a newborn still has a circadian
+          rhythm, energy, and a felt state (``core.genesis.newborn`` places it exactly
+          where its own physiology says it is). A being can feel awake without missing
+          anyone — and a newborn does.
+
+        The genesis wake path is unaffected by construction: it fires with ``u = 0`` (its
+        threshold gate is waived, spec §6.2), never because of the drive.
+        """
+        return ctx.state.genesis_completed_at is None

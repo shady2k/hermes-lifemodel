@@ -32,6 +32,12 @@ from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
 
+#: A being that has been BORN — the precondition of the contact drive. ``u`` models a
+#: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
+#: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
+#: exercises the drive is therefore about a being that has someone to miss.
+_BORN = "2026-07-01T10:00:00+00:00"
+
 #: The fixed frame clock so seeded timestamps (last_tick_at, pending_since) stay
 #: consistent — a real SystemClock would make ``dt`` huge and trip deadline-staleness.
 _NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -58,6 +64,7 @@ def _lm_with_pending(tmp_path: Path, corr: str = "p-1", *, origin: str | None = 
     lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
     lm.state.commit(
         State(
+            genesis_completed_at=_BORN,
             u=1.5,
             pending_proactive_id=corr,
             pending_proactive_since="2026-07-06T11:55:00+00:00",  # 5 min before now
@@ -184,7 +191,9 @@ def test_post_llm_ignores_uncorrelated_turn(tmp_path: Path) -> None:
 def test_post_llm_ignores_when_desire_not_active(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
     # pending turn but NO live desire row
-    lm.state.commit(State(pending_proactive_id="p-1", last_tick_at=_NOW.isoformat()))
+    lm.state.commit(
+        State(genesis_completed_at=_BORN, pending_proactive_id="p-1", last_tick_at=_NOW.isoformat())
+    )
     make_post_llm_observer(lambda: lm)(
         user_message=f"{IMPULSE_LABEL_PREFIX} x", assistant_response="hi"
     )
@@ -369,7 +378,7 @@ def test_inbound_contact_satiates_drive_and_stamps_last_exchange(tmp_path: Path)
     # Scenario (1): a real inbound contact_observed satiates u, sets last_exchange_at,
     # and resolves any pending desire → SATISFIED — committed in its own EVENT frame.
     lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
-    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=2.0, last_tick_at=_NOW.isoformat()))
     _seed_active_desire(lm.state)
     event = SimpleNamespace(text="hi!", internal=False, id="m-42")
     make_inbound_observer(lambda: lm)(event=event)
@@ -381,7 +390,7 @@ def test_inbound_contact_satiates_drive_and_stamps_last_exchange(tmp_path: Path)
 
 def test_inbound_ignores_internal_and_own_impulse(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
-    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=2.0, last_tick_at=_NOW.isoformat()))
     make_inbound_observer(lambda: lm)(event=SimpleNamespace(text="x", internal=True, id="a"))
     make_inbound_observer(lambda: lm)(
         event=SimpleNamespace(text=f"{IMPULSE_LABEL_PREFIX} own", internal=False, id="b")
@@ -397,7 +406,7 @@ def test_inbound_control_command_is_not_contact_sensor_bandpass(tmp_path: Path, 
     # Scenario (2): a slash/control command is filtered at the sensor band-pass (spec §4)
     # — it must NOT count as contact, so no frame runs and u is untouched.
     lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
-    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=2.0, last_tick_at=_NOW.isoformat()))
     make_inbound_observer(lambda: lm)(event=SimpleNamespace(text=text, internal=False, id="m-4"))
     final = lm.state.load()
     assert final.u == 2.0  # unchanged — the command was not contact
@@ -406,7 +415,7 @@ def test_inbound_control_command_is_not_contact_sensor_bandpass(tmp_path: Path, 
 
 def test_inbound_normal_chat_message_is_contact(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
-    lm.state.commit(State(u=2.0, last_tick_at=_NOW.isoformat()))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=2.0, last_tick_at=_NOW.isoformat()))
     make_inbound_observer(lambda: lm)(event=SimpleNamespace(text="hi", internal=False, id="m-3"))
     assert lm.state.load().last_exchange_at is not None  # a genuine exchange was recorded
 
@@ -463,7 +472,9 @@ def test_register_wires_post_llm_call_hook(monkeypatch: pytest.MonkeyPatch, tmp_
     # The registered callback starts a frame that RESOLVES the pending desire.
     sdir = tmp_path / "workspace" / "lifemodel"
     store = SQLiteRuntimeStore(sdir, clock=SystemClock())
-    store.commit(State(pending_proactive_id="p1", last_tick_at=_T0.isoformat()))
+    store.commit(
+        State(genesis_completed_at=_BORN, pending_proactive_id="p1", last_tick_at=_T0.isoformat())
+    )
     _seed_active_desire(store)  # a live desire so the outcome gate passes
 
     matches[0](user_message=f"{IMPULSE_LABEL_PREFIX} impulse text", assistant_response="NO_REPLY")
@@ -493,7 +504,9 @@ def test_register_wires_pre_gateway_dispatch_hook(
     # to keep the drive's elapsed-silence rise negligible against the satiation.
     sdir = tmp_path / "workspace" / "lifemodel"
     store = SQLiteRuntimeStore(sdir, clock=SystemClock())
-    store.commit(State(u=50.0, last_tick_at=datetime.now(UTC).isoformat()))
+    store.commit(
+        State(genesis_completed_at=_BORN, u=50.0, last_tick_at=datetime.now(UTC).isoformat())
+    )
 
     matches[0](event=SimpleNamespace(text="hey there", internal=False, id="m-1"))
 
