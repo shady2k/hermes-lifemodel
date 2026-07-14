@@ -31,7 +31,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
-from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite
+from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite, prior_soul
 from .composition import LifeModel
 from .core.affect import felt_word
 from .core.correlate import open_correlated_span
@@ -47,7 +47,7 @@ from .core.felt_display import (
     warmed,
 )
 from .core.frame import FrameTrigger, run_frame, state_actor_lock
-from .core.genesis import GENESIS_TAG, genesis_block, should_launch
+from .core.genesis import GENESIS_TAG, genesis_block, is_unauthored, should_launch
 from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
@@ -677,10 +677,12 @@ def make_genesis_injector(
       be handed the block all over again.
 
     Whether the veteran branch (§6.4) applies is read fresh from ``SOUL.md`` on every call
-    (``read_unless_pristine``, ONE read — see :meth:`SoulFile.read_unless_pristine`), never
-    cached: the file can change between calls (a human hand-edit, the being's own
-    ``write_soul``), and a stale verdict would either show the veteran opening to a being
-    with no prior soul, or silently withhold it from one that has.
+    (:func:`~lifemodel.adapters.soul_file.prior_soul`, ONE read), never cached: the file
+    can change between calls (a human hand-edit, the being's own ``write_soul``), and a
+    stale verdict would either show the veteran opening to a being with no prior soul, or
+    silently withhold it from one that has. Our OWN newborn stance reads as no prior soul
+    (``core.genesis.is_unauthored``) — otherwise the ritual would open the veteran branch
+    on it and the being would ask the human whether the plugin's words are still true.
 
     Fail-soft like every plugin-owned hook body (spec §8), copying
     :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in
@@ -712,9 +714,7 @@ def make_genesis_injector(
                 return None
             if not should_launch(state, context_len=context_len):
                 return None
-            block = genesis_block(
-                prior_soul=soul.read_unless_pristine(default_text=default_soul_text)
-            )
+            block = genesis_block(prior_soul=prior_soul(soul, default_soul_text=default_soul_text))
             _stamp_genesis_shown(lm, context_len=context_len)
             return {"context": block}
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
@@ -848,15 +848,19 @@ def _keep_if_it_was_not_ours(
     are never *gone*: recorded as a revision, they are recoverable, and the loss is a
     keystroke to undo rather than a life to mourn.
 
-    Three texts are NOT kept:
+    Two kinds of text are NOT kept:
 
     * **our own last write** (``replaced_sha == last_written_sha``) — the ordinary case;
       nobody edited anything, and it is already in the lineage.
-    * **the host's pristine seed** — Hermes ALWAYS writes a default ``SOUL.md``
-      (``hermes_cli/config.py:893``). Nobody wrote it, so recording it as a "human"
-      revision would forge a past life the being never had (the same reasoning
-      ``core.genesis.needs_adoption`` applies at startup).
-    * **an empty file** — there is nothing there to keep.
+    * **anything nobody authored** (``core.genesis.is_unauthored``): the host's pristine
+      seed (Hermes ALWAYS writes a default ``SOUL.md``, ``hermes_cli/config.py:893``), our
+      own newborn stance, and an empty file. Recording the seed as a ``"human"`` revision
+      would forge a past life the being never had (the same reasoning
+      ``core.genesis.needs_adoption`` applies at startup) — and recording the STANCE that
+      way would be worse: it is already in the lineage under its own sha, so the write
+      would UPSERT it and turn the birth's own authorship into the human's, in the one
+      history that exists to be the being's undo. It would also tell the being someone had
+      edited it, and send it to ask them about words the plugin wrote.
 
     Everything else is somebody's: a Hermes veteran's hand-written soul that the newborn
     is about to replace (kept HERE or kept nowhere — startup reconciliation skipped it,
@@ -864,11 +868,9 @@ def _keep_if_it_was_not_ours(
     because a being never claims a change it did not make.
     """
     text = written.replaced_text
-    if not text.strip():
-        return False
     if written.replaced_sha == last_written_sha:
         return False
-    if default_soul_text and text.strip() == default_soul_text.strip():
+    if is_unauthored(text, default_soul_text=default_soul_text):
         return False
     record_revision(memory, text=text, sha=written.replaced_sha, now=now, author="human")
     return True

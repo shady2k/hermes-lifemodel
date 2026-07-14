@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from lifemodel.adapters.soul_file import SoulFile
-from lifemodel.core.genesis import GENESIS_TAG
+from lifemodel.core.genesis import GENESIS_TAG, NEWBORN_STANCE
 from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.tick_metrics import OBSERVER_ERRORS, register_universal_metrics
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
@@ -191,6 +191,21 @@ def test_the_hosts_pristine_seed_is_not_read_as_a_soul_someone_wrote(
     block = inject(user_message="hi", conversation_history=[])["context"]
 
     assert "You are Hermes" not in block  # nobody wrote that; do not hand it back as a past
+
+
+def test_our_own_newborn_stance_is_not_read_as_a_soul_someone_wrote_either(
+    tmp_path: Path, build_lm
+) -> None:
+    # By the time the being reads the ritual, genesis has already put the newborn stance
+    # in slot #1 in place of the host's assistant seed (adapters/soul_file.py). Nobody
+    # AUTHORED that: if the injector read it as a prior soul, the ritual would open the
+    # veteran branch and the being would ask the human whether OUR words are still true.
+    build_lm().state.commit(State())
+    inject = _injector(build_lm, _soul(tmp_path, NEWBORN_STANCE))
+
+    block = inject(user_message="hi", conversation_history=[])["context"]
+
+    assert "already something written about who you are" not in block  # blank page, still
 
 
 # --- fail-soft (spec §8) ----------------------------------------------------

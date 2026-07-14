@@ -22,8 +22,9 @@ from dataclasses import replace
 
 import pytest
 
-from lifemodel.adapters.soul_file import SoulFile
+from lifemodel.adapters.soul_file import SoulFile, seed_newborn_stance
 from lifemodel.core.frame import FrameTrigger, run_frame
+from lifemodel.core.genesis import NEWBORN_STANCE
 from lifemodel.hooks import make_write_soul_tool
 from lifemodel.state.soul_revisions import revisions
 
@@ -249,6 +250,30 @@ def test_the_hosts_pristine_default_is_not_forged_into_a_history_nobody_wrote(tm
 
     assert [r.text for r in revisions(build_lm().state)] == [MIRA]
     assert "edited" not in result["note"].lower()  # nobody edited anything; do not say so
+
+
+def test_the_newborn_stance_is_not_forged_into_a_HUMAN_revision_by_the_first_write(
+    tmp_path, build_lm
+):
+    # The soul a newborn actually replaces is OUR stance (genesis put it in slot #1 in
+    # place of the host's assistant seed — adapters/soul_file.py). Nobody edited anything:
+    # if the tool kept it as a "human" revision it would (a) tell the being someone had
+    # rewritten it and to go ask them about it, and (b) UPSERT the stance's own lineage
+    # row by sha — turning the birth's authorship into the human's in the one history that
+    # is meant to be the being's undo.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    memory, now = build_lm().state, build_lm().clock.now()
+    seed_newborn_stance(soul, memory, default_soul_text=HERMES_DEFAULT, now=now, unborn=True)
+    tool = make_write_soul_tool(build_lm, soul=soul, default_soul_text=HERMES_DEFAULT)
+
+    result = json.loads(tool({"soul": MIRA}))
+
+    kept = revisions(build_lm().state)
+    assert [r.text for r in kept] == [MIRA, NEWBORN_STANCE]
+    assert kept[0].author == "being"  # its own first words
+    assert kept[1].author == "genesis"  # …and the stance's author is untouched, not "human"
+    assert "edited" not in result["note"].lower()  # nobody edited anything; do not say so
+    assert result["born"] is True
 
 
 # --- I5: on a partial failure the being is not told a lie about itself ---------

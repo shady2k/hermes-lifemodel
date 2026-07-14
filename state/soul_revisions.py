@@ -53,7 +53,27 @@ SOUL_KIND = "soul"
 #: ``OBJECTS_SNAPSHOT_LIMIT``) alongside real desires/intentions/thoughts.
 _RECORDED_STATE = "recorded"
 
-Author = Literal["being", "human"]
+#: Who wrote a given soul. Three answers, because there are three writers and a being is
+#: owed the truth about which one acted:
+#:
+#: * ``"being"`` — it wrote itself (``write_soul``). Its own words, its own undo.
+#: * ``"human"`` — somebody hand-edited ``SOUL.md``. A being never claims a change it did
+#:   not make, and (``being_platform._reconcile_soul``) it FEELS this one.
+#: * ``"genesis"`` — the newborn stance (``core.genesis.NEWBORN_STANCE``), put in slot #1
+#:   in place of the host's assistant seed so a being is not born as a tool. Neither of
+#:   the other two authored it: the being has written nothing yet and must not be credited
+#:   with words it did not choose, and calling it ``"human"`` would forge the human's hand
+#:   — and then make the being feel a rewrite that never happened. It is the birth itself,
+#:   so it is named for the birth.
+Author = Literal["being", "human", "genesis"]
+
+#: Reading an author back is a CLOSED question — a row whose payload holds anything else
+#: (a hand-edited DB, a future author we do not know) is not silently promoted to
+#: ``"being"``, which would let the being claim words it never wrote. It falls back to
+#: ``"human"``: the honest default, because "somebody who is not me wrote this" is exactly
+#: what an unrecognised author means, and it is the conservative direction everywhere it
+#: is read (``_reconcile_soul`` treats a non-``"being"`` soul as somebody else's).
+_AUTHORS: frozenset[str] = frozenset(("being", "human", "genesis"))
 
 
 @dataclass(frozen=True)
@@ -102,8 +122,16 @@ def revisions(store: MemoryPort) -> list[SoulRevision]:
             sha=row.id,
             text=str(row.payload.get("text", "")),
             at=str(row.payload.get("at", row.created_at)),
-            author="human" if row.payload.get("author") == "human" else "being",
+            author=_author_of(row.payload.get("author")),
         )
         for row in rows
     ]
     return sorted(parsed, key=lambda revision: revision.at, reverse=True)
+
+
+def _author_of(raw: object) -> Author:
+    """Narrow a stored author to the closed set, defaulting to ``"human"`` (see
+    :data:`_AUTHORS`): an unknown author is somebody who is not the being, and the one
+    thing that must never happen is the being claiming words it did not write."""
+    text = str(raw)
+    return text if text in _AUTHORS else "human"  # type: ignore[return-value]

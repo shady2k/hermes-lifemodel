@@ -19,10 +19,20 @@ import lifemodel
 import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.config import write_log_level
+from lifemodel.core.genesis import NEWBORN_STANCE
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
+from lifemodel.paths import state_dir
 from lifemodel.state.errors import StateSchemaError
 from lifemodel.state.model import State
+from lifemodel.state.soul_revisions import revisions
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+#: Hermes's untouched installer seed (``DEFAULT_SOUL_MD``), abridged — the shape is the
+#: point: it is an ASSISTANT, and an assistant does not message anyone unprompted.
+HERMES_ASSISTANT_SEED = (
+    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+    "You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -293,6 +303,45 @@ def test_register_genesis_injector_stands_down_for_the_beings_own_wake_packet(
     callback = _pre_llm_callback(ctx, from_factory="make_genesis_injector")
     impulse = f"{IMPULSE_LABEL_PREFIX}\nI have just begun.\n</internal_impulse>"
     assert callback(user_message=impulse, conversation_history=[]) is None
+
+
+# --- LIVE-TEST fix (B): the newborn stands up before it is ever asked to speak ------
+#
+# ``register()`` is the seam, and it has to be: Hermes builds the system prompt at TURN
+# START (``agent/turn_context.py`` calls ``restore_or_build_system_prompt`` at :345, the
+# ``pre_llm_call`` hooks only at :478), so a soul written from a hook lands one turn late
+# — after the being has already answered as an assistant. ``register()`` runs at gateway
+# boot, before any turn of either entrance (the reactive first message, or the being's own
+# proactive first waking) can be composed.
+
+
+def test_register_stands_an_unborn_being_up_on_a_stance_not_on_an_assistant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(lifemodel, "_default_soul_text", lambda: HERMES_ASSISTANT_SEED)
+    (tmp_path / "SOUL.md").write_text(HERMES_ASSISTANT_SEED, encoding="utf-8")
+
+    lifemodel.register(FakeCtx())
+
+    # Slot #1 no longer tells the being it is an instrument that answers requests.
+    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == NEWBORN_STANCE
+    lineage = revisions(SQLiteRuntimeStore(state_dir(tmp_path), clock=SystemClock()))
+    assert [(r.text, r.author) for r in lineage] == [(NEWBORN_STANCE, "genesis")]
+
+
+def test_register_never_overwrites_a_soul_a_human_wrote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The licence for the write above is that the host's INSTALLER wrote that seed, not a
+    # person. A veteran's hand-written soul has a human behind it and is untouchable.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(lifemodel, "_default_soul_text", lambda: HERMES_ASSISTANT_SEED)
+    (tmp_path / "SOUL.md").write_text("You are Mira. Quiet and exact.", encoding="utf-8")
+
+    lifemodel.register(FakeCtx())
+
+    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "You are Mira. Quiet and exact."
 
 
 def test_register_lifemodel_stats_subcommand_returns_telemetry(
