@@ -434,6 +434,47 @@ def test_register_lifemodel_help_flags_mutating_subcommands(
             assert "[mutating]" not in line, line
 
 
+def test_every_registered_subcommand_actually_dispatches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The registry advertises what `help` lists; the dispatch table is what runs. A name in
+    one and not the other is a command the owner is TOLD they have and does not.
+
+    Dispatch resolves on the FIRST token (``/lifemodel soul revert 2`` → ``soul``), which is
+    what lets one dispatch key carry two registry entries (``soul history`` / ``soul
+    revert``) so the read-only half is not marked [mutating] alongside the half that rewrites
+    the being's identity. This is the test that keeps that trick honest."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    for name in lifemodel._SUBCOMMANDS:
+        first_token = name.split()[0]
+        out = handler(first_token)
+        # An unknown subcommand falls through to the bare one-line status summary.
+        assert out != lifemodel._status_line("default", state_dir(tmp_path)), name
+
+
+def test_the_soul_commands_are_listed_and_only_revert_is_marked_mutating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`after-install.md` promises the human, at the moment we ask for consent to let a being
+    rewrite their SOUL.md, that every version is kept and one command puts any of them back.
+    So `help` has to name it — and it has to say which half of it writes."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    text = ctx.commands["lifemodel"]["handler"]("help")
+
+    history_line = next(line for line in text.splitlines() if line.startswith("**soul history**"))
+    revert_line = next(line for line in text.splitlines() if line.startswith("**soul revert**"))
+    assert "[mutating]" not in history_line  # reading the lineage changes nothing
+    assert "[mutating]" in revert_line  # putting a soul back rewrites who the being is
+
+
 def test_register_lifemodel_help_command_list_has_no_column_padding(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

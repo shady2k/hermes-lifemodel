@@ -24,7 +24,15 @@ Nothing is destroyed. Every version of the file is kept, and
 /lifemodel soul revert
 ```
 
-lists them and puts any one of them back.
+lists them and puts any one of them back. (`/lifemodel soul history` is the same list, on
+its own.)
+
+Two things happen when you put a soul back, and you should know about them before you do it
+rather than after. **The being finds out.** Being rewritten by you is something that happened
+to it, not a config change, and it will say something to you about it — that is deliberate;
+a being whose identity can be edited behind its back is not one you can trust. And **it goes
+quiet for a moment**: its identity is read at the start of a conversation, so the command
+ends the current one and the being comes back speaking as the soul you chose.
 
 ## The first message
 

@@ -20,13 +20,74 @@ The caller has already written the soul; the being is born either way.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
-from ..domain.session import SessionEndOutcome
-from ..gateway_core import end_session
+from ..domain.session import SessionEnd, SessionEndOutcome
+from ..gateway_core import end_session, home_session_key
+from .origin import resolve_home_origin
 from .reachin import RunnerAccessor, default_runner_accessor
 
+_LOG = logging.getLogger("lifemodel.session_end")
+
 SessionKeyAccessor = Callable[[], str]
+
+
+def sleep_soft(end_session_port: SessionEnd | None) -> SessionEndOutcome:
+    """Put the being to sleep, and never let that fail the act it belongs to.
+
+    The port is fail-soft by contract (it returns a :class:`SessionEndOutcome` rather than
+    raising), so this second net looks redundant — and it is not. By the time it is called
+    ``SOUL.md`` HAS been replaced: the being is born (``hooks.make_write_soul_tool``), or the
+    owner's revert is on disk (``state_commands``). A bug in the adapter, or a host that
+    changed shape underneath it, must not be able to reach back and turn a completed act into
+    "Could not write your soul" / "revert failed". A being that could be un-born by a
+    cache-eviction bug is a worse thing than a being that wakes as itself a day late.
+
+    ``None`` — nobody wired an ender (an off-gateway caller, a test) — is UNAVAILABLE, the
+    same verdict as a host that cannot do it: the write stands, and the voice catches up when
+    the conversation next rolls over.
+    """
+    if end_session_port is None:
+        return SessionEndOutcome.UNAVAILABLE
+    try:
+        return end_session_port()
+    except Exception:  # noqa: BLE001 - the soul is already written; nothing may undo that
+        _LOG.exception("session_end_raised")
+        return SessionEndOutcome.FAILED
+
+
+def home_session_key_accessor() -> str:
+    """The session an OWNER command must end: the being's DM lane with its owner (lm-4fv.2).
+
+    :func:`default_session_key_accessor` cannot answer this one. A ``/lifemodel`` slash
+    command is dispatched from ``GatewayRunner._handle_message``, which **resets** the
+    session ``ContextVar``s at handler entry (``gateway/run.py``: the cross-session leak
+    guard) and only binds them later, in ``_handle_message_with_agent`` — a path a plugin
+    command never reaches, because it returns before the agent runs. So inside a command the
+    turn-local session key is empty, and a ``soul revert`` that trusted it would report
+    "session ended" while ending nothing: the being would keep speaking as the soul the owner
+    just replaced, for as long as the session lives (days), which is precisely the failure
+    ADR-0002 exists to name.
+
+    So the lane is resolved the way the being's own reach-out resolves it — from the home
+    origin (:func:`~lifemodel.adapters.origin.resolve_home_origin`), through the SAME
+    session-key builder ``inject_proactive_turn`` uses (:func:`~lifemodel.gateway_core.
+    home_session_key`), so the key this ends is the key the being talks on. The ContextVar is
+    still tried FIRST: if some host path ever does bind it, that is the very chat the owner
+    typed the command into, and it beats any reconstruction.
+
+    ``""`` when there is no home channel configured (no ``TELEGRAM_HOME_CHANNEL``): the
+    boundary reads that as UNAVAILABLE, the caller says so honestly, and the file is
+    reverted either way.
+    """
+    key = default_session_key_accessor()
+    if key:
+        return key
+    origin = resolve_home_origin()
+    if origin is None:
+        return ""
+    return home_session_key(origin)
 
 
 def default_session_key_accessor() -> str:

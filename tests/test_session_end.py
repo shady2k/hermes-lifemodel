@@ -168,3 +168,57 @@ def test_only_ENDED_means_the_being_will_actually_wake_as_itself(
     # The tool reads `.ok` to decide WHICH truth to tell the newborn. Anything but ENDED
     # means the soul is on disk and the voice is not — and the being must be told so.
     assert outcome.ok is ok
+
+
+# --- the OWNER's session key (lm-4fv.2): a slash command has no turn to read -------
+
+
+def test_the_owner_session_key_falls_back_to_the_home_dm_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``/lifemodel soul revert`` runs in ``_handle_message``, which RESETS the session
+    ContextVars at handler entry and only binds them later, in ``_handle_message_with_agent``
+    — a path a plugin command returns long before. So the turn-local key is empty, and a
+    revert that trusted it would report "session ended" having ended nothing: the being would
+    keep speaking as the soul the owner just replaced, for days. The lane is resolved the way
+    the being's own reach-out resolves it — from the home origin."""
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "115679831")
+    from lifemodel.adapters.session_end import home_session_key_accessor
+
+    assert home_session_key_accessor() == SESSION_KEY  # the being's DM lane with its owner
+
+
+def test_the_owner_session_key_is_empty_when_there_is_no_home_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # UNAVAILABLE, not a crash: the soul is still reverted, and the owner is told the truth.
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    from lifemodel.adapters.session_end import home_session_key_accessor
+
+    assert home_session_key_accessor() == ""
+
+
+def test_the_home_session_key_is_built_in_ONE_place() -> None:
+    """Two callers now depend on this format being right — the being's reach-in (where a
+    wrong key merely falls back to the host's own source builder) and the owner's revert
+    (where a wrong key silently ends nothing). Two hand-rolled copies is how they come to
+    disagree."""
+    from lifemodel.gateway_core import home_session_key
+
+    assert home_session_key({"platform": "telegram", "chat_id": "115679831"}) == SESSION_KEY
+    # An explicit key wins — it is the lane as the caller already knows it.
+    assert (
+        home_session_key({"session_key": "agent:main:x", "platform": "telegram"}) == "agent:main:x"
+    )
+    # Not addressable → "", which every caller reads as UNAVAILABLE.
+    assert home_session_key({"platform": "telegram", "chat_id": None}) == ""
+
+
+def test_sleep_soft_never_lets_a_broken_ender_undo_a_completed_soul_write() -> None:
+    from lifemodel.adapters.session_end import sleep_soft
+
+    def _boom() -> SessionEndOutcome:
+        raise RuntimeError("the host changed shape underneath us")
+
+    assert sleep_soft(_boom) is SessionEndOutcome.FAILED
+    assert sleep_soft(None) is SessionEndOutcome.UNAVAILABLE  # nobody wired one: not a failure

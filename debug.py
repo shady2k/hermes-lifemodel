@@ -118,13 +118,16 @@ def _resolve_tz() -> tzinfo | None:
         return None
 
 
-def _local(iso: str | None) -> str:
+def local_time(iso: str | None) -> str:
     """Render a stored UTC ISO timestamp in the owner's local timezone.
 
-    The single conversion point for every timestamp field the dump shows
-    (last_contact, last_exchange, pending_since, ...): Hermes-configured zone
-    when :func:`_resolve_tz` cleanly provides one, else system-local — and
-    trimmed to whole seconds so the dump stays scannable.
+    The single conversion point for every timestamp field an OWNER-FACING view shows
+    (this dump's last_contact/last_exchange/pending_since, and ``/lifemodel soul
+    history``'s lineage): Hermes-configured zone when :func:`_resolve_tz` cleanly
+    provides one, else system-local — and trimmed to whole seconds so the view stays
+    scannable. A raw stored instant (``2026-07-14T13:29:00.551071+00:00``) is precise and
+    unreadable, and a listing whose entire job is to be compared AT A GLANCE cannot afford
+    six digits of microseconds in every row.
     """
     if iso is None:
         return "n/a"
@@ -211,7 +214,7 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
 
     pending = str(r.pending)
     if r.pending and r.pending_since:
-        pending += f" (since {_local(r.pending_since)})"
+        pending += f" (since {local_time(r.pending_since)})"
 
     lines.append("**PHYSIOLOGY**")
     lines += _metrics(
@@ -235,13 +238,13 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
             ("target", f"v {_n(r.affect_target_valence)} / a {_n(r.affect_target_arousal)}"),
             ("tugging v", _contribs(r.affect_valence_contributions)),
             ("tugging a", _contribs(r.affect_arousal_contributions)),
-            ("updated", _local(r.affect_updated_at)),
+            ("updated", local_time(r.affect_updated_at)),
             # The reactive show (lm-ukc.4): the felt word last surfaced AMBIENTLY
             # into ordinary talk + when, so the owner sees whether/when the mood
             # proves itself (calibration, spec §9). "never shown" until it first does.
             (
                 "display",
-                _display_line(r.affect_display_last_word, _local(r.affect_display_last_at)),
+                _display_line(r.affect_display_last_word, local_time(r.affect_display_last_at)),
             ),
         ]
     )
@@ -276,8 +279,8 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
             ("intention", r.intention_status),
             ("why", r.contact_chain),
             ("pending_turn", pending),
-            ("last_contact", _local(r.last_contact_at)),
-            ("last_exchange", _local(r.last_exchange_at)),
+            ("last_contact", local_time(r.last_contact_at)),
+            ("last_exchange", local_time(r.last_exchange_at)),
         ]
     )
     lines.append("")
@@ -338,7 +341,7 @@ def render_debug_dump(*, readings: Readings, last_wake: LastWakeOutcome | None =
         lines += _metrics(
             [
                 ("outcome", last_wake.outcome),
-                ("when", _local(last_wake.ts)),
+                ("when", local_time(last_wake.ts)),
                 ("trace", f"`{last_wake.trace_id}`  (→ /lifemodel trace {last_wake.trace_id})"),
             ]
         )

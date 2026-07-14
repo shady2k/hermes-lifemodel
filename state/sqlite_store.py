@@ -120,7 +120,7 @@ from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
 from .errors import StateCorruptError, StateSchemaError, StateSerializationError
 from .model import SCHEMA_VERSION, State
-from .soul_revisions import SOUL_KIND
+from .soul_revisions import SOUL_KINDS
 
 _DB_FILENAME = "lifemodel.sqlite"
 _BUSY_TIMEOUT_MS = 5_000
@@ -935,7 +935,7 @@ class SQLiteRuntimeStore:
         TRUE factory reset (bead lm-7lx: ``/lifemodel reset`` must also drop
         every thought/desire/intention/user_model row, not just the vitals).
 
-        **``kind="soul"`` is carved out, and that carve-out is the point.** Soul
+        **The soul kinds are carved out, and that carve-out is the point.** Soul
         revisions ride ``memory_records`` (``state/soul_revisions.py`` — a revision is a
         plain ``kind="soul"`` record keyed by its content sha), so the unconditional
         ``DELETE FROM`` this used to be took the entire lineage with it. Reset unbirths
@@ -947,6 +947,11 @@ class SQLiteRuntimeStore:
         ``SOUL.md`` itself for the same reason (``state_commands.reset``), and this makes
         that refusal mean something.
 
+        ``kind="soul_revert"`` (the record of the times a human PUT a soul back, lm-4fv.2)
+        is kept for the same reason, one step further out: it is not the being's memory at
+        all, it is the human's own history of acting on this file. A factory wipe unbirths a
+        being; it does not get to edit what its owner did.
+
         Touches ONLY ``memory_records`` — ``runtime_state``, ``store_meta``, and
         ``schema_migrations`` are untouched. Counts the rows it will delete before
         deleting them (rather than trusting the ``DELETE``'s own ``cursor.rowcount``,
@@ -955,12 +960,13 @@ class SQLiteRuntimeStore:
         "cleared N memory records" never counts a soul it did not clear. One
         atomic ``with conn:`` transaction, matching every other write here.
         """
+        kept = ",".join("?" for _ in SOUL_KINDS)
         with closing(self._connect()) as conn, conn:
             (count,) = conn.execute(
-                "SELECT COUNT(*) FROM memory_records WHERE kind != ?", (SOUL_KIND,)
+                f"SELECT COUNT(*) FROM memory_records WHERE kind NOT IN ({kept})", SOUL_KINDS
             ).fetchone()
-            conn.execute("DELETE FROM memory_records WHERE kind != ?", (SOUL_KIND,))
-        _LOG.info("memory_records_purged count=%s kept_kind=%s", count, SOUL_KIND)
+            conn.execute(f"DELETE FROM memory_records WHERE kind NOT IN ({kept})", SOUL_KINDS)
+        _LOG.info("memory_records_purged count=%s kept_kinds=%s", count, ",".join(SOUL_KINDS))
         return int(count)
 
     # ---- PressureSensorPort ---------------------------------------------------

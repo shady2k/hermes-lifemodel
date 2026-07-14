@@ -47,6 +47,33 @@ _REQUIRED_RUNNER_ATTRS = (
 _REQUIRED_SESSION_END_ATTRS = ("session_store", "_evict_cached_agent")
 
 
+def home_session_key(target: Mapping[str, str | None]) -> str:
+    """The session key for a target lane, or ``""`` when the lane is not addressable.
+
+    INTERIM (spec §8): the host's DM session-key format
+    (``agent:main:<platform>:<chat_type>:<chat_id>``, ``gateway/session.py:854``) is
+    reconstructed here rather than asked for — the upstream primitive that would resolve it
+    generically does not exist yet. It lives in ONE function because two callers now depend
+    on it being right: :func:`inject_proactive_turn` (which passes it to the host's own
+    source builder, so a wrong key merely falls back) and the owner's ``soul revert``
+    (:func:`~lifemodel.adapters.session_end.home_session_key_accessor`, where a wrong key
+    silently ends nothing and leaves the being speaking as the soul that was just replaced).
+    Two hand-rolled copies of a format string is how those two quietly come to disagree.
+
+    An explicit ``session_key`` on *target* wins — it is the lane as the caller already knows
+    it, not a reconstruction of it.
+    """
+    session_key = target.get("session_key")
+    if session_key:
+        return session_key
+    platform = target.get("platform")
+    chat_id = target.get("chat_id")
+    if not platform or not chat_id:
+        return ""
+    chat_type = target.get("chat_type") or "dm"
+    return f"agent:main:{platform}:{chat_type}:{chat_id}"
+
+
 def reachin_available(runner: Any | None) -> bool:
     """True only if *runner* exposes every attribute inject_proactive_turn needs."""
     if runner is None:
@@ -185,17 +212,14 @@ def inject_proactive_turn(
         # reliable path the spike proved); also pass chat_type so the fallback path
         # in _build_process_event_source can still build a SessionSource when the
         # session isn't in the store (it returns None without a chat_type).
-        # INTERIM: the DM session_key format ("agent:main:<platform>:<chat_type>:<chat_id>")
-        # and the "dm" default are hardcoded for the home DM lane — the upstream
-        # primitive will resolve this generically (spec §8).
+        # INTERIM: the DM session_key format and the "dm" default are reconstructed for the
+        # home DM lane by `home_session_key` (see there) — the upstream primitive will
+        # resolve this generically (spec §8).
         platform = target.get("platform")
         chat_id = target.get("chat_id")
         chat_type = target.get("chat_type") or "dm"
-        session_key = target.get("session_key")
-        if not session_key and platform and chat_id:
-            session_key = f"agent:main:{platform}:{chat_type}:{chat_id}"
         evt = {
-            "session_key": session_key,
+            "session_key": home_session_key(target) or None,
             "platform": platform,
             "chat_id": chat_id,
             "chat_type": chat_type,

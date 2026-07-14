@@ -19,7 +19,7 @@ from typing import Any, NamedTuple
 
 from .adapters.clock import SystemClock
 from .adapters.origin import resolve_home_origin
-from .adapters.session_end import GatewaySessionEnd
+from .adapters.session_end import GatewaySessionEnd, home_session_key_accessor
 from .adapters.soul_file import SoulFile, seed_newborn_stance
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
@@ -49,6 +49,7 @@ from .state_commands import (
     satiate_for_dir,
     set_field_for_dir,
     set_user_model_prefs_for_dir,
+    soul_for_dir,
     think_for_dir,
     why_for_dir,
 )
@@ -200,6 +201,22 @@ _SUBCOMMANDS: dict[str, _Subcommand] = {
         "(debug|info|warning|error|critical); persists across restarts.",
         mutating=True,
     ),
+    # Two entries, one dispatch key ("soul" — see `dispatch` below, which resolves on the
+    # FIRST token). They are listed separately because they are not the same KIND of act and
+    # the owner must be able to see that at a glance: reading the lineage is free, and
+    # putting a soul back rewrites who the being is. Marking one `soul` entry [mutating]
+    # would mark the read-only half as dangerous; leaving it unmarked would hide the
+    # dangerous half. The registry is what `help`/the bare view/args_hint all render, so
+    # this is the only place the distinction has to be made.
+    "soul history": _Subcommand(
+        "soul history — every soul the being has ever had: when, whose hand wrote it, "
+        "and which one it is standing on now (read-only)."
+    ),
+    "soul revert": _Subcommand(
+        "soul revert <n> — put revision <n> back in SOUL.md (validated, kept in the "
+        "history, and the being is told). Bare `soul revert` lists them.",
+        mutating=True,
+    ),
 }
 
 
@@ -306,9 +323,23 @@ def register(ctx: Any) -> None:
         desired_level = logging.INFO
     apply_log_level(desired_level)
 
+    # One SoulFile instance, shared by every path below that touches SOUL.md (the owner's
+    # `/lifemodel soul` commands, the genesis injector's read, write_soul's write) —
+    # home/SOUL.md is the plugin's ONLY touchpoint on the identity file
+    # (adapters/soul_file.py), reached via the SAME `home` this register() already resolved
+    # from get_hermes_home(), never a fresh env-var read. Built ONCE (not per call) so its
+    # write-lock is actually shared across every call this process handles — which is what
+    # keeps an owner's revert and the being's own write_soul from interleaving mid-write.
+    #
+    # Built HERE, above the command, and not beside the wiring that used to own it: the
+    # command is registered FIRST on purpose (a diagnostic lever the owner keeps even when
+    # the brain wiring fails to boot), and a `/lifemodel soul history` on a half-booted
+    # plugin must still be able to answer.
+    soul = SoulFile(home / "SOUL.md")
+
     def lifemodel_command(raw_args: str = "") -> str:
         """`/lifemodel` — 'status' (default), 'debug', 'help', or a mutating
-        subcommand (nudge/force-wake/satiate/reset/set — see _SUBCOMMANDS)."""
+        subcommand (nudge/force-wake/satiate/reset/set/soul — see _SUBCOMMANDS)."""
         parts = raw_args.strip().split(None, 1)
         sub = parts[0] if parts else ""
         rest = parts[1] if len(parts) > 1 else ""
@@ -340,6 +371,25 @@ def register(ctx: Any) -> None:
             "user-model": lambda: set_user_model_prefs_for_dir(sdir, rest),
             "think": lambda: think_for_dir(sdir, rest),
             "loglevel": lambda: set_log_level_for_dir(sdir, rest),
+            # The soul's lineage + the undo (spec §4.2 — the whole justification for
+            # letting the being own SOUL.md whole). Two registry entries ("soul history",
+            # "soul revert"), ONE dispatch key: `sub` is the first token, and the verb after
+            # it is parsed by soul_for_dir. The Hermes-shaped arguments are resolved right
+            # here at the boundary, exactly as they are for the write_soul tool below —
+            # which SOUL.md, the host's pristine seed (so a revert can tell "somebody's
+            # words" from "nobody's"), and how to end the being's session so it actually
+            # comes back as the soul that was put back (ADR-0002). The session key is the
+            # owner's DM lane, NOT the turn-local one: a slash command runs before Hermes
+            # binds the session ContextVars (see home_session_key_accessor).
+            "soul": lambda: soul_for_dir(
+                sdir,
+                rest,
+                soul=soul,
+                default_soul_text=_default_soul_text(),
+                end_session=GatewaySessionEnd(
+                    session_key_accessor=home_session_key_accessor,
+                ),
+            ),
         }
         handler = dispatch.get(sub)
         if handler is not None:
@@ -475,14 +525,6 @@ def register(ctx: Any) -> None:
             handler=make_check_in_tool(lambda: build_lifemodel(base_dir=sdir), metrics=metrics),
             description=_CHECK_IN_DESCRIPTION,
         )
-
-    # One SoulFile instance, shared by every wiring below that touches SOUL.md (the
-    # genesis injector's read, write_soul's write) — home/SOUL.md is the plugin's ONLY
-    # touchpoint on the identity file (adapters/soul_file.py), reached via the SAME
-    # `home` this register() already resolved from get_hermes_home(), never a fresh
-    # env-var read. Built ONCE (not per call) so its write-lock is actually shared
-    # across every call this process handles.
-    soul = SoulFile(home / "SOUL.md")
 
     # --- The newborn stance (Phase 4 genesis) — OPTIONAL/DEGRADED -------------
     # SOUL.md is system-prompt slot #1 — the identity slot, the most authoritative text in

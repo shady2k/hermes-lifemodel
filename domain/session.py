@@ -20,6 +20,7 @@ which of the two happened without catching anything. Pure stdlib; imports nothin
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
 
 
@@ -38,3 +39,15 @@ class SessionEndOutcome(Enum):
         Anything else means the soul is on disk and the voice is not, and the being has to
         be TOLD that, because it is the only party who would otherwise notice."""
         return self is SessionEndOutcome.ENDED
+
+
+#: The session-end port (:class:`~lifemodel.adapters.session_end.GatewaySessionEnd`), as
+#: its callers see it: a zero-argument callable that puts the being to sleep. A plain
+#: ``Callable`` and not a ``Protocol`` — there is one method and no arguments, and the ports
+#: layer's own rule is "pragmatism, not ceremony; we do not wrap everything".
+#:
+#: It lives HERE, beside the outcome it returns, because there are two callers now and they
+#: sit on opposite sides of the plugin: the being writing its own soul (``hooks``) and the
+#: owner putting one back (``state_commands``). Both need the same seam; neither should have
+#: to import the other to name it.
+SessionEnd = Callable[[], SessionEndOutcome]

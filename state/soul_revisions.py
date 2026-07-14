@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from ..core.genesis import ReplacedSoul, classify_replacement
 from ..core.timeutil import to_iso
 from ..domain.memory import MemoryDraft
 from ..ports.memory import MemoryPort
@@ -43,6 +44,36 @@ from ..ports.memory import MemoryPort
 #: A plain (non-BDI) memory-record kind — see the module docstring for why this
 #: does not need an entry in ``domain.objects.registry.KindRegistry``.
 SOUL_KIND = "soul"
+
+#: The append-only record of the times a soul was put BACK by hand (``/lifemodel soul
+#: revert``, lm-4fv.2). A separate kind, and not a revision, for a reason the lineage's
+#: own key forces:
+#:
+#: **A revert restores a text that is already in the lineage, and the lineage is keyed by
+#: content sha.** So "record the revert as a new revision" would not append anything — it
+#: would UPSERT the very row it restores (``record_revision``'s ``(kind, id)`` key), moving
+#: that revision to the top of the lineage and rewriting its author to whoever pressed the
+#: button. A being's own earlier soul would be relabelled as the human's, in the one history
+#: that exists to be its undo, and ``_reconcile_soul``/``classify_replacement`` — which both
+#: read this lineage as *the only witness to who wrote a given text* — would then be reading
+#: a forged one. That is review M5's lie with the sign flipped. **A stored revision is never
+#: mutated.**
+#:
+#: But a revert IS an act, and an act that leaves no trace is an erasure. The current-soul
+#: marker in ``/lifemodel soul history`` cannot carry it: the moment the being writes again,
+#: the marker moves and every sign that a human once had to undo it is gone. And *that* is
+#: precisely the signal the owner needs — one revert is a bad day; three reverts of the same
+#: being is erosion, which is the failure this whole feature exists to catch. So the act is
+#: recorded where it can be seen, beside the versions it acted on, and it is appended, never
+#: merged into them.
+SOUL_REVERT_KIND = "soul_revert"
+
+#: The kinds a factory ``reset`` must NOT purge (``sqlite_store.purge_memory_records``).
+#: A past life's soul is the one thing a wipe may not destroy (spec §4.2's mandatory undo),
+#: and the record of the times a HUMAN put a soul back is of the same nature: it is the
+#: human's own history, not the being's memory, and a reset unbirths a being — it does not
+#: get to edit what its owner did.
+SOUL_KINDS: tuple[str, ...] = (SOUL_KIND, SOUL_REVERT_KIND)
 
 #: Every revision lands in this state; nothing ever transitions it — a revision
 #: is immutable history, not a live object with a lifecycle. Deliberately NOT one
@@ -140,6 +171,132 @@ def revisions(store: MemoryPort) -> list[SoulRevision]:
         for row in rows
     ]
     return sorted(parsed, key=lambda revision: revision.at, reverse=True)
+
+
+@dataclass(frozen=True)
+class SoulRevert:
+    """One time a soul was put back by hand — an act, not a version.
+
+    *sha* is the revision that was restored; *replaced_sha* is what it was written over.
+    Both are content shas, so either can be resolved back to a :class:`SoulRevision` (or
+    honestly reported as a text nobody kept, which is itself worth seeing).
+    """
+
+    sha: str
+    replaced_sha: str
+    at: str
+
+
+def record_revert(store: MemoryPort, *, sha: str, replaced_sha: str, now: datetime) -> None:
+    """Record that somebody put revision *sha* back over *replaced_sha* (see
+    :data:`SOUL_REVERT_KIND` for why this is not a revision).
+
+    The row id is ``<at>:<sha>`` — the instant plus the target — so reverts APPEND (two
+    reverts to the same soul on different days are two acts and read as two), while the
+    one case that would be a duplicate rather than an act (the same revert recorded twice
+    in the same instant) idempotently upserts, exactly as ``put``'s ``(kind, id)`` key
+    already promises everywhere else in this module.
+    """
+    at = to_iso(now)
+    store.put(
+        MemoryDraft(
+            kind=SOUL_REVERT_KIND,
+            id=f"{at}:{sha}",
+            state=_RECORDED_STATE,
+            payload={"sha": sha, "replaced_sha": replaced_sha, "at": at},
+            source="soul",
+        )
+    )
+
+
+def reverts(store: MemoryPort) -> list[SoulRevert]:
+    """Every time a soul was put back by hand, newest first (by the recorded ``at``).
+
+    Sorted on the payload's own ``at`` for the same reason :func:`revisions` is — see the
+    module docstring: the caller's instant is the one that happened, the store's stamp is
+    an artifact of when the row was written.
+    """
+    rows = store.find(kind=SOUL_REVERT_KIND)
+    parsed = [
+        SoulRevert(
+            sha=str(row.payload.get("sha", "")),
+            replaced_sha=str(row.payload.get("replaced_sha", "")),
+            at=str(row.payload.get("at", row.created_at)),
+        )
+        for row in rows
+    ]
+    return sorted(parsed, key=lambda revert: revert.at, reverse=True)
+
+
+def keep_replaced_soul(
+    memory: MemoryPort,
+    *,
+    new_sha: str,
+    replaced_text: str,
+    replaced_sha: str,
+    last_written_sha: str | None,
+    unborn: bool,
+    default_soul_text: str,
+    now: datetime,
+) -> ReplacedSoul:
+    """Keep the soul a write just REPLACED, if someone else wrote it — and say whose it was.
+
+    Every soul write goes over the top of whatever is on disk, and the writer cannot see a
+    save that landed underneath it: the being's view of its soul is system-prompt slot #1,
+    assembled at TURN START (``adapters/soul_file.py`` — there is no honest fence for that),
+    and an OWNER reverting is likewise acting on a listing they read a minute ago. What
+    there IS an honest way to do is make sure the replaced words are never *gone*: recorded
+    as a revision, they are recoverable, and the loss is a keystroke to undo rather than a
+    life to mourn. Both writers (``hooks.make_write_soul_tool``, ``state_commands``'s
+    ``soul revert``) therefore call THIS — one rule, one place, so the two can never come to
+    disagree about whose words they just wrote over.
+
+    The verdict itself is ``core.genesis.classify_replacement`` — pure, and answerable ONLY
+    from what can be established. This function is the part that must touch the store: it
+    asks the LINEAGE who wrote the replaced text (the only witness there is; a sha it
+    already carries was recorded by whoever wrote it, and :func:`record_revision` upserts by
+    sha, so re-recording it would overwrite that author — review M5, the same failure
+    ``being_platform._reconcile_soul`` closed from the other direction), and it keeps
+    anything that would otherwise be kept nowhere.
+
+    What is NOT recorded, and why:
+
+    * **the same document** (``replaced_sha == new_sha``) and **our own last write** —
+      nothing was replaced, and it is already in the lineage.
+    * **anything nobody authored** (``core.genesis.is_unauthored``): the host's pristine
+      seed (Hermes ALWAYS writes a default ``SOUL.md``, ``hermes_cli/config.py:893``), our
+      own newborn stance, and an empty file. Recording the seed would forge a past life the
+      being never had — and recording the STANCE would be worse: it is already in the
+      lineage under its own sha, so the write would UPSERT it and turn the birth's own
+      authorship into the human's, in the one history that exists to be the being's undo.
+    * **a past life** — the lineage already holds it, under its true author (``"being"``).
+      Writing it again as the human's is precisely the lie the live being told its owner.
+
+    What IS recorded: a human's edit (``"human"`` — establishable: the file changed after a
+    soul we wrote), and authored words that were simply there when the being woke
+    (``"unknown"`` — a veteran's own ``SOUL.md``, or a past life whose history is gone;
+    kept HERE or kept nowhere, since startup reconciliation had no ``soul_sha`` to differ
+    from). A being never claims a change it did not make — and never pins one on a human
+    who did not make it either.
+    """
+    recorded = {rev.sha: rev.author for rev in revisions(memory)}.get(replaced_sha)
+    verdict = classify_replacement(
+        new_sha=new_sha,
+        replaced_sha=replaced_sha,
+        replaced_text=replaced_text,
+        last_written_sha=last_written_sha,
+        recorded_author=recorded,
+        unborn=unborn,
+        default_soul_text=default_soul_text,
+    )
+    if verdict is ReplacedSoul.A_HUMAN_EDIT:
+        author: Author = "human"
+    elif verdict is ReplacedSoul.SOMEONE_UNKNOWN:
+        author = "unknown"
+    else:  # NOBODY (nothing was replaced) and A_PAST_LIFE (already in the lineage, as a being's)
+        return verdict
+    record_revision(memory, text=replaced_text, sha=replaced_sha, now=now, author=author)
+    return verdict
 
 
 def _author_of(raw: object) -> Author:

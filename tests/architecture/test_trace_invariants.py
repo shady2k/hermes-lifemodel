@@ -47,7 +47,13 @@ _EXCLUDE_PARTS = {"tests", "testing", "__pycache__", "docs", ".git", ".beads", "
 #: failure is observed before any span exists, spec §4.3/MAJOR-4), the pure time helper
 #: (spec §3/lm-fib.10 — ``core/timeutil.to_display`` is fail-open on a bad stored row and
 #: logs a WARNING; a leaf format/parse utility called with no ctx, it is NOT a tick
-#: component and can hold no ``SpanBoundLogger``), and the adapters
+#: component and can hold no ``SpanBoundLogger``), the OWNER-COMMAND surface
+#: (``state_commands.py`` — a ``/lifemodel`` command is typed by a human OUTSIDE any tick or
+#: frame, so there is no ambient span to bind to; it logs exactly one thing, and it is the
+#: one thing that must never be swallowed: ``soul revert`` replaced ``SOUL.md`` and the
+#: bookkeeping after it failed), the session-end boundary (``adapters/session_end.py`` — the
+#: same no-ambient-span adapter case, logging a host that changed shape underneath a
+#: completed soul write), and the adapters
 #: that have no ambient span. Everything else — every ``core/`` tick component above
 #: all — must log ONLY through a ``SpanBoundLogger``.
 _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
@@ -56,9 +62,11 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "__init__.py",
         "gateway_core.py",
         "hooks.py",
+        "state_commands.py",
         "core/timeutil.py",
         "adapters/being_platform.py",
         "adapters/delivery.py",
+        "adapters/session_end.py",
         "state/sqlite_store.py",
         "state/trace_store.py",
         "state/metrics_store.py",

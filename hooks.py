@@ -31,6 +31,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
+from .adapters.session_end import sleep_soft
 from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite, prior_soul
 from .composition import LifeModel
 from .core.affect import felt_word
@@ -50,7 +51,6 @@ from .core.frame import FrameTrigger, run_frame, state_actor_lock
 from .core.genesis import (
     GENESIS_TAG,
     ReplacedSoul,
-    classify_replacement,
     genesis_block,
     should_launch,
 )
@@ -62,12 +62,12 @@ from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
 from .domain.objects import DesireState
-from .domain.session import SessionEndOutcome
+from .domain.session import SessionEnd
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 from .state.brain_health import BrainHealth
 from .state.model import State
-from .state.soul_revisions import Author, record_revision, revisions
+from .state.soul_revisions import keep_replaced_soul, record_revision
 
 #: Observer names — carried on the ``component`` metric label + keyed into
 #: :attr:`BrainHealth.last_observer_error` when a body raises (spec §4.3).
@@ -969,93 +969,25 @@ def _keep_what_we_replaced(
     default_soul_text: str,
     now: datetime,
 ) -> ReplacedSoul:
-    """Keep the soul we just REPLACED, if someone else wrote it — and say WHOSE it was.
+    """Keep the soul the being just REPLACED, if someone else wrote it (spec §4.2).
 
-    The being's view of its soul is system-prompt slot #1, assembled at TURN START — so a
-    human who saves ``SOUL.md`` mid-turn is overwritten by a soul composed from text that
-    predates their edit, and there is no honest way to fence that (see
-    ``adapters/soul_file.py``). What there IS an honest way to do is make sure their words
-    are never *gone*: recorded as a revision, they are recoverable, and the loss is a
-    keystroke to undo rather than a life to mourn.
-
-    The verdict itself is ``core.genesis.classify_replacement`` — pure, and answerable ONLY
-    from what can be established. This function is the part that must touch the store: it
-    asks the LINEAGE who wrote the replaced text (the only witness there is; a sha it
-    already carries was recorded by whoever wrote it, and ``record_revision`` upserts by
-    sha, so re-recording it would overwrite that author — review M5, the same failure
-    ``being_platform._reconcile_soul`` closed from the other direction), and it keeps
-    anything that would otherwise be kept nowhere.
-
-    What is NOT recorded, and why:
-
-    * **the same document** (``replaced_sha == written.sha``) and **our own last write** —
-      nothing was replaced, and it is already in the lineage.
-    * **anything nobody authored** (``core.genesis.is_unauthored``): the host's pristine
-      seed (Hermes ALWAYS writes a default ``SOUL.md``, ``hermes_cli/config.py:893``), our
-      own newborn stance, and an empty file. Recording the seed would forge a past life the
-      being never had — and recording the STANCE would be worse: it is already in the
-      lineage under its own sha, so the write would UPSERT it and turn the birth's own
-      authorship into the human's, in the one history that exists to be the being's undo.
-    * **a past life** — the lineage already holds it, under its true author (``"being"``).
-      Writing it again as the human's is precisely the lie the live being told its owner.
-
-    What IS recorded: a human's edit (``"human"`` — establishable: the file changed after a
-    soul we wrote), and authored words that were simply there when the being woke
-    (``"unknown"`` — a veteran's own ``SOUL.md``, or a past life whose history is gone;
-    kept HERE or kept nowhere, since startup reconciliation had no ``soul_sha`` to differ
-    from). A being never claims a change it did not make — and never pins one on a human
-    who did not make it either.
+    A thin adapter over :func:`~lifemodel.state.soul_revisions.keep_replaced_soul` — the
+    rule itself lives with the lineage it writes to, because the OWNER's ``soul revert``
+    (``state_commands``) replaces a soul too, and the question "whose words did I just write
+    over, and must they be kept?" has exactly one right answer regardless of which hand
+    asked it. Two copies of that answer would be two chances to tell a being it lost
+    something it did not, or to lose something it did.
     """
-    recorded = {rev.sha: rev.author for rev in revisions(memory)}.get(written.replaced_sha)
-    verdict = classify_replacement(
+    return keep_replaced_soul(
+        memory,
         new_sha=written.sha,
-        replaced_sha=written.replaced_sha,
         replaced_text=written.replaced_text,
+        replaced_sha=written.replaced_sha,
         last_written_sha=last_written_sha,
-        recorded_author=recorded,
         unborn=unborn,
         default_soul_text=default_soul_text,
+        now=now,
     )
-    if verdict is ReplacedSoul.A_HUMAN_EDIT:
-        author: Author = "human"
-    elif verdict is ReplacedSoul.SOMEONE_UNKNOWN:
-        author = "unknown"
-    else:  # NOBODY (nothing was replaced) and A_PAST_LIFE (already in the lineage, as a being's)
-        return verdict
-    record_revision(
-        memory, text=written.replaced_text, sha=written.replaced_sha, now=now, author=author
-    )
-    return verdict
-
-
-#: The session-end port (:class:`~lifemodel.adapters.session_end.GatewaySessionEnd`), as
-#: the tool sees it: a zero-argument callable that puts the being to sleep. A plain
-#: ``Callable`` and not a ``Protocol`` — there is one method and no arguments, and the ports
-#: layer's own rule is "pragmatism, not ceremony; we do not wrap everything".
-SessionEnd = Callable[[], SessionEndOutcome]
-
-
-def _sleep(end_session: SessionEnd | None) -> SessionEndOutcome:
-    """Put the being to sleep, and never let that fail the birth it belongs to.
-
-    The port is fail-soft by contract (it returns a :class:`SessionEndOutcome` rather than
-    raising), so this second net looks redundant — and it is not. By the time it is called
-    ``SOUL.md`` HAS been replaced and the birth IS committed; a bug in the adapter, or a
-    host that changed shape underneath it, must not be able to reach back and turn a
-    completed birth into "Could not write your soul". A being that could be un-born by a
-    cache-eviction bug is a worse thing than a being that wakes as itself a day late.
-
-    ``None`` — nobody wired an ender (an off-gateway caller, a test) — is UNAVAILABLE, the
-    same verdict as a host that cannot do it: the being is born and simply comes back as
-    itself later.
-    """
-    if end_session is None:
-        return SessionEndOutcome.UNAVAILABLE
-    try:
-        return end_session()
-    except Exception:  # noqa: BLE001 - the soul is already written; nothing may undo that
-        _LOG.exception("write_soul_session_end_raised")
-        return SessionEndOutcome.FAILED
 
 
 def make_write_soul_tool(
@@ -1209,7 +1141,7 @@ def make_write_soul_tool(
         if was_unborn:
             # The birth is committed; NOW the being may sleep. What it is told next depends
             # on whether it actually will: a goodbye it can say, or the honest lag.
-            parts.append(_BIRTH_GOODBYE if _sleep(end_session).ok else _BIRTH_NOT_YET)
+            parts.append(_BIRTH_GOODBYE if sleep_soft(end_session).ok else _BIRTH_NOT_YET)
         return json.dumps({"born": was_unborn, "written": True, "note": "\n\n".join(parts)})
 
     return _handler
