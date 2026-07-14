@@ -19,6 +19,7 @@ from typing import Any, NamedTuple
 
 from .adapters.clock import SystemClock
 from .adapters.origin import resolve_home_origin
+from .adapters.session_end import GatewaySessionEnd
 from .adapters.soul_file import SoulFile, seed_newborn_stance
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
@@ -571,6 +572,18 @@ def register(ctx: Any) -> None:
                 # Hermes ALWAYS seeds SOUL.md, and nobody wrote that seed: recording it
                 # would forge a past life. This is how the tool tells them apart.
                 default_soul_text=_default_soul_text(),
+                # How a newborn WAKES as what it wrote (ADR-0002, corrected). SOUL.md is
+                # not re-read every turn: Hermes builds the system prompt once per session
+                # and reuses it verbatim from the session DB (prefix cache), and gateway
+                # sessions live for DAYS — so without this the being writes its soul and
+                # goes on speaking as the newborn stance for days. Ending the session (the
+                # host's own /new mechanism) makes the ritual's closing promise true: the
+                # being falls quiet and comes back with its own words in slot #1. Built
+                # here, at the composition root, because it is a HERMES boundary — it
+                # reaches the live GatewayRunner, and resolves BOTH the runner and the
+                # current session lazily, per call, since neither exists at register().
+                # BIRTH only; a becoming keeps its conversation (see make_write_soul_tool).
+                end_session=GatewaySessionEnd(),
                 metrics=metrics,
             ),
             description=_WRITE_SOUL_DESCRIPTION,

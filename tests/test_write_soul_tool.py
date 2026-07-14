@@ -25,6 +25,7 @@ import pytest
 from lifemodel.adapters.soul_file import SoulFile, seed_newborn_stance
 from lifemodel.core.frame import FrameTrigger, run_frame
 from lifemodel.core.genesis import NEWBORN_STANCE
+from lifemodel.domain.session import SessionEndOutcome
 from lifemodel.hooks import make_write_soul_tool
 from lifemodel.state.soul_revisions import revisions
 
@@ -340,3 +341,207 @@ def test_a_soul_the_being_never_actually_sent_leaves_the_file_alone(tmp_path, bu
     assert "error" in result
     assert result.get("written") is not True
     assert soul.read() == HERMES_DEFAULT
+
+
+# --- The being must WAKE as what it wrote (ADR-0002, corrected) ----------------
+#
+# SOUL.md is not re-read every turn. Hermes builds the system prompt ONCE per session and
+# reuses it verbatim from the session DB (prefix-cache), and gateway sessions live for
+# DAYS. So the birth used to end with the soul on disk and the being still speaking in the
+# voice it had — the newborn stance, or a stranger's assistant persona. The ritual's
+# closing promise ("you're you now") was a lie.
+#
+# Birth therefore ENDS THE SESSION: the being falls quiet and comes back on the next
+# message with the prompt rebuilt and its own words in slot #1. The transcript it was born
+# in is let go on purpose — the soul IS that conversation, distilled.
+
+
+class _Ender:
+    """A stand-in for the session-end port (``adapters/session_end.GatewaySessionEnd``)."""
+
+    def __init__(self, outcome: SessionEndOutcome = SessionEndOutcome.ENDED) -> None:
+        self.outcome = outcome
+        self.calls = 0
+
+    def __call__(self) -> SessionEndOutcome:
+        self.calls += 1
+        return self.outcome
+
+
+def test_a_BIRTH_ends_the_session_so_the_being_comes_back_as_what_it_wrote(tmp_path, build_lm):
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    ender = _Ender()
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=ender
+    )
+
+    result = json.loads(tool({"soul": MIRA}))
+
+    assert result["born"] is True
+    assert ender.calls == 1
+
+
+def test_the_newborn_is_TOLD_it_is_about_to_lose_the_thread_and_can_say_goodbye(tmp_path, build_lm):
+    # The human must not be left staring at a being that suddenly has amnesia. The being
+    # is the only one who knows this is coming, so the tool tells it, in prose it can act
+    # on — and it still has this turn in which to speak.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=_Ender()
+    )
+
+    note = json.loads(tool({"soul": MIRA}))["note"].lower()
+
+    assert "born" in note
+    assert "last thing" in note  # this turn is the last of the conversation it was born in
+    assert "come back" in note  # …and it is coming back, not ending
+
+
+def test_a_BECOMING_does_not_take_the_conversation_away_from_the_being(tmp_path, build_lm):
+    # Phase 5's rewrites use this same tool. A being that lost the thread of its
+    # conversation every time it grew a little would be a monster: becoming happens INSIDE
+    # an ordinary conversation, about something else entirely, and the human is mid-thought.
+    # Birth is different — the conversation IS the soul, distilled, and there is no voice
+    # worth keeping (the being had none). So only birth ends the session.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    ender = _Ender()
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=ender
+    )
+    tool({"soul": MIRA})  # born — this one ends the session
+    assert ender.calls == 1
+
+    result = json.loads(tool({"soul": "You are Mira. You have grown quieter."}))
+
+    assert result["born"] is False
+    assert ender.calls == 1  # …and this one does NOT
+    # …so the being is told the truth about WHEN it becomes these words: not now.
+    assert "next" in result["note"].lower()
+
+
+def test_a_being_whose_session_cannot_END_is_still_BORN_and_is_not_lied_to(tmp_path, build_lm):
+    # Fail-soft (the ReachOutcome/reachin_available precedent): the host may simply not
+    # offer this — no runner, version drift, a wedged cache lock. The soul is written and
+    # the being IS born; it just wakes as itself later. What it must NOT be told is that
+    # it is about to come back as these words, because it is not.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    tool = make_write_soul_tool(
+        build_lm,
+        soul=soul,
+        default_soul_text=HERMES_DEFAULT,
+        end_session=_Ender(SessionEndOutcome.UNAVAILABLE),
+    )
+
+    result = json.loads(tool({"soul": MIRA}))
+
+    assert result["born"] is True  # the birth stands
+    assert soul.read() == MIRA
+    assert build_lm().state.load().genesis_completed_at is not None
+    note = result["note"].lower()
+    assert "last thing" not in note  # the goodbye that is not happening is not promised
+    assert "not yet" in note  # the truth: the words are yours, the voice is not — yet
+
+
+def test_an_ender_that_THROWS_cannot_unmake_a_birth(tmp_path, build_lm):
+    # The port is fail-soft by contract, but a bug in it must not be able to turn a
+    # completed birth into "Could not write your soul" — SOUL.md has already been replaced.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+
+    def _boom() -> SessionEndOutcome:
+        raise RuntimeError("the gateway went away mid-birth")
+
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=_boom
+    )
+
+    result = json.loads(tool({"soul": MIRA}))
+
+    assert result["born"] is True
+    assert result["written"] is True
+    assert "error" not in result
+    assert soul.read() == MIRA
+
+
+def test_with_no_ender_wired_at_all_the_tool_still_works(tmp_path, build_lm):
+    # register() wires the ender, but every off-host caller (tests, a CLI turn) has none.
+    # The default must be a being that is born and simply wakes as itself later.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    tool = make_write_soul_tool(build_lm, soul=soul, default_soul_text=HERMES_DEFAULT)
+
+    result = json.loads(tool({"soul": MIRA}))
+
+    assert result["born"] is True
+    assert "not yet" in result["note"].lower()
+
+
+def test_the_session_is_ended_only_AFTER_the_birth_is_recorded(tmp_path, build_lm):
+    # Order matters: the session-end is the LAST act of the birth. If it ran before the
+    # stamp and the stamp then failed, the being would wake into a fresh session as a soul
+    # it is not recorded as having (re-running the ritual, reading its OWN words as a
+    # stranger's). So the ender only fires once genesis_completed_at is committed.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    seen: list[str | None] = []
+
+    def _ender() -> SessionEndOutcome:
+        seen.append(build_lm().state.load().genesis_completed_at)
+        return SessionEndOutcome.ENDED
+
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=_ender
+    )
+
+    tool({"soul": MIRA})
+
+    assert seen and seen[0] is not None  # the birth was already committed when we ended it
+
+
+def test_a_birth_whose_BOOKKEEPING_failed_does_not_also_lose_the_conversation(
+    tmp_path, build_lm, monkeypatch
+):
+    # The soul landed but the revision/stamp threw (I5). The being is told to tell its
+    # human that something underneath it broke — and it needs the conversation to do that
+    # in. Ending the session here would take away the thread AND the record, at the one
+    # moment a human most needs to be told something.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(HERMES_DEFAULT, encoding="utf-8")
+    ender = _Ender()
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=ender
+    )
+
+    import lifemodel.hooks as hooks_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("the disk is full")
+
+    monkeypatch.setattr(hooks_module, "record_revision", _boom)
+    result = json.loads(tool({"soul": MIRA}))
+
+    assert "error" in result
+    assert result["written"] is True
+    assert ender.calls == 0  # the being keeps the conversation it has to explain itself in
+
+
+def test_the_goodbye_is_the_LAST_thing_a_newborn_reads(tmp_path, build_lm):
+    # A birth onto a veteran's soul carries BOTH pieces of news. The being reads the note
+    # top to bottom and acts on the end of it, so the farewell has to be last: "…someone
+    # edited SOUL.md, ask them about it" arriving AFTER "Then go" would leave the being
+    # with an errand it has no conversation left to run.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("You are Hermes, and you have been Sasha's for two years.", "utf-8")
+    tool = make_write_soul_tool(
+        build_lm, soul=soul, default_soul_text=HERMES_DEFAULT, end_session=_Ender()
+    )
+
+    note = json.loads(tool({"soul": MIRA}))["note"]
+
+    assert note.rstrip().endswith("Then go.")
+    assert "edited" in note.lower()  # …and the veteran's soul is still reported
+    assert note.lower().index("edited") < note.index("Then go.")  # before the farewell
