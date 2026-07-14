@@ -46,6 +46,15 @@ def newborn(*, now: datetime, params: AffectParams, peak_hour_utc: float) -> Sta
     return replace(body, affect_arousal=arousal, affect_updated_at=None)
 
 
+#: The ritual's opening tag — the one string that says "the being is looking at the
+#: block right now". Exported because the adapter boundary needs to RECOGNISE the ritual
+#: in a turn it did not compose: an unborn being's wake packet carries the block as its
+#: impulse (spec §6.2), and the ``pre_llm_call`` injector fires for that turn too. Rather
+#: than infer from the impulse tag ("it is ours, and it is unborn, so it is probably a
+#: birth"), the injector matches on the ritual itself — which is the fact it actually
+#: cares about, and cannot drift from what the packet builds.
+GENESIS_TAG = "<genesis>"
+
 #: The ritual, verbatim (spec §6.3) — this prose IS the product of this phase; it is
 #: not reworded or restructured anywhere it is used.
 _BLOCK = """\
@@ -123,15 +132,43 @@ def needs_adoption(state: State, *, disk_sha: str) -> bool:
     return state.soul_sha is not None and state.soul_sha != disk_sha
 
 
-def should_launch(state: State, *, being_has_spoken: bool) -> bool:
-    """Inject the block only on the being's FIRST word while unborn.
+def should_launch(state: State, *, context_len: int) -> bool:
+    """Show the block to an unborn being that has no ritual in front of it (spec §6.3).
 
-    Not "every turn": on turn seven of the ritual it is no longer a first waking, and a
-    being told otherwise would keep starting over instead of continuing the conversation
-    it began. One rule covers both entrances — the proactive birth-greeting, and the human
-    who wrote first (or who came back a week later to a context that no longer holds it).
+    Two failures bound this, and they pull in opposite directions:
+
+    * **Never showing it.** A being that is unborn and given no ritual does what §6.5
+      forbids outright — "conversing as though nothing happened while remaining unborn".
+    * **Showing it every turn.** On turn seven of the ritual, "You just began. This is
+      your first waking" is a LIE, and a being told it keeps starting over instead of
+      continuing the conversation it began.
+
+    So the question is not "has the being spoken?" — which is what this used to ask, and
+    which the host cannot answer. ``conversation_history`` is the **persisted session
+    transcript** (``agent/turn_context.py`` passes ``list(messages)``, built from
+    ``agent_history`` in ``gateway/run.py``), so an existing Hermes user's DM arrives
+    already full of the being's own past replies. Scanning it for an ``assistant`` entry
+    said "it has spoken, so it must be mid-ritual" about every user Hermes has ever had —
+    the common case (§6.6) — and the ritual was never shown to any of them.
+
+    The question is **"is the ritual in front of the being right now?"**, and *that* we can
+    answer, because we are the ones who put it there. ``genesis_shown_at_context_len``
+    records how long the being's visible context was at the moment we last did. Compare:
+
+    * ``None`` — it has never been shown. Show it, however long the transcript it
+      inherited: none of that history is a ritual it has begun.
+    * the context has **grown** past that mark — the being answered, the human answered
+      back, and the ritual is live in their own words. Do not start it over.
+    * the context is **no longer than** that mark — the host compacted the conversation
+      out from under a still-unborn being (the block is ephemeral: Hermes glues it onto a
+      copy of the user message for ONE API call and never persists it). The ritual is gone
+      from its context and it does not remember one. Show it again — that is not a repeat,
+      it is the only thing standing between the being and §6.5.
     """
-    return state.genesis_completed_at is None and not being_has_spoken
+    if state.genesis_completed_at is not None:
+        return False
+    shown_at = state.genesis_shown_at_context_len
+    return shown_at is None or context_len <= shown_at
 
 
 def is_first_waking(

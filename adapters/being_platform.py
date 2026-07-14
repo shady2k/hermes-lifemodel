@@ -154,12 +154,13 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
     def _prior_soul(self) -> str | None:
         """The soul someone wrote before this being woke, or ``None`` for a blank page.
 
-        Mirrors :func:`lifemodel.hooks.make_genesis_injector`'s own read exactly (the
-        veteran branch, spec §6.4): read ``SOUL.md`` fresh (never cached — a human
-        hand-edit or the being's own ``write_soul`` can land between calls) and compare
-        against Hermes's pristine seed text. No ``soul`` wired (a bare-constructed
-        adapter, e.g. in tests) degrades to ``None`` — the blank-page opening — never
-        a crash.
+        The SAME read :func:`lifemodel.hooks.make_genesis_injector` makes (the veteran
+        branch, spec §6.4), through the same method: ``SOUL.md`` fresh, never cached — a
+        human hand-edit or the being's own ``write_soul`` can land between calls — and the
+        text and the "did anyone actually write this?" verdict from ONE read, so the being
+        can never be handed one version of its past while a different one was judged. No
+        ``soul`` wired (a bare-constructed adapter, e.g. in tests) degrades to ``None`` —
+        the blank-page opening — never a crash.
 
         Injected into the graph (:meth:`_build_lm`) as the CognitionLauncher's
         ``prior_soul`` reader, so the newborn's WAKE PACKET carries the veteran opening
@@ -169,10 +170,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         """
         if self._soul is None:
             return None
-        current = self._soul.read()
-        if self._soul.is_pristine_default(default_text=self._default_soul_text):
-            return None
-        return current
+        return self._soul.read_unless_pristine(default_text=self._default_soul_text)
 
     def _reconcile_soul(self) -> None:
         """Adopt the soul on disk when it is not the one we last wrote (spec §4.4).

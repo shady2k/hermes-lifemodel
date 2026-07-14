@@ -85,10 +85,36 @@ def test_a_pristine_default_is_recognised_so_a_veteran_is_not_mistaken_for_a_new
 ) -> None:
     # A stranger installing the plugin has Hermes's untouched DEFAULT_SOUL_MD; a Hermes
     # veteran has something they wrote themselves. The ritual must open differently for
-    # each.
+    # each — and the caller wants the TEXT when there is one, so the two answers come
+    # back from ONE read (see below).
     default = _soul(tmp_path, "# Identity\nYou are Hermes.\n")
-    assert default.is_pristine_default(default_text="# Identity\nYou are Hermes.\n") is True
-    assert default.is_pristine_default(default_text="something else entirely") is False
+    assert default.read_unless_pristine(default_text="# Identity\nYou are Hermes.\n") is None
+    assert (
+        default.read_unless_pristine(default_text="something else entirely")
+        == "# Identity\nYou are Hermes.\n"
+    )
+
+
+def test_the_prior_soul_and_the_pristine_verdict_come_from_the_SAME_bytes(
+    tmp_path: Path,
+) -> None:
+    # Both callers (the genesis injector, and the wake packet's veteran branch) used to
+    # ``read()`` the file and then call a predicate that read it AGAIN — two reads, and a
+    # window between them in which the human's editor can land. The being would then be
+    # handed one version of its past while the other was judged. One read, one answer.
+    soul = _soul(tmp_path, "You are Mira.")
+    reads: list[str] = []
+    real_read = soul.read
+
+    def _counting_read() -> str:
+        reads.append("x")
+        return real_read()
+
+    soul.read = _counting_read  # type: ignore[method-assign]
+    assert (
+        soul.read_unless_pristine(default_text="# Identity\nYou are Hermes.\n") == "You are Mira."
+    )
+    assert len(reads) == 1
 
 
 def test_a_missing_soul_file_reads_as_empty_rather_than_exploding(tmp_path: Path) -> None:

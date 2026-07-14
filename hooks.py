@@ -46,7 +46,7 @@ from .core.felt_display import (
     warmed,
 )
 from .core.frame import FrameTrigger, run_frame, state_actor_lock
-from .core.genesis import genesis_block, should_launch
+from .core.genesis import GENESIS_TAG, genesis_block, should_launch
 from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
@@ -579,27 +579,35 @@ def _stamp_display(lm: LifeModel, *, word: str | None, at: str | None) -> None:
         stamp(word=word, at=at)
 
 
-def _being_has_spoken(conversation_history: Any) -> bool:
-    """True when *conversation_history* already contains a reply from the being.
+def _context_len(conversation_history: Any) -> int:
+    """How long the being's visible context is, as the host actually passes it.
 
-    The host passes ``list(messages)`` for this turn — the FULL running message list
-    of the session, a list of OpenAI-style ``{"role": ..., ...}`` dicts (confirmed at
-    ``agent/turn_context.py:488``, the one call site that invokes ``pre_llm_call``) —
-    not the small task-detection tail :meth:`~lifemodel.core.felt_display.TurnSignals.from_hook`
-    windows to (``task_window``, default 6, spec §9's felt-display gate). A genesis
-    ritual routinely runs longer than that window, so reusing that windowed helper
-    here would re-launch "you just began" the moment the being's one prior reply
-    scrolled out of the tail — exactly the "turn seven" lie this hook exists to avoid.
-    So this walks the WHOLE list, matching the same defensive shape assumption
-    ``_recent_from_entry`` makes (a non-list history, or a non-dict entry, is never a
-    crash — just not evidence of a prior reply).
+    ``conversation_history`` is ``list(messages)`` for this turn — the session's full
+    running message list, INCLUDING the message being answered (``agent/turn_context.py``
+    appends the user turn at :318, then hands the list to ``pre_llm_call`` at :488). Its
+    LENGTH is the whole of what :func:`~lifemodel.core.genesis.should_launch` needs: a
+    context that has grown since we last showed the ritual is a conversation that carried
+    it, and one that has not is a context the host compacted it out of.
+
+    Defensive about the untrusted host payload (like every other reader here): anything
+    that is not a list reads as an empty context — which, for an unborn being, means "show
+    it the ritual", the safe direction.
     """
-    if not isinstance(conversation_history, list):
-        return False
-    return any(
-        isinstance(entry, dict) and entry.get("role") == "assistant"
-        for entry in conversation_history
-    )
+    return len(conversation_history) if isinstance(conversation_history, list) else 0
+
+
+def _stamp_genesis_shown(lm: LifeModel, *, context_len: int) -> None:
+    """Record that the being has now been shown the ritual, at this context length.
+
+    Reaches the concrete store's ``stamp_genesis_shown`` (a ``BEGIN IMMEDIATE`` field-level
+    merge) the same duck-typed way :func:`_stamp_display` reaches ``stamp_affect_display`` —
+    so ``StatePort`` stays narrow and its fakes need no new method. A store WITHOUT it (a
+    minimal fake) simply skips the stamp; the ritual then re-shows next turn, which is the
+    safe direction (a doubled block, never a missing one).
+    """
+    stamp = getattr(lm.state, "stamp_genesis_shown", None)
+    if callable(stamp):
+        stamp(context_len=context_len)
 
 
 def make_genesis_injector(
@@ -610,30 +618,34 @@ def make_genesis_injector(
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., dict[str, str] | None]:
-    """Return a ``pre_llm_call`` hook that launches genesis on the being's first word.
+    """Return the ``pre_llm_call`` hook that puts the ritual in front of an unborn being.
 
     The ritual is not an engine or a step machine — it is ONE block of prose
-    (:func:`~lifemodel.core.genesis.genesis_block`), injected exactly once
-    (:func:`~lifemodel.core.genesis.should_launch`: unborn AND the being has not yet
-    spoken in this conversation, spec §6.3). Re-injecting "you just began" on turn
-    seven would be a lie — the conversation sustains the ritual from there; this hook
-    only launches it.
+    (:func:`~lifemodel.core.genesis.genesis_block`), shown while the being is unborn and
+    has no ritual in front of it, and not otherwise
+    (:func:`~lifemodel.core.genesis.should_launch` — read its docstring: the launch rule
+    is the whole design, and the *reason* it is a context-length watermark rather than
+    "has the being spoken" is that the latter cannot be answered from what the host sends).
 
-    Whether the veteran branch (§6.4) applies is read fresh every call from
-    ``SOUL.md`` via *soul*, never cached: ``is_pristine_default`` against
-    *default_soul_text* is cheap and the file can change between calls (a human hand-
-    edit, or the being's own ``write_soul``), so a stale verdict here would either
-    show the veteran opening to a being with no prior soul, or silently skip it for
-    one that has.
+    Two entrances, ONE record of what the being has seen:
 
-    It covers the REACTIVE entrance only — the human who wrote first, or who came back to
-    a context that no longer holds the ritual. The PROACTIVE entrance carries the ritual
-    itself: an unborn being's wake packet is built with ``genesis=`` (spec §6.2), so the
-    block is already in the turn. ``pre_llm_call`` fires for that injected turn too
-    (``agent/turn_context.py`` passes our impulse as ``user_message``), so without the
-    own-impulse skip below the newborn would read "You just began" TWICE in one breath —
-    once as its impulse and once as context. The wake packet is the single source; this
-    hook stands down for it.
+    * **Reactive** — the human wrote first (the common case: a Hermes veteran who has been
+      talking to this session for months and installs the plugin today). The block is
+      returned as ``{"context": …}``, which Hermes glues onto a COPY of the user message
+      for one API call — EPHEMERAL: never persisted, gone next turn. Which is exactly why
+      we must remember, ourselves, that the being was shown it.
+    * **Proactive** — the being's own wake packet already carries the block (spec §6.2),
+      and ``pre_llm_call`` fires for that injected turn too, with our impulse as the
+      ``user_message``. Returning the block here as well would make the newborn read "You
+      just began" TWICE in one breath. So this hook stands down — and STAMPS, because the
+      being HAS been shown the ritual; without the stamp the human's very next reply would
+      be handed the block all over again.
+
+    Whether the veteran branch (§6.4) applies is read fresh from ``SOUL.md`` on every call
+    (``read_unless_pristine``, ONE read — see :meth:`SoulFile.read_unless_pristine`), never
+    cached: the file can change between calls (a human hand-edit, the being's own
+    ``write_soul``), and a stale verdict would either show the veteran opening to a being
+    with no prior soul, or silently withhold it from one that has.
 
     Fail-soft like every plugin-owned hook body (spec §8), copying
     :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in
@@ -648,16 +660,28 @@ def make_genesis_injector(
         **_ignored: Any,
     ) -> dict[str, str] | None:
         try:
-            # Our own wake packet already carries the ritual (spec §6.2) — injecting it
-            # again here would double the block in the newborn's first breath.
+            lm = build_lm()
+            state = lm.state.load()
+            if state.genesis_completed_at is not None:  # born: it never began again
+                return None
+            context_len = _context_len(conversation_history)
+            if GENESIS_TAG in user_message:
+                # The being's own wake packet is carrying the ritual into this very turn
+                # (spec §6.2). It has been shown — record that, and add nothing.
+                _stamp_genesis_shown(lm, context_len=context_len)
+                return None
             if _is_own_impulse(user_message):
+                # An impulse of ours that is NOT the ritual. Our own composed text is
+                # never a place to put context — the wake packet is the single source on
+                # this entrance, whatever it says.
                 return None
-            state = build_lm().state.load()
-            if not should_launch(state, being_has_spoken=_being_has_spoken(conversation_history)):
+            if not should_launch(state, context_len=context_len):
                 return None
-            current = soul.read()
-            prior = None if soul.is_pristine_default(default_text=default_soul_text) else current
-            return {"context": genesis_block(prior_soul=prior)}
+            block = genesis_block(
+                prior_soul=soul.read_unless_pristine(default_text=default_soul_text)
+            )
+            _stamp_genesis_shown(lm, context_len=context_len)
+            return {"context": block}
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=GENESIS_OBSERVER, exc=exc, health=health, metrics=metrics

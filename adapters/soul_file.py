@@ -84,14 +84,24 @@ class SoulFile:
         """Digest of the current content — the compare-and-swap token."""
         return hashlib.sha256(self.read().encode("utf-8")).hexdigest()
 
-    def is_pristine_default(self, *, default_text: str) -> bool:
-        """True when the soul is still the host's untouched seed.
+    def read_unless_pristine(self, *, default_text: str) -> str | None:
+        """The soul someone WROTE, or ``None`` when it is still the host's untouched seed.
 
-        A stranger has Hermes's ``DEFAULT_SOUL_MD``; a veteran has prose they wrote
-        themselves. The ritual opens differently for each (spec §6.4), and this is the
-        only way to tell — the file ALWAYS exists (``hermes_cli/config.py:893``).
+        A stranger installing the plugin has Hermes's ``DEFAULT_SOUL_MD``; a veteran has
+        prose they wrote themselves. The ritual opens differently for each (spec §6.4),
+        and this is the only way to tell them apart — the file ALWAYS exists
+        (``hermes_cli/config.py:893``), so its presence proves nothing.
+
+        **One read, one answer.** Both callers (the ``pre_llm_call`` injector, and the
+        newborn's wake packet via ``BeingAdapter._prior_soul``) want the same two facts —
+        *is there a prior soul, and what does it say* — and used to get them from two
+        separate reads: ``read()`` for the text, then a predicate that read the file AGAIN
+        to judge it. Between those reads a human's editor can land, so the being could be
+        handed one version of its past while a different one was being judged pristine.
+        The bytes that answer the question are the bytes that are returned.
         """
-        return self.read().strip() == default_text.strip()
+        text = self.read()
+        return None if text.strip() == default_text.strip() else text
 
     def write(self, text: str) -> SoulWrite:
         """Validate, replace atomically, and report what was replaced.

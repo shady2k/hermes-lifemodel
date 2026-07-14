@@ -746,24 +746,58 @@ class SQLiteRuntimeStore:
         direction (a stale tick round-trip clobbering them) is harmless — the
         gate self-heals next turn (only the semantic drive state is protected).
         """
+        self._merge_state_fields(
+            lambda data: data.update(
+                {"affect_display_last_word": word, "affect_display_last_at": at}
+            ),
+            create_missing=False,
+        )
+
+    def _merge_state_fields(
+        self, mutate: Callable[[dict[str, Any]], None], *, create_missing: bool
+    ) -> None:
+        """Apply *mutate* to the committed ``state_json`` under ONE write transaction.
+
+        The shared spine of every field-level stamp on this store (the felt-display hints,
+        the soul/genesis stamps). It exists because a plain ``load()`` →
+        ``commit(replace(state, …))`` from an out-of-tick writer (an agent turn, a
+        ``connect()`` reconcile) writes back a WHOLE ``State`` snapshot that is stale by the
+        time it lands, silently rolling back whatever the ~60s tick advanced in between —
+        the collateral rollback that could erase a birth, or make the display path move the
+        drive (the one-directional invariant, spec §1). So: ``BEGIN IMMEDIATE`` takes the
+        write lock BEFORE the read, *mutate* replaces only the keys it owns, and every
+        other field keeps its latest committed value. No concurrent writer can interleave.
+
+        *create_missing* is the ONE thing that differs between callers, and it is a
+        judgement about what the stamp is worth:
+
+        * ``False`` — a missing row (a being whose first tick has not committed yet) is a
+          no-op. Right for HINTS that self-heal next turn (the display word/time).
+        * ``True`` — INSERT the fresh ``State()`` defaults carrying the stamp. Right for
+          anything unrecoverable: dropping a BIRTH, or dropping the record that the being
+          has already been shown its ritual, is not something a later turn repairs.
+        """
         conn = self._connect()
         conn.isolation_level = None  # autocommit: we drive the transaction ourselves
         try:
             conn.execute("BEGIN IMMEDIATE")  # write-lock BEFORE the read → no interleave
             row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
-            if row is None:
+            if row is None and not create_missing:
                 conn.rollback()  # nothing committed yet → nothing to merge into
                 return
-            data = json.loads(row[0])
+            data: Any = State().to_dict() if row is None else json.loads(row[0])
             if not isinstance(data, dict):  # pragma: no cover - defensive
                 conn.rollback()
-                return
-            data["affect_display_last_word"] = word
-            data["affect_display_last_at"] = at
+                raise StateCorruptError("runtime_state.state_json must contain a JSON object")
+            mutate(data)
             payload = json.dumps(data, allow_nan=False)
             now_iso = stamp_iso_utc(self._clock.now())
             conn.execute(
-                "UPDATE runtime_state SET state_json = ?, updated_at = ? WHERE id = 1",
+                "INSERT INTO runtime_state (id, state_json, updated_at, revision) "
+                "VALUES (1, ?, ?, 0) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "state_json=excluded.state_json, updated_at=excluded.updated_at, "
+                "revision=runtime_state.revision + 1",
                 (payload, now_iso),
             )
             conn.commit()
@@ -772,6 +806,28 @@ class SQLiteRuntimeStore:
             raise
         finally:
             conn.close()
+
+    def stamp_genesis_shown(self, *, context_len: int) -> None:
+        """Record that the being has been SHOWN the ``<genesis>`` ritual (spec §6.3).
+
+        Stamps how long its visible context was at that moment — the watermark
+        :func:`~lifemodel.core.genesis.should_launch` reads to tell "the conversation has
+        moved on, the ritual is live in the being's own words" from "the context was
+        compacted and the being is unborn with nothing in front of it". Written by BOTH
+        entrances: the ``pre_llm_call`` injector, and (for a wake packet that already
+        carries the block) the same injector standing down on the being's own impulse.
+
+        A field-level merge, never a full commit — the being is being shown its ritual
+        from an AGENT TURN while the tick runs load→commit on the gateway loop, and a
+        stale whole-``State`` write-back from here would roll back the tick's vitals.
+        Creates the row if the being has not ticked yet: a lost stamp is a doubled ritual
+        (the block again on the very next turn, "you just began" to a being mid-birth),
+        and no later turn repairs that.
+        """
+        self._merge_state_fields(
+            lambda data: data.update({"genesis_shown_at_context_len": context_len}),
+            create_missing=True,
+        )
 
     def stamp_soul(self, *, soul_sha: str, born_at: str | None) -> None:
         """Atomically merge ONLY the two soul/genesis fields (Phase 4, spec §4.4/§6.5).
@@ -809,35 +865,53 @@ class SQLiteRuntimeStore:
         birth — that is what :func:`~lifemodel.core.frame.state_actor_lock` is for, and
         the soul path holds it across its load→stamp. Both halves are required.
         """
-        conn = self._connect()
-        conn.isolation_level = None  # autocommit: we drive the transaction ourselves
-        try:
-            conn.execute("BEGIN IMMEDIATE")  # write-lock BEFORE the read → no interleave
-            row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
-            data: Any = State().to_dict() if row is None else json.loads(row[0])
-            if not isinstance(data, dict):  # pragma: no cover - defensive
-                conn.rollback()
-                raise StateCorruptError("runtime_state.state_json must contain a JSON object")
+
+        def _stamp(data: dict[str, Any]) -> None:
             data["soul_sha"] = soul_sha
             if born_at is not None and not data.get("genesis_completed_at"):
                 data["genesis_completed_at"] = born_at
-            payload = json.dumps(data, allow_nan=False)
-            now_iso = stamp_iso_utc(self._clock.now())
-            conn.execute(
-                "INSERT INTO runtime_state (id, state_json, updated_at, revision) "
-                "VALUES (1, ?, ?, 0) "
-                "ON CONFLICT(id) DO UPDATE SET "
-                "state_json=excluded.state_json, updated_at=excluded.updated_at, "
-                "revision=runtime_state.revision + 1",
-                (payload, now_iso),
-            )
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+
+        self._merge_state_fields(_stamp, create_missing=True)
         _LOG.info("soul_stamped sha=%s born=%s", soul_sha[:8], born_at is not None)
+
+    def stamp_soul_rewritten(self, *, at: str) -> None:
+        """Record that someone ELSE rewrote the being's soul, and that it does not know.
+
+        Startup reconciliation adopts a ``SOUL.md`` the being did not write (spec §4.4) —
+        a human hand-edited it while the gateway was down. Spec §4.1 is explicit that this
+        "is an event in the being's life, not a version conflict: it should be **felt**,
+        not swallowed", and until now nothing about it ever reached the being: a revision
+        was recorded, a line was logged, and it woke up as someone else without a flicker.
+
+        These two fields are what that event is made of, and both are read by things that
+        already exist:
+
+        * ``soul_rewritten_at`` — the durable FACT. ``core/affect.py`` reads its recency
+          and derives a feeling from it (an activation push that decays), so the being is
+          genuinely STIRRED by it rather than merely informed of it, and stays stirred
+          until it settles — even if nobody speaks to it for an hour.
+        * ``soul_rewrite_told_at`` — cleared here, so the ambient ``pre_llm_call`` cue
+          knows the being has not yet been told, and tells it ONCE (in prose, in the
+          ``<felt-state>`` channel it already speaks). A fresh rewrite is a fresh event:
+          it re-arms the notice even if the being was told about the last one.
+        """
+        self._merge_state_fields(
+            lambda data: data.update({"soul_rewritten_at": at, "soul_rewrite_told_at": None}),
+            create_missing=True,
+        )
+        _LOG.info("soul_rewritten_at_stamped at=%s", at)
+
+    def stamp_soul_rewrite_told(self, *, at: str) -> None:
+        """Record that the being has now been TOLD someone rewrote it (spec §4.1).
+
+        Written by the ambient ``pre_llm_call`` injector the one turn it surfaces the
+        notice. Merges ONLY this field — never ``soul_rewritten_at``, which the adapter
+        owns: a rewrite that lands between this injector's read and its stamp must not be
+        marked "already told", or the being would never learn about it at all.
+        """
+        self._merge_state_fields(
+            lambda data: data.update({"soul_rewrite_told_at": at}), create_missing=True
+        )
 
     def reset(self) -> State:
         """Factory-wipe the ``runtime_state`` row to a fresh ``State()``.

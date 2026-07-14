@@ -140,6 +140,12 @@ _SET_PROTECTED: dict[str, str] = {
         "reactive-display hint — written atomically by the injector (lm-ukc.4), never by hand"
     ),
     "affect_display_last_at": "reactive-display hint (see affect_display_last_word)",
+    "genesis_shown_at_context_len": (
+        "the record of how much context the being had when it was last shown its birth "
+        "ritual — written by the pre_llm_call injector against the host's real message "
+        "list; a hand-set value would either hide the ritual from an unborn being or "
+        "restart it mid-birth. Use `reset` to make the being unborn again."
+    ),
 }
 
 #: Field TYPE -> coercion kind. A field whose type is absent here (``list``/``dict``) has no

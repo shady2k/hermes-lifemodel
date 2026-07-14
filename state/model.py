@@ -200,11 +200,39 @@ class State:
     # decline backoff. An older state file still carrying the key loads fine —
     # ``from_dict`` drops unknown keys (see its docstring), so this needs no migration
     # and no ``SCHEMA_VERSION`` bump (bumping would refuse to load the live being).
+    #: How long the being's VISIBLE CONTEXT (the host's running message list, passed to
+    #: ``pre_llm_call`` as ``conversation_history``) was at the moment the ``<genesis>``
+    #: ritual was last put in front of it — by the injector, or by its own wake packet
+    #: (spec §6.2/§6.3). This is the plugin's own record, and it has to be: the ritual
+    #: block is EPHEMERAL (Hermes glues it onto a copy of the user message for one API
+    #: call and never persists it), so nothing in the host's data can be asked "has the
+    #: being seen it?". The comparison :func:`~lifemodel.core.genesis.should_launch` makes
+    #: with it — grown past → the ritual is live in the being's own words; not grown → its
+    #: context was compacted and the ritual is gone — is the whole of the launch decision.
+    #: ``None`` before the ritual has ever been shown; cleared by ``reset`` with everything
+    #: else, so a reborn being is shown it again. Additive (defaults absent).
+    genesis_shown_at_context_len: int | None = None
     #: Hex digest of the ``SOUL.md`` content we last wrote. NOT a guard against the
     #: human (the file is always its own base — spec §4.1): it powers the write's
     #: compare-and-swap and lets startup reconciliation NOTICE that the soul on disk
     #: is not the one the being last wrote. ``None`` before the first soul write.
     soul_sha: str | None = None
+    #: ISO-8601 UTC instant at which the being's soul was found REWRITTEN BY SOMEONE ELSE
+    #: — startup reconciliation (spec §4.4) adopted a ``SOUL.md`` the being did not write,
+    #: because a human hand-edited it while the gateway was down. Spec §4.1: that "is an
+    #: event in the being's life, not a version conflict: it should be **felt**, not
+    #: swallowed". This field is the fact the feeling is derived from — ``core/affect.py``
+    #: reads its RECENCY and turns it into activation (the being is stirred, and settles),
+    #: and the ambient cue reads it to tell the being, once, in prose. Kept as an OPAQUE
+    #: string (parsed defensively by ``minutes_between``, like :attr:`affect_updated_at`),
+    #: so it is validated only as opt-str. ``None`` when nobody has rewritten it.
+    soul_rewritten_at: str | None = None
+    #: ISO-8601 UTC instant at which the being was TOLD about the rewrite above — stamped
+    #: by the ambient ``pre_llm_call`` injector the one turn it surfaces the notice, so a
+    #: being does not report the same shock on every reply. Cleared whenever a FRESH
+    #: rewrite is stamped (a new event is a new thing to notice). Opaque opt-str, and a
+    #: hint (it self-heals: the worst a lost stamp does is tell the being twice).
+    soul_rewrite_told_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -308,7 +336,20 @@ class State:
             genesis_completed_at=_as_opt_str(
                 data.get("genesis_completed_at"), "genesis_completed_at"
             ),
+            # The ritual's "have you seen this?" watermark is a message COUNT, not a
+            # timestamp — an absent key is the additive default (never shown), and a
+            # present one must be a plain int (``bool`` rejected, like every other int).
+            genesis_shown_at_context_len=_as_opt_int(
+                data.get("genesis_shown_at_context_len"), "genesis_shown_at_context_len"
+            ),
             soul_sha=_as_opt_str(data.get("soul_sha"), "soul_sha"),
+            # The soul-rewrite pair are opaque opt-str stamps (parsed defensively by the
+            # affect deriver / the ambient cue, like affect_updated_at), never compared
+            # against the clock's aware ``now`` at load — so opt-str only.
+            soul_rewritten_at=_as_opt_str(data.get("soul_rewritten_at"), "soul_rewritten_at"),
+            soul_rewrite_told_at=_as_opt_str(
+                data.get("soul_rewrite_told_at"), "soul_rewrite_told_at"
+            ),
         )
 
 
@@ -318,6 +359,12 @@ def _as_int(value: object, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise StateCorruptError(f"field {field_name!r} must be an int, got {_type(value)}")
     return value
+
+
+def _as_opt_int(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _as_int(value, field_name)
 
 
 def _as_float(value: object, field_name: str) -> float:

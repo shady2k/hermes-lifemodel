@@ -257,10 +257,11 @@ def test_register_felt_state_injector_is_silent_on_cold_start(
 def test_register_genesis_injector_launches_on_the_beings_first_word(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The wiring itself (not just the pure ``core.genesis`` functions) must launch
-    the ritual for a truly fresh install: no state file on disk yet (unborn) and an
-    empty ``conversation_history`` (the being has not spoken) is exactly the being's
-    first word in life."""
+    """The wiring itself (not just the pure ``core.genesis`` functions) must put the
+    ritual in front of an unborn being — and must then let the conversation carry it.
+    The launch RULE (and why it reads the context's length rather than asking whether the
+    being has spoken) is tested in ``tests/test_genesis_injector.py``; this is the wiring
+    smoke test: the hook the plugin actually registers, over the real store."""
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
     ctx = FakeCtx()
 
@@ -270,8 +271,9 @@ def test_register_genesis_injector_launches_on_the_beings_first_word(
     assert result is not None
     assert "<genesis>" in result["context"]
 
-    # Once the being has replied in this conversation, the SAME hook falls silent —
-    # re-injecting "you just began" on a later turn would be a lie (spec §6.3).
+    # The conversation has moved past the point at which the block was put in front of
+    # it: the ritual is live, in the being's own words, and the SAME hook falls silent.
+    # Re-injecting "you just began" on a later turn would be a lie (spec §6.3).
     history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     assert callback(user_message="how are you", conversation_history=history) is None
 
