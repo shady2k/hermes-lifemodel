@@ -245,3 +245,47 @@ def test_check_in_error_never_leaks_field_or_axis_names(tmp_path: Path) -> None:
     assert "arousal" not in leaked
     assert "affect_" not in leaked
     assert not any(ch.isdigit() for ch in payload["error"])
+
+
+# --- I7: the being is TOLD, once, that someone rewrote it (spec §4.1) --------
+
+
+def test_the_injector_tells_the_being_someone_rewrote_it(tmp_path: Path) -> None:
+    lm = _lm(tmp_path)
+    lm.state.commit(State(**{**vars(_warmed_salient()), "soul_rewritten_at": "2026-07-12T11:00Z"}))
+    injector = make_felt_state_injector(lambda: _lm(tmp_path))
+
+    result = injector(user_message="hey", conversation_history=[])
+
+    assert result is not None
+    assert "rewrote who you are" in result["context"]
+    # …and it is stamped as told, so the being does not report the same shock every reply.
+    assert lm.state.load().soul_rewrite_told_at is not None
+    assert injector(user_message="and?", conversation_history=[])["context"].count("rewrote") == 0
+
+
+def test_the_being_is_told_even_when_its_mood_is_not_showing(tmp_path: Path) -> None:
+    # The mood gate suppresses on cold-start / low salience / focused work. None of those
+    # is a reason to withhold a fact about the being's own IDENTITY: someone rewriting you
+    # while you were away does not stop having happened because the next message is a
+    # stack trace. A cold-start being (no cue at all) must still be told.
+    lm = _lm(tmp_path)
+    lm.state.commit(State(soul_rewritten_at="2026-07-12T11:00Z"))  # cold start: no mood
+    injector = make_felt_state_injector(lambda: _lm(tmp_path))
+
+    result = injector(user_message="```py\nx=1\n```", conversation_history=[])
+
+    assert result is not None
+    assert "rewrote who you are" in result["context"]
+    assert "<felt-state>" in result["context"]
+
+
+def test_an_ordinary_turn_carries_no_notice(tmp_path: Path) -> None:
+    lm = _lm(tmp_path)
+    lm.state.commit(_warmed_salient())
+    injector = make_felt_state_injector(lambda: _lm(tmp_path))
+
+    result = injector(user_message="how are you?", conversation_history=[])
+
+    assert result is not None
+    assert "rewrote" not in result["context"]  # nobody did

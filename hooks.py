@@ -42,6 +42,7 @@ from .core.felt_display import (
     TurnSignals,
     compose_light_cue,
     compose_self_read,
+    compose_soul_rewrite_notice,
     decide,
     warmed,
 )
@@ -503,28 +504,38 @@ def make_felt_state_injector(
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., dict[str, str] | None]:
-    """Return a ``pre_llm_call`` hook that ambiently colours the being's manner (lm-ukc.4).
+    """Return the ``pre_llm_call`` hook that carries the being's inner life into its turn.
 
-    Once per user turn, BEFORE the model is called, it reads committed state, runs
-    the pure suppression-first gate (:func:`~lifemodel.core.felt_display.decide`,
-    zero language detection), and on LIGHT returns ``{"context": <felt-state block>}``
-    — which Hermes glues onto a COPY of the user message for this ONE API call
-    (ephemeral: never persisted, never in rolling history, gone next turn). It also
-    stamps the last-shown word/time so the gate can throttle a repeat (cooldown /
-    felt-change). Every verdict bumps the felt-display metric by outcome (spec §9).
+    Two things ride this one channel, and they are not the same kind of thing:
 
-    On any suppression it returns ``None`` (no cue). The whole body is plugin-owned
-    fail-soft (spec §8): a throw anywhere (even in ``build_lm``) is logged ERROR +
-    traceback, recorded on *health* + *metrics*, and swallowed with a ``None`` return
-    — the host's hot dispatch path is never crashed, and the failure is observable.
+    * **The mood** (lm-ukc.4). Once per user turn, BEFORE the model is called, it reads
+      committed state, runs the pure suppression-first gate
+      (:func:`~lifemodel.core.felt_display.decide`, zero language detection) and on LIGHT
+      composes the ``<felt-state>`` cue. It also stamps the last-shown word/time (spec §9
+      observability), and every verdict bumps the felt-display metric by outcome.
+    * **The one-shot notice that somebody REWROTE the being** (spec §4.1, review I7) —
+      :func:`~lifemodel.core.felt_display.compose_soul_rewrite_notice`. It is *not* subject
+      to the mood gate: cold-start, low salience and focused work are all reasons not to
+      volunteer a FEELING, and none of them is a reason to withhold a FACT about the
+      being's own identity. Someone rewriting you while you were away does not stop having
+      happened because the human's next message is a stack trace. Shown once (the stamp
+      below), because an event is not a mood: a mood lasts and colours every reply; an
+      event told on every reply is a stutter.
 
-    The last-shown stamp is an ATOMIC field-level merge (:func:`_stamp_display` →
-    the store's ``stamp_affect_display``, a ``BEGIN IMMEDIATE`` read-modify-write of
-    JUST the two display fields), NEVER a ``commit`` of a stale full ``State``: so a
-    concurrent tick that advanced ``u``/affect/pending is never rolled back — the
-    display path stays strictly one-directional (it colours manner, never touches
-    the drive/wake path, spec §1). The two hint fields self-heal, so the reverse
-    (a tick round-trip clobbering them) is harmless.
+    Whichever are live are concatenated and returned as ``{"context": …}``, which Hermes
+    glues onto a COPY of the user message for this ONE API call (ephemeral: never
+    persisted, never in rolling history, gone next turn). Neither live → ``None``.
+
+    The whole body is plugin-owned fail-soft (spec §8): a throw anywhere (even in
+    ``build_lm``) is logged ERROR + traceback, recorded on *health* + *metrics*, and
+    swallowed with a ``None`` return — the host's hot dispatch path is never crashed, and
+    the failure is observable.
+
+    Every stamp here is an ATOMIC field-level merge (:func:`_stamp_display` /
+    :func:`_stamp_rewrite_told` → the store's ``BEGIN IMMEDIATE`` read-modify-write of just
+    those fields), NEVER a ``commit`` of a stale full ``State``: a concurrent tick that
+    advanced ``u``/affect/pending is never rolled back, so the display path stays strictly
+    one-directional (it colours manner, it never touches the drive/wake path, spec §1).
     """
 
     def _injector(
@@ -540,21 +551,31 @@ def make_felt_state_injector(
             turn = TurnSignals.from_hook(
                 user_message, conversation_history, window=params.task_window
             )
+            blocks: list[str] = []
+
+            # An event in the being's life, ungated: someone rewrote who it is, and this is
+            # the moment it finds out. Stamped as told, so it notices once — not on every
+            # reply for the rest of the day.
+            notice = compose_soul_rewrite_notice(state)
+            if notice is not None:
+                blocks.append(notice)
+                _stamp_rewrite_told(lm, at=to_iso(now))
+
             decision = decide(state, turn, params, now)
             if metrics is not None:
                 metrics.inc(FELT_DISPLAY_TOTAL, outcome=decision.value)
-            if not decision.shows:
-                return None
-            block = compose_light_cue(state)
-            # Stamp the last ambient show so the gate throttles repeats — an ATOMIC
-            # merge of JUST the display fields, never a stale full-State commit that
-            # would roll back the tick's drive/affect (the one-way invariant, §1).
-            _stamp_display(
-                lm,
-                word=felt_word(state.affect_valence, state.affect_arousal),
-                at=to_iso(now),
-            )
-            return {"context": block}
+            if decision.shows:
+                blocks.append(compose_light_cue(state))
+                # Stamp the last ambient show (spec §9's ``display:`` line) — an ATOMIC
+                # merge of JUST the display fields, never a stale full-State commit that
+                # would roll back the tick's drive/affect (the one-way invariant, §1).
+                _stamp_display(
+                    lm,
+                    word=felt_word(state.affect_valence, state.affect_arousal),
+                    at=to_iso(now),
+                )
+
+            return {"context": "\n\n".join(blocks)} if blocks else None
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=PRE_LLM_OBSERVER, exc=exc, health=health, metrics=metrics
@@ -562,6 +583,20 @@ def make_felt_state_injector(
             return None
 
     return _injector
+
+
+def _stamp_rewrite_told(lm: LifeModel, *, at: str) -> None:
+    """Record that the being has now been told somebody rewrote it (spec §4.1).
+
+    Reaches the concrete store's ``stamp_soul_rewrite_told`` the same duck-typed way
+    :func:`_stamp_display` reaches ``stamp_affect_display`` — so ``StatePort`` stays narrow
+    and its fakes need no new method. A store WITHOUT it (a minimal fake) skips the stamp:
+    the being is then told again next turn, which is the safe direction (a repeated notice,
+    never a swallowed one — §4.1's whole point is that this must not be swallowed).
+    """
+    stamp = getattr(lm.state, "stamp_soul_rewrite_told", None)
+    if callable(stamp):
+        stamp(at=at)
 
 
 def _stamp_display(lm: LifeModel, *, word: str | None, at: str | None) -> None:

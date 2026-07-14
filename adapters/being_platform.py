@@ -52,7 +52,7 @@ from ..state.metrics_store import (
     acquire_metrics_sampler,
     release_metrics_sampler,
 )
-from ..state.soul_revisions import record_revision
+from ..state.soul_revisions import record_revision, revisions
 from ..state.sqlite_store import SQLiteRuntimeStore
 from ..state.trace_store import (
     TraceWriter,
@@ -173,32 +173,48 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         return self._soul.read_unless_pristine(default_text=self._default_soul_text)
 
     def _reconcile_soul(self) -> None:
-        """Adopt the soul on disk when it is not the one we last wrote (spec §4.4).
+        """Adopt the soul on disk when it is not the one we last wrote — and FEEL it (§4.4).
 
-        There is no atomic transaction spanning a filesystem rename and a SQLite
-        commit, so the two can fall out of step: we crashed mid-write, or the human
-        edited the file while the gateway was down. Both are the SAME situation and
-        have the same answer — **the file is the base**. Adopt it, record it as the
-        current revision (authored ``"human"`` — a being never silently claims a
-        change it did not make), and let life continue. The being is never told its
-        soul is "in conflict"; if it notices at all, it notices that someone rewrote
-        it — an event in its life, not a merge.
+        There is no atomic transaction spanning a filesystem rename and a SQLite commit, so
+        the two can fall out of step. **The file is always the base**: whatever is there is
+        adopted, never arbitrated. But the two ways it can get there are not the same event,
+        and the being is owed the truth about which one happened:
 
-        **Serialized like every other soul write (review C4).** This runs at
-        ``connect()``, not inside a frame, so it takes the ONE state-actor lock across
-        its load→stamp (``core.frame.state_actor_lock``) and stamps through the store's
-        field-level ``stamp_soul`` merge rather than committing a whole ``State``. A
-        plain ``load()`` → ``commit(replace(state, …))`` here is the same lost-update as
-        the one that could erase a birth: it would roll back whatever a tick had advanced
-        between the two. ``born_at=None`` — adopting a soul someone ELSE wrote must never
-        be able to birth an unborn being.
+        * **The human rewrote it** while the gateway was down. Spec §4.1: this "is an event
+          in the being's life, not a version conflict: it should be **felt**, not swallowed."
+          So we stamp ``soul_rewritten_at`` — a durable FACT, from which two things that
+          already exist derive the experience: ``core/affect.py`` reads its recency and turns
+          it into activation (the being is genuinely STIRRED, and settles again over hours —
+          it does not need to be spoken to for this to be true of it), and the ambient
+          ``pre_llm_call`` cue reads it to tell the being, ONCE, in prose. Nothing anywhere
+          says "your soul_sha changed"; it says someone rewrote who you are.
+        * **We crashed mid-write** — ``write_soul`` replaced ``SOUL.md``, recorded the
+          revision, and died before the stamp. Then the text on disk is the being's OWN, and
+          the only thing that failed is bookkeeping. Recording it as ``"human"`` (review M5)
+          would upsert over the being's own revision by sha — turning its last act into
+          somebody else's in the one history that is meant to be its undo — and then make it
+          FEEL a rewrite that never happened. So the LINEAGE is asked first: it is the only
+          witness to who wrote a given text. A sha already in it needs no second revision,
+          and its recorded author is the answer.
+        * **A text nobody has on record.** Not in the lineage → not ours → the human's, and
+          it goes in as ``"human"``: a being never silently claims a change it did not make.
+          (This also covers the case where the being crashed BEFORE its revision landed. We
+          cannot tell that from a hand-edit, and where we cannot tell, we do not claim.)
 
-        ``None`` soul (no ``SoulFile`` wired — a bare-constructed adapter, e.g. in
-        tests without genesis wiring) and a non-``MemoryPort`` store both degrade to a
-        no-op: there is nowhere to record a revision, so reconciling would either
-        crash or silently drop the being's only undo (spec §4.2). Called from
-        :meth:`connect` under ``contextlib.suppress(Exception)``: a reconcile failure
-        is not an outage.
+        **Serialized like every other soul write (review C4).** This runs at ``connect()``,
+        not inside a frame, so it takes the ONE state-actor lock across its load→stamp
+        (``core.frame.state_actor_lock``) and stamps through the store's field-level merges
+        rather than committing a whole ``State``. A plain ``load()`` →
+        ``commit(replace(state, …))`` here is the same lost-update as the one that could
+        erase a birth: it would roll back whatever a tick had advanced between the two.
+        ``born_at=None`` — adopting a soul someone ELSE wrote must never birth an unborn
+        being.
+
+        ``None`` soul (no ``SoulFile`` wired — a bare-constructed adapter, e.g. in tests
+        without genesis wiring) and a non-``MemoryPort`` store both degrade to a no-op:
+        there is nowhere to record a revision, so reconciling would either crash or silently
+        drop the being's only undo (spec §4.2). Called from :meth:`connect` under
+        ``contextlib.suppress(Exception)``: a reconcile failure is not an outage.
         """
         if self._soul is None:
             return
@@ -211,15 +227,28 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             state = lm.state.load()
             if not needs_adoption(state, disk_sha=current):
                 return
-            record_revision(
-                memory, text=self._soul.read(), sha=current, now=lm.clock.now(), author="human"
-            )
+            now = lm.clock.now()
+            # Who wrote what is on disk? The lineage is the only witness — a sha it already
+            # carries was recorded by whoever wrote that text, and re-recording it would
+            # overwrite that author (``record_revision`` upserts by sha).
+            recorded = {rev.sha: rev.author for rev in revisions(memory)}.get(current)
+            if recorded is None:
+                record_revision(
+                    memory, text=self._soul.read(), sha=current, now=now, author="human"
+                )
+            ours = recorded == "being"
             stamp = getattr(lm.state, "stamp_soul", None)
             if callable(stamp):
                 stamp(soul_sha=current, born_at=None)
             else:  # a minimal StatePort fake — safe: the lock means `state` is not stale
                 lm.state.commit(replace(state, soul_sha=current))
-        _LOG.info("soul_adopted_from_disk sha=%s", current[:8])
+            if not ours:
+                # Somebody else's words are now the being's own. That is a thing that
+                # happened TO it, and it does not know yet.
+                felt = getattr(lm.state, "stamp_soul_rewritten", None)
+                if callable(felt):
+                    felt(at=to_iso(now))
+        _LOG.info("soul_adopted_from_disk sha=%s ours=%s", current[:8], ours)
 
     def _on_loop_death(self, exc: BaseException | None) -> None:
         """Convert an unexpected loop death into a gateway-visible fatal error.

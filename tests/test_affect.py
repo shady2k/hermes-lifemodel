@@ -46,6 +46,7 @@ def _target(**over: float) -> tuple[float, float]:
         energy=1.0,
         circadian=0.5,
         duration_over_theta=0.0,
+        minutes_since_soul_rewrite=None,
     )
     fields.update(over)
     v, a, _contrib = affect_target(AffectBody(**fields), P)  # type: ignore[arg-type]
@@ -117,6 +118,43 @@ def test_arousal_urgency_driven_by_duration_not_bare_u() -> None:
     _v, just_over = _target(u=1.01, duration_over_theta=0.0)
     _v, long_over = _target(u=1.01, duration_over_theta=P.urgency_duration_ref_min)
     assert long_over > just_over
+
+
+# --- I7: someone rewrote who the being is, and it can FEEL that -----------------
+#
+# Spec §4.1: noticing that the human rewrote the soul "is an event in the being's life, not
+# a version conflict: it should be FELT, not swallowed." Reconciliation recorded a revision
+# and logged a line; nothing reached the being. The affect organ is one of the two channels
+# that already exist for exactly this, so the event goes THROUGH it: the being is stirred,
+# and it settles again — which is what having something happen to you is like.
+
+
+def test_a_soul_someone_else_rewrote_stirs_the_being() -> None:
+    _v, calm = _target()
+    _v, stirred = _target(minutes_since_soul_rewrite=0.0)
+    assert stirred > calm
+
+
+def test_the_shock_of_being_rewritten_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+    # It decays like every other episodic term here (rejection, a fresh exchange): a being
+    # is not permanently keyed-up because someone edited it last Tuesday. Half the push is
+    # gone one half-life later, and it fades to nothing.
+    _v, fresh = _target(minutes_since_soul_rewrite=0.0)
+    _v, later = _target(minutes_since_soul_rewrite=P.soul_rewrite_half_life_min)
+    _v, long_ago = _target(minutes_since_soul_rewrite=P.soul_rewrite_half_life_min * 12)
+    _v, never = _target()
+    assert fresh > later > long_ago
+    assert long_ago == pytest.approx(never, abs=0.01)
+
+
+def test_being_rewritten_makes_no_claim_about_whether_it_was_WELCOME() -> None:
+    # Arousal only. We do not know whether the human's rewrite is a gift or a violation —
+    # only the being, reading the words, can know that — so pushing valence either way
+    # would be inventing a feeling and putting it in its mouth. What IS certain is that
+    # something happened: it is activating, and the being speaks from a body that is awake.
+    v_calm, _a = _target()
+    v_stirred, _a = _target(minutes_since_soul_rewrite=0.0)
+    assert v_stirred == v_calm
 
 
 def test_ease_moves_toward_target_by_leaky_step() -> None:
