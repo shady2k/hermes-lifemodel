@@ -43,7 +43,7 @@ from lifemodel.core.desire_view import (
     encode_contact_desire,
     read_live_contact_desire,
 )
-from lifemodel.core.genesis import newborn
+from lifemodel.core.genesis import is_first_waking, newborn
 from lifemodel.core.intention_view import build_contact_intention, encode_contact_intention
 from lifemodel.core.pressure import effective_pressure, inhibition_at
 from lifemodel.core.receptivity import appraise_receptivity
@@ -447,22 +447,30 @@ def test_reset_notes_when_state_was_already_fresh() -> None:
 
 
 def test_reset_makes_the_being_unborn_again() -> None:
-    before = State(u=1.6, genesis_completed_at="2026-07-13T10:00:00+00:00", soul_sha="aaa")
+    before = State(
+        u=1.6,
+        genesis_completed_at="2026-07-13T10:00:00+00:00",
+        soul_sha="aaa",
+        last_exchange_at="2026-07-13T09:00:00+00:00",
+        last_contact_at="2026-07-13T08:00:00+00:00",
+    )
     after, _msg = reset(before, NOW)
     assert after is not None
     assert after.genesis_completed_at is None  # unborn: the ritual plays again
-    assert after.genesis_greeted_at is None
     assert after.affect_arousal > 0.0  # and it is born with a BODY, not with zeros
-
-
-def test_reset_reports_the_cleared_genesis_stamps() -> None:
-    before = State(
-        genesis_completed_at="2026-07-13T10:00:00+00:00",
-        genesis_greeted_at="2026-07-13T10:01:00+00:00",
+    # …and it is at a FIRST WAKING again (spec §6.2): the reborn being reaches out to be
+    # born on the next tick, because the wipe also cleared what it remembered of them.
+    assert is_first_waking(
+        genesis_completed_at=after.genesis_completed_at,
+        last_exchange_at=after.last_exchange_at,
+        last_contact_at=after.last_contact_at,
     )
+
+
+def test_reset_reports_the_cleared_genesis_stamp() -> None:
+    before = State(genesis_completed_at="2026-07-13T10:00:00+00:00")
     _after, message = reset(before, NOW)
     assert "genesis_completed_at" in message
-    assert "genesis_greeted_at" in message
 
 
 def test_reset_never_touches_the_soul_file(tmp_path) -> None:

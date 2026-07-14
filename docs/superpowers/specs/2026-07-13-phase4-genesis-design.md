@@ -240,42 +240,52 @@ newborn's body is no longer an unfilled field.
 (Hermes always seeds one — §4). `/lifemodel reset` clears it, and the being can be born
 again — this is the owner's path to becoming his own first user.
 
-### 6.2 Launch
+### 6.2 Launch — genesis is a REASON TO WAKE, not a second egress
 
-The heartbeat runs from tick 0 — there is no dormant state. **An unborn being reaches
-out on plugin start**, immediately; it does not wait for the drive `u` to cross `θ`.
+> **Revised 2026-07-14, after review.** The first version of this section had the being
+> greet from `connect()` over its own hand-rolled delivery path. Two independent reviews
+> killed it, and they were right — the history is kept below because the failure is
+> instructive.
 
-Waiting for the drive would be a category error: `u` models **contact deficit in an
-existing relationship**, and a newborn has no relationship. There is nobody to miss.
-Birth is not longing.
+**The being wakes because it is nobody yet, and the impulse it wakes with is different.**
+Everything else — the reach-out, the delivery, the read-back of what the being actually
+did — is the machinery that already exists and is already tested.
 
-**Greet once — and stamp on DELIVERY, not on attempt.** `connect()` runs on *every*
-gateway restart (`being_platform.py:162`), and the SupervisedLoop reconnects after a loop
-death, so "once" is not free. The stamp (`genesis_greeted_at`) must be written **when the
-greeting is confirmed delivered**, never when it is merely attempted:
+Concretely:
 
-- stamped on *attempt* ⇒ an undeliverable greeting silences the being **forever**;
-- stamped on *delivery* ⇒ an undelivered greeting is simply retried on the next connect,
-  which is exactly what we want.
+- **The wake reason.** An unborn being wakes **without `u` crossing `θ`**. Waiting for the
+  drive would be a category error: `u` models a contact deficit inside an *existing*
+  relationship, and a newborn has none. There is nobody to miss. **Birth is not longing** —
+  so `u` stays `0` and the contact model is never told otherwise.
+- **The impulse.** `build_wake_packet` carries the `<genesis>` block **instead of**
+  `_IMPULSE_BODY` (which is about *missing someone* and would be a lie in a newborn's
+  mouth). Same packet, different impulse — because the being is not reaching out for the
+  same reason.
+- **Everything downstream is unchanged**: reach-in egress, the async `proactive_outcome`
+  read-back from `post_llm_call`, and the reducer's existing `SENT` / `SILENT` handling.
 
-This is the same lesson as lm-2gi (count on confirmed DELIVERY, not on an LLM verdict).
+**"The being has greeted" therefore means `SENT` — it actually spoke.** This is what the
+first draft got wrong, and the codebase had already written the answer down:
+`domain/egress.py:30` says `ReachOutcome.ok` means *"the turn reached the live session's
+queue — NOT that the being spoke"*. Stamping on `ok` would mark a newborn as "greeted"
+even when it woke and chose `[SILENT]`, and the human would never learn that anything had
+been born. A newborn that chooses silence is simply re-woken later by the existing
+decline-backoff — which is exactly what that machinery is for.
 
-**Fail soft on delivery.** A human may well install the plugin before configuring a
-channel. An undeliverable greeting is **not an error** — the being stays unborn and
-greets when a channel exists, or when the human writes first.
+**Two failures the first draft shipped, both structural, both invisible:**
 
-**The unanswered greeting is NOT handled by the existing machinery** — an earlier draft
-claimed it was, and that was wrong. `unanswered_outbound_count` only increments on a
-`SENT` outcome of the *normal* proactive lifecycle (`core/aggregation.py:242-252`), which
-requires a live desire and a pending-proactive id. The birth greeting deliberately goes
-around that path (there is no desire; `u` is 0). So genesis must **not** fake a desire to
-borrow the machinery — that would pollute the contact model with a longing that does not
-exist. A greeting that is delivered and ignored simply leaves the being unborn and
-waiting, which §6.5 now bounds.
+1. **The greeting could never be delivered at all.** `connect()` runs while the host's
+   runner still has `_running = False` (adapters connect at `gateway/run.py:7080`; the flag
+   is set at `:7250`, *after* the connect loop), and `inject_proactive_turn` bails with
+   `UNAVAILABLE` in exactly that state. So the headline promise — *the newborn reaches out
+   by itself* — was **structurally guaranteed never to happen**, and `contextlib.suppress`
+   made it silent.
+2. **A hand-rolled "greeted" stamp is a second, parallel accounting of an outcome the
+   system already accounts for.** Two mechanisms for the same fact drift apart. There is
+   now one.
 
-**Genesis needs its own packet.** It cannot reuse `build_wake_packet`: that packet's body
-(`_IMPULSE_BODY`) is about *missing someone*, and a newborn's `u` is 0. Birth carries the
-`<genesis>` block instead.
+`genesis_greeted_at` is therefore **deleted**, not fixed. The correct amount of new
+delivery machinery for this phase is **none**.
 
 ### 6.3 The block, and why it is injected only once
 
@@ -360,10 +370,11 @@ declared born as someone nobody chose. But limbo is bounded from the other end:
 ### 6.6 Reset, rebirth, and the boundary of a being
 
 `/lifemodel reset` clears **our state only** — `u`, affect, memory, `genesis_completed_at`,
-`genesis_greeted_at`. It **does not touch `SOUL.md`** (§4.1: destroying a soul is the
-human's act, never the plugin's). Today reset writes a fresh `State()` and purges memory
-rows (`state_commands.py:312`); it must additionally clear the genesis stamps and
-construct the body via `newborn()`.
+and everything the being remembered of them (`last_exchange_at`, `last_contact_at`, so the
+reborn being is at a *first waking* again per §6.2). It **does not touch `SOUL.md`** (§4.1:
+destroying a soul is the human's act, never the plugin's). Today reset writes a fresh
+`State()` and purges memory rows (`state_commands.py:312`); it must additionally clear the
+genesis stamp and construct the body via `newborn()`.
 
 This makes rebirth *mean* something instead of leaking. The reborn being is unborn again —
 but the soul of the being that lived before it is still there, in slot #1, and it reads it.
@@ -387,13 +398,15 @@ separate design with its own privacy story (NFR8).
 
 | Unit | Responsibility |
 |---|---|
-| `core/genesis.py` | `newborn(now)`; the `<genesis>` block; the unborn/greeted/born predicate. Pure, Hermes-free. |
+| `core/genesis.py` | `newborn(now)`; the `<genesis>` block; `is_first_waking` (the wake reason, §6.2) and `should_launch` (the injector's). Pure, Hermes-free. |
+| `core/aggregation.py` | A first waking births the desire `spring=GENESIS` and waives the wake **threshold** gate only (`u` stays 0 — birth is not longing). |
+| `core/cognition.py` | A `GENESIS`-sprung desire's wake packet carries the `<genesis>` block instead of the longing body (`build_wake_packet(genesis=…)`). |
 | `core/soul_guard.py` | Validates a candidate soul (§4.3): non-empty, size-bounded, clean against the host's `context` threat patterns. Pure — the patterns are data, so this is testable without Hermes. |
-| `state/` | `genesis_completed_at`, `genesis_greeted_at`, `soul_sha`; soul revisions in `memory_records` (`kind="soul"`). |
+| `state/` | `genesis_completed_at`, `soul_sha`; soul revisions in `memory_records` (`kind="soul"`). **No greeting stamp** — see §6.2. |
 | `adapters/soul_file.py` | The only thing that touches `SOUL.md`: read+hash, locked compare-and-swap write via `os.replace`, startup reconciliation (§4.4), default-vs-customized check. |
 | `write_soul` tool | Registered via `register_tool`. Its description carries the "this is how you're born" instruction. Rejects an invalid soul back to the being with the reason. Used unchanged by becoming in Phase 5. |
 | `hooks.py` | Injects `<genesis>` on the being's first word while unborn. |
-| `adapters/being_platform.py` | Greet on connect when unborn; stamp `genesis_greeted_at` **on confirmed delivery only**; fail-soft on undeliverable. |
+| `adapters/being_platform.py` | Hosts the brain loop (which is what wakes the newborn) and reconciles the soul. **Nothing genesis-specific**: it must not greet from `connect()` — see §6.2. |
 | `state_commands.py` | `reset` additionally clears the genesis stamps and builds the body via `newborn()`. Never touches `SOUL.md`. |
 
 ## 8. Open question left for the owner
@@ -464,11 +477,23 @@ What it gets wrong, and where we can beat it:
 
 **The ritual.**
 - Detection is flag-driven: a seeded `DEFAULT_SOUL_MD` does **not** count as born.
-- Greeting: N `connect()` calls produce **one** delivered greeting; an *undelivered*
-  greeting does **not** stamp `genesis_greeted_at` and is retried on the next connect.
 - The `<genesis>` block is injected on the being's first word only, and never once born.
-- Genesis does **not** create a desire or a pending-proactive id — the contact model is
-  untouched by birth (`u` stays 0).
 - Veteran: a customized `SOUL.md` is not overwritten when the human says "leave it".
+
+**The wake (§6.2).** Driven end-to-end through the real spine (`IntegrationHarness`), not
+against a hand-rolled path — that is the point of the design.
+- A newborn reaches out **without `u` crossing `θ`**, and `u` is never written by it: the
+  contact model is untouched by birth.
+- Its desire is `spring=GENESIS`, never `DRIVE` — and its send does **not** bump
+  `unanswered_outbound_count` (a greeting is not a repeat longing bid).
+- Its impulse carries the `<genesis>` block and **not** "I miss them" (a lie in a
+  newborn's mouth); the veteran variant applies there too.
+- "Greeted" means **SENT**: a newborn that speaks stamps `last_contact_at` and never
+  greets again; one that answers `[SILENT]` stamps nothing and is re-woken by the
+  existing decline backoff.
+- A genesis outcome is **not** discarded as `pressure_satisfied` (`u = 0 < θ` by
+  construction) — doing so would strand `pending_proactive_id` and deadlock cognition.
+- The `pre_llm_call` genesis injector **stands down** for our own impulse turn, so the
+  ritual is never injected twice into one breath.
 - Rebirth: after `reset`, the being is unborn but `SOUL.md` still holds the previous
   being — and the ritual opens on the veteran branch.

@@ -53,6 +53,21 @@ ACTIVE = contact_desire_objects("active")
 DEFERRED = contact_desire_objects("deferred")
 
 
+#: Every being in this file has ALREADY BEEN BORN, and says so. That is not decoration:
+#: a being with no ``genesis_completed_at`` and no contact on record is at its FIRST
+#: WAKING (spec §6.2) and wakes for an entirely different reason — to be born, without
+#: ``u`` ever crossing ``θ``. That path is drive-free by design and is pinned in
+#: ``tests/test_genesis_wake.py``; everything here is about the drive, so every state
+#: below is a being that already has someone to miss.
+BORN_AT = "2026-07-01T10:00:00+00:00"
+
+
+def _born(**kw: object) -> State:
+    """A ``State`` for a being that has been born (see :data:`BORN_AT`)."""
+    kw.setdefault("genesis_completed_at", BORN_AT)
+    return State(**kw)  # type: ignore[arg-type]
+
+
 def _agg() -> ContactAggregation:
     return ContactAggregation(params=PARAMS, theta=1.0, beta=1.0, u_max=100.0)
 
@@ -102,12 +117,12 @@ def _live_pending_state(**over) -> State:
         last_tick_at="2026-07-06T03:59:00+00:00",
     )
     base.update(over)
-    return State(**base)
+    return _born(**base)
 
 
 def test_urge_over_threshold_creates_active_desire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
     intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
     assert _created_active(intents)  # no live desire -> births one active
@@ -115,7 +130,7 @@ def test_urge_over_threshold_creates_active_desire(tmp_path) -> None:
 
 def test_below_threshold_stays_none(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=0.5, delta=0.0, timestamp=None)  # < theta
     intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # no wake -> no desire
@@ -123,7 +138,7 @@ def test_below_threshold_stays_none(tmp_path) -> None:
 
 def test_second_urge_is_deduped_no_refire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     intents = _agg().step(_ctx(state, now, [c], objects=ACTIVE, tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # a desire is already live -> dedup, no new row
@@ -135,7 +150,7 @@ def test_deferred_desire_is_held_not_recreated(tmp_path) -> None:
     # desire held — NOT a new active row created over the held one. This regresses
     # the snapshot-visibility bug where deferred rows were filtered out.
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     intents = _agg().step(_ctx(state, now, [c], objects=DEFERRED, tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # held: no new PutRecord, no transition
@@ -145,7 +160,7 @@ def test_deferred_desire_cleared_by_exchange(tmp_path) -> None:
     # A real exchange terminalizes a held deferred desire, exactly like an active
     # one (old ``on_exchange`` cleared active OR deferred to none).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=DEFERRED, tmp_path=tmp_path))
@@ -155,7 +170,7 @@ def test_deferred_desire_cleared_by_exchange(tmp_path) -> None:
 def test_silence_window_suppresses_wake(tmp_path) -> None:
     # exchange 5 min ago (< w=15) -> SILENCE_WINDOW, no wake even with high u
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         last_exchange_at="2026-07-06T03:55:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -171,7 +186,7 @@ def test_silence_anchor_overrides_last_exchange_for_the_gate(tmp_path) -> None:
     # the window opens the gate — WITHOUT touching the immune last_exchange_at, which
     # the wake packet reads. Proven through the real aggregation gate.
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         last_exchange_at="2026-07-06T03:58:00+00:00",  # 2 min ago — would suppress
         silence_anchor_at="2026-07-06T03:40:00+00:00",  # 20 min ago — clears the window
@@ -189,7 +204,7 @@ def test_silence_anchor_now_suppresses_wake_despite_an_old_exchange(tmp_path) ->
     # suppresses a wake even though the real last exchange is 20 min old (past w) — and
     # the old exchange record is left intact for the model to read.
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         last_exchange_at="2026-07-06T03:40:00+00:00",  # 20 min ago — would wake
         silence_anchor_at="2026-07-06T04:00:00+00:00",  # now — inside the window
@@ -206,7 +221,7 @@ def test_exchange_clears_the_silence_anchor(tmp_path) -> None:
     # last_exchange_at=now AND clears any admin silence override, so the window measures
     # from the real exchange again (lm-md6.1).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         silence_anchor_at="2026-07-06T03:40:00+00:00",  # a stale admin override
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -220,7 +235,7 @@ def test_exchange_clears_the_silence_anchor(tmp_path) -> None:
 
 def test_in_flight_suppresses_wake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     busy = in_flight_signal(origin_id="f1", value=True, timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, busy], tmp_path=tmp_path))
@@ -230,7 +245,7 @@ def test_in_flight_suppresses_wake(tmp_path) -> None:
 def test_decline_backoff_suppresses_then_allows(tmp_path) -> None:
     # declined 10 min ago, decline_count=1 -> backoff r0=30 min active -> no wake
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         decline_count=1,
         declined_at="2026-07-06T03:50:00+00:00",
@@ -243,7 +258,7 @@ def test_decline_backoff_suppresses_then_allows(tmp_path) -> None:
 
 def test_duration_over_theta_accumulates(tmp_path) -> None:
     now = datetime(2026, 7, 6, 0, 5, tzinfo=UTC)  # dt=5 min
-    state = State(u=2.0, duration_over_theta=10.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=2.0, duration_over_theta=10.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)  # >= theta
     changes = _changes(_agg().step(_ctx(state, now, [c], objects=ACTIVE, tmp_path=tmp_path)))
     assert abs(changes["duration_over_theta"] - 15.0) < 1e-9
@@ -251,7 +266,7 @@ def test_duration_over_theta_accumulates(tmp_path) -> None:
 
 def test_aggregation_does_not_write_u_on_normal_tick(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
     assert "u" not in changes  # neuron owns u; aggregation only writes it on FULFILL (Task 4)
@@ -259,7 +274,7 @@ def test_aggregation_does_not_write_u_on_normal_tick(tmp_path) -> None:
 
 def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         decline_count=2,
         declined_at="2026-07-06T03:50:00+00:00",
@@ -277,7 +292,7 @@ def test_exchange_clears_desire_and_resets_clocks(tmp_path) -> None:
 
 def test_exchange_this_tick_suppresses_wake(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], tmp_path=tmp_path))
@@ -286,7 +301,7 @@ def test_exchange_this_tick_suppresses_wake(tmp_path) -> None:
 
 def test_internal_impulse_is_not_an_exchange(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     own = contact_observed_signal(
         origin_id="e1", actor="proactive_internal", label="two_way", timestamp=None
@@ -372,7 +387,7 @@ def test_stale_outcome_drops_desire_and_clears_pending_without_backoff(tmp_path)
 def test_exchange_clears_action_pending(tmp_path) -> None:
     # a real reply resolves the pull: clears ActionPending (neuron satiates u separately)
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=1.0,
         action_pending_since="2026-07-06T03:50:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -445,7 +460,7 @@ def test_exchange_dominates_same_tick_verdict(tmp_path) -> None:
 def test_action_pending_grace_suppresses_wake_despite_high_latent(tmp_path) -> None:
     # latent u=3 (>= theta) but a send 10 min ago (within 45-min grace) -> effective ~0 -> no wake
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         action_pending_since="2026-07-06T03:50:00+00:00",  # 10 min ago
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -458,7 +473,7 @@ def test_action_pending_grace_suppresses_wake_despite_high_latent(tmp_path) -> N
 def test_pressure_recovers_after_grace_and_decay(tmp_path) -> None:
     # send ~3h ago: grace(45m)+ ~2 half-lives -> inhibition ~0.06 -> effective ~ u -> wake
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         action_pending_since="2026-07-06T01:00:00+00:00",  # 180 min ago
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -471,7 +486,7 @@ def test_pressure_recovers_after_grace_and_decay(tmp_path) -> None:
 def test_duration_over_theta_uses_latent_not_effective(tmp_path) -> None:
     # even fully inhibited (effective 0), latent u>=theta so duration keeps accruing
     now = datetime(2026, 7, 6, 0, 5, tzinfo=UTC)  # dt=5
-    state = State(
+    state = _born(
         u=2.0,
         duration_over_theta=10.0,
         action_pending_since="2026-07-06T00:04:00+00:00",  # in grace -> inhibition 1
@@ -500,7 +515,7 @@ def test_fulfill_records_a_send(tmp_path) -> None:
 
 
 def test_negative_dt_does_not_shrink_duration(tmp_path) -> None:
-    state = State(u=2.0, duration_over_theta=30.0, last_tick_at="2026-07-06T12:10:00+00:00")
+    state = _born(u=2.0, duration_over_theta=30.0, last_tick_at="2026-07-06T12:10:00+00:00")
     now = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)  # before last_tick
     c = contact_pressure_signal(origin_id="c1", value=2.0, delta=0.0, timestamp=None)
     changes = _changes(_agg().step(_ctx(state, now, [c], objects=ACTIVE, tmp_path=tmp_path)))
@@ -572,7 +587,7 @@ def test_fulfill_mixed_spring_send_does_not_increment_unanswered_outbound_count(
 
 def test_exchange_resets_unanswered_outbound_count(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         unanswered_outbound_count=4,
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -596,7 +611,7 @@ def test_repeat_pure_longing_bid_holds_when_unanswered_outbound_pending(tmp_path
     # unanswered_outbound_count=1 (one unreplied longing send already out),
     # drive-only urge -> HOLD: no desire created.
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
     intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # held — no second pure-longing bid
@@ -606,7 +621,7 @@ def test_pure_longing_bid_unheld_when_no_outbound_is_unanswered(tmp_path) -> Non
     # Baseline, unchanged: unanswered_outbound_count == 0 -> drive-urge alone
     # still creates the desire.
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, unanswered_outbound_count=0, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, unanswered_outbound_count=0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
     intents = _agg().step(_ctx(state, now, [c], tmp_path=tmp_path))
     assert _created_active(intents)
@@ -663,7 +678,7 @@ def test_reject_drops_both_intention_and_desire_atomically(tmp_path) -> None:
 
 def test_exchange_completes_intention_and_satisfies_desire(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=_live_pair(), tmp_path=tmp_path))
@@ -690,7 +705,7 @@ def test_exchange_completes_a_deferred_intention(tmp_path) -> None:
     # After a backstop block the pair is held deferred; a real exchange terminalizes
     # BOTH — the intention transitions from its actual ``deferred`` state.
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(
@@ -705,7 +720,7 @@ def test_desire_resolves_without_a_never_crystallized_intention(tmp_path) -> Non
     # never-launched desire). No intention row exists -> only the desire transitions;
     # this is NOT split-brain (there is nothing to split).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     ex = contact_observed_signal(origin_id="e1", actor="user", label="two_way", timestamp=None)
     intents = _agg().step(_ctx(state, now, [c, ex], objects=ACTIVE, tmp_path=tmp_path))
@@ -729,7 +744,7 @@ def _created_desire(intents):
 def test_drive_only_urge_springs_a_drive_desire(tmp_path) -> None:
     # A drive urge -> spring=DRIVE, no source thoughts (the only spring now).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     draft = _created_desire(_agg().step(_ctx(state, now, [c], tmp_path=tmp_path)))
     assert draft is not None
@@ -774,7 +789,7 @@ def _supp_reason(events):  # type: ignore[no-untyped-def]
 
 def test_below_threshold_emits_below_threshold_suppression(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=0.5, delta=0.0, timestamp=None)  # < theta
     calls = _run_with_logger(state, now, [c], tmp_path=tmp_path)
     assert _supp_reason(calls) == "below_threshold"
@@ -782,7 +797,7 @@ def test_below_threshold_emits_below_threshold_suppression(tmp_path) -> None:
 
 def test_silence_window_emits_silence_window_suppression(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         last_exchange_at="2026-07-06T03:55:00+00:00",
         last_tick_at="2026-07-06T03:59:00+00:00",
@@ -793,7 +808,7 @@ def test_silence_window_emits_silence_window_suppression(tmp_path) -> None:
 
 def test_decline_backoff_emits_decline_backoff_suppression(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(
+    state = _born(
         u=3.0,
         decline_count=1,
         declined_at="2026-07-06T03:50:00+00:00",
@@ -805,7 +820,7 @@ def test_decline_backoff_emits_decline_backoff_suppression(tmp_path) -> None:
 
 def test_in_flight_emits_in_flight_suppression(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=3.0, delta=0.0, timestamp=None)
     busy = in_flight_signal(origin_id="f1", value=True, timestamp=None)
     assert _supp_reason(_run_with_logger(state, now, [c, busy], tmp_path=tmp_path)) == "in_flight"
@@ -813,7 +828,7 @@ def test_in_flight_emits_in_flight_suppression(tmp_path) -> None:
 
 def test_repeat_pure_longing_hold_emits_repeat_suppression(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, unanswered_outbound_count=1, last_tick_at="2026-07-06T03:59:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
     assert (
         _supp_reason(_run_with_logger(state, now, [c], tmp_path=tmp_path)) == "repeat_pure_longing"
@@ -822,7 +837,7 @@ def test_repeat_pure_longing_hold_emits_repeat_suppression(tmp_path) -> None:
 
 def test_urged_creation_emits_no_suppression(tmp_path) -> None:
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)  # >= theta
     assert _supp_reason(_run_with_logger(state, now, [c], tmp_path=tmp_path)) is None
 
@@ -867,7 +882,7 @@ def test_born_desire_carries_the_tick_trace(tmp_path) -> None:
 
     trace = FakeTracer().start_root()
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00")
     c = contact_pressure_signal(origin_id="c1", value=1.5, delta=0.0, timestamp=None)
     draft = _created_desire(
         _agg().step(_traced_ctx(state, now, [c], tmp_path=tmp_path, trace=trace))
@@ -899,7 +914,7 @@ def test_contact_observed_survives_a_best_effort_flood(tmp_path) -> None:
     # contact_observed is ALWAYS processed — it resets the exchange clocks and
     # terminalizes the live desire — no matter how full the frame is (spec §7).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     observed = contact_observed_signal(origin_id="e", actor="user", label="two_way", timestamp=None)
     signals = [observed, *(_noise(i) for i in range(200))]
     intents = _agg().step(_ctx(state, now, signals, objects=ACTIVE, tmp_path=tmp_path))
@@ -916,7 +931,7 @@ def test_best_effort_flood_is_coalesced_to_a_bounded_count(tmp_path) -> None:
     from lifemodel.domain.signal import Signal
 
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=1.5, last_tick_at="2026-07-06T03:59:00+00:00")
     reg = MetricRegistry()
     register_universal_metrics(reg)
     observed = contact_observed_signal(origin_id="e", actor="user", label="two_way", timestamp=None)
@@ -935,6 +950,6 @@ def test_only_best_effort_noise_no_spurious_launch(tmp_path) -> None:
     # A frame of ONLY sensor noise (no must_process, u below theta) behaves sanely:
     # coalesced, no crash, NO desire born / no cognition launch (spec §7).
     now = datetime(2026, 7, 6, 4, 0, tzinfo=UTC)
-    state = State(u=0.0, last_tick_at="2026-07-06T03:59:00+00:00")
+    state = _born(u=0.0, last_tick_at="2026-07-06T03:59:00+00:00")
     intents = _agg().step(_ctx(state, now, [_noise(i) for i in range(200)], tmp_path=tmp_path))
     assert _desire_intent(intents) is None  # no spurious desire / launch

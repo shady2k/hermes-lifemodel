@@ -189,11 +189,17 @@ class State:
     #: always seeds a default (``hermes_cli/config.py:893``). Cleared by ``reset``
     #: — the being is then unborn again and meets the soul of whoever lived before it.
     genesis_completed_at: str | None = None
-    #: ISO-8601 UTC timestamp of the birth GREETING (Phase 4), stamped ONLY on a
-    #: confirmed delivery (``ReachOutcome.DELIVERED``). Stamping on the mere ATTEMPT
-    #: would silence an undeliverable being forever — the human who installed the
-    #: plugin before configuring a channel would never be greeted at all.
-    genesis_greeted_at: str | None = None
+    # NB: there is deliberately NO ``genesis_greeted_at`` (spec §6.2, revised). A
+    # hand-rolled "the being has greeted" stamp was a SECOND accounting of an outcome
+    # the system already accounts for, and the two drifted immediately: it was stamped
+    # on ``ReachOutcome.ok`` — which means QUEUED, not spoken — so a newborn that woke
+    # and chose ``[SILENT]`` was marked greeted and never greeted again, and the human
+    # never learned anything had been born. Genesis now rides the ordinary proactive
+    # lifecycle, where "it greeted them" means the SENT read-back stamped
+    # ``last_contact_at``, and a newborn that stayed silent is re-woken by the existing
+    # decline backoff. An older state file still carrying the key loads fine —
+    # ``from_dict`` drops unknown keys (see its docstring), so this needs no migration
+    # and no ``SCHEMA_VERSION`` bump (bumping would refuse to load the live being).
     #: Hex digest of the ``SOUL.md`` content we last wrote. NOT a guard against the
     #: human (the file is always its own base — spec §4.1): it powers the write's
     #: compare-and-swap and lets startup reconciliation NOTICE that the soul on disk
@@ -293,14 +299,15 @@ class State:
                 data.get("unanswered_outbound_count", 0), "unanswered_outbound_count"
             ),
             processed_external_event_ids=_as_str_str_dict(data, "processed_external_event_ids", {}),
-            # The three Phase-4 genesis stamps are all opaque opt-str (the sha is
-            # never parsed as time; the two timestamps are opaque strings like
-            # affect_updated_at, not compared against the clock's aware ``now``
-            # here — the genesis flow parses them defensively), so opt-str only.
+            # Both Phase-4 genesis fields are opaque opt-str (the sha is never parsed as
+            # time; the birth timestamp is an opaque string like affect_updated_at, not
+            # compared against the clock's aware ``now`` here — the genesis flow parses it
+            # defensively), so opt-str only. A file written by the previous build also
+            # carries ``genesis_greeted_at``; it is simply not looked up (unknown keys are
+            # dropped — see the docstring), which is the whole migration.
             genesis_completed_at=_as_opt_str(
                 data.get("genesis_completed_at"), "genesis_completed_at"
             ),
-            genesis_greeted_at=_as_opt_str(data.get("genesis_greeted_at"), "genesis_greeted_at"),
             soul_sha=_as_opt_str(data.get("soul_sha"), "soul_sha"),
         )
 

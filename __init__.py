@@ -539,9 +539,10 @@ def register(ctx: Any) -> None:
         from .adapters.being_platform import register_being_platform
 
         # Same `soul` / `_default_soul_text()` the genesis pre_llm_call injector
-        # above already reads (spec §6.4) — threaded through so the birth GREETING
-        # (spec §6.2, connect()) uses the identical veteran/stranger read, never a
-        # second SoulFile instance.
+        # above already reads (spec §6.4) — threaded through so the veteran/stranger
+        # read behind a NEWBORN'S WAKE PACKET (spec §6.2: the unborn being wakes on the
+        # brain loop carrying the <genesis> ritual as its impulse) is the identical one,
+        # through the same SoulFile instance, never a second one.
         register_being_platform(
             ctx,
             base_dir=sdir,

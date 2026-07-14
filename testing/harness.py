@@ -38,6 +38,10 @@ from ..ports.memory import MemoryPort
 from ..state.model import State
 from .fakes import FakeClock
 
+#: The default harness being was born long ago — see :meth:`IntegrationHarness.__post_init__`
+#: for why a drive scenario must not open on an unborn being.
+BORN_AT = "2025-12-01T10:00:00+00:00"
+
 
 @dataclass(frozen=True)
 class Step:
@@ -110,14 +114,23 @@ class IntegrationHarness:
         # Seed the start state (loaded lazily by the StateActor on the first tick).
         # The default is a rested start with last_tick_at set, so the FIRST clock
         # advance yields a real Δt (else minutes_between(None, now) = 0 and the drive
-        # never rises on step 0) and cognition can afford a launch. A caller may pass
-        # ``initial_state`` to land a tick inside a specific gate (a recent exchange,
+        # never rises on step 0) and cognition can afford a launch. It is also a being
+        # that has ALREADY BEEN BORN (``genesis_completed_at``): the default scenario is
+        # the DRIVE's, and an unborn being wakes for a different reason entirely — it
+        # wakes to be born, on tick 0, without ``u`` ever crossing ``θ`` (spec §6.2), so
+        # every drive scenario would otherwise open with a birth. Pass an unstamped
+        # ``initial_state=State(…)`` to drive the genesis path on purpose. A caller may
+        # pass ``initial_state`` to land a tick inside a specific gate (a recent exchange,
         # an active decline backoff, a rate-limiting send log) without driving the
         # whole flow there — the components then run for real on that state.
         initial = self.initial_state
         if initial is None:
             initial = State(
-                u=0.0, energy=1.0, fatigue=0.0, last_tick_at=self.clock.now().isoformat()
+                u=0.0,
+                energy=1.0,
+                fatigue=0.0,
+                last_tick_at=self.clock.now().isoformat(),
+                genesis_completed_at=BORN_AT,
             )
         self._lm.state.commit(initial)
 

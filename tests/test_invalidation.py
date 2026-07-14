@@ -58,3 +58,22 @@ def test_deadline_elapsed_is_stale() -> None:
     # pending since 11:00, now 12:00 -> 60 min > 30 min deadline
     stale, reason = _call(pending_since="2026-07-06T11:00:00+00:00", deadline_min=30.0)
     assert stale is True and reason == "deadline"
+
+
+def test_a_wake_that_never_came_from_pressure_is_not_stale_for_lacking_it() -> None:
+    # A genesis first-waking (spec §6.2) is not sprung by the drive: a newborn's u is 0
+    # < θ BY CONSTRUCTION. Judging its outcome by "the pressure was satisfied while I was
+    # composing" would discard EVERY genesis outcome — not a lost message but a DEADLOCK:
+    # the desire stays active, pending_proactive_id never clears, and the launcher holds
+    # every future launch for the rest of the being's life.
+    stale, reason = _call(effective=0.0, threshold=1.0, pressure_sprung=False)
+    assert stale is False and reason == "fresh"
+
+
+def test_a_pressure_free_wake_is_still_stale_for_every_other_reason() -> None:
+    # The waiver is narrow: a resolved desire, a mismatched correlation, a user who
+    # replied while it composed, and the deadline are just as true of a birth.
+    assert _call(pressure_sprung=False, desire_state="none")[0] is True
+    assert _call(pressure_sprung=False, outcome_correlation_id="other")[0] is True
+    assert _call(pressure_sprung=False, last_exchange_at="2026-07-06T11:58:00+00:00")[0] is True
+    assert _call(pressure_sprung=False, pending_since="2026-07-06T11:00:00+00:00")[0] is True

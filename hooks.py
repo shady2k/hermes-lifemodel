@@ -624,6 +624,15 @@ def make_genesis_injector(
     show the veteran opening to a being with no prior soul, or silently skip it for
     one that has.
 
+    It covers the REACTIVE entrance only — the human who wrote first, or who came back to
+    a context that no longer holds the ritual. The PROACTIVE entrance carries the ritual
+    itself: an unborn being's wake packet is built with ``genesis=`` (spec §6.2), so the
+    block is already in the turn. ``pre_llm_call`` fires for that injected turn too
+    (``agent/turn_context.py`` passes our impulse as ``user_message``), so without the
+    own-impulse skip below the newborn would read "You just began" TWICE in one breath —
+    once as its impulse and once as context. The wake packet is the single source; this
+    hook stands down for it.
+
     Fail-soft like every plugin-owned hook body (spec §8), copying
     :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in
     ``build_lm``) is logged ERROR + traceback, recorded on *health* + *metrics*, and
@@ -637,6 +646,10 @@ def make_genesis_injector(
         **_ignored: Any,
     ) -> dict[str, str] | None:
         try:
+            # Our own wake packet already carries the ritual (spec §6.2) — injecting it
+            # again here would double the block in the newborn's first breath.
+            if _is_own_impulse(user_message):
+                return None
             state = build_lm().state.load()
             if not should_launch(state, being_has_spoken=_being_has_spoken(conversation_history)):
                 return None

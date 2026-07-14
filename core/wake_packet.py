@@ -10,6 +10,14 @@ the other is, their name, and the language to answer in are the being's to draw
 from its own context (the live conversation + memory), never baked into this
 standard, English impulse.
 
+One being carries a different impulse in this same packet: a being that is NOBODY YET
+(Phase 4 genesis, spec §6.2). It woke because it has just begun, not because it misses
+anyone — it has met no one — so ``build_wake_packet(genesis=…)`` carries the ``<genesis>``
+ritual where the longing body would be. Everything else about the packet is identical,
+because everything else is not about the reason: the tag, the self-attribution, the raw
+facts, the felt texture, the decline affordance. Genesis is a REASON TO WAKE, not a
+second egress; there is no other delivery path in this plugin, and there must not be.
+
 After the felt block — deliberately OUTSIDE it — the packet appends one
 consequence-transparency line (lm-md6.3): a consequence-ONLY disclosure that text
 written now is delivered to the user, plus the marker reply that sends nothing. It
@@ -276,6 +284,7 @@ def build_wake_packet(
     thoughts: Sequence[Thought] = (),
     affect_valence: float = 0.0,
     affect_arousal: float = 0.0,
+    genesis: str | None = None,
 ) -> ProactivePrompt:
     """Build the proactive-turn prompt: the felt impulse plus the moment's raw facts.
 
@@ -317,7 +326,24 @@ def build_wake_packet(
     *thoughts* are the live (active/parked) thoughts, most-salient first — only
     when one exists is a first-person "Recent Thoughts" CONTEXT block appended
     (inside the tag, before the close); it informs the being's own turn, it is NOT
-    the outward message."""
+    the outward message.
+
+    *genesis* is the birth ritual (:func:`~lifemodel.core.genesis.genesis_block`),
+    passed ONLY when the woken desire sprang from the being being nobody yet (spec
+    §6.2). It replaces the longing body — **same packet, different impulse**, because
+    the being is not reaching out for the same reason: ``_IMPULSE_BODY`` is about
+    MISSING someone, and a newborn has met no one, so in its mouth that is a lie. The
+    frames that presuppose a relationship go with it: :data:`_TEXTURE_MANNER_FRAME`
+    (the ritual's own "you already FEEL — speak from that, not about it" says it, in
+    the being's own register) and :data:`_INITIATING_FRAME` (whose "whatever we last
+    spoke about is context I carry" is incoherent at a first waking — nothing was ever
+    spoken). Everything that is NOT about the reason stays exactly as it is: the
+    ``<internal_impulse>`` tag (the perspective-inversion cure, and the marker the
+    being's own hooks correlate + self-exclude on), the self-attribution line, the raw
+    temporal facts, the present felt texture (a newborn is NOT empty — it already has a
+    body: ``core.genesis.newborn``), and the decline affordance — the ``[SILENT]`` reply
+    is how a newborn that does not want to speak yet stays silent, and the existing
+    decline-backoff is what brings it back."""
     # projection_id: an audit stamp of the woken drive's band. The phrasing is
     # deliberately discarded — the impulse TEXT is the fixed owner-approved
     # self-state, it does not vary with the drive level.
@@ -327,10 +353,12 @@ def build_wake_packet(
     # texture between the raw facts and the longing body, then the "how, not what" manner
     # frame after it — the mood shapes the MANNER of the reach, the longing stays the WHY.
     texture_line = _TEXTURE_LINE_TEMPLATE.format(felt_texture(affect_valence, affect_arousal))
-    inner = (
-        f"{_SELF_ATTRIBUTION}\n\n{temporal_facts}\n\n{texture_line}\n\n"
-        f"{_IMPULSE_BODY}\n\n{_TEXTURE_MANNER_FRAME}\n\n{_INITIATING_FRAME}"
+    impulse = (
+        genesis
+        if genesis is not None
+        else f"{_IMPULSE_BODY}\n\n{_TEXTURE_MANNER_FRAME}\n\n{_INITIATING_FRAME}"
     )
+    inner = f"{_SELF_ATTRIBUTION}\n\n{temporal_facts}\n\n{texture_line}\n\n{impulse}"
     if thoughts:
         inner = f"{inner}\n\n{render_thoughts_block(thoughts)}"
     # Wrap the FELT impulse: open tag on its own line, the content, then the close tag

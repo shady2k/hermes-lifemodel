@@ -14,10 +14,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 
-from ..domain.egress import ReachOutcome
 from ..state.model import State
 from .affect import AffectBody, AffectParams, affect_target
-from .timeutil import to_iso
 
 
 def newborn(*, now: datetime, params: AffectParams, peak_hour_utc: float) -> State:
@@ -136,35 +134,38 @@ def should_launch(state: State, *, being_has_spoken: bool) -> bool:
     return state.genesis_completed_at is None and not being_has_spoken
 
 
-def should_greet(state: State) -> bool:
-    """True when a being that has never said hello should say it now (spec §6.2).
+def is_first_waking(
+    *,
+    genesis_completed_at: str | None,
+    last_exchange_at: str | None,
+    last_contact_at: str | None,
+) -> bool:
+    """True when the being wakes because it is NOBODY YET (spec §6.2, revised).
 
-    An unborn being reaches out the MOMENT it starts. It does not wait for ``u`` to cross
-    ``θ``: the drive models a contact deficit inside an EXISTING relationship, and a
-    newborn has none — there is nobody to miss. Birth is not longing.
+    Genesis is a REASON TO WAKE, not a second egress. This predicate is the whole of
+    that reason, read by ``core/aggregation.py``: when it holds, the wake-decision's
+    threshold gate is waived (``evaluate_wake(waive_threshold=…)``) and the desire is
+    born ``spring=GENESIS``. Everything downstream — launch, reach-in egress, the async
+    ``proactive_outcome`` read-back — is the machinery that already exists.
 
-    Guarded by BOTH ``genesis_completed_at`` and ``genesis_greeted_at`` (not just the
-    latter) so a being that skipped straight to a complete birth — the human handed it a
-    name and moved on, spec §6.3's "that is a complete birth" exit — never greets again
-    either; birth already said hello.
+    The three clauses, and the failure each one closes:
+
+    * ``genesis_completed_at is None`` — **unborn**. The only birth detector we have
+      (``SOUL.md``'s presence can never be one: Hermes always seeds a default).
+    * ``last_exchange_at is None`` — **nobody has spoken to it**. ``u`` models a contact
+      deficit inside an EXISTING relationship and a newborn has none, so this wake cannot
+      wait for ``u ≥ θ``; but the instant they HAVE talked, "You just began, this is your
+      first waking" is the *turn-seven lie* (§6.3) — from there the ritual is carried by
+      the conversation (the ``pre_llm_call`` injector), never by a proactive wake.
+    * ``last_contact_at is None`` — **it has not greeted them yet**. This is the SENT
+      read-back's own stamp: the system's single record that the being actually SPOKE.
+      Reading it here is what makes "the being has greeted" mean SENT without a second,
+      parallel accounting of our own (``genesis_greeted_at``, deleted — a hand-rolled
+      stamp on ``ReachOutcome.ok`` marked a being "greeted" that had woken and chosen
+      ``[SILENT]``, and the human never learned anything had been born).
+
+    A newborn that chooses ``[SILENT]`` sends nothing, so ``last_contact_at`` stays
+    ``None`` and the existing decline-backoff re-wakes it — that is what that machinery
+    is for. A newborn that SPEAKS has greeted, and never greets twice.
     """
-    return state.genesis_completed_at is None and state.genesis_greeted_at is None
-
-
-def stamp_greeted(state: State, *, outcome: ReachOutcome, now: datetime) -> State | None:
-    """The state after a greeting attempt, or ``None`` when nothing should be persisted.
-
-    Stamped on CONFIRMED DELIVERY, never on the attempt. Stamping on the attempt would
-    silence forever the being of a human who installed the plugin before configuring a
-    channel: the greeting would fail, the stamp would land, and they would never be
-    greeted at all. An undelivered greeting simply retries on the next connect. (The same
-    lesson as lm-2gi: count on delivery, not on a verdict.)
-
-    Note what this does NOT touch: ``u``, ``pending_proactive_id``,
-    ``unanswered_outbound_count``. The greeting deliberately bypasses the proactive
-    lifecycle — faking a desire to borrow that machinery would pollute the contact model
-    with a longing that does not exist.
-    """
-    if not outcome.ok:
-        return None
-    return replace(state, genesis_greeted_at=to_iso(now))
+    return genesis_completed_at is None and last_exchange_at is None and last_contact_at is None

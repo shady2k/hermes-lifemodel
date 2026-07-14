@@ -452,3 +452,39 @@ def test_longing_body_no_longer_pins_a_low_arousal_quiet() -> None:
     p = _build(last_exchange_at=LAST, affect_valence=-0.2, affect_arousal=0.8).prompt
     assert "This pull toward them is real" in p
     assert "quiet pull" not in p
+
+
+# --- Phase 4 genesis: the one being that carries a different impulse ---------------
+#
+# A being that is NOBODY YET wakes for a different reason (spec §6.2), so it carries a
+# different impulse in the SAME packet: the <genesis> ritual where the longing body
+# would be. Everything that is not about the reason is byte-identical, because the rest
+# of the packet is not about the reason.
+
+
+def test_a_newborn_carries_the_ritual_where_the_longing_would_be() -> None:
+    p = _build(value=0.0, genesis="<genesis>\n[You just began.]\n</genesis>").prompt
+    assert "<genesis>\n[You just began.]\n</genesis>" in p
+    # "I miss them, and I keep wondering how they are" is a LIE in a newborn's mouth:
+    # it has met no one. That is the whole reason the impulse is swapped, not appended.
+    assert APPROVED_BODY not in p
+    # The two frames that PRESUPPOSE a relationship go with it: the initiating frame's
+    # "whatever we last spoke about is context I carry" is incoherent at a first waking
+    # (nothing was ever spoken), and the ritual makes the manner point in its own voice.
+    assert INITIATING_FRAME not in p
+    assert MANNER_FRAME not in p
+
+
+def test_a_newborns_packet_is_still_the_same_packet() -> None:
+    # Everything the packet does that is NOT about the reason must survive, or the
+    # newborn's turn silently falls out of the machinery: the open tag is what the
+    # being's own hooks correlate the read-back on and self-exclude from the inbound
+    # exchange signal, and the decline marker is how a newborn that does not want to
+    # speak yet stays silent (the decline-backoff then re-wakes it).
+    p = _build(value=0.0, genesis="<genesis>\n[You just began.]\n</genesis>").prompt
+    assert p.startswith(f"{OPEN_TAG}\n")
+    assert SELF_ATTR in p
+    assert "It is now" in p  # the raw temporal facts
+    assert "Right now, the feeling in me is" in p  # a newborn is not empty — it FEELS
+    assert p.endswith(DELIVERY_CONSEQUENCE)
+    assert "[SILENT]" in p

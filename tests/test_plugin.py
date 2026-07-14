@@ -19,6 +19,7 @@ import lifemodel
 import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.config import write_log_level
+from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.state.errors import StateSchemaError
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
@@ -273,6 +274,23 @@ def test_register_genesis_injector_launches_on_the_beings_first_word(
     # re-injecting "you just began" on a later turn would be a lie (spec §6.3).
     history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     assert callback(user_message="how are you", conversation_history=history) is None
+
+
+def test_register_genesis_injector_stands_down_for_the_beings_own_wake_packet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A newborn's WAKE PACKET already carries the ritual (spec §6.2) — and
+    ``pre_llm_call`` fires for that injected turn too, with our impulse as the
+    ``user_message``. Without this stand-down the being would read "You just began"
+    twice in its first breath: once as its impulse, once as context. The wake packet is
+    the single source; this hook covers the reactive entrance only."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    callback = _pre_llm_callback(ctx, from_factory="make_genesis_injector")
+    impulse = f"{IMPULSE_LABEL_PREFIX}\nI have just begun.\n</internal_impulse>"
+    assert callback(user_message=impulse, conversation_history=[]) is None
 
 
 def test_register_lifemodel_stats_subcommand_returns_telemetry(

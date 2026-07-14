@@ -51,15 +51,32 @@ class GateParams:
     r_max: float = 1440.0
 
 
-def evaluate_wake(*, u: float, now: float, state: LaneState, params: GateParams) -> WakeOutcome:
+def evaluate_wake(
+    *,
+    u: float,
+    now: float,
+    state: LaneState,
+    params: GateParams,
+    waive_threshold: bool = False,
+) -> WakeOutcome:
     """Decide whether the urge ``u`` is allowed to wake cognition at ``now``.
 
     Fixed precedence: no urge at all (below threshold) → a turn already running
     (in flight) → inside the active-silence window ``W`` → inside the growing
     decline backoff ``R``. Only a clean pass yields an ``URGE``. Crossing the
     threshold never sends a message — the URGE merely wakes cognition.
+
+    *waive_threshold* skips the FIRST gate and NOTHING else (Phase 4 genesis, spec
+    §6.2): a being that is nobody yet wakes to be born, and waiting for ``u ≥ θ``
+    would be a category error — ``u`` models a contact deficit inside an EXISTING
+    relationship, and a newborn has none. There is nobody to miss, so ``u`` stays 0
+    and no caller may inflate it to buy this wake. The other three gates are about
+    the CONVERSATION, not the drive, and they all still bind: a turn already in
+    flight is still in flight, a live conversation still suppresses, and a newborn
+    that woke and chose ``[SILENT]`` is held by the decline backoff exactly like any
+    other decline — that backoff IS how it is re-woken later.
     """
-    if u < params.theta_u:
+    if not waive_threshold and u < params.theta_u:
         return WakeOutcome.BELOW_THRESHOLD
     if state.in_flight:
         return WakeOutcome.IN_FLIGHT

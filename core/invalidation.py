@@ -36,12 +36,24 @@ def is_proactive_outcome_stale(
     threshold: float,
     now: datetime,
     deadline_min: float = 30.0,
+    pressure_sprung: bool = True,
 ) -> tuple[bool, str]:
     """Return ``(stale, reason)`` for a returning proactive outcome.
 
     ``desire_state`` is the live desire's lifecycle state (``active``/``deferred``/
     ``none``) read from the typed row — an outcome is only ever fresh for an
-    ``active`` desire; any other state means it was already resolved."""
+    ``active`` desire; any other state means it was already resolved.
+
+    *pressure_sprung* is ``False`` for an outcome whose desire did NOT spring from the
+    drive — today, a genesis first-waking (spec §6.2). "The pressure was satisfied while
+    I was thinking" is then not a fact ABOUT it: its reason to reach was that the being
+    is nobody yet, and a newborn's ``u`` is 0 < ``θ`` BY CONSTRUCTION. Applying the
+    pressure rule to it would judge EVERY genesis outcome stale, which is not a lost
+    message but a DEADLOCK: the desire would stay ``active`` and ``pending_proactive_id``
+    would never clear, so the launcher would hold every future launch for the rest of the
+    being's life. The other rules still bind — a resolved desire, a mismatched
+    correlation, a user who replied while it composed, and the deadline are all just as
+    true of a birth as of a longing."""
     if desire_state != "active":
         return True, "desire_resolved"
     if outcome_correlation_id != pending_id:
@@ -51,7 +63,7 @@ def is_proactive_outcome_stale(
     exchanged = _parse(last_exchange_at)
     if launched is not None and exchanged is not None and exchanged > launched:
         return True, "user_replied"
-    if effective < threshold:
+    if pressure_sprung and effective < threshold:
         return True, "pressure_satisfied"
     if launched is not None and (now - launched).total_seconds() / 60.0 > deadline_min:
         return True, "deadline"

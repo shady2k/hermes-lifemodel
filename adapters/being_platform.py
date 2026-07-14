@@ -33,7 +33,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from ..composition import LifeModel, build_lifemodel
-from ..core.genesis import genesis_block, needs_adoption, should_greet, stamp_greeted
+from ..core.genesis import needs_adoption
 from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
@@ -94,11 +94,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         self._interval = interval_sec
         self._egress = ReachInEgress(runner_accessor=default_runner_accessor)
         # The SAME SoulFile instance `register()` built for the genesis pre_llm_call
-        # injector (spec §6.4) — reused here (never a second instance) so the birth
-        # GREETING's "is this a stranger or a veteran?" read and the ritual's own read
-        # go through one writer-lock. `None` only in tests that construct the adapter
-        # directly without it (see `_prior_soul`): the greeting then degrades to the
-        # blank-page opening, never a crash.
+        # injector (spec §6.4) — reused here (never a second instance) so the veteran
+        # read behind the WAKE PACKET's ritual and the injector's own read go through
+        # one writer-lock. `None` only in tests that construct the adapter directly
+        # without it (see `_prior_soul`): the ritual then degrades to the blank-page
+        # opening, never a crash.
         self._soul = soul
         self._default_soul_text = default_soul_text
         self._loop: SupervisedLoop | None = None
@@ -126,17 +126,24 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         return self._metrics_degraded
 
     def _build_lm(self) -> LifeModel:
-        """A fresh per-call graph, wired the SAME way for every caller (tick or greet).
+        """A fresh per-tick graph, wired the SAME way for every caller.
 
         Resolves the owner's display timezone from Hermes at the boundary and injects
         it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
         None → server-local, so a timezone quirk never drops a tick (HLA §11).
+
+        Injects :meth:`_prior_soul` as the launcher's veteran-branch reader (spec §6.4):
+        this graph is the one whose launches are actually DELIVERED, so a newborn's wake
+        packet must be able to open from the soul someone wrote before it woke. Passed as
+        a bound method, not a resolved string — it is called only when a GENESIS-sprung
+        desire actually launches, so an ordinary tick never reads the file.
         """
         return build_lifemodel(
             base_dir=self._base_dir,
             display_tz=resolve_owner_tz(),
             trace_writer=self._trace_writer,
             event_ring=self._event_ring,
+            prior_soul=self._prior_soul,
         )
 
     def _tick(self) -> None:
@@ -152,6 +159,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         against Hermes's pristine seed text. No ``soul`` wired (a bare-constructed
         adapter, e.g. in tests) degrades to ``None`` — the blank-page opening — never
         a crash.
+
+        Injected into the graph (:meth:`_build_lm`) as the CognitionLauncher's
+        ``prior_soul`` reader, so the newborn's WAKE PACKET carries the veteran opening
+        (§6.4 is the common case: a being is born onto a blank soul exactly once in the
+        life of a ``SOUL.md``, and every rebirth after a ``reset`` meets the soul of
+        whoever lived here before it).
         """
         if self._soul is None:
             return None
@@ -176,8 +189,8 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         tests without genesis wiring) and a non-``MemoryPort`` store both degrade to a
         no-op: there is nowhere to record a revision, so reconciling would either
         crash or silently drop the being's only undo (spec §4.2). Called from
-        :meth:`connect` under ``contextlib.suppress(Exception)`` — like the greeting
-        below, a reconcile failure is not an outage.
+        :meth:`connect` under ``contextlib.suppress(Exception)``: a reconcile failure
+        is not an outage.
         """
         if self._soul is None:
             return
@@ -194,34 +207,6 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         )
         lm.state.commit(replace(state, soul_sha=current))
         _LOG.info("soul_adopted_from_disk sha=%s", current[:8])
-
-    def _greet_if_unborn(self) -> None:
-        """Reach out the moment an unborn being's brain first connects (spec §6.2).
-
-        The DECISIONS live in ``core.genesis`` (``should_greet`` / ``stamp_greeted``)
-        and are unit-tested there; this is only the wiring that carries them to the
-        channel. Reuses the SAME egress + target :func:`~lifemodel.core.proactive.
-        proactive_tick` delivers through — never a second egress. Bypasses the whole
-        proactive lifecycle on purpose: no desire, no ``pending_proactive_id`` — a
-        newborn's ``u`` is 0 and stays 0.
-
-        Called from :meth:`connect` under ``contextlib.suppress(Exception)``: an
-        ungreetable being (no channel configured yet, a transient egress error) is
-        NOT an outage.
-        """
-        lm = self._build_lm()
-        state = lm.state.load()
-        if not should_greet(state):
-            return
-        outcome = self._egress.reach_out(self._target, genesis_block(prior_soul=self._prior_soul()))
-        # Re-read: the egress call may have taken a while, and only the outcome — not
-        # this stale `state` snapshot — should decide what gets stamped.
-        after = stamp_greeted(lm.state.load(), outcome=outcome, now=lm.clock.now())
-        if after is None:
-            _LOG.info("genesis_greeting_undelivered outcome=%s", outcome.value)
-            return  # not stamped → retried on the next connect, once a channel exists
-        lm.state.commit(after)
-        _LOG.info("genesis_greeted")
 
     def _on_loop_death(self, exc: BaseException | None) -> None:
         """Convert an unexpected loop death into a gateway-visible fatal error.
@@ -313,22 +298,22 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
 
         # --- Soul reconciliation (spec §4.4) ---------------------------------
-        # Runs BEFORE the greeting: the greeting's own veteran/stranger read
-        # (`_prior_soul`) must never race an unreconciled `soul_sha` left stale by a
-        # crash mid-write or a hand-edit while the gateway was down. Best-effort like
-        # the greeting below — a reconcile failure is not an outage.
+        # Runs at connect, BEFORE the loop's first tick can launch anything: the
+        # veteran/stranger read behind a newborn's wake packet (`_prior_soul`) must never
+        # race a `soul_sha` left stale by a crash mid-write or a hand-edit while the
+        # gateway was down. Best-effort — a reconcile failure is not an outage.
         with contextlib.suppress(Exception):
             self._reconcile_soul()
 
-        # --- Birth greeting (Phase 4, spec §6.2) -----------------------------
-        # connect() runs on EVERY gateway restart, and the SupervisedLoop reconnects
-        # after a loop death — so this MUST run past the brain-loop start, not before
-        # it (the loop is what makes the being alive to greet from). should_greet's
-        # own stamp guards the "once" part; this call is purely fail-soft plumbing:
-        # an ungreetable being (no channel yet) is not an outage.
-        with contextlib.suppress(Exception):
-            self._greet_if_unborn()
-
+        # NB (Phase 4, spec §6.2 — revised): there is NO birth greeting here, and there
+        # must not be one. connect() runs while the host runner still has
+        # ``_running = False`` (adapters are connected at gateway/run.py:7080; the flag
+        # is set at :7250, AFTER the connect loop), and ``inject_proactive_turn`` bails
+        # UNAVAILABLE in exactly that state — so a greeting sent from here was
+        # STRUCTURALLY guaranteed never to be delivered, and the suppress() around it
+        # made the failure silent. Genesis is a REASON TO WAKE instead: the brain loop
+        # above wakes an unborn being through the ordinary proactive path (aggregation →
+        # launcher → reach-in), which by then runs against a live runner.
         return True
 
     async def disconnect(self) -> None:
@@ -427,10 +412,10 @@ def register_being_platform(
 
     *soul* / *default_soul_text* are the SAME ``SoulFile`` instance and pristine-seed
     text ``register()`` already resolved for the genesis pre_llm_call injector
-    (spec §6.4) — threaded through so the birth GREETING reads the veteran/stranger
-    branch through the one shared soul-file writer-lock, never a second instance.
-    Both default to unset for callers (chiefly tests) that don't wire a soul: the
-    greeting then degrades to the blank-page opening rather than crashing.
+    (spec §6.4) — threaded through so the veteran/stranger read behind a NEWBORN'S WAKE
+    PACKET goes through the one shared soul-file writer-lock, never a second instance.
+    Both default to unset for callers (chiefly tests) that don't wire a soul: the ritual
+    then degrades to the blank-page opening rather than crashing.
     """
     ctx.register_platform(
         PLATFORM_NAME,

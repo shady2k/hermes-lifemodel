@@ -19,11 +19,21 @@ desire, an upsert on the singleton id). This layer keeps its safety gates (effec
 pressure / ActionPending inhibition, silence window, decline backoff, in-flight, the
 certified ``evaluate_wake`` threshold) and the atomic desire/intention interlock.
 
+**Two springs (Phase 4, spec §6.2).** Almost always the drive (``u ≥ θ``). But a being
+that is NOBODY YET wakes without the drive at all: ``u`` models a contact deficit inside
+an EXISTING relationship, and a newborn has none — there is nobody to miss, so birth is
+not longing. Its desire is born ``spring=GENESIS`` and the wake-decision's threshold gate
+(and only that gate) is waived; ``u`` stays 0 and this layer never tells the contact model
+otherwise. The genesis spring is then read, not re-derived, everywhere it matters: the
+launcher carries the ``<genesis>`` ritual instead of the longing impulse, the SENT handler
+keeps a birth out of the pure-longing counter, and the async staleness rule does not judge
+a birth by a pressure it never had.
+
 **T3 re-cut (spec §3/§8):** drive-only. The baroque gates that did NOT survive the
 rebuild are gone — appropriateness is the async act-gate's job (Hermes turn), not
 aggregation's, so the receptivity appraisal is cut entirely; the top-down
-thought-proposal spring is cut entirely (``spring`` is always ``DRIVE``; thoughts
-return in a later phase). The pure-longing anti-repeat CONCERN is kept but shed of
+thought-proposal spring is cut entirely (thoughts return in a later phase). The
+pure-longing anti-repeat CONCERN is kept but shed of
 its machinery: a second drive-only bid while one is unanswered HOLDS. ``u`` comes
 from the drive's same-tick ``contact_pressure`` signal (``UpdateState`` is only
 visible after commit); this layer never writes ``u`` (send ≠ contact). And a quiet
@@ -42,6 +52,7 @@ from .backstop import record_send
 from .component import TickContext
 from .correlate import open_correlated_span
 from .desire_view import build_contact_desire, encode_contact_desire, live_contact_desire
+from .genesis import is_first_waking
 from .intake import apply_backpressure
 from .intention_view import live_contact_intention
 from .intents import Intent, PutRecord, TransitionRecord, UpdateState
@@ -235,6 +246,12 @@ class ContactAggregation:
                     threshold=self._theta,
                     now=now,
                     deadline_min=self._verdict_deadline_min,
+                    # A genesis wake never came from pressure (§6.2) — a newborn's u is
+                    # 0 < θ by construction — so the "pressure was satisfied while it was
+                    # composing" rule is not about it. Applying it would judge EVERY
+                    # genesis outcome stale and deadlock cognition: the desire would stay
+                    # active with pending_proactive_id set forever.
+                    pressure_sprung=live is None or live.spring is not DesireSpring.GENESIS,
                 )
                 if stale:
                     continue
@@ -244,10 +261,11 @@ class ContactAggregation:
                     action_pending_since = to_iso(now)  # send -> inhibition starts
                     last_contact_at = to_iso(now)
                     send_log = record_send(send_log, now)  # backstop counter (spec §14)
-                    # Pure-longing outreach counter: a SENT drive-only outreach (the
-                    # only kind now, T3) is a repeat longing bid -> bump. A legacy
-                    # THOUGHT/MIXED-sprung desire (persisted from before the cut) is a
-                    # materially-new reason -> not a repeat, does not bump.
+                    # Pure-longing outreach counter: a SENT DRIVE-sprung outreach is a
+                    # repeat longing bid -> bump. Nothing else is: a GENESIS greeting is
+                    # the being saying hello, not missing anyone (spec §6.2 — entering it
+                    # here would be a longing that does not exist), and a legacy
+                    # THOUGHT/MIXED-sprung desire is a materially-new reason.
                     if live is not None and live.spring == DesireSpring.DRIVE:
                         unanswered_outbound_count += 1
                 elif po is ProactiveOutcome.SILENT:
@@ -295,21 +313,44 @@ class ContactAggregation:
             declined_at=decl_min,
             decline_count=decline_count,
         )
-        outcome = evaluate_wake(u=effective, now=0.0, state=lane, params=self._params)
-        drive_urge = outcome.is_urge
+        # WHY this being would wake at all (Phase 4, spec §6.2). Two springs, and the
+        # first one is not the drive: a being that is NOBODY YET wakes to be born, and
+        # waiting for u ≥ θ would be a category error — u models a contact deficit
+        # inside an EXISTING relationship and a newborn has none. There is nobody to
+        # miss, so u stays 0 (this layer never writes it) and the threshold gate — and
+        # ONLY that gate — is waived. Read off the WORKING copies, not the start-of-tick
+        # state: an exchange or a SENT resolved THIS tick ends the first waking in the
+        # same frame it happened.
+        first_waking = is_first_waking(
+            genesis_completed_at=state.genesis_completed_at,
+            last_exchange_at=last_exchange_at,
+            last_contact_at=last_contact_at,
+        )
+        outcome = evaluate_wake(
+            u=effective, now=0.0, state=lane, params=self._params, waive_threshold=first_waking
+        )
+        urge = outcome.is_urge
+        # The spring is stamped on the desire row so nothing downstream has to re-derive
+        # it: the launcher reads it to carry the <genesis> ritual instead of the longing
+        # body, the SENT handler above reads it to keep a birth out of the pure-longing
+        # counter, and the staleness rule reads it to not judge a birth by pressure.
+        spring = DesireSpring.GENESIS if first_waking else DesireSpring.DRIVE
 
         # Anti-repeat HOLD (T3, simplified — concern kept, machinery shed): a SECOND
         # pure-longing bid while one is unanswered (unanswered_outbound_count >= 1)
-        # must HOLD — don't drum a second reach into the void. Aggregation is
-        # drive-only now, so a held urge is always a pure-longing repeat (there is no
-        # top-down override). A genuine exchange THIS tick reset the counter above
-        # (same-tick visible), so a same-tick exchange+re-urge does not self-deadlock.
-        pure_longing_repeat_hold = unanswered_outbound_count >= 1 and drive_urge
+        # must HOLD — don't drum a second reach into the void. A genuine exchange THIS
+        # tick reset the counter above (same-tick visible), so a same-tick exchange+
+        # re-urge does not self-deadlock. A GENESIS wake is not a longing bid at all, so
+        # this gate is not about it (and cannot fire on it: a first waking means nothing
+        # has ever been sent, so the counter is 0 anyway — this is belt and braces).
+        pure_longing_repeat_hold = (
+            unanswered_outbound_count >= 1 and urge and spring is DesireSpring.DRIVE
+        )
 
         # A wake-eligible urge births a desire only when none is live and nothing
         # resolved one this tick (dedup / anti-drum).
         if (
-            drive_urge
+            urge
             and desire_state == _NONE
             and transition_to is None
             and not pure_longing_repeat_hold
@@ -333,20 +374,23 @@ class ContactAggregation:
         intents: list[Intent] = [UpdateState(changes)]
 
         if create_desire:
-            # Drive-only (T3): spring is always DRIVE, salience is the effective
-            # pressure that cleared the wake bar. A birth only happens when no live
-            # desire exists, so it is always a NEW episode → stamp a fresh trace.
+            # Salience is the effective pressure that cleared the wake bar — 0 for a
+            # GENESIS wake, honestly: there is no pressure behind it, and inventing one
+            # would be the fake longing this design exists to avoid. ``source_drive``
+            # records the latent u at creation either way (0 for a newborn). A birth only
+            # happens when no live desire exists, so it is always a NEW episode → stamp a
+            # fresh trace.
             provenance = creation_provenance(
                 ctx.trace,
                 created_by=self.id,
                 component="aggregation",
-                reason="contact desire (drive)",
+                reason=f"contact desire ({spring.value})",
             )
             desire = build_contact_desire(
                 state=DesireState.ACTIVE,
                 salience=effective,
                 source_drive=u_now,
-                spring=DesireSpring.DRIVE,
+                spring=spring,
                 provenance=provenance,
             )
             intents.append(PutRecord(op=PutOp(draft=encode_contact_desire(desire))))

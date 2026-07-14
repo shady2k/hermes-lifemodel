@@ -35,6 +35,19 @@ from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock, FakeDelivery, FakeStateStore
 
+#: These are DRIVE-path pipeline tests, so every being in them has already been born and
+#: says so. A being with no ``genesis_completed_at`` and nothing on record is at its FIRST
+#: WAKING (spec §6.2): it wakes to be BORN, without ``u`` ever crossing ``θ``, and would
+#: make "below threshold ⇒ quiet" assertions here false for a reason that has nothing to
+#: do with the drive. The genesis wake path is pinned in ``tests/test_genesis_wake.py``.
+BORN_AT = "2026-07-01T10:00:00+00:00"
+
+
+def _born(**kw: object) -> State:
+    """A ``State`` for a being that has been born (see :data:`BORN_AT`)."""
+    kw.setdefault("genesis_completed_at", BORN_AT)
+    return State(**kw)  # type: ignore[arg-type]
+
 
 def _assert_no_hermes() -> None:
     assert "hermes_constants" not in sys.modules
@@ -64,7 +77,10 @@ def test_injected_fake_state_store_graph_can_tick(tmp_path: Path) -> None:
     # lm-27n.2: an injected StatePort-only fake leaves the memory/pressure slots
     # unwired (CoreLoop reads empty snapshots) and the StateActor falls back to
     # the fake's own commit_tick — a full frame must still run and persist.
-    fake_state = FakeStateStore()
+    # The being is BORN: an unborn one wakes to be born on its very first tick (§6.2)
+    # and the frame would then carry a desire-row mutation this memory-less fake
+    # (correctly) refuses — which is a genesis assertion, not a wiring one.
+    fake_state = FakeStateStore(_born())
     lm = build_lifemodel(
         base_dir=tmp_path / "unused",
         state=fake_state,
@@ -99,7 +115,7 @@ def test_default_graph_is_exercisable_end_to_end(tmp_path: Path) -> None:
     # the registered pipeline and checkpoints the bookkeeping bump.
     lm = build_lifemodel(base_dir=tmp_path)
 
-    lm.state.commit(State(u=1.5))
+    lm.state.commit(_born(u=1.5))
     assert lm.state.load().u == 1.5
 
     report = lm.coreloop.tick()
@@ -168,7 +184,7 @@ def test_pipeline_tick_rises_u_and_persists(tmp_path: Path) -> None:
     # Seed last_tick_at 240 min before the clock; one frame should rise u to ~1.0.
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    store.commit(_born(u=0.0, last_tick_at="2026-07-06T00:00:00+00:00"))
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     assert abs(store.load().u - 1.0) < 1e-9
@@ -177,7 +193,7 @@ def test_pipeline_tick_rises_u_and_persists(tmp_path: Path) -> None:
 def test_pipeline_tick_satiates_on_inbound_exchange(tmp_path: Path) -> None:
     clock = _FixedClock(datetime(2026, 7, 6, 0, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(u=1.0, last_tick_at="2026-07-06T00:00:00+00:00"))
+    store.commit(_born(u=1.0, last_tick_at="2026-07-06T00:00:00+00:00"))
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     # A contact_observed reading seeded into the frame (spec §3) — no durable bus.
     lm.coreloop.tick(
@@ -210,7 +226,7 @@ def test_pipeline_rises_then_wakes_desire(tmp_path: Path) -> None:
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
     # u already high; 1 min elapsed → neuron keeps it high, aggregation wakes a desire
-    store.commit(State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    store.commit(_born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     desire = read_live_contact_desire(store)  # the desire is now a typed row, not a flag
@@ -222,7 +238,7 @@ def test_pipeline_dedups_desire_across_ticks(tmp_path: Path) -> None:
     # the singleton row is not re-written (revision stays put), no double-wake.
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    store.commit(_born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     born = store.get("desire", "contact:owner")
@@ -235,7 +251,7 @@ def test_pipeline_dedups_desire_across_ticks(tmp_path: Path) -> None:
 def test_pipeline_exchange_satiates_and_clears(tmp_path: Path) -> None:
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    store.commit(_born(u=3.0, last_tick_at="2026-07-06T03:59:00+00:00"))
     _seed_active_desire(store)  # a live desire the contact must terminalize
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick(
@@ -257,7 +273,7 @@ def test_pipeline_send_suppresses_then_recovers(tmp_path: Path) -> None:
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
     # high latent, a send 10 min ago -> within grace -> no wake this frame
     store.commit(
-        State(
+        _born(
             u=3.0,
             action_pending_since="2026-07-06T03:50:00+00:00",
             last_tick_at="2026-07-06T03:59:00+00:00",
@@ -281,7 +297,7 @@ def test_personality_is_registered(tmp_path: Path) -> None:
 def test_pipeline_tick_recovers_energy_and_decays_fatigue(tmp_path: Path) -> None:
     clock = _FixedClock(datetime(2026, 7, 6, 12, 30, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(energy=0.5, fatigue=0.5, last_tick_at="2026-07-06T12:00:00+00:00"))
+    store.commit(_born(energy=0.5, fatigue=0.5, last_tick_at="2026-07-06T12:00:00+00:00"))
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
     final = store.load()
@@ -333,7 +349,7 @@ def test_pipeline_crystallizes_intention_on_launch(tmp_path: Path) -> None:
 
     clock = _FixedClock(datetime(2026, 7, 6, 4, 0, tzinfo=UTC))
     store = SQLiteRuntimeStore(tmp_path, clock=clock)
-    store.commit(State(u=3.0, energy=1.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    store.commit(_born(u=3.0, energy=1.0, last_tick_at="2026-07-06T03:59:00+00:00"))
     _seed_active_desire(store)  # a live active desire cognition can launch on
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
     lm.coreloop.tick()
@@ -353,7 +369,7 @@ def test_pipeline_exchange_resolves_desire_and_intention_atomically(tmp_path: Pa
     # a turn already in flight (pending set) gates cognition off, so this frame only
     # RESOLVES the launched pair — it does not re-launch/re-crystallize.
     store.commit(
-        State(
+        _born(
             u=3.0,
             pending_proactive_id="proactive-inflight",
             last_tick_at="2026-07-06T03:59:00+00:00",
