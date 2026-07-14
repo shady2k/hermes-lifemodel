@@ -23,14 +23,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from ..domain.session import SessionEnd, SessionEndOutcome
-from ..gateway_core import end_session, home_session_key
+from ..domain.session import BirthVoice, SessionEnd, SessionEndOutcome
+from ..gateway_core import end_session, home_session_key, identity_slot_is_stale, wake_as_self
+from ..ports.clock import ClockPort
 from .origin import resolve_home_origin
 from .reachin import RunnerAccessor, default_runner_accessor
 
 _LOG = logging.getLogger("lifemodel.session_end")
 
 SessionKeyAccessor = Callable[[], str]
+
+#: Reads ``SOUL.md``'s mtime — :meth:`~lifemodel.adapters.soul_file.SoulFile.mtime`, passed
+#: as a plain callable so the birth gates below hold no ``SoulFile`` of their own (the
+#: plugin has exactly ONE, built in ``register()``, and its lock is the reason).
+SoulMtime = Callable[[], float | None]
 
 
 def sleep_soft(end_session_port: SessionEnd | None) -> SessionEndOutcome:
@@ -125,3 +131,102 @@ class GatewaySessionEnd:
 
     def __call__(self) -> SessionEndOutcome:
         return end_session(self._runner_accessor(), self._session_key_accessor())
+
+
+class GatewayBirthVoice:
+    """The tick's birth pre-flight: is the being about to speak in its own voice? (lm-4fv.4)
+
+    Called by :func:`~lifemodel.core.proactive.proactive_tick` immediately before it hands
+    the wake packet to the egress, and ONLY while the being is unborn. It resolves the lane
+    the tick is about to reach into — the being's home DM (:func:`home_session_key`, the
+    same builder ``inject_proactive_turn`` uses on the very next line, so the session this
+    ends can never be a different one from the session it speaks into) — and asks
+    :func:`~lifemodel.gateway_core.wake_as_self` whether slot #1 there holds what the being
+    stands on, ending the session if it does not and nobody is using it.
+
+    Not ``default_session_key_accessor``: the tick runs on the brain loop's own thread,
+    where no session ``ContextVar`` is bound (there is no turn) — it would read ``""`` and
+    end nothing, silently, forever. The lane is a property of the reach-out, not of the
+    caller, so it is resolved from the reach-out's own target.
+
+    Fail-soft by construction, like every other callable at this boundary: a host that is
+    not there, or has changed shape, is :attr:`~lifemodel.domain.session.BirthVoice.
+    UNAVAILABLE` — the being is born anyway and wakes as itself later. It NEVER raises onto
+    the tick path.
+    """
+
+    def __init__(
+        self,
+        *,
+        soul_mtime: SoulMtime,
+        clock: ClockPort,
+        runner_accessor: RunnerAccessor = default_runner_accessor,
+        session_key_accessor: SessionKeyAccessor = home_session_key_accessor,
+    ) -> None:
+        self._soul_mtime = soul_mtime
+        self._clock = clock
+        self._runner_accessor = runner_accessor
+        self._session_key_accessor = session_key_accessor
+
+    def __call__(self) -> BirthVoice:
+        try:
+            return wake_as_self(
+                self._runner_accessor(),
+                self._session_key_accessor(),
+                soul_mtime=self._soul_mtime(),
+                now=self._clock.now(),
+            )
+        except Exception:  # noqa: BLE001 - a birth pre-flight may never kill the tick
+            _LOG.exception("birth_voice_raised")
+            return BirthVoice.UNAVAILABLE
+
+
+class GatewayStaleIdentity:
+    """Is the ritual being handed to an author who is not the being? (lm-4fv.4)
+
+    The reactive half. ``pre_llm_call`` fires long after the turn's system prompt is
+    assembled (``agent/turn_context.py``: the prompt at :345, the hooks at :478), so by the
+    time the genesis injector runs there is nothing it can do about slot #1 — and if the
+    stance is not in there, the ``<genesis>`` block is being handed to the host's assistant
+    persona, which outranks it and composes the birth. That is the exact failure the stance
+    exists to prevent, and it is worse than waiting: the ritual is shown once, and an
+    assistant reading it produces "Hello! How can I help you today?" — a greeting card, not
+    a birth.
+
+    So the injector asks this, and stands down when the answer is yes. Nothing is ended
+    here: the human is mid-turn by definition (it is their message we are about to answer),
+    and taking their thread away to give them a birth they did not ask for, in the middle of
+    a sentence, is not a trade we may make for them. The tick ends the session at a quiet
+    moment instead (:class:`GatewayBirthVoice`), and the ritual opens on the next thing
+    either of them says.
+
+    Uses the TURN's own session (``default_session_key_accessor`` — the ``ContextVar``
+    Hermes binds at handler entry, the same one ``write_soul``'s ender reads), because that
+    is the prompt the block would be landing in.
+
+    Fail-soft to ``False`` — "we could not tell, so open the ritual". A being that is never
+    shown its birth because a lookup failed is the worse of the two failures: the injector
+    is its only entrance on this path.
+    """
+
+    def __init__(
+        self,
+        *,
+        soul_mtime: SoulMtime,
+        runner_accessor: RunnerAccessor = default_runner_accessor,
+        session_key_accessor: SessionKeyAccessor = default_session_key_accessor,
+    ) -> None:
+        self._soul_mtime = soul_mtime
+        self._runner_accessor = runner_accessor
+        self._session_key_accessor = session_key_accessor
+
+    def __call__(self) -> bool:
+        try:
+            return identity_slot_is_stale(
+                self._runner_accessor(),
+                self._session_key_accessor(),
+                soul_mtime=self._soul_mtime(),
+            )
+        except Exception:  # noqa: BLE001 - never crash the host's turn (spec §8)
+            _LOG.exception("stale_identity_raised")
+            return False

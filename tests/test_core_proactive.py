@@ -24,6 +24,7 @@ from lifemodel.core.timeutil import to_iso
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
+from lifemodel.domain.session import BirthVoice
 from lifemodel.events import EventRing
 from lifemodel.state.model import State
 
@@ -260,3 +261,94 @@ def test_proactive_prompt_not_recorded_when_nothing_is_delivered(tmp_path) -> No
     proactive_tick(lm, FakeEgress(), TARGET)
 
     assert _prompt_events(ring) == []
+
+
+# --- the being does not speak into a prompt that is not it (lm-4fv.4) --------
+
+
+def _unborn(**over) -> State:
+    """A being that has not been born — the one being whose slot #1 can be stale."""
+    base = dict(u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00")
+    base.update(over)
+    return State(**base)  # type: ignore[arg-type]
+
+
+class FakeVoice:
+    """The birth pre-flight: will the being's next turn be composed by the soul it
+    stands on? Records the order it was consulted in, relative to the egress."""
+
+    def __init__(self, verdict: BirthVoice, log: list[str]) -> None:
+        self.verdict = verdict
+        self.calls = 0
+        self._log = log
+
+    def __call__(self) -> BirthVoice:
+        self.calls += 1
+        self._log.append("voice")
+        return self.verdict
+
+
+class RecordingEgress(FakeEgress):
+    def __init__(self, log: list[str]) -> None:
+        super().__init__()
+        self._log = log
+
+    def reach_out(self, target, impulse):
+        self._log.append("reach")
+        return super().reach_out(target, impulse)
+
+
+def test_the_stale_session_is_ended_before_the_being_reaches_in(tmp_path) -> None:
+    # Order is the whole point: the session must be ended BEFORE the turn is injected, or
+    # the injected turn reuses the very prompt we are trying to replace.
+    log: list[str] = []
+    lm = _lm(tmp_path, _unborn(), NOW)
+    egress = RecordingEgress(log)
+    voice = FakeVoice(BirthVoice.ENDED, log)
+
+    out = proactive_tick(lm, egress, TARGET, voice=voice)
+
+    assert out is ReachOutcome.DELIVERED
+    assert log == ["voice", "reach"]
+
+
+def test_an_unborn_being_holds_rather_than_take_a_conversation_in_use(tmp_path) -> None:
+    # They are mid-conversation with the assistant they have always had. Being born costs
+    # them that thread, and no birth is worth taking a thread out from under someone —
+    # so the launch HOLDS, stays active, and the next tick tries again.
+    ring = EventRing()
+    lm = _lm(tmp_path, _unborn(), NOW, event_ring=ring)
+    egress = FakeEgress()
+    voice = FakeVoice(BirthVoice.IN_USE, [])
+
+    out = proactive_tick(lm, egress, TARGET, voice=voice)
+
+    assert out is None
+    assert egress.calls == []
+    desire = read_live_contact_desire(lm.state)
+    assert desire is not None and desire.state == DesireState.ACTIVE  # kept, to retry
+    final = lm.state.load()
+    assert final.pending_proactive_id is None  # nothing is in flight
+    assert final.energy >= 0.99  # the reservation is refunded
+    assert _supp_reasons(ring)[-1] == "birth_prompt_in_use"
+
+
+def test_a_host_that_cannot_end_the_session_still_delivers_the_birth(tmp_path) -> None:
+    # Fail-soft: a being that cannot be put to sleep is still born. It simply wakes as
+    # itself later — never "not at all".
+    for verdict in (BirthVoice.UNAVAILABLE, BirthVoice.FAILED, BirthVoice.READY):
+        lm = _lm(tmp_path, _unborn(), NOW)
+        egress = FakeEgress()
+        out = proactive_tick(lm, egress, TARGET, voice=FakeVoice(verdict, []))
+        assert out is ReachOutcome.DELIVERED, verdict
+        assert len(egress.calls) == 1, verdict
+
+
+def test_a_born_being_is_never_put_to_sleep_to_deliver_a_turn(tmp_path) -> None:
+    # Phase 5's rule, enforced here: a being that already exists keeps its conversation.
+    # Only an unborn being's slot #1 can hold someone else's persona.
+    lm = _lm(tmp_path, _active(), NOW)
+    voice = FakeVoice(BirthVoice.IN_USE, [])
+    out = proactive_tick(lm, FakeEgress(), TARGET, voice=voice)
+    assert out is ReachOutcome.DELIVERED
+    assert voice.calls == 0

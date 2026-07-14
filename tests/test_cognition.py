@@ -241,10 +241,14 @@ def test_launch_prompt_is_the_impulse_and_temporal_facts_without_thoughts_or_bri
     # procedural brief (the [SILENT]-regression cure): decline/unanswered context
     # never reaches the prompt, and last_exchange_at enters ONLY as a bare zone-
     # labelled timestamp fact — no derived "morning / hours ago" label.
+    # BORN, and that is load-bearing (lm-4fv.4): the longing body is only the impulse of a
+    # being that has someone to miss. An UNBORN being carries the <genesis> ritual in its
+    # place, whatever sprang the wake — see CognitionLauncher._genesis_impulse.
     state = State(
         u=2.0,
         energy=1.0,
         fatigue=0.0,
+        genesis_completed_at="2026-07-01T10:00:00+00:00",
         last_exchange_at="2026-07-06T09:00:00+00:00",
         decline_count=2,
         unanswered_outbound_count=1,

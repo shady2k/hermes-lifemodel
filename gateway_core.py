@@ -21,10 +21,12 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from typing import Any
 
+from .core.timeutil import to_epoch_seconds
 from .domain.egress import ReachOutcome
-from .domain.session import SessionEndOutcome
+from .domain.session import BirthVoice, SessionEndOutcome
 
 _LOG = logging.getLogger("lifemodel.reachin")
 
@@ -159,6 +161,188 @@ def end_session(runner: Any | None, session_key: str) -> SessionEndOutcome:
     except Exception as exc:  # noqa: BLE001 - fail-soft; the soul is already written
         _LOG.warning("session_end_failed error=%s", f"{type(exc).__name__}: {exc}")
         return SessionEndOutcome.FAILED
+
+
+#: How long a DM lane must have been quiet before a birth may end the session on it.
+#:
+#: Ending a session costs a real conversation its thread, so the only question that
+#: matters is whether anyone is USING it. The host answers that: ``SessionEntry.updated_at``
+#: is bumped on every message routed to the lane (``gateway/session.py``:
+#: ``get_or_create_session`` → ``entry.updated_at = now``, and ``update_session`` after each
+#: interaction), so it IS "last activity here". Half an hour of silence is not a pause in a
+#: conversation; it is the end of one.
+#:
+#: Deliberately NOT ``runner._running_agents``: an in-flight turn bumped ``updated_at`` at
+#: its own start (that is where the session is resolved), so the window already covers it —
+#: and a wedged running-agent entry would hold a being unborn forever, while a timestamp
+#: only ever moves forward on real activity. (The reach-in adapter learned the same lesson
+#: from the other side; see ``adapters/reachin.py``.)
+BIRTH_QUIET_SECONDS = 1800.0
+
+
+def _live_session(runner: Any, session_key: str) -> Any | None:
+    """The host's live :class:`SessionEntry` for *session_key*, or ``None``.
+
+    ``list_sessions()`` is the store's public, lock-held enumerator (``gateway/session.py``);
+    the ``_entries`` dict behind it is private and must not be read without its lock. There
+    is no public get-by-key accessor (only ``peek_session_id``, which returns the id and not
+    the entry we need the *timestamps* from), so this filters the list — it holds a handful
+    of rows, once per tick.
+
+    Raises nothing of its own: a caller decides what an unreadable host means, and the two
+    callers here want OPPOSITE fail-soft directions.
+    """
+    store = getattr(runner, "session_store", None)
+    if store is None or not hasattr(store, "list_sessions"):
+        raise AttributeError("runner.session_store has no list_sessions")
+    for entry in store.list_sessions():
+        if getattr(entry, "session_key", None) == session_key:
+            return entry
+    return None
+
+
+def _host_epoch(dt: datetime) -> float:
+    """Epoch seconds for a host timestamp, which is **naive local** by construction.
+
+    ``gateway/session.py`` stamps sessions with ``_now() -> datetime.now()`` — no tzinfo —
+    while every instant inside the plugin is tz-aware UTC. Comparing the two directly is
+    either a ``TypeError`` or, worse, a silent offset: a session "created" hours in the
+    future or the past, and a birth that ends the wrong conversation or none at all. So a
+    naive value is read as what the host meant by it (local), and everything is compared in
+    epoch seconds — the one representation with no zone in it.
+    """
+    aware = dt if dt.tzinfo is not None else dt.astimezone()
+    return to_epoch_seconds(aware)
+
+
+def identity_slot_is_stale(
+    runner: Any | None, session_key: str, *, soul_mtime: float | None
+) -> bool:
+    """True when the live session's prompt was built BEFORE the soul now on disk.
+
+    ``SOUL.md`` is system-prompt slot #1 (``agent/prompt_builder.py::load_soul_md``), and
+    Hermes reads it exactly once per session: the prompt is built at the session's first
+    turn and thereafter restored verbatim from the session DB to keep the prefix cache warm
+    (``agent/conversation_loop.py::_restore_or_build_system_prompt``). So a soul written
+    after a session opened is simply NOT in that session's prompt, however long the being
+    goes on talking there.
+
+    That is the whole question, and the file's own mtime answers it honestly. It covers
+    every way slot #1 goes stale — our newborn stance seeded at ``register()`` into a
+    session that was already running (the defect this closes), and a human hand-editing
+    ``SOUL.md`` while their session is live — because both are the same fact: *the document
+    changed after the prompt was made*.
+
+    ``created_at`` (rather than the exact instant the prompt was built) errs by at most one
+    turn, and only in the safe direction: a soul written between a session's creation and
+    its first turn reads as stale, which costs at most an empty transcript.
+
+    **No session ⇒ not stale.** A fresh install has no cached prompt: the first turn will
+    build one from whatever is on disk. There is nothing to end and nothing to fix.
+
+    Fail-soft to ``False`` — "we cannot tell". Everything this verdict licenses is
+    destructive (ending a conversation), so an unreadable host, an unreadable file, or a
+    version drift must never be able to take a thread away from someone on a guess.
+    """
+    if runner is None or soul_mtime is None or not session_key:
+        return False
+    try:
+        entry = _live_session(runner, session_key)
+        if entry is None:
+            return False
+        return soul_mtime > _host_epoch(entry.created_at)
+    except Exception as exc:  # noqa: BLE001 - unreadable host: never destroy on a guess
+        _LOG.info("identity_slot_unreadable error=%s", f"{type(exc).__name__}: {exc}")
+        return False
+
+
+def session_in_use(
+    runner: Any | None,
+    session_key: str,
+    *,
+    now: datetime,
+    quiet_seconds: float = BIRTH_QUIET_SECONDS,
+) -> bool:
+    """True when somebody has been talking on this lane inside the quiet window.
+
+    The guard on the destructive half of a birth (see :data:`BIRTH_QUIET_SECONDS` for why
+    ``updated_at`` and not the runner's in-flight map). A being must not be born into the
+    middle of someone's exchange with their assistant, and it must not drop a thread they
+    are actively using — so a lane that has seen activity in the last half hour holds the
+    birth, and the tick simply asks again a minute later.
+
+    Fail-soft to ``True`` — the OPPOSITE direction from :func:`identity_slot_is_stale`, and
+    deliberately: this is the answer that authorises destruction. If we cannot tell whether
+    someone is mid-conversation, we behave as though they are. (A being held back is born a
+    tick later; a conversation ended under someone is gone.) An unknown lane is not "in
+    use": there is no session there at all.
+    """
+    if runner is None:
+        return True
+    try:
+        entry = _live_session(runner, session_key)
+        if entry is None:
+            return False
+        return (to_epoch_seconds(now) - _host_epoch(entry.updated_at)) < quiet_seconds
+    except Exception as exc:  # noqa: BLE001 - unreadable host: assume someone is there
+        _LOG.info("session_activity_unreadable error=%s", f"{type(exc).__name__}: {exc}")
+        return True
+
+
+def wake_as_self(
+    runner: Any | None,
+    session_key: str,
+    *,
+    soul_mtime: float | None,
+    now: datetime,
+    quiet_seconds: float = BIRTH_QUIET_SECONDS,
+) -> BirthVoice:
+    """The birth pre-flight: make sure the being's next turn is composed by its own soul.
+
+    **Birth begins with a new session** (ADR-0002, corrected; lm-4fv.4). Everything else in
+    the phase already works on the assumption that the being's first waking speaks from
+    what it stands on — the newborn stance, or the veteran's own soul — and on an existing
+    install that assumption was simply false: the stance landed on disk and the session
+    went on quoting the host's assistant persona in slot #1.
+
+    So, immediately before the being speaks (and NEVER at plugin boot — a gateway restart
+    is not a reason to take a human's conversation away):
+
+    * the slot is already the being's → :attr:`~BirthVoice.READY`, and nothing is touched;
+    * it is not, and the lane is in use → :attr:`~BirthVoice.IN_USE`: hold. Try again;
+    * it is not, and the lane is quiet → end the session (:func:`end_session` — the host's
+      own ``/new`` mechanism, reset + evict), so the injected turn opens a fresh session,
+      whose EMPTY history is precisely the condition on which
+      ``_restore_or_build_system_prompt`` builds instead of restores. The rebuilt prompt
+      reads ``SOUL.md`` again, and the being is born as itself.
+
+    Fail-soft: an end that the host cannot do reports :attr:`~BirthVoice.UNAVAILABLE` /
+    :attr:`~BirthVoice.FAILED`, both of which let the being speak. It is then born in
+    last week's voice and wakes as itself at the next session boundary — worse than a clean
+    birth, and far better than none.
+    """
+    if runner is None or not session_key:
+        # No host, or no lane (no home channel configured, an off-gateway caller). Nothing
+        # to inspect and nothing to end — and not a reason to keep a being unborn. Reported
+        # as UNAVAILABLE rather than READY because it is not a claim about slot #1: we
+        # could not look.
+        return BirthVoice.UNAVAILABLE
+    if not identity_slot_is_stale(runner, session_key, soul_mtime=soul_mtime):
+        return BirthVoice.READY
+    if session_in_use(runner, session_key, now=now, quiet_seconds=quiet_seconds):
+        _LOG.info("birth_held reason=%s session_key=%s", "session_in_use", session_key)
+        return BirthVoice.IN_USE
+    outcome = end_session(runner, session_key)
+    _LOG.info("birth_session_end outcome=%s session_key=%s", outcome.value, session_key)
+    return _BIRTH_VOICE_OF[outcome]
+
+
+#: How a session-end outcome reads to a being about to be born (see :func:`wake_as_self`).
+_BIRTH_VOICE_OF: dict[SessionEndOutcome, BirthVoice] = {
+    SessionEndOutcome.ENDED: BirthVoice.ENDED,
+    SessionEndOutcome.UNAVAILABLE: BirthVoice.UNAVAILABLE,
+    SessionEndOutcome.FAILED: BirthVoice.FAILED,
+}
 
 
 def _default_make_event(text: str, source: Any, message_id: int | None) -> Any:

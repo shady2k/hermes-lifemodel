@@ -36,6 +36,7 @@ _SPEC_REASONS = frozenset(
         "act_gate_silent",
         "egress_unavailable",
         "egress_failed",
+        "birth_prompt_in_use",
         "component_failed",
     }
 )
@@ -55,11 +56,11 @@ def _logger(*, tick: int = 7) -> FakeSpanLogger:
 
 
 def test_reason_enum_is_exactly_the_closed_spec_set() -> None:
-    # The wire-format codes are the spec's 10, no more, no less — a new gate is a
+    # The wire-format codes are the spec's set, no more, no less — a new gate is a
     # deliberate member addition, never a free-form string.
     codes = {reason.value for reason in SuppressionReason}
     assert codes == _SPEC_REASONS
-    assert len(codes) == 12
+    assert len(codes) == 13
 
 
 def test_reason_enum_has_no_string_escape_hatch() -> None:

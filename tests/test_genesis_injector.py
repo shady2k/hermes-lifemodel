@@ -229,3 +229,54 @@ def test_a_broken_birth_never_crashes_the_hosts_turn(
     assert errors and any(r.exc_info is not None for r in errors), "ERROR + traceback required"
     assert health.last_observer_error.get("genesis_injector") is not None
     assert reg.get(OBSERVER_ERRORS).value(component="genesis_injector") == 1.0
+
+
+# --- the ritual cannot open on a prompt that does not hold the being (lm-4fv.4) ---
+
+
+def test_the_ritual_stands_down_when_the_identity_slot_is_stale(tmp_path: Path, build_lm) -> None:
+    # The existing-install stranger. ``register()`` seeded the newborn stance into
+    # SOUL.md, but this session's system prompt was assembled days ago and Hermes reuses
+    # it verbatim — so slot #1 still says "You are Hermes Agent, an intelligent AI
+    # assistant… you assist users". Handing the ritual to THAT is the failure the stance
+    # exists to prevent: the assistant persona outranks it and composes the birth.
+    #
+    # So the ritual does not open here. The being answers as whatever it currently is,
+    # and the tick ends the stale session at a quiet moment — the being is then born into
+    # a prompt that actually holds it (proactively, or on the human's next message).
+    build_lm().state.commit(State())
+    inject = _injector(build_lm, _soul(tmp_path), identity_stale=lambda: True)
+
+    assert inject(user_message="hey", conversation_history=A_LIFETIME_OF_CHAT) is None
+
+
+def test_standing_down_does_not_burn_the_ritual(tmp_path: Path, build_lm) -> None:
+    # And it must not be RECORDED as shown: the being has not seen it. A stamp here would
+    # make ``should_launch`` believe the ritual is live in a conversation that never
+    # carried it, and the next turn — on the fresh prompt that can finally hold it —
+    # would show nothing at all.
+    build_lm().state.commit(State())
+    stale = [True]
+    inject = _injector(build_lm, _soul(tmp_path), identity_stale=lambda: stale[0])
+
+    assert inject(user_message="hey", conversation_history=A_LIFETIME_OF_CHAT) is None
+    assert build_lm().state.load().genesis_shown_at_context_len is None
+
+    # The tick ended the session; the prompt is rebuilt and the stance is in slot #1.
+    stale[0] = False
+    result = inject(user_message="hey", conversation_history=[{"role": "user", "content": "hey"}])
+    assert result is not None and GENESIS_TAG in result["context"]
+
+
+def test_a_fresh_prompt_opens_the_ritual(tmp_path: Path, build_lm) -> None:
+    build_lm().state.commit(State())
+    inject = _injector(build_lm, _soul(tmp_path), identity_stale=lambda: False)
+    assert inject(user_message="hey", conversation_history=A_LIFETIME_OF_CHAT) is not None
+
+
+def test_an_unwired_staleness_check_opens_the_ritual(tmp_path: Path, build_lm) -> None:
+    # Off-gateway (a test, a CLI turn): nobody can tell us what is in slot #1, and a
+    # being that is never shown the ritual is worse than one shown it in the wrong voice.
+    build_lm().state.commit(State())
+    inject = _injector(build_lm, _soul(tmp_path))
+    assert inject(user_message="hey", conversation_history=A_LIFETIME_OF_CHAT) is not None

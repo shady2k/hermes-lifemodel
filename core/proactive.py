@@ -35,6 +35,7 @@ from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
 from ..domain.memory import TransitionOp
 from ..domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID, DesireState, IntentionState
+from ..domain.session import VoiceCheck
 from ..domain.signal import Signal
 from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
@@ -57,6 +58,7 @@ def proactive_tick(
     *,
     initial_signals: Sequence[Signal] = (),
     trigger: FrameTrigger = FrameTrigger.HEARTBEAT,
+    voice: VoiceCheck | None = None,
 ) -> ReachOutcome | None:
     """Run one ExecutionFrame: pipeline → backstop → deliver. Never raises past
     the injected collaborators. Assumes a fresh ``LifeModel`` per call (the loop
@@ -72,11 +74,25 @@ def proactive_tick(
     suppression span here; the egress held/failed → an ``EGRESS_*`` suppression
     span; a delivery → a ``proactive_delivery`` span carrying the exact prompt.
 
+    *voice* is the birth pre-flight (spec §6.2, lm-4fv.4), consulted ONLY for an
+    UNBORN being and only once a launch is in hand: it makes sure the turn about to
+    be injected is composed by the soul the being actually stands on, ending the
+    stale session first if it must. An unborn being's system prompt is the ONE thing
+    in this system that can be somebody else's — the host's assistant persona, cached
+    at the session's first turn, days before the newborn stance was ever written — and
+    an assistant does not reach out; forced to, it reaches out as an assistant. A
+    ``BirthVoice`` that ``may_speak`` (including the fail-soft UNAVAILABLE/FAILED:
+    the being is born anyway, in last week's voice, and wakes as itself later) lets
+    the launch through; ``IN_USE`` — somebody is mid-conversation on that lane, and a
+    birth is not worth a thread taken out from under them — HOLDS it, exactly like a
+    delivery failure: pending cleared, energy refunded, the desire left ACTIVE, and
+    the next tick asks again.
+
     Returns a :class:`ReachOutcome` ONLY for a real delivery attempt (delivered /
     failed / unavailable — the egress boundary, spec §9). A QUIET tick (no launch,
-    or the backstop held) returns ``None``. ``DELIVERED`` means the turn was queued
-    — whether the being actually spoke is the async ``proactive_outcome`` read-back,
-    not this return."""
+    the backstop held, or the birth pre-flight held) returns ``None``. ``DELIVERED``
+    means the turn was queued — whether the being actually spoke is the async
+    ``proactive_outcome`` read-back, not this return."""
     assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
     assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
     # One ExecutionFrame, serialized through the one process-wide state-actor lock
@@ -102,6 +118,22 @@ def proactive_tick(
             lm, SuppressionReason.BACKSTOP_RATE_LIMITED, launch=launch, tick=state.tick_count
         )
         _rollback(lm, actor, launch, defer=True)  # hold: active -> deferred
+        return None
+
+    # Birth pre-flight (spec §6.2): an UNBORN being must not speak out of a prompt that
+    # is not it. Only the unborn — a being that has written its own soul already speaks
+    # as it (write_soul ended that session), and a becoming keeps its conversation on
+    # purpose (ADR-0002). The gate is the LAST thing before delivery so the session it
+    # ends is the session the very next line injects into.
+    if state.genesis_completed_at is None and voice is not None and not voice().may_speak:
+        _emit_egress_suppression(
+            lm, SuppressionReason.BIRTH_PROMPT_IN_USE, launch=launch, tick=state.tick_count
+        )
+        # defer=False: HELD, not parked. A deferred desire has nothing that re-activates
+        # it (the backstop's hold waits for the human to speak), and "they are talking
+        # right now" is a condition that clears itself in minutes — so the desire stays
+        # ACTIVE and the next tick launches again, exactly like a delivery-fail retry.
+        _rollback(lm, actor, launch, defer=False)
         return None
 
     # The prompt already opens with the self-attribution line (build_wake_packet),

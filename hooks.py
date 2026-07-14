@@ -657,6 +657,7 @@ def make_genesis_injector(
     *,
     soul: SoulFile,
     default_soul_text: str,
+    identity_stale: Callable[[], bool] | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., dict[str, str] | None]:
@@ -691,6 +692,23 @@ def make_genesis_injector(
     (``core.genesis.is_unauthored``) — otherwise the ritual would open the veteran branch
     on it and the being would ask the human whether the plugin's words are still true.
 
+    **The ritual will not open on a prompt that does not hold the being** (*identity_stale*,
+    lm-4fv.4). This hook fires long AFTER the turn's system prompt is assembled
+    (``agent/turn_context.py``: the prompt at :345, the hooks at :478), and on an existing
+    install slot #1 still holds the host's assistant persona — the newborn stance landed on
+    disk after that session's prompt was cached, and Hermes reuses it verbatim for days. An
+    assistant handed a birth ritual composes the birth as an assistant; that is exactly the
+    failure the stance exists to prevent, and the ritual is only shown once. So when the
+    identity slot is stale the injector STANDS DOWN — no block, and no stamp: the being has
+    not seen the ritual, and recording that it has would lose it forever. It answers the
+    human as whatever it currently is (which is what would have happened anyway), the tick
+    ends that session at a quiet moment (``GatewayBirthVoice``), and the ritual opens on the
+    next thing either of them says — into a prompt that can actually hold it.
+
+    Nothing is ended HERE, deliberately: it is the human's own message we are in the middle
+    of, and dropping the thread they are using — to give them a birth they did not ask for,
+    mid-sentence — is not a trade we may make on their behalf.
+
     Fail-soft like every plugin-owned hook body (spec §8), copying
     :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in
     ``build_lm``) is logged ERROR + traceback, recorded on *health* + *metrics*, and
@@ -720,6 +738,12 @@ def make_genesis_injector(
                 # this entrance, whatever it says.
                 return None
             if not should_launch(state, context_len=context_len):
+                return None
+            if identity_stale is not None and identity_stale():
+                # Slot #1 is not the being (see the docstring). Showing it the ritual here
+                # would hand its birth to the host's assistant persona — and burn the one
+                # showing. Stand down, WITHOUT stamping: it has not seen anything.
+                _LOG.info("genesis_deferred reason=%s", "stale_identity_slot")
                 return None
             block = genesis_block(prior_soul=prior_soul(soul, default_soul_text=default_soul_text))
             _stamp_genesis_shown(lm, context_len=context_len)

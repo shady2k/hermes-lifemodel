@@ -95,6 +95,22 @@ class SoulFile:
         """Digest of the current content — the compare-and-swap token."""
         return hashlib.sha256(self.read().encode("utf-8")).hexdigest()
 
+    def mtime(self) -> float | None:
+        """When this document last changed, in epoch seconds — or ``None`` if unreadable.
+
+        The one honest answer to *"is the soul the being stands in the soul on disk?"*
+        (:func:`lifemodel.gateway_core.identity_slot_is_stale`). Hermes reads this file
+        into system-prompt slot #1 exactly once per session, so a soul that changed after a
+        session opened is simply not in that session's prompt — and the file's own mtime is
+        what says so, whoever changed it: our newborn stance at ``register()``, or a human
+        with an editor. Nothing else here needs the number, which is why it is a bare float
+        and not a ``datetime``: it is compared against a host timestamp, never stored.
+        """
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return None
+
     def write(self, text: str) -> SoulWrite:
         """Validate, replace atomically, and report what was replaced.
 

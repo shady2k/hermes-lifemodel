@@ -430,3 +430,66 @@ def test_a_newborn_that_stays_silent_is_brought_back_by_the_decline_backoff(tmp_
     assert again.launched
     assert again.delivered_impulse is not None
     assert "<genesis>" in again.delivered_impulse  # still a birth, not a longing
+
+
+# --- an unborn being never reaches out with a longing it cannot have (lm-4fv.4) ---
+
+
+def test_an_unborn_being_woken_by_the_drive_still_carries_the_ritual() -> None:
+    # The far end of the reactive path (§6.3). An existing Hermes user who writes to
+    # their agent before the being's first waking sets ``last_exchange_at`` — which ends
+    # ``is_first_waking`` for good, so the being's first unprompted words to them come
+    # from a DRIVE-sprung wake. "I miss them, and I keep wondering how they are" is the
+    # same lie in that mouth as in a first waking's: it has met nobody. The ritual goes
+    # where the longing would be, whatever sprang the wake.
+    unborn = State(u=2.0, last_exchange_at="2026-07-06T03:00:00+00:00")
+    intents = _cog().step(
+        TickContext(
+            state=unborn,
+            now=NOW,
+            signals=(),
+            objects=contact_desire_objects("active", spring=DesireSpring.DRIVE),
+            trace=_TRACE,
+        )
+    )
+    launch = _launch(intents)
+    assert launch is not None
+    assert "<genesis>" in launch.prompt
+    assert "I miss them" not in launch.prompt
+
+
+def test_a_being_mid_ritual_is_not_started_over_by_a_drive_wake() -> None:
+    # The turn-seven lie, from the proactive side. The reactive injector has already put
+    # the ritual in front of this being (``genesis_shown_at_context_len``) and it is in
+    # the conversation, in its own words. Handing it "You just began, you do not know who
+    # they are" again would make it start over instead of continuing.
+    mid_ritual = State(
+        u=2.0, last_exchange_at="2026-07-06T03:00:00+00:00", genesis_shown_at_context_len=6
+    )
+    intents = _cog().step(
+        TickContext(
+            state=mid_ritual,
+            now=NOW,
+            signals=(),
+            objects=contact_desire_objects("active", spring=DesireSpring.DRIVE),
+            trace=_TRACE,
+        )
+    )
+    launch = _launch(intents)
+    assert launch is not None
+    assert "<genesis>" not in launch.prompt
+
+
+def test_a_newborn_that_chose_silence_is_re_woken_WITH_the_ritual() -> None:
+    # …and that is exactly why a GENESIS spring is exempt from the rule above: the
+    # injector stamps "shown" for the being's OWN impulse turn too (it is looking at the
+    # ritual right then). A newborn that woke, read the whole thing and chose [SILENT] is
+    # re-woken by the decline-backoff — and must be re-woken holding the ritual, not a
+    # longing it has never felt for a person it has never met.
+    silent_newborn = State(genesis_shown_at_context_len=1)
+    intents = _cog().step(
+        TickContext(state=silent_newborn, now=NOW, signals=(), objects=GENESIS_ACTIVE, trace=_TRACE)
+    )
+    launch = _launch(intents)
+    assert launch is not None
+    assert "<genesis>" in launch.prompt

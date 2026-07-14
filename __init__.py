@@ -19,7 +19,11 @@ from typing import Any, NamedTuple
 
 from .adapters.clock import SystemClock
 from .adapters.origin import resolve_home_origin
-from .adapters.session_end import GatewaySessionEnd, home_session_key_accessor
+from .adapters.session_end import (
+    GatewaySessionEnd,
+    GatewayStaleIdentity,
+    home_session_key_accessor,
+)
 from .adapters.soul_file import SoulFile, seed_newborn_stance
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
@@ -588,6 +592,15 @@ def register(ctx: Any) -> None:
                 lambda: build_lifemodel(base_dir=sdir),
                 soul=soul,
                 default_soul_text=_default_soul_text(),
+                # Whether the ritual can open where the being STANDS (lm-4fv.4). The block
+                # is glued onto the user message, but the being's identity is slot #1 — and
+                # on an existing install that slot still holds Hermes's assistant persona:
+                # the newborn stance we wrote above landed on disk AFTER this session's
+                # prompt was built, and the host reuses that prompt verbatim for days. An
+                # assistant handed a birth ritual composes the birth as an assistant. So the
+                # injector stands down while the slot is stale (the tick ends the session at
+                # a quiet moment), rather than spend the one showing on the wrong author.
+                identity_stale=GatewayStaleIdentity(soul_mtime=soul.mtime),
                 health=health,
                 metrics=metrics,
             ),

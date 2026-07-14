@@ -66,6 +66,10 @@ class SuppressionReason(enum.Enum):
       conscious verdict, logged — not a random break).
     * ``EGRESS_UNAVAILABLE`` — no delivery channel was wired/available.
     * ``EGRESS_FAILED`` — delivery was attempted and failed at the boundary.
+    * ``BIRTH_PROMPT_IN_USE`` — an UNBORN being would have had to end a live
+      conversation to be born into a prompt that actually holds it (lm-4fv.4), and
+      somebody is using that conversation. Held, not lost: the desire stays active
+      and the next tick asks again.
     * ``COMPONENT_FAILED`` — a component fault suppressed the tick's outcome
       (the circuit-breaker path).
     """
@@ -81,6 +85,7 @@ class SuppressionReason(enum.Enum):
     ACT_GATE_SILENT = "act_gate_silent"
     EGRESS_UNAVAILABLE = "egress_unavailable"
     EGRESS_FAILED = "egress_failed"
+    BIRTH_PROMPT_IN_USE = "birth_prompt_in_use"
     COMPONENT_FAILED = "component_failed"
 
 

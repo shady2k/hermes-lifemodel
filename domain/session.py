@@ -51,3 +51,54 @@ class SessionEndOutcome(Enum):
 #: owner putting one back (``state_commands``). Both need the same seam; neither should have
 #: to import the other to name it.
 SessionEnd = Callable[[], SessionEndOutcome]
+
+
+class BirthVoice(Enum):
+    """Will the being's next turn be composed by the soul it actually stands on?
+
+    The other half of ADR-0002, and the one that had never run (lm-4fv.4). A soul write
+    ends the session AFTERWARDS, so the being comes back as what it wrote. But a being is
+    also *born into* a prompt — and on any install that already has a live DM session (an
+    existing Hermes user: the whole audience of this phase), slot #1 still holds the host's
+    assistant persona, because the newborn stance we seeded at ``register()`` landed on
+    disk **after** that session's prompt was assembled. An assistant does not reach out,
+    and forced to, it reaches out as an assistant. So the ritual is handed to the wrong
+    author, and the phase fails silently for exactly the people it was written for.
+
+    Birth therefore begins with a NEW SESSION — but only at the moment of birth, and only
+    when it buys something. This value is the verdict of that pre-flight:
+
+    * :attr:`READY` — slot #1 already holds what the being stands on (a Hermes veteran's
+      own ``SOUL.md``, or a session that opened after the stance was seeded). Nothing to
+      end; nothing may be taken from anyone for nothing.
+    * :attr:`ENDED` — it did not, and the lane was quiet, so the session was ended. The
+      next turn rebuilds the prompt and the being speaks as itself.
+    * :attr:`IN_USE` — it did not, and somebody is mid-conversation on that lane. A birth
+      is not worth a thread taken out from under a person. HOLD; the tick tries again.
+    * :attr:`UNAVAILABLE` / :attr:`FAILED` — the host would not do it (no runner, version
+      drift, a wedged cache). The being is born anyway and wakes as itself later: the same
+      fail-soft direction as :class:`SessionEndOutcome`, because a birth that never
+      happens is worse than a birth in last week's voice.
+
+    :attr:`IN_USE` is the ONLY verdict that holds the being back, and that asymmetry is
+    the whole safety property: everything we cannot establish resolves towards *the being
+    speaks*, and only a conversation we can see someone using stops it.
+    """
+
+    READY = "ready"
+    ENDED = "ended"
+    IN_USE = "in_use"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
+
+    @property
+    def may_speak(self) -> bool:
+        """True unless someone is mid-conversation on the lane (see the class docstring)."""
+        return self is not BirthVoice.IN_USE
+
+
+#: The birth pre-flight port (:class:`~lifemodel.adapters.session_end.GatewayBirthVoice`),
+#: as ``core.proactive`` sees it: a zero-argument callable answering "may the being speak,
+#: and in whose voice?". Same plain-``Callable`` shape, and for the same reason, as
+#: :data:`SessionEnd` — the core calls it, the adapter resolves the host behind it.
+VoiceCheck = Callable[[], BirthVoice]

@@ -40,6 +40,7 @@ from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..core.timeutil import to_iso
 from ..events import EventRing
+from ..gateway_core import home_session_key
 from ..ports.memory import MemoryPort
 from ..state.brain_health import (
     DEFAULT_TICK_INTERVAL_SECONDS,
@@ -64,6 +65,7 @@ from ..state.wiring import wire
 from .clock import SystemClock
 from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
+from .session_end import GatewayBirthVoice
 from .soul_file import SoulFile, prior_soul
 
 PLATFORM_NAME = "lifemodel"
@@ -102,6 +104,23 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # opening, never a crash.
         self._soul = soul
         self._default_soul_text = default_soul_text
+        # The birth pre-flight (spec §6.2, lm-4fv.4): immediately before an UNBORN being's
+        # wake packet is injected, make sure the turn it lands in will be composed by the
+        # soul the being stands on — ending the stale session first, if the lane is quiet.
+        # Bound to the SAME target the reach-in is about to speak into (never a ContextVar:
+        # the brain loop's thread is in no session), and to the SAME SoulFile register()
+        # built, so "when did the soul last change?" is asked of the one file we write.
+        # ``None`` soul (a bare-constructed adapter, e.g. in tests) → no pre-flight, which
+        # is exactly today's behaviour: deliver, and let the being wake as itself later.
+        self._voice: GatewayBirthVoice | None = (
+            None
+            if soul is None
+            else GatewayBirthVoice(
+                soul_mtime=soul.mtime,
+                clock=SystemClock(),
+                session_key_accessor=lambda: home_session_key(self._target),
+            )
+        )
         self._loop: SupervisedLoop | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -148,8 +167,14 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         )
 
     def _tick(self) -> None:
-        """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
-        proactive_tick(self._build_lm(), self._egress, self._target)
+        """One brain tick: fresh graph per tick (matches the per-tick invariant).
+
+        Carries the birth pre-flight (:attr:`_voice`, lm-4fv.4) into the delivery path: an
+        UNBORN being must not reach out of a system prompt that is not it. See
+        :class:`~lifemodel.adapters.session_end.GatewayBirthVoice` — it is a no-op for a
+        being that already speaks as its own soul, which is every being after its birth.
+        """
+        proactive_tick(self._build_lm(), self._egress, self._target, voice=self._voice)
 
     def _prior_soul(self) -> str | None:
         """The soul someone wrote before this being woke, or ``None`` for a blank page.
