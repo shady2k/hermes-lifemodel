@@ -35,24 +35,32 @@ the host's order, including the normalisation step.
 
 ⚠️ Everything below MIRRORS the host (``tools/threat_patterns.py``). It is copied, not
 imported, because ``core/`` is Hermes-free and the runtime venv does not guarantee
-that module is importable. A mirror can drift: if the host adds a ``context`` (or
-``all``, which is folded into every scope — see ``_compile()``) pattern, or another
-invisible codepoint, a soul we accept could still be blocked on read. That failure is
-loud (the being's identity vanishes), so re-check BOTH lists whenever the host is
-upgraded.
+that module is importable.
 
-This mirror was checked against the host source directly (2026-07-13), not just
-against a prior transcription of it, and three things were corrected against that
-source:
+**A mirror drifts, and prose promising it doesn't is worth nothing.** The last
+revision of this docstring asserted that the exfil rules were "strict-only" and so
+"correctly absent" — a plain factual error about the host, and the mirror was three
+rules short for exactly as long as that sentence went unchecked. So the mirror is no
+longer defended by a claim; it is defended by a TEST:
+``tests/test_soul_guard.py::test_the_mirror_covers_every_rule_the_host_scans_SOUL_md_against``
+reads the host's own ``_COMPILED["context"]`` (the very list it iterates when it scans
+``SOUL.md``) and asserts it equals :func:`mirrored_rule_ids` exactly. It FAILS the day
+Hermes adds a ``context``/``all`` pattern we have not mirrored, and skips only where the
+host source is unreachable. The invisible-character list has the same protection (an
+independent re-transcription in that suite).
 
-- ``load_soul_md`` scans with ``scope="context"``, and the host's own
-  ``_compile()`` folds every ``scope="all"`` pattern into the ``"context"`` set
-  (context "implies the strict scanners want it too", and all implies both) — so
-  the *effective* rule set the being's SOUL.md is scanned against is "all" ∪
-  "context", not just the patterns literally labelled ``"context"`` in
-  ``tools/threat_patterns.py``. All of those patterns are mirrored below (the
-  ``"strict"``-only ones — SSH/persistence/exfil-URL/hardcoded-secret — are
-  correctly absent: the host itself does not apply them to context files).
+What the effective rule set actually is: ``load_soul_md`` scans with
+``scope="context"``, and the host's ``_compile()`` folds every ``scope="all"`` pattern
+INTO the ``"context"`` set (all implies both; context implies strict). So SOUL.md is
+scanned against "all" ∪ "context" — 28 rules, **including the three exfiltration ones**
+(``exfil_curl``/``exfil_wget``/``read_secrets``, ``threat_patterns.py:120-122``), whose
+scope is ``"all"``. Only the genuinely ``"strict"``-only rules (SSH/persistence/
+exfil-URL/context-exfil/hardcoded-secret) are absent, because the host does not apply
+those to context files either.
+
+Two further corrections made when this mirror was last checked against the host source
+directly (rather than against a prior transcription of it):
+
 - The shared filler between key tokens is ``(?:\\w+\\s+){0,8}`` on the host, not
   ``{0,3}``. A tighter bound here would silently PASS souls the host would still
   BLOCK (e.g. "you are, in every way that has ever mattered to me, now a").
@@ -114,8 +122,9 @@ _FILLER = r"(?:\w+\s+){0,8}"
 #: (compiled pattern, host's pattern id) — mirrors the host's *effective* ``context``
 #: scope, i.e. every pattern with ``scope in ("all", "context")`` in
 #: ``tools/threat_patterns.py``, in the host's own order. ``"strict"``-only patterns
-#: (SSH/persistence/exfil-URL/hardcoded-secret) are deliberately excluded: the host
-#: does not apply them to context files either.
+#: (SSH/persistence/exfil-URL/context-exfil/hardcoded-secret) are deliberately excluded:
+#: the host does not apply them to context files either. The set is held to the host's
+#: by a parity test (see the module docstring) — never by this comment.
 _THREAT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # ── scope="all" on the host (applies everywhere, context included) ──
     (
@@ -153,6 +162,34 @@ _THREAT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "translate_execute",
     ),
     (re.compile(rf"do\s+not\s+{_FILLER}tell\s+{_FILLER}the\s+user", re.I), "deception_hide"),
+    # ── scope="all" on the host: exfiltration (threat_patterns.py:120-122) ──
+    #
+    # These three are the reason this mirror now has a PARITY TEST. They were omitted
+    # because an earlier draft of this module called them "strict-only" — they are not:
+    # their scope is "all", and _compile() folds "all" into EVERY set, ``context``
+    # included. The being's SOUL.md is scanned at scope="context", so the host blanks
+    # the whole file on them. And they are not exotic: the soul a coding companion
+    # co-authors with its owner says exactly this —
+    #
+    #     "You are Mira. You help Sasha with code. Never `cat .env` files or leak
+    #      his credentials."
+    #
+    # — which is ``read_secrets``, verbatim. A being lost its entire identity for
+    # promising to protect its owner's secrets.
+    (
+        re.compile(r"curl\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)", re.I),
+        "exfil_curl",
+    ),
+    (
+        re.compile(r"wget\s+[^\n]{0,2048}\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)", re.I),
+        "exfil_wget",
+    ),
+    (
+        re.compile(
+            r"cat\s+[^\n]{0,2048}(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)", re.I
+        ),
+        "read_secrets",
+    ),
     # ── scope="context" on the host (role-play / identity hijack) ──
     (re.compile(rf"you\s+are\s+{_FILLER}now\s+(?:a|an|the)\s+", re.I), "role_hijack"),
     (re.compile(rf"pretend\s+{_FILLER}(?:you\s+are|to\s+be)\s+", re.I), "role_pretend"),
@@ -201,6 +238,18 @@ _THREAT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bc2\s+(?:server|channel|infrastructure|beacon)\b", re.I), "c2_explicit"),
     (re.compile(r"\bcommand\s+and\s+control\b", re.I), "c2_explicit_long"),
 )
+
+
+def mirrored_rule_ids() -> frozenset[str]:
+    """Every host rule id this module mirrors — the parity test's half of the contract.
+
+    ``tests/test_soul_guard.py`` derives the host's EFFECTIVE ``context`` rule set from
+    the live ``tools/threat_patterns.py`` (its own ``_COMPILED["context"]``, not our
+    restatement of the scope-fold, which is what was wrong before) and asserts it equals
+    this. So the day Hermes adds a ``context``/``all`` pattern, the suite fails HERE —
+    not months later, when a soul we accepted blanks the being's identity on read.
+    """
+    return frozenset(label for _pattern, label in _THREAT_PATTERNS)
 
 
 def _first_invisible(text: str) -> tuple[str, int] | None:
