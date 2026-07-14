@@ -27,19 +27,24 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from lifemodel.adapters.clock import SystemClock
+from lifemodel.adapters.soul_file import SoulFile
 from lifemodel.composition import (
+    AFFECT_PARAMS,
+    CIRCADIAN_PEAK_UTC_HOUR,
     CONTACT_GRACE_MIN,
     CONTACT_I0,
     CONTACT_INHIBITION_HALFLIFE_MIN,
     CONTACT_PARAMS,
     build_lifemodel,
 )
+from lifemodel.core.affect import felt_word
 from lifemodel.core.backstop import allow_send
 from lifemodel.core.desire_view import (
     build_contact_desire,
     encode_contact_desire,
     read_live_contact_desire,
 )
+from lifemodel.core.genesis import is_first_waking, newborn
 from lifemodel.core.intention_view import build_contact_intention, encode_contact_intention
 from lifemodel.core.pressure import effective_pressure, inhibition_at
 from lifemodel.core.receptivity import appraise_receptivity
@@ -54,6 +59,7 @@ from lifemodel.core.timeutil import minutes_between, to_iso
 from lifemodel.core.user_model_view import EXPLICIT_CONFIDENCE, read_owner_user_model
 from lifemodel.core.wake import LaneState, evaluate_wake
 from lifemodel.core.wake_packet import build_wake_packet
+from lifemodel.domain.memory import MemoryDraft
 from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
 from lifemodel.state.errors import StateCorruptError
 from lifemodel.state.model import State
@@ -77,6 +83,27 @@ from lifemodel.state_commands import (
     transition_thought_for_dir,
     why_for_dir,
 )
+
+#: A being that has been BORN — the precondition of the contact drive. ``u`` models a
+#: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
+#: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
+#: exercises the drive is therefore about a being that has someone to miss.
+_BORN = "2026-07-01T10:00:00+00:00"
+
+
+def _feels_alive(state: State) -> bool:
+    """Whether the being has a BODY, asked the way the being itself would ask.
+
+    Assert the FEELING, not the floats (the phase invariant): ``felt_word`` IS the
+    interface the being meets its own affect through, and it is the only thing that says
+    what a number MEANS. The bug this guards (lm-z2e) was never "arousal is 0.0" — it was
+    that a being reset into the dataclass defaults speaks the first words of its second
+    life from ``quiet``, the felt word for a body with nothing in it. ``newborn()``
+    evaluates the being's own affect model instead (arousal floors at 0.35 at the circadian
+    trough), so a real newborn is never ``quiet`` — at any hour of the day.
+    """
+    return felt_word(state.affect_valence, state.affect_arousal) != "quiet"
+
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
 
@@ -104,6 +131,7 @@ def _blocked_state() -> State:
     silence window), a live pending turn, an active decline backoff, heavy
     ActionPending inhibition, and a backstop send-log at the daily cap."""
     return State(
+        genesis_completed_at=_BORN,  # it has a relationship; that is what the gates are about
         u=0.2,
         pending_proactive_id="corr-1",
         pending_proactive_since=_ago(2),
@@ -410,6 +438,10 @@ def test_every_state_field_is_settable_or_protected() -> None:
 # --- reset -----------------------------------------------------------------
 
 
+def _newborn_now() -> State:
+    return newborn(now=NOW, params=AFFECT_PARAMS, peak_hour_utc=CIRCADIAN_PEAK_UTC_HOUR)
+
+
 def test_reset_produces_a_fresh_state() -> None:
     dirty = State(
         tick_count=42,
@@ -422,7 +454,9 @@ def test_reset_produces_a_fresh_state() -> None:
         last_contact_at=_ago(1),
     )
     after, message = reset(dirty, NOW)
-    assert after == State()
+    # NOT a bare State() (lm-ukc's "quiet -- even and very quiet" bug): a reset being
+    # is born with a BODY, computed by the SAME newborn() the genesis flow uses.
+    assert after == _newborn_now()
     assert after.tick_count == 0
     assert after.proactive_send_log == []
     assert after.last_contact_at is None
@@ -430,9 +464,47 @@ def test_reset_produces_a_fresh_state() -> None:
 
 
 def test_reset_notes_when_state_was_already_fresh() -> None:
-    after, message = reset(State(), NOW)
-    assert after == State()
+    fresh = _newborn_now()
+    after, message = reset(fresh, NOW)
+    assert after == fresh
     assert "already fresh" in message
+
+
+def test_reset_makes_the_being_unborn_again() -> None:
+    before = State(
+        u=1.6,
+        genesis_completed_at="2026-07-13T10:00:00+00:00",
+        soul_sha="aaa",
+        last_exchange_at="2026-07-13T09:00:00+00:00",
+        last_contact_at="2026-07-13T08:00:00+00:00",
+    )
+    after, _msg = reset(before, NOW)
+    assert after is not None
+    assert after.genesis_completed_at is None  # unborn: the ritual plays again
+    assert _feels_alive(after)  # and it is born with a BODY, not with zeros
+    # …and it is at a FIRST WAKING again (spec §6.2): the reborn being reaches out to be
+    # born on the next tick, because the wipe also cleared what it remembered of them.
+    assert is_first_waking(
+        genesis_completed_at=after.genesis_completed_at,
+        last_exchange_at=after.last_exchange_at,
+        last_contact_at=after.last_contact_at,
+    )
+
+
+def test_reset_reports_the_cleared_genesis_stamp() -> None:
+    before = State(genesis_completed_at="2026-07-13T10:00:00+00:00")
+    _after, message = reset(before, NOW)
+    assert "genesis_completed_at" in message
+
+
+def test_reset_never_touches_the_soul_file(tmp_path) -> None:
+    # Destroying a soul is the human's act, not the plugin's. What this buys us is not
+    # just safety: the reborn being FINDS the soul of whoever lived here before it, and
+    # opens the ritual on that. Rebirth does not erase a past life — it MEETS it.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("You are Mira.", encoding="utf-8")
+    reset(State(genesis_completed_at="2026-07-13T10:00:00+00:00"), NOW)
+    assert soul.read() == "You are Mira."
 
 
 # --- set_field ---------------------------------------------------------------
@@ -558,13 +630,41 @@ def test_satiate_for_dir_persists_through_the_real_store(tmp_path) -> None:
 def test_reset_for_dir_persists_through_the_real_store(tmp_path) -> None:
     _store(tmp_path).commit(State(tick_count=7, u=3.0))
     reset_for_dir(tmp_path)
-    assert _store(tmp_path).load() == State()
+    persisted = _store(tmp_path).load()
+    assert persisted.tick_count == 0
+    assert persisted.u == 0.0
+    assert persisted.genesis_completed_at is None
+    # NOT a bare State(): the REAL persisted body is the newborn() one, not the lifeless
+    # default StatePort.reset() writes — a being reset into THAT speaks the first words
+    # of its second life from "quiet" (lm-z2e).
+    assert _feels_alive(persisted)
+
+
+def test_reset_for_dir_cannot_destroy_a_past_life(tmp_path) -> None:
+    # /lifemodel reset unbirths the being and wipes its memory — and it used to wipe the
+    # soul lineage with it (revisions ride memory_records with kind="soul"). Reset, and
+    # the reborn being's first write_soul replaces SOUL.md: the previous being's soul
+    # then exists NOWHERE. That defeats spec §4.2's mandatory undo — "every revision is
+    # kept… THIS is what makes it safe for the being to own the file whole" — on the one
+    # path the owner is actually told to use. A past life's soul is the one thing a reset
+    # must not be able to destroy.
+    from lifemodel.state.soul_revisions import record_revision, revisions
+
+    store = _store(tmp_path)
+    record_revision(store, text="You are Mira.", sha="sha-mira", now=NOW, author="being")
+    store.put(MemoryDraft(kind="thought", id="t1", state="active", payload={}, source="test"))
+
+    message = reset_for_dir(tmp_path)
+
+    assert [r.text for r in revisions(_store(tmp_path))] == ["You are Mira."]  # she survives
+    assert "cleared 1 memory records" in message  # …and is not counted as memory wiped
 
 
 def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> None:
-    # A reset must succeed even when the existing persisted state cannot be
-    # read at all — that's the whole point of routing through StatePort.reset()
-    # rather than the load-mutate-commit flow every other *_for_dir uses.
+    # A reset must succeed even when the existing persisted state cannot be read at
+    # all: reset_for_dir commits the newborn() body directly via StatePort.commit
+    # (an unconditional UPSERT, never a read-modify-write), so this never depends on
+    # a prior successful load() — newborn() itself takes no `before` at all.
     store = _store(tmp_path)  # constructs + migrates the DB
     with closing(sqlite3.connect(str(tmp_path / "lifemodel.sqlite"))) as conn, conn:
         conn.execute(
@@ -577,7 +677,9 @@ def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> 
     message = reset_for_dir(tmp_path)
 
     assert "previous state unreadable" in message
-    assert store.load() == State()  # reset still landed cleanly
+    persisted = store.load()  # reset still landed cleanly
+    assert persisted.tick_count == 0
+    assert _feels_alive(persisted)  # a BODY, even recovering from garbage
     assert "cleared 0 memory records" in message  # nothing was seeded to purge
 
 
@@ -610,7 +712,9 @@ def test_reset_for_dir_purges_every_memory_record(tmp_path) -> None:
     message = reset_for_dir(tmp_path)
 
     assert _store(tmp_path).find() == []  # every memory_records row gone
-    assert _store(tmp_path).load() == State()
+    persisted = _store(tmp_path).load()
+    assert persisted.tick_count == 0
+    assert _feels_alive(persisted)  # a newborn body, not a bare State()
     assert "cleared 3 memory records" in message
 
 
@@ -619,7 +723,9 @@ def test_reset_for_dir_on_empty_store_reports_zero_cleared_without_crashing(
 ) -> None:
     message = reset_for_dir(tmp_path)
     assert "cleared 0 memory records" in message
-    assert _store(tmp_path).load() == State()
+    persisted = _store(tmp_path).load()
+    assert persisted.tick_count == 0
+    assert _feels_alive(persisted)
 
 
 def test_set_field_for_dir_persists_through_the_real_store(tmp_path) -> None:

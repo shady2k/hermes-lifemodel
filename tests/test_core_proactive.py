@@ -29,6 +29,18 @@ from lifemodel.state.model import State
 
 TARGET = {"platform": "telegram", "chat_id": "1", "thread_id": None}
 
+#: These are DRIVE-path delivery tests, so every being in them has already been born. An
+#: unborn being with nothing on record is at its FIRST WAKING (spec §6.2) and reaches out
+#: WITHOUT ``u`` crossing ``θ`` — which would quietly falsify the "below threshold ⇒ no
+#: launch" assertions here. The genesis wake path is pinned in ``tests/test_genesis_wake.py``.
+BORN_AT = "2026-07-01T10:00:00+00:00"
+
+
+def _born(**kw: object) -> State:
+    """A ``State`` for a being that has been born (see :data:`BORN_AT`)."""
+    kw.setdefault("genesis_completed_at", BORN_AT)
+    return State(**kw)  # type: ignore[arg-type]
+
 
 class FakeEgress:
     def __init__(self, outcome: ReachOutcome = ReachOutcome.DELIVERED) -> None:
@@ -75,7 +87,7 @@ def _supp_reasons(ring: EventRing) -> list[str]:
 def _active(**over) -> State:
     base = dict(u=2.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00")
     base.update(over)
-    return State(**base)
+    return _born(**base)
 
 
 NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -94,7 +106,7 @@ def test_active_desire_launches_native_turn(tmp_path) -> None:
 
 
 def test_no_active_desire_does_not_reach_out(tmp_path) -> None:
-    idle = State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
+    idle = _born(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00")
     lm = _lm(tmp_path, idle, NOW, desire=None)  # no live desire row
     egress = FakeEgress()
     out = proactive_tick(lm, egress, TARGET)
@@ -124,7 +136,7 @@ def test_no_launch_returns_none_and_logs_a_suppression_reason(tmp_path) -> None:
     # logger) emits a below_threshold suppression; proactive_tick then returns None.
     ring = EventRing()
     lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), event_ring=ring)
-    lm.state.commit(State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
+    lm.state.commit(_born(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
     egress = FakeEgress()
     out = proactive_tick(lm, egress, TARGET)
     assert out is None  # quiet — no egress outcome
@@ -202,7 +214,7 @@ def test_failed_delivery_keeps_intention_active_to_retry(tmp_path) -> None:
 
 
 def test_does_not_stamp_egress_service_alive_at(tmp_path) -> None:
-    lm = _lm(tmp_path, State(last_tick_at="2026-07-06T11:59:00+00:00"), NOW, desire=None)
+    lm = _lm(tmp_path, _born(last_tick_at="2026-07-06T11:59:00+00:00"), NOW, desire=None)
     proactive_tick(lm, FakeEgress(), TARGET)
     # liveness is NOT a separate stamp anymore; last_tick_at (dt clock) carries it
     assert getattr(lm.state.load(), "egress_service_alive_at", None) is None
@@ -244,7 +256,7 @@ def test_proactive_prompt_not_recorded_when_nothing_is_delivered(tmp_path) -> No
     # so there is no prompt to record — the delivery span never opens.
     ring = EventRing()
     lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), event_ring=ring)
-    lm.state.commit(State(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
+    lm.state.commit(_born(u=0.0, last_tick_at="2026-07-06T11:59:00+00:00"))  # below theta
     proactive_tick(lm, FakeEgress(), TARGET)
 
     assert _prompt_events(ring) == []

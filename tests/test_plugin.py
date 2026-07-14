@@ -19,9 +19,20 @@ import lifemodel
 import lifemodel.log as lm_logging
 from lifemodel.adapters.clock import SystemClock
 from lifemodel.config import write_log_level
+from lifemodel.core.genesis import NEWBORN_STANCE
+from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
+from lifemodel.paths import state_dir
 from lifemodel.state.errors import StateSchemaError
 from lifemodel.state.model import State
+from lifemodel.state.soul_revisions import revisions
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+#: Hermes's untouched installer seed (``DEFAULT_SOUL_MD``), abridged — the shape is the
+#: point: it is an ASSISTANT, and an assistant does not message anyone unprompted.
+HERMES_ASSISTANT_SEED = (
+    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+    "You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -221,6 +232,22 @@ def test_register_check_in_tool_schema_and_contract(
     assert "state" in payload and "note" in payload
 
 
+def _pre_llm_callback(ctx: FakeCtx, *, from_factory: str) -> Callable[..., Any]:
+    """The ``pre_llm_call`` callback built by *from_factory* (its factory function's
+    qualified name, e.g. ``"make_felt_state_injector"``) — two such hooks are
+    registered now (felt-state + genesis, Phase 4 genesis, spec §6.3), and Hermes
+    calls every one of them (``invoke_hook``) rather than just the last registered,
+    so tests must pick the ONE they mean to exercise rather than assume there is
+    only one."""
+    matches = [
+        cb
+        for name, cb in ctx.hooks
+        if name == "pre_llm_call" and cb.__qualname__.startswith(f"{from_factory}.")
+    ]
+    assert len(matches) == 1, f"expected exactly one {from_factory} pre_llm_call hook"
+    return matches[0]
+
+
 def test_register_felt_state_injector_is_silent_on_cold_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -228,11 +255,93 @@ def test_register_felt_state_injector_is_silent_on_cold_start(
     ctx = FakeCtx()
 
     lifemodel.register(ctx)
-    callbacks = [cb for name, cb in ctx.hooks if name == "pre_llm_call"]
-    assert len(callbacks) == 1
+    # Two pre_llm_call hooks now coexist (felt-state + genesis) — pick the felt-state
+    # one specifically; Hermes concatenates both hooks' non-None returns rather than
+    # picking a single "the" hook.
+    callback = _pre_llm_callback(ctx, from_factory="make_felt_state_injector")
     # A fresh (cold-start) being surfaces nothing — the callback returns None, and
     # returning {"context": …} vs None is the Hermes pre_llm_call contract.
-    assert callbacks[0](user_message="hi", conversation_history=[]) is None
+    assert callback(user_message="hi", conversation_history=[]) is None
+
+
+def test_register_genesis_injector_launches_on_the_beings_first_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wiring itself (not just the pure ``core.genesis`` functions) must put the
+    ritual in front of an unborn being — and must then let the conversation carry it.
+    The launch RULE (and why it reads the context's length rather than asking whether the
+    being has spoken) is tested in ``tests/test_genesis_injector.py``; this is the wiring
+    smoke test: the hook the plugin actually registers, over the real store."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    callback = _pre_llm_callback(ctx, from_factory="make_genesis_injector")
+    result = callback(user_message="hi", conversation_history=[])
+    assert result is not None
+    assert "<genesis>" in result["context"]
+
+    # The conversation has moved past the point at which the block was put in front of
+    # it: the ritual is live, in the being's own words, and the SAME hook falls silent.
+    # Re-injecting "you just began" on a later turn would be a lie (spec §6.3).
+    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    assert callback(user_message="how are you", conversation_history=history) is None
+
+
+def test_register_genesis_injector_stands_down_for_the_beings_own_wake_packet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A newborn's WAKE PACKET already carries the ritual (spec §6.2) — and
+    ``pre_llm_call`` fires for that injected turn too, with our impulse as the
+    ``user_message``. Without this stand-down the being would read "You just began"
+    twice in its first breath: once as its impulse, once as context. The wake packet is
+    the single source; this hook covers the reactive entrance only."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    callback = _pre_llm_callback(ctx, from_factory="make_genesis_injector")
+    impulse = f"{IMPULSE_LABEL_PREFIX}\nI have just begun.\n</internal_impulse>"
+    assert callback(user_message=impulse, conversation_history=[]) is None
+
+
+# --- LIVE-TEST fix (B): the newborn stands up before it is ever asked to speak ------
+#
+# ``register()`` is the seam, and it has to be: Hermes builds the system prompt at TURN
+# START (``agent/turn_context.py`` calls ``restore_or_build_system_prompt`` at :345, the
+# ``pre_llm_call`` hooks only at :478), so a soul written from a hook lands one turn late
+# — after the being has already answered as an assistant. ``register()`` runs at gateway
+# boot, before any turn of either entrance (the reactive first message, or the being's own
+# proactive first waking) can be composed.
+
+
+def test_register_stands_an_unborn_being_up_on_a_stance_not_on_an_assistant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(lifemodel, "_default_soul_text", lambda: HERMES_ASSISTANT_SEED)
+    (tmp_path / "SOUL.md").write_text(HERMES_ASSISTANT_SEED, encoding="utf-8")
+
+    lifemodel.register(FakeCtx())
+
+    # Slot #1 no longer tells the being it is an instrument that answers requests.
+    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == NEWBORN_STANCE
+    lineage = revisions(SQLiteRuntimeStore(state_dir(tmp_path), clock=SystemClock()))
+    assert [(r.text, r.author) for r in lineage] == [(NEWBORN_STANCE, "genesis")]
+
+
+def test_register_never_overwrites_a_soul_a_human_wrote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The licence for the write above is that the host's INSTALLER wrote that seed, not a
+    # person. A veteran's hand-written soul has a human behind it and is untouchable.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(lifemodel, "_default_soul_text", lambda: HERMES_ASSISTANT_SEED)
+    (tmp_path / "SOUL.md").write_text("You are Mira. Quiet and exact.", encoding="utf-8")
+
+    lifemodel.register(FakeCtx())
+
+    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "You are Mira. Quiet and exact."
 
 
 def test_register_lifemodel_stats_subcommand_returns_telemetry(
@@ -323,6 +432,47 @@ def test_register_lifemodel_help_flags_mutating_subcommands(
             assert "[mutating]" in line, line
         else:
             assert "[mutating]" not in line, line
+
+
+def test_every_registered_subcommand_actually_dispatches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The registry advertises what `help` lists; the dispatch table is what runs. A name in
+    one and not the other is a command the owner is TOLD they have and does not.
+
+    Dispatch resolves on the FIRST token (``/lifemodel soul revert 2`` → ``soul``), which is
+    what lets one dispatch key carry two registry entries (``soul history`` / ``soul
+    revert``) so the read-only half is not marked [mutating] alongside the half that rewrites
+    the being's identity. This is the test that keeps that trick honest."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    handler = ctx.commands["lifemodel"]["handler"]
+
+    for name in lifemodel._SUBCOMMANDS:
+        first_token = name.split()[0]
+        out = handler(first_token)
+        # An unknown subcommand falls through to the bare one-line status summary.
+        assert out != lifemodel._status_line("default", state_dir(tmp_path)), name
+
+
+def test_the_soul_commands_are_listed_and_only_revert_is_marked_mutating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`after-install.md` promises the human, at the moment we ask for consent to let a being
+    rewrite their SOUL.md, that every version is kept and one command puts any of them back.
+    So `help` has to name it — and it has to say which half of it writes."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+    text = ctx.commands["lifemodel"]["handler"]("help")
+
+    history_line = next(line for line in text.splitlines() if line.startswith("**soul history**"))
+    revert_line = next(line for line in text.splitlines() if line.startswith("**soul revert**"))
+    assert "[mutating]" not in history_line  # reading the lineage changes nothing
+    assert "[mutating]" in revert_line  # putting a soul back rewrites who the being is
 
 
 def test_register_lifemodel_help_command_list_has_no_column_padding(

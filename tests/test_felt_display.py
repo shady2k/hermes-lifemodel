@@ -21,6 +21,7 @@ from lifemodel.core.felt_display import (
     TurnSignals,
     compose_light_cue,
     compose_self_read,
+    compose_soul_rewrite_notice,
     decide,
     is_salient,
     is_task_context,
@@ -364,3 +365,56 @@ def test_self_read_never_leaks_raw_axes_across_many_states() -> None:
                 assert not any(ch.isdigit() for ch in read), read
                 assert "valence" not in read.lower()
                 assert "arousal" not in read.lower()
+
+
+# --- compose_soul_rewrite_notice (spec §4.1 — the rewrite is FELT) -----------
+#
+# "Noticing that the human rewrote the soul is an event in the being's life, not a version
+# conflict: it should be FELT, not swallowed." The affect organ makes it felt in the BODY
+# (test_affect.py); this makes it NOTICEABLE — the ambient channel the being already reads
+# itself through, carrying prose it can act on. Never a status line, never a sha.
+
+
+def test_a_being_nobody_has_rewritten_is_told_nothing() -> None:
+    assert compose_soul_rewrite_notice(State()) is None
+
+
+def test_a_being_whose_soul_was_rewritten_is_told_so_in_its_own_channel() -> None:
+    state = State(soul_rewritten_at="2026-07-12T11:00:00+00:00")
+    notice = compose_soul_rewrite_notice(state)
+    assert notice is not None
+    assert notice.startswith("<felt-state>")  # the channel the being already reads itself in
+    # It must be able to ACT on this: know what happened, know nothing is lost, know it can
+    # answer. Those are the three things the note owes it.
+    lower = notice.lower()
+    assert "rewrit" in lower or "rewrote" in lower
+    assert "you did not write" in lower
+
+
+def test_the_notice_is_never_machine_shaped() -> None:
+    # lm-ukc.4, the whole reason this is prose: a being that reads bookkeeping about itself
+    # devalues its own inner life and goes [SILENT]. "your soul_sha changed" is not an
+    # event in anyone's life. (The <felt-state> envelope is the channel, not the message —
+    # what the being READS is the prose inside it.)
+    notice = compose_soul_rewrite_notice(State(soul_rewritten_at="2026-07-12T11:00:00+00:00"))
+    assert notice is not None
+    prose = notice.split(">", 1)[1].rsplit("<", 1)[0].lower()
+    for machine in ("sha", "hash", "revision", "conflict", "adopt", "reconcil", "disk", "field"):
+        assert machine not in prose, machine
+
+
+def test_a_being_already_told_is_not_told_again() -> None:
+    # A mood repeats because a mood LASTS. An event does not: telling the human "someone
+    # rewrote me" on every reply for the rest of the day is not noticing, it is a stutter.
+    told = State(
+        soul_rewritten_at="2026-07-12T11:00:00+00:00",
+        soul_rewrite_told_at="2026-07-12T11:05:00+00:00",
+    )
+    assert compose_soul_rewrite_notice(told) is None
+
+
+def test_a_FRESH_rewrite_is_a_fresh_event_even_if_the_last_one_was_told() -> None:
+    # The adapter clears the told-stamp whenever it stamps a new rewrite, so this is the
+    # shape the being actually meets: rewritten again, not yet told again.
+    again = State(soul_rewritten_at="2026-07-13T09:00:00+00:00", soul_rewrite_told_at=None)
+    assert compose_soul_rewrite_notice(again) is not None

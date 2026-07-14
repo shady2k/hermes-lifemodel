@@ -30,6 +30,12 @@ from lifemodel.state.trace_store import TraceWriter, observability_db_path
 from lifemodel.testing.fakes import FakeClock, FakeTracer
 from lifemodel.testing.harness import RecordingEgress
 
+#: A being that has been BORN — the precondition of the contact drive. ``u`` models a
+#: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
+#: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
+#: exercises the drive is therefore about a being that has someone to miss.
+_BORN = "2026-07-01T10:00:00+00:00"
+
 _T0 = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
 
 
@@ -37,7 +43,7 @@ def _seed_launch_ready(lm: object) -> None:
     """Seed a live ACTIVE contact desire + a rested state so tick 1 launches."""
     store = lm.state  # type: ignore[attr-defined]
     assert isinstance(store, MemoryPort)
-    store.commit(State(u=2.0, energy=1.0, last_tick_at=_T0.isoformat()))
+    store.commit(State(genesis_completed_at=_BORN, u=2.0, energy=1.0, last_tick_at=_T0.isoformat()))
     store.put(encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0)))
 
 
@@ -122,7 +128,7 @@ def test_missing_origin_anchor_becomes_orphan_not_foreign_attachment(tmp_path: P
             event_ring=EventRing(),
         )
         # A pending turn whose durable origin anchor is GONE (only the id survived).
-        lm.state.commit(State(pending_proactive_id="p-orphan"))
+        lm.state.commit(State(genesis_completed_at=_BORN, pending_proactive_id="p-orphan"))
         lm.state.put(
             encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0))
         )

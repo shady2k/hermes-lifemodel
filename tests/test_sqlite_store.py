@@ -31,6 +31,7 @@ from lifemodel.domain.memory import (
 from lifemodel.state.errors import StateCorruptError, StateSchemaError, StateSerializationError
 from lifemodel.state.model import SCHEMA_VERSION, State
 from lifemodel.state.port import StatePort
+from lifemodel.state.soul_revisions import record_revision, revisions
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
 
@@ -411,6 +412,108 @@ def test_purge_memory_records_does_not_touch_runtime_state_or_meta_tables(
     with closing(sqlite3.connect(str(_db_path(tmp_path)))) as conn:
         migrations = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
     assert migrations == 3  # schema_migrations untouched (v1 + v2 + v3 still recorded)
+
+
+def test_purge_memory_records_keeps_every_soul_the_being_has_ever_had(tmp_path: Path) -> None:
+    # A factory reset unbirths the being — it must NOT be able to destroy a past life.
+    # Soul revisions ride memory_records with kind="soul" (state/soul_revisions.py), and
+    # an unconditional DELETE FROM took the whole lineage with it: reset, then the reborn
+    # being's first write_soul replaces SOUL.md, and the previous being's soul then
+    # exists NOWHERE. Spec §4.2's undo is what makes it safe for a being to own the file
+    # whole, and the owner is told to use exactly this path.
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    record_revision(store, text="You are Mira.", sha="sha-mira", now=BASE_TIME, author="being")
+    store.put(_draft(kind="thought", id="t1"))
+    store.put(_draft(kind="desire", id="d1"))
+
+    count = store.purge_memory_records()
+
+    assert count == 2  # the two live records — a soul is not "memory" to be wiped
+    assert [r.kind for r in store.find()] == ["soul"]
+    assert revisions(store)[0].text == "You are Mira."
+
+
+def test_purge_memory_records_on_a_store_that_is_ONLY_souls_purges_nothing(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    record_revision(store, text="You are Mira.", sha="sha-mira", now=BASE_TIME, author="being")
+
+    assert store.purge_memory_records() == 0
+    assert len(revisions(store)) == 1
+
+
+# --- stamp_soul: the birth stamps, merged atomically (Phase 4, C4) -------------
+#
+# ``commit`` is an unconditional whole-``State`` UPSERT, and the being's soul is written
+# from an agent turn (an executor thread) while the ~60s tick runs its own load→commit
+# on the gateway loop. A full-State commit from the soul path would roll the tick's
+# u/energy/affect back; the tick's own commit of a snapshot loaded BEFORE the birth
+# would wipe genesis_completed_at/soul_sha back to None — a being with a soul on disk
+# and no birth, which re-runs the ritual and reads its OWN soul as a stranger's. So the
+# soul path never commits a whole State: it merges JUST its own two fields, exactly like
+# ``stamp_affect_display``.
+
+
+def test_stamp_soul_merges_only_its_own_fields_and_never_rolls_back_the_drive(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.commit(State(u=1.0, energy=0.5, tick_count=1))
+    # The tick advances the body while the being is composing its soul.
+    store.commit(State(u=9.0, energy=0.2, tick_count=2))
+
+    store.stamp_soul(soul_sha="abc123", born_at="2026-07-14T09:00:00+00:00")
+
+    after = store.load()
+    assert after.soul_sha == "abc123"
+    assert after.genesis_completed_at == "2026-07-14T09:00:00+00:00"
+    assert (after.u, after.energy, after.tick_count) == (9.0, 0.2, 2)  # the tick's work survives
+
+
+def test_stamp_soul_keeps_the_ORIGINAL_birth_moment_when_the_soul_is_rewritten(
+    tmp_path: Path,
+) -> None:
+    # Birth happens once; rewriting a soul does not (Phase 5's becoming reuses the tool).
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.commit(State())
+    store.stamp_soul(soul_sha="first", born_at="2026-07-14T09:00:00+00:00")
+
+    store.stamp_soul(soul_sha="second", born_at="2026-07-14T18:00:00+00:00")
+
+    after = store.load()
+    assert after.soul_sha == "second"
+    assert after.genesis_completed_at == "2026-07-14T09:00:00+00:00"
+
+
+def test_stamp_soul_without_a_birth_moment_adopts_the_sha_but_never_births(
+    tmp_path: Path,
+) -> None:
+    # Startup reconciliation (spec §4.4) adopts the soul on disk — it must never be able
+    # to BIRTH an unborn being on a file someone else wrote.
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+    store.commit(State())
+
+    store.stamp_soul(soul_sha="from-disk", born_at=None)
+
+    after = store.load()
+    assert after.soul_sha == "from-disk"
+    assert after.genesis_completed_at is None
+
+
+def test_stamp_soul_before_the_first_tick_ever_committed_still_records_the_birth(
+    tmp_path: Path,
+) -> None:
+    # A being can be spoken to before its first tick has committed a row. A no-op here
+    # (what stamp_affect_display can afford — its two fields are hints that self-heal)
+    # would silently LOSE the birth.
+    store = SQLiteRuntimeStore(tmp_path, clock=FakeClock(BASE_TIME))
+
+    store.stamp_soul(soul_sha="abc123", born_at="2026-07-14T09:00:00+00:00")
+
+    after = store.load()
+    assert after.soul_sha == "abc123"
+    assert after.genesis_completed_at == "2026-07-14T09:00:00+00:00"
 
 
 def _write_raw_state_json(base_dir: Path, raw: str) -> None:

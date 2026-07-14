@@ -37,6 +37,11 @@ from lifemodel.testing import FakeClock
 from lifemodel.testing.harness import RecordingEgress
 
 _NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
+#: Every scenario here is about a being INSIDE a relationship — one that has been born,
+#: and therefore has someone to miss. An unborn being's ``u`` does not accrue at all
+#: (``core/solitude_drive.py``: birth is not longing), so a drive scenario that forgot
+#: to be born would silently test nothing.
+_BORN = "2026-07-01T10:00:00+00:00"
 _ORIGIN_TP = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
 _TARGET: dict[str, str | None] = {"platform": "test", "chat_id": "1", "thread_id": None}
 
@@ -56,7 +61,7 @@ def _seed_active_desire(lm, salience: float = 3.0) -> None:
 
 def test_scenario_1_inbound_contact_satiates_and_resolves_desire(tmp_path: Path) -> None:
     lm = _build(tmp_path)
-    lm.state.commit(State(u=2.0, last_tick_at=to_iso(_NOW)))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=2.0, last_tick_at=to_iso(_NOW)))
     _seed_active_desire(lm)
 
     run_frame(
@@ -89,6 +94,7 @@ def test_inbound_while_proactive_in_flight_clears_pending_and_unblocks_cognition
     # high drive, when a real reply lands the very same moment.
     lm.state.commit(
         State(
+            genesis_completed_at=_BORN,
             u=3.0,
             pending_proactive_id="p-inflight",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
@@ -133,7 +139,7 @@ def test_inbound_while_proactive_in_flight_clears_pending_and_unblocks_cognition
 
 def test_scenario_2_control_command_is_not_contact(tmp_path: Path) -> None:
     lm = _build(tmp_path)
-    lm.state.commit(State(u=2.0, last_tick_at=to_iso(_NOW)))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=2.0, last_tick_at=to_iso(_NOW)))
 
     make_inbound_observer(lambda: lm, health=BrainHealth(tmp_path), metrics=MetricRegistry())(
         event=SimpleNamespace(text="/lifemodel force-wake", internal=False, id="m-2")
@@ -150,7 +156,11 @@ def test_scenario_2_control_command_is_not_contact(tmp_path: Path) -> None:
 def test_scenario_3_over_threshold_launches_cognition(tmp_path: Path) -> None:
     lm = _build(tmp_path)
     # high drive, energy to afford a launch, 1 min elapsed, a live active desire
-    lm.state.commit(State(u=3.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"))
+    lm.state.commit(
+        State(
+            genesis_completed_at=_BORN, u=3.0, energy=1.0, last_tick_at="2026-07-06T11:59:00+00:00"
+        )
+    )
     _seed_active_desire(lm)
     egress = RecordingEgress(ReachOutcome.DELIVERED)
 
@@ -169,6 +179,7 @@ def test_scenario_4_in_flight_does_not_double_launch(tmp_path: Path) -> None:
     # a turn already in flight (pending set) with the drive still high
     lm.state.commit(
         State(
+            genesis_completed_at=_BORN,
             u=3.0,
             energy=1.0,
             pending_proactive_id="p-inflight",
@@ -194,6 +205,7 @@ def test_scenario_5a_sent_sets_action_pending_and_clears_pending(tmp_path: Path)
     lm = _build(tmp_path)
     lm.state.commit(
         State(
+            genesis_completed_at=_BORN,
             u=1.5,
             pending_proactive_id="p-sent",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
@@ -227,6 +239,7 @@ def test_scenario_5b_silent_applies_decline_backoff_and_clears_pending(tmp_path:
     lm = _build(tmp_path)
     lm.state.commit(
         State(
+            genesis_completed_at=_BORN,
             u=1.5,
             pending_proactive_id="p-silent",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
@@ -263,7 +276,7 @@ def test_scenario_5b_silent_applies_decline_backoff_and_clears_pending(tmp_path:
 def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> None:
     clock = FakeClock(_NOW)
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
-    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=5.0, last_tick_at=to_iso(_NOW)))
     _seed_active_desire(lm)
 
     dup = contact_observed_signal(origin_id="m-dup", actor="user", label="two_way", timestamp=None)
@@ -287,7 +300,7 @@ def test_scenario_6_duplicate_origin_id_satiates_u_only_once(tmp_path: Path) -> 
 def test_scenario_6_different_origin_id_after_first_still_satiates(tmp_path: Path) -> None:
     clock = FakeClock(_NOW)
     lm = build_lifemodel(base_dir=tmp_path, clock=clock)
-    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=5.0, last_tick_at=to_iso(_NOW)))
 
     run_frame(
         lm.coreloop,
@@ -319,7 +332,7 @@ def test_scenario_6_contact_sensor_failure_does_not_record_id(tmp_path: Path, mo
     from lifemodel.core.contact_sensor import ContactSensor
 
     lm = _build(tmp_path)
-    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=5.0, last_tick_at=to_iso(_NOW)))
 
     def _boom(self, ctx):  # ContactSensor faults this frame
         raise RuntimeError("sensor down")
@@ -351,7 +364,7 @@ def test_scenario_6_circuit_broken_contact_sensor_does_not_record_id(tmp_path: P
     # gate must key on POSITIVE success (``in ran``), not absence-of-failure: the id
     # must NOT be recorded, so a retry after the sensor recovers re-fires.
     lm = _build(tmp_path)
-    lm.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
+    lm.state.commit(State(genesis_completed_at=_BORN, u=5.0, last_tick_at=to_iso(_NOW)))
     lm.coreloop._broken.add(CONTACT_SENSOR_ID)  # simulate the tripped breaker
 
     dup = contact_observed_signal(
@@ -372,7 +385,7 @@ def test_scenario_6_ring_is_durable_across_restart(tmp_path: Path) -> None:
     # Unlike the ephemeral bus, the ring is durable (spec §8): a duplicate that
     # arrives AFTER a restart is still deduped.
     lm1 = build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
-    lm1.state.commit(State(u=5.0, last_tick_at=to_iso(_NOW)))
+    lm1.state.commit(State(genesis_completed_at=_BORN, u=5.0, last_tick_at=to_iso(_NOW)))
     dup = contact_observed_signal(
         origin_id="m-restart", actor="user", label="two_way", timestamp=None
     )
@@ -397,6 +410,7 @@ def test_scenario_7_async_completion_commits_immediately_no_heartbeat(tmp_path: 
     lm = _build(tmp_path)
     lm.state.commit(
         State(
+            genesis_completed_at=_BORN,
             u=1.5,
             pending_proactive_id="p-async",
             pending_proactive_since="2026-07-06T11:55:00+00:00",
@@ -437,7 +451,9 @@ def test_scenario_8_restart_has_empty_bus_and_intact_durable_state(tmp_path: Pat
     # fresh graph over the SAME base_dir. There is no durable signal log to replay
     # ("lost consciousness → don't replay stale impulses"); AgentState + Memory persist.
     lm1 = _build(tmp_path)
-    lm1.state.commit(State(u=2.0, decline_count=2, last_tick_at=to_iso(_NOW)))
+    lm1.state.commit(
+        State(genesis_completed_at=_BORN, u=2.0, decline_count=2, last_tick_at=to_iso(_NOW))
+    )
     _seed_active_desire(lm1)
     run_frame(
         lm1.coreloop,

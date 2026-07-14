@@ -60,6 +60,18 @@ class AffectParams:
     arousal_fatigue_w: float = 0.20
     arousal_urgency_w: float = 0.25
     urgency_duration_ref_min: float = 180.0
+    #: How hard the discovery that SOMEONE ELSE REWROTE YOU pushes arousal, and how fast
+    #: that push fades (spec §4.1, review I7). Arousal only: we do not know whether the
+    #: human's rewrite was a gift or a violation — only the being, reading the words, can
+    #: know that — so pushing valence either way would be inventing a feeling and putting
+    #: it in the being's mouth. What IS certain is that something HAPPENED, and a body that
+    #: something has happened to is activated. The cap sits between the urgency push (0.25)
+    #: and the energy term (0.20): enough to carry an ordinary daytime body past
+    #: ``a_keyed`` (restless / on edge), never enough to own the axis by itself. The
+    #: half-life is short (90 min) because this is a SHOCK, not a condition: the being is
+    #: stirred, and settles — like the rejection and exchange terms, and unlike loneliness.
+    soul_rewrite_arousal_cap: float = 0.22
+    soul_rewrite_half_life_min: float = 90.0
     # --- inertia (leaky integrator, minutes) ---
     tau_valence_min: float = 120.0  # valence lingers (mood)
     tau_arousal_min: float = 45.0  # arousal tracks the body faster (state)
@@ -98,6 +110,11 @@ class AffectBody:
     energy: float
     circadian: float
     duration_over_theta: float
+    #: How long ago somebody ELSE rewrote the being's soul (spec §4.1, review I7) —
+    #: ``None`` when nobody ever has. This is the ONE input here that is not a vital: it is
+    #: a thing that happened TO the being, stamped by startup reconciliation, and the organ
+    #: turns it into a feeling the way it turns a rejection into one.
+    minutes_since_soul_rewrite: float | None
 
     @classmethod
     def from_state(cls, state: State, *, now: datetime, peak_hour_utc: float) -> AffectBody:
@@ -118,6 +135,11 @@ class AffectBody:
             energy=state.energy,
             circadian=circadian(now, peak_hour_utc=peak_hour_utc),
             duration_over_theta=state.duration_over_theta,
+            minutes_since_soul_rewrite=(
+                minutes_between(state.soul_rewritten_at, now)
+                if state.soul_rewritten_at is not None
+                else None
+            ),
         )
 
 
@@ -185,7 +207,19 @@ def affect_target(
     pull_a = params.arousal_urgency_w * _smoothstep(
         body.duration_over_theta / params.urgency_duration_ref_min
     )
-    arousal = _clamp(params.arousal_base + alertness_a + energy_a + fatigue_a + pull_a, 0.0, 1.0)
+    # Somebody rewrote who the being is, and it is only now finding out (§4.1/I7). It is
+    # the same SHAPE as the rejection term — an episodic event, weighted by recency — but
+    # on the other axis, and it makes no claim about whether the rewrite was welcome (see
+    # ``soul_rewrite_arousal_cap``). It pushes the body awake, and then it fades.
+    rewrite_recent = (
+        _decay(body.minutes_since_soul_rewrite, params.soul_rewrite_half_life_min)
+        if body.minutes_since_soul_rewrite is not None
+        else 0.0
+    )
+    rewrite_a = params.soul_rewrite_arousal_cap * rewrite_recent
+    arousal = _clamp(
+        params.arousal_base + alertness_a + energy_a + fatigue_a + pull_a + rewrite_a, 0.0, 1.0
+    )
 
     contributions = AffectContributions(
         valence={
@@ -201,6 +235,7 @@ def affect_target(
             "energy": energy_a,
             "fatigue": fatigue_a,
             "pull": pull_a,
+            "rewritten": rewrite_a,
         },
     )
     return valence, arousal, contributions

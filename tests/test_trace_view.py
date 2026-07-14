@@ -41,6 +41,12 @@ from lifemodel.trace_view import (
     trace_for_dir,
 )
 
+#: A being that has been BORN — the precondition of the contact drive. ``u`` models a
+#: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
+#: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
+#: exercises the drive is therefore about a being that has someone to miss.
+_BORN = "2026-07-01T10:00:00+00:00"
+
 T0 = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
 
 
@@ -195,7 +201,9 @@ def populated(tmp_path: Path):
         lm = build_lifemodel(
             base_dir=tmp_path, clock=clock, trace_writer=writer, event_ring=EventRing()
         )
-        lm.state.commit(State(u=2.0, energy=1.0, last_tick_at=T0.isoformat()))
+        lm.state.commit(
+            State(genesis_completed_at=_BORN, u=2.0, energy=1.0, last_tick_at=T0.isoformat())
+        )
         lm.state.put(
             encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=2.0))
         )
@@ -215,7 +223,7 @@ def populated(tmp_path: Path):
 
         # An orphan (newest root trace): post_llm with a pending id but NO origin anchor.
         clock.advance(timedelta(minutes=2))
-        lm.state.commit(State(pending_proactive_id="lost"))
+        lm.state.commit(State(genesis_completed_at=_BORN, pending_proactive_id="lost"))
         lm.state.put(
             encode_contact_desire(build_contact_desire(state=DesireState.ACTIVE, salience=1.0))
         )

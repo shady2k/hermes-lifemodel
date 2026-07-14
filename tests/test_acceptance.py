@@ -24,6 +24,18 @@ from lifemodel.testing.fakes import FakeClock
 
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
+#: Every being below has already been BORN. An unborn being with nothing on record is at
+#: its FIRST WAKING (spec §6.2) — it wakes to be born, without ``u`` ever crossing ``θ``,
+#: carrying the ``<genesis>`` ritual instead of the longing. That is a different acceptance
+#: story (``tests/test_genesis_wake.py``); these are the DRIVE's.
+_BORN_AT = "2026-07-01T10:00:00+00:00"
+
+
+def _born(**kw: object) -> State:
+    """A ``State`` for a being that has been born (see :data:`_BORN_AT`)."""
+    kw.setdefault("genesis_completed_at", _BORN_AT)
+    return State(**kw)  # type: ignore[arg-type]
+
 
 # --- Positive: the [SILENT] cure (silence → threshold → message) -------------
 
@@ -99,7 +111,7 @@ def test_backstop_rate_limited_holds_a_launch_with_a_recent_send(tmp_path) -> No
     # launch. The desire is born naturally (u ≥ θ) and cognition launches, but the
     # egress backstop holds it — logged as backstop_rate_limited.
     clock = FakeClock(_T0)
-    initial = State(
+    initial = _born(
         u=2.0,
         energy=1.0,
         fatigue=0.0,
@@ -128,7 +140,7 @@ def test_inbound_exchange_satiates_the_drive_and_prevents_wake(tmp_path) -> None
 
 def test_silence_window_suppresses_a_wake_right_after_an_exchange(tmp_path) -> None:
     clock = FakeClock(_T0)
-    initial = State(
+    initial = _born(
         u=2.0,
         energy=1.0,
         fatigue=0.0,
@@ -150,7 +162,7 @@ def test_force_wake_keeps_the_real_last_exchange_in_the_wake_packet(tmp_path) ->
     # wake packet the model reads still carries the genuine last-exchange time.
     real_last = "2020-01-01T00:00:00+00:00"  # a genuine, long-ago exchange
     store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
-    store.commit(State(u=0.2, last_exchange_at=real_last))
+    store.commit(_born(u=0.2, last_exchange_at=real_last))
 
     message = force_wake_for_dir(tmp_path)
     assert "gates satisfied" in message
@@ -172,7 +184,7 @@ def test_force_wake_keeps_the_real_last_exchange_in_the_wake_packet(tmp_path) ->
 
 def test_decline_backoff_suppresses_a_wake_right_after_a_rejection(tmp_path) -> None:
     clock = FakeClock(_T0)
-    initial = State(
+    initial = _born(
         u=2.0,
         energy=1.0,
         fatigue=0.0,

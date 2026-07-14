@@ -14,7 +14,7 @@ from lifemodel.state import SCHEMA_VERSION, State, StateCorruptError
 
 def test_defaults_are_documented_and_current_schema() -> None:
     state = State()
-    assert state.schema_version == SCHEMA_VERSION == 3
+    assert state.schema_version == SCHEMA_VERSION == 4
     assert state.tick_count == 0
     assert state.energy == 1.0
     assert state.last_tick_at is None
@@ -360,3 +360,40 @@ def test_affect_updated_at_rejects_non_string() -> None:
     # consumed by the deriver); a non-string value is corruption caught loud at load.
     with pytest.raises(StateCorruptError):
         State.from_dict({"schema_version": SCHEMA_VERSION, "affect_updated_at": 123})
+
+
+def test_genesis_fields_default_unborn_and_roundtrip() -> None:
+    # A being with no genesis stamp is UNBORN — this is the only birth detector.
+    # SOUL.md's presence can never serve: Hermes always seeds one.
+    fresh = State()
+    assert fresh.genesis_completed_at is None
+    assert fresh.soul_sha is None
+
+    stamped = State(genesis_completed_at="2026-07-13T10:00:00+00:00", soul_sha="a1b2c3")
+    assert State.from_dict(stamped.to_dict()) == stamped
+
+
+def test_genesis_fields_are_additive_for_older_files() -> None:
+    # An older state file has no genesis keys; it must load as UNBORN, not crash.
+    state = State.from_dict({"schema_version": SCHEMA_VERSION, "u": 0.5})
+    assert state.genesis_completed_at is None
+    assert state.soul_sha is None
+
+
+def test_a_state_file_from_the_greeting_era_still_loads() -> None:
+    # THE MIGRATION, in full. ``genesis_greeted_at`` was deleted (spec §6.2, revised):
+    # it was a second, hand-rolled accounting of "the being has greeted" that drifted
+    # from the one the system already keeps (it stamped on ``ReachOutcome.ok`` — QUEUED,
+    # not spoken). A state file written by that build still carries the key; it must load
+    # as an ordinary unknown key (dropped), NOT raise — and NOT need a SCHEMA_VERSION
+    # bump, which would refuse to load the live being's row outright.
+    state = State.from_dict(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "u": 0.5,
+            "genesis_completed_at": "2026-07-13T10:00:00+00:00",
+            "genesis_greeted_at": "2026-07-13T09:00:00+00:00",  # the retired field
+        }
+    )
+    assert state.genesis_completed_at == "2026-07-13T10:00:00+00:00"
+    assert not hasattr(state, "genesis_greeted_at")

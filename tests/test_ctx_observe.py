@@ -24,6 +24,12 @@ from lifemodel.core.state_actor import StateActor
 from lifemodel.state.model import State
 from lifemodel.testing import FakeTracer
 
+#: A being that has been BORN — the precondition of the contact drive. ``u`` models a
+#: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
+#: accrue at all (``core/solitude_drive.py``: birth is not longing). Every scenario that
+#: exercises the drive is therefore about a being that has someone to miss.
+_BORN = "2026-07-01T10:00:00+00:00"
+
 # --------------------------------------------------------------------------- #
 # ComponentObserver — the typed handle, unit level
 # --------------------------------------------------------------------------- #
@@ -194,7 +200,7 @@ def test_coreloop_wires_observer_and_drive_emits_contact_drive_u(tmp_path) -> No
     metrics = MetricRegistry()
     # No ContactSensor → no contact_presence reading → the drive holds u; it still
     # publishes its computed level through ctx.observe. Start-of-tick u = 5.0.
-    store = RecordingStore(State(u=5.0))
+    store = RecordingStore(State(genesis_completed_at=_BORN, u=5.0))
 
     _loop(reg, store, metrics).tick()
 
@@ -227,7 +233,7 @@ def test_bare_context_has_no_observer_and_drive_step_survives(tmp_path) -> None:
     # guards on it and simply skips domain emission — the step still runs.
     drive = SolitudeDrive(alpha=1.0 / 240.0, beta=1.0, u_max=100.0)
     ctx = TickContext(
-        state=State(u=3.0),
+        state=State(genesis_completed_at=_BORN, u=3.0),
         now=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
         trace=FakeTracer().start_root(),
     )

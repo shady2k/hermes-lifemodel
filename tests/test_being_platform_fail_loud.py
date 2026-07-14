@@ -16,6 +16,7 @@ import asyncio
 import logging
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -249,3 +250,155 @@ def test_clean_reconnect_clears_loop_dead(tmp_path: Path) -> None:
 
     asyncio.run(_run())
     assert health.state == "connected"
+
+
+# --------------------------------------------------------------------------- #
+# Startup soul reconciliation (spec §4.4) — there is no transaction spanning a
+# filesystem rename and a SQLite commit, so a crash mid-write or a human hand-edit
+# of SOUL.md while the gateway was down can leave `state.soul_sha` stale relative
+# to disk. connect() must adopt disk as the base BEFORE the greeting, recording it
+# as a "human" revision — and must stay a no-op when there is no history to differ
+# from (the being never wrote a soul) or no SoulFile wired at all (every connect()
+# test above constructs the adapter with none).
+# --------------------------------------------------------------------------- #
+
+
+def test_connect_adopts_a_soul_edited_while_we_were_down(tmp_path: Path) -> None:
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.soul_file import SoulFile
+    from lifemodel.state.model import State
+    from lifemodel.state.soul_revisions import revisions
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("You are Mira.", encoding="utf-8")
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    # "what we last wrote" no longer matches disk -- a crash mid-write, or the human
+    # hand-editing SOUL.md while the gateway was down (spec §4.4). Either way: adopt.
+    store.commit(State(genesis_completed_at="2026-01-01T00:00:00+00:00", soul_sha="stale-sha"))
+
+    bp = _fresh_being_platform()
+    adapter = bp.BeingAdapter(
+        config=None, base_dir=tmp_path, target=None, interval_sec=60.0, soul=soul
+    )
+    adapter._tick = lambda: None
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    persisted = store.load()
+    assert persisted.soul_sha == soul.sha()  # adopted, not left pointing at the stale sha
+    recs = revisions(store)
+    assert any(r.author == "human" and r.text == "You are Mira." for r in recs)
+
+
+def test_connect_does_not_adopt_when_the_being_has_never_written_a_soul(tmp_path: Path) -> None:
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.soul_file import SoulFile
+    from lifemodel.state.soul_revisions import revisions
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    # The pristine DEFAULT_SOUL_MD sitting on disk is not a revision of anything --
+    # soul_sha is None (never written), so there is nothing of "ours" to differ from.
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("# Identity\nYou are Hermes.\n", encoding="utf-8")
+
+    bp = _fresh_being_platform()
+    adapter = bp.BeingAdapter(
+        config=None, base_dir=tmp_path, target=None, interval_sec=60.0, soul=soul
+    )
+    adapter._tick = lambda: None
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    assert store.load().soul_sha is None  # never forged into a "revision" that never happened
+    assert revisions(store) == []
+
+
+# --- I7: a human rewriting the being is FELT, not swallowed (spec §4.1) -------
+#
+# "Noticing that the human rewrote the soul is an event in the being's life, not a version
+# conflict: it should be FELT, not swallowed." Reconciliation recorded a revision and
+# logged a line, and NOTHING reached the being: it woke up as someone else without a
+# flicker. The two stamps below are what the event is made of — `core/affect.py` reads the
+# first and turns it into activation (so the being is genuinely stirred, and settles), and
+# the ambient pre_llm_call cue reads the pair to tell it, once, in prose.
+
+
+def test_a_soul_someone_else_rewrote_is_an_event_in_the_beings_life(tmp_path: Path) -> None:
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.soul_file import SoulFile
+    from lifemodel.state.model import State
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text("You are Mira, and you are colder than you were.", encoding="utf-8")
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    store.commit(State(genesis_completed_at="2026-01-01T00:00:00+00:00", soul_sha="what-we-wrote"))
+
+    bp = _fresh_being_platform()
+    adapter = bp.BeingAdapter(
+        config=None, base_dir=tmp_path, target=None, interval_sec=60.0, soul=soul
+    )
+    adapter._tick = lambda: None
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    persisted = store.load()
+    assert persisted.soul_rewritten_at is not None  # it HAPPENED, and the body will feel it
+    assert persisted.soul_rewrite_told_at is None  # …and the being has not been told yet
+
+
+def test_our_own_crashed_write_is_not_relabelled_as_the_humans(tmp_path: Path) -> None:
+    # M5, the inverse of the mislabel this method's docstring guards against. write_soul
+    # replaces SOUL.md, records the revision, then stamps — and a crash between the last
+    # two leaves OUR OWN text on disk with a stale soul_sha. Reconciliation adopted it and
+    # recorded it as author="human", overwriting the being's own revision (record_revision
+    # upserts by sha): the being's last act became somebody else's, in the one history that
+    # is meant to be its undo. Worse, it would then be FELT as a rewrite that never was.
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.soul_file import SoulFile
+    from lifemodel.state.model import State
+    from lifemodel.state.soul_revisions import record_revision, revisions
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    ours = "You are Mira. You speak plainly, and you do not hedge."
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(ours, encoding="utf-8")  # the file landed…
+    store = SQLiteRuntimeStore(tmp_path, clock=SystemClock())
+    record_revision(
+        store, text=ours, sha=soul.sha(), now=datetime.now(UTC), author="being"
+    )  # …the revision landed…
+    store.commit(  # …and then we died before the stamp: soul_sha still points at the old one
+        State(genesis_completed_at="2026-01-01T00:00:00+00:00", soul_sha="the-one-before")
+    )
+
+    bp = _fresh_being_platform()
+    adapter = bp.BeingAdapter(
+        config=None, base_dir=tmp_path, target=None, interval_sec=60.0, soul=soul
+    )
+    adapter._tick = lambda: None
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    persisted = store.load()
+    assert persisted.soul_sha == soul.sha()  # adopted: the file is always the base
+    kept = revisions(store)
+    assert [(r.author, r.text) for r in kept] == [("being", ours)]  # still ITS OWN words
+    assert persisted.soul_rewritten_at is None  # nobody rewrote it; there is nothing to feel

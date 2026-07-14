@@ -52,7 +52,7 @@ from .adapters.trace_export import make_trace_exporter
 from .adapters.tracer import StdlibTracer
 from .core.affect import AFFECT_AROUSAL_SPEC, AFFECT_VALENCE_SPEC, AffectParams, AffectSense
 from .core.aggregation import ContactAggregation
-from .core.cognition import CognitionLauncher
+from .core.cognition import CognitionLauncher, PriorSoulReader
 from .core.component import layer_for_type
 from .core.contact_sensor import ContactSensor
 from .core.coreloop import CoreLoop
@@ -169,6 +169,7 @@ def build_lifemodel(
     event_ring: EventRing | None = None,
     metrics: MetricRegistry | None = None,
     display_tz: tzinfo | None = None,
+    prior_soul: PriorSoulReader | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -183,6 +184,12 @@ def build_lifemodel(
     Hermes) and forwarded to the :class:`CognitionLauncher` as a plain stdlib
     ``tzinfo``; ``None`` (the default, and every test/CLI caller) falls back to
     server-local then UTC.
+
+    ``prior_soul`` reads ``SOUL.md`` for the genesis veteran branch (spec §6.4) — a plain
+    callable built at the adapter boundary (the core never touches the file, nor Hermes).
+    It is wired by the being adapter, the ONE graph whose launches are actually delivered;
+    the hook/CLI graphs leave it unwired (their frames never deliver a launch) and would
+    fall back to the blank-page ritual.
     """
     resolved_clock: ClockPort = clock or SystemClock()
     resolved_state: StatePort = state or SQLiteRuntimeStore(base_dir, clock=resolved_clock)
@@ -319,6 +326,9 @@ def build_lifemodel(
             # threaded through as a plain stdlib ``tzinfo``; ``None`` → server-local
             # then UTC (see wake_packet._fmt_ts).
             display_tz=display_tz,
+            # The veteran-branch soul read (spec §6.4), called only when a GENESIS
+            # desire is launched — never on an ordinary tick.
+            prior_soul=prior_soul,
         )
         resolved_registry.register(
             launcher, _component_manifest(launcher.id, "launcher", accepts_signals=False)

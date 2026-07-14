@@ -27,12 +27,14 @@ rather than re-stamping it with the retry tick's trace.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Callable, Sequence
 from datetime import tzinfo
 
 from ..domain.memory import PutOp
 from ..domain.objects import (
     CONTACT_DESIRE_ID,
+    DesireSpring,
     DesireState,
     IntentionState,
     qualified_id,
@@ -41,6 +43,7 @@ from ..ports.tracer import format_traceparent
 from .component import TickContext
 from .desire_view import live_contact_desire
 from .energy import cost_real, reserve
+from .genesis import genesis_block
 from .intention_view import (
     build_contact_intention,
     encode_contact_intention,
@@ -51,6 +54,12 @@ from .suppression import SuppressionReason, emit_suppression_span
 from .timeutil import to_iso
 from .trace import creation_provenance
 from .wake_packet import build_wake_packet
+
+#: Reads the soul someone wrote before this being woke, or ``None`` for a blank page —
+#: the genesis veteran branch (spec §6.4). A plain callable, not a Hermes type: the
+#: adapter owns ``SOUL.md`` and injects this at composition, so the core stays
+#: Hermes-free and the launcher unit-tests with a lambda.
+PriorSoulReader = Callable[[], str | None]
 
 
 class CognitionLauncher:
@@ -68,6 +77,7 @@ class CognitionLauncher:
         send_cost: float,
         alpha: float,
         display_tz: tzinfo | None = None,
+        prior_soul: PriorSoulReader | None = None,
         id: str = "cognition-launcher",
     ) -> None:
         self.id = id
@@ -80,6 +90,11 @@ class CognitionLauncher:
         # wake_packet._fmt_ts). Fixed per graph; a config change takes effect on the
         # next gateway restart, like every other adapter-wired dependency.
         self._display_tz = display_tz
+        # Reads ``SOUL.md`` for the genesis veteran branch (§6.4), injected by the
+        # being adapter — the ONE path that actually delivers a launch. Called lazily,
+        # only when a GENESIS-sprung desire is being launched, so an ordinary tick never
+        # touches the file. Unwired (``None``) → the blank-page ritual.
+        self._prior_soul = prior_soul
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         state = ctx.state
@@ -123,6 +138,11 @@ class CognitionLauncher:
             # (lm-ukc.5) — the mood shapes the manner, the longing stays the reason.
             affect_valence=state.affect_valence,
             affect_arousal=state.affect_arousal,
+            # WHY this being woke, read off the desire the wake actually sprang from
+            # (never re-derived from State): a GENESIS desire carries the birth ritual
+            # where the longing body would be (spec §6.2). Same packet, same egress,
+            # same read-back — only the impulse differs, because only the reason does.
+            genesis=self._genesis_impulse(desire.spring),
         )
         # Creation provenance is IMMUTABLE per episode (lm-27n.11). This PutRecord is
         # an upsert on the singleton intention: on a delivery-fail RETRY it re-emits
@@ -192,6 +212,27 @@ class CognitionLauncher:
                 }
             ),
         ]
+
+    def _genesis_impulse(self, spring: DesireSpring) -> str | None:
+        """The ``<genesis>`` ritual for a GENESIS-sprung wake, else ``None`` (spec §6.2).
+
+        The veteran branch (§6.4) is the COMMON case — a being is born onto a blank soul
+        exactly once in the life of a ``SOUL.md``, and every rebirth after a ``reset``
+        meets the soul of whoever lived here before it — so the prior soul is read HERE,
+        at launch, never cached: a human hand-edit or the being's own ``write_soul`` can
+        land between ticks.
+
+        A failing read degrades to the blank-page opening rather than dropping the wake:
+        a birth must not be lost to a file-system hiccup, and the ritual still works
+        without the veteran opening (it simply does not know there is prior text). The
+        same reasoning as the adapter's own fail-soft soul reads."""
+        if spring is not DesireSpring.GENESIS:
+            return None
+        prior: str | None = None
+        if self._prior_soul is not None:
+            with contextlib.suppress(Exception):  # a bad read must never drop a birth
+                prior = self._prior_soul()
+        return genesis_block(prior_soul=prior)
 
     def _emit_suppression(self, ctx: TickContext, reason: SuppressionReason) -> None:
         """Log a HOLD as a suppression span (spec §5) — only when a span-bound logger

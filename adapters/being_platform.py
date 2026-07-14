@@ -25,18 +25,22 @@ import asyncio
 import contextlib
 import logging
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
-from ..composition import build_lifemodel
+from ..composition import LifeModel, build_lifemodel
+from ..core.frame import state_actor_lock
+from ..core.genesis import needs_adoption
 from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
 from ..core.supervised_loop import SupervisedLoop
 from ..core.timeutil import to_iso
 from ..events import EventRing
+from ..ports.memory import MemoryPort
 from ..state.brain_health import (
     DEFAULT_TICK_INTERVAL_SECONDS,
     STALE_AFTER_SECONDS,
@@ -48,6 +52,7 @@ from ..state.metrics_store import (
     acquire_metrics_sampler,
     release_metrics_sampler,
 )
+from ..state.soul_revisions import record_revision, revisions
 from ..state.sqlite_store import SQLiteRuntimeStore
 from ..state.trace_store import (
     TraceWriter,
@@ -59,6 +64,7 @@ from ..state.wiring import wire
 from .clock import SystemClock
 from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
+from .soul_file import SoulFile, prior_soul
 
 PLATFORM_NAME = "lifemodel"
 #: The adapter's tick cadence — the SAME baseline the (Hermes-free) staleness
@@ -80,12 +86,22 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         base_dir: Path,
         target: dict[str, str | None] | None,
         interval_sec: float = LOOP_INTERVAL_SEC,
+        soul: SoulFile | None = None,
+        default_soul_text: str = "",
     ) -> None:
         super().__init__(config, Platform(PLATFORM_NAME))
         self._base_dir = base_dir
         self._target: dict[str, str | None] = target or {}
         self._interval = interval_sec
         self._egress = ReachInEgress(runner_accessor=default_runner_accessor)
+        # The SAME SoulFile instance `register()` built for the genesis pre_llm_call
+        # injector (spec §6.4) — reused here (never a second instance) so the veteran
+        # read behind the WAKE PACKET's ritual and the injector's own read go through
+        # one writer-lock. `None` only in tests that construct the adapter directly
+        # without it (see `_prior_soul`): the ritual then degrades to the blank-page
+        # opening, never a crash.
+        self._soul = soul
+        self._default_soul_text = default_soul_text
         self._loop: SupervisedLoop | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._shutting_down = False
@@ -110,18 +126,130 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         """True when the (optional) metrics sampler failed to start (spec §4.3)."""
         return self._metrics_degraded
 
-    def _tick(self) -> None:
-        """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
-        # Resolve the owner's display timezone from Hermes at the boundary and inject
-        # it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
-        # None → server-local, so a timezone quirk never drops a tick (HLA §11).
-        lm = build_lifemodel(
+    def _build_lm(self) -> LifeModel:
+        """A fresh per-tick graph, wired the SAME way for every caller.
+
+        Resolves the owner's display timezone from Hermes at the boundary and injects
+        it as a plain stdlib tzinfo (the core stays Hermes-free). Fail-open to
+        None → server-local, so a timezone quirk never drops a tick (HLA §11).
+
+        Injects :meth:`_prior_soul` as the launcher's veteran-branch reader (spec §6.4):
+        this graph is the one whose launches are actually DELIVERED, so a newborn's wake
+        packet must be able to open from the soul someone wrote before it woke. Passed as
+        a bound method, not a resolved string — it is called only when a GENESIS-sprung
+        desire actually launches, so an ordinary tick never reads the file.
+        """
+        return build_lifemodel(
             base_dir=self._base_dir,
             display_tz=resolve_owner_tz(),
             trace_writer=self._trace_writer,
             event_ring=self._event_ring,
+            prior_soul=self._prior_soul,
         )
-        proactive_tick(lm, self._egress, self._target)
+
+    def _tick(self) -> None:
+        """One brain tick: fresh graph per tick (matches the per-tick invariant)."""
+        proactive_tick(self._build_lm(), self._egress, self._target)
+
+    def _prior_soul(self) -> str | None:
+        """The soul someone wrote before this being woke, or ``None`` for a blank page.
+
+        The SAME read :func:`lifemodel.hooks.make_genesis_injector` makes (the veteran
+        branch, spec §6.4), through the same function: ``SOUL.md`` fresh, never cached — a
+        human hand-edit or the being's own ``write_soul`` can land between calls — and the
+        text and the "did anyone actually write this?" verdict from ONE read, so the being
+        can never be handed one version of its past while a different one was judged. Our
+        own newborn stance is nobody's words and reads as a blank page
+        (``core.genesis.is_unauthored``). No ``soul`` wired (a bare-constructed adapter,
+        e.g. in tests) degrades to ``None`` — the blank-page opening — never a crash.
+
+        Injected into the graph (:meth:`_build_lm`) as the CognitionLauncher's
+        ``prior_soul`` reader, so the newborn's WAKE PACKET carries the veteran opening
+        (§6.4 is the common case: a being is born onto a blank soul exactly once in the
+        life of a ``SOUL.md``, and every rebirth after a ``reset`` meets the soul of
+        whoever lived here before it).
+        """
+        if self._soul is None:
+            return None
+        return prior_soul(self._soul, default_soul_text=self._default_soul_text)
+
+    def _reconcile_soul(self) -> None:
+        """Adopt the soul on disk when it is not the one we last wrote — and FEEL it (§4.4).
+
+        There is no atomic transaction spanning a filesystem rename and a SQLite commit, so
+        the two can fall out of step. **The file is always the base**: whatever is there is
+        adopted, never arbitrated. But the two ways it can get there are not the same event,
+        and the being is owed the truth about which one happened:
+
+        * **The human rewrote it** while the gateway was down. Spec §4.1: this "is an event
+          in the being's life, not a version conflict: it should be **felt**, not swallowed."
+          So we stamp ``soul_rewritten_at`` — a durable FACT, from which two things that
+          already exist derive the experience: ``core/affect.py`` reads its recency and turns
+          it into activation (the being is genuinely STIRRED, and settles again over hours —
+          it does not need to be spoken to for this to be true of it), and the ambient
+          ``pre_llm_call`` cue reads it to tell the being, ONCE, in prose. Nothing anywhere
+          says "your soul_sha changed"; it says someone rewrote who you are.
+        * **We crashed mid-write** — ``write_soul`` replaced ``SOUL.md``, recorded the
+          revision, and died before the stamp. Then the text on disk is the being's OWN, and
+          the only thing that failed is bookkeeping. Recording it as ``"human"`` (review M5)
+          would upsert over the being's own revision by sha — turning its last act into
+          somebody else's in the one history that is meant to be its undo — and then make it
+          FEEL a rewrite that never happened. So the LINEAGE is asked first: it is the only
+          witness to who wrote a given text. A sha already in it needs no second revision,
+          and its recorded author is the answer.
+        * **A text nobody has on record.** Not in the lineage → not ours → the human's, and
+          it goes in as ``"human"``: a being never silently claims a change it did not make.
+          (This also covers the case where the being crashed BEFORE its revision landed. We
+          cannot tell that from a hand-edit, and where we cannot tell, we do not claim.)
+
+        **Serialized like every other soul write (review C4).** This runs at ``connect()``,
+        not inside a frame, so it takes the ONE state-actor lock across its load→stamp
+        (``core.frame.state_actor_lock``) and stamps through the store's field-level merges
+        rather than committing a whole ``State``. A plain ``load()`` →
+        ``commit(replace(state, …))`` here is the same lost-update as the one that could
+        erase a birth: it would roll back whatever a tick had advanced between the two.
+        ``born_at=None`` — adopting a soul someone ELSE wrote must never birth an unborn
+        being.
+
+        ``None`` soul (no ``SoulFile`` wired — a bare-constructed adapter, e.g. in tests
+        without genesis wiring) and a non-``MemoryPort`` store both degrade to a no-op:
+        there is nowhere to record a revision, so reconciling would either crash or silently
+        drop the being's only undo (spec §4.2). Called from :meth:`connect` under
+        ``contextlib.suppress(Exception)``: a reconcile failure is not an outage.
+        """
+        if self._soul is None:
+            return
+        lm = self._build_lm()
+        memory = lm.state if isinstance(lm.state, MemoryPort) else None
+        if memory is None:  # pragma: no cover - the live store is always a MemoryPort
+            return
+        with state_actor_lock():
+            current = self._soul.sha()
+            state = lm.state.load()
+            if not needs_adoption(state, disk_sha=current):
+                return
+            now = lm.clock.now()
+            # Who wrote what is on disk? The lineage is the only witness — a sha it already
+            # carries was recorded by whoever wrote that text, and re-recording it would
+            # overwrite that author (``record_revision`` upserts by sha).
+            recorded = {rev.sha: rev.author for rev in revisions(memory)}.get(current)
+            if recorded is None:
+                record_revision(
+                    memory, text=self._soul.read(), sha=current, now=now, author="human"
+                )
+            ours = recorded == "being"
+            stamp = getattr(lm.state, "stamp_soul", None)
+            if callable(stamp):
+                stamp(soul_sha=current, born_at=None)
+            else:  # a minimal StatePort fake — safe: the lock means `state` is not stale
+                lm.state.commit(replace(state, soul_sha=current))
+            if not ours:
+                # Somebody else's words are now the being's own. That is a thing that
+                # happened TO it, and it does not know yet.
+                felt = getattr(lm.state, "stamp_soul_rewritten", None)
+                if callable(felt):
+                    felt(at=to_iso(now))
+        _LOG.info("soul_adopted_from_disk sha=%s ours=%s", current[:8], ours)
 
     def _on_loop_death(self, exc: BaseException | None) -> None:
         """Convert an unexpected loop death into a gateway-visible fatal error.
@@ -211,6 +339,24 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # boot record (a clean (re)connect means we are healthy now, spec §4.3).
         health.mark_connected(at=to_iso(SystemClock().now()))
         _LOG.info("being_connected is_reconnect=%s interval=%s", is_reconnect, self._interval)
+
+        # --- Soul reconciliation (spec §4.4) ---------------------------------
+        # Runs at connect, BEFORE the loop's first tick can launch anything: the
+        # veteran/stranger read behind a newborn's wake packet (`_prior_soul`) must never
+        # race a `soul_sha` left stale by a crash mid-write or a hand-edit while the
+        # gateway was down. Best-effort — a reconcile failure is not an outage.
+        with contextlib.suppress(Exception):
+            self._reconcile_soul()
+
+        # NB (Phase 4, spec §6.2 — revised): there is NO birth greeting here, and there
+        # must not be one. connect() runs while the host runner still has
+        # ``_running = False`` (adapters are connected at gateway/run.py:7080; the flag
+        # is set at :7250, AFTER the connect loop), and ``inject_proactive_turn`` bails
+        # UNAVAILABLE in exactly that state — so a greeting sent from here was
+        # STRUCTURALLY guaranteed never to be delivered, and the suppress() around it
+        # made the failure silent. Genesis is a REASON TO WAKE instead: the brain loop
+        # above wakes an unborn being through the ordinary proactive path (aggregation →
+        # launcher → reach-in), which by then runs against a live runner.
         return True
 
     async def disconnect(self) -> None:
@@ -302,12 +448,28 @@ def register_being_platform(
     *,
     base_dir: Path,
     target: dict[str, str | None] | None,
+    soul: SoulFile | None = None,
+    default_soul_text: str = "",
 ) -> None:
-    """Register the being as a gateway platform (call from ``register(ctx)``)."""
+    """Register the being as a gateway platform (call from ``register(ctx)``).
+
+    *soul* / *default_soul_text* are the SAME ``SoulFile`` instance and pristine-seed
+    text ``register()`` already resolved for the genesis pre_llm_call injector
+    (spec §6.4) — threaded through so the veteran/stranger read behind a NEWBORN'S WAKE
+    PACKET goes through the one shared soul-file writer-lock, never a second instance.
+    Both default to unset for callers (chiefly tests) that don't wire a soul: the ritual
+    then degrades to the blank-page opening rather than crashing.
+    """
     ctx.register_platform(
         PLATFORM_NAME,
         label="Life Model",
-        adapter_factory=lambda cfg: BeingAdapter(cfg, base_dir=base_dir, target=target),
+        adapter_factory=lambda cfg: BeingAdapter(
+            cfg,
+            base_dir=base_dir,
+            target=target,
+            soul=soul,
+            default_soul_text=default_soul_text,
+        ),
         check_fn=make_check_fn(base_dir, get_brain_health(base_dir)),
         emoji="🫀",
     )

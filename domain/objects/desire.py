@@ -36,11 +36,22 @@ class DesireState(StrEnum):
 
 
 class DesireSpring(StrEnum):
-    """Where the desire sprang from (named ``spring`` to avoid the ``source`` column)."""
+    """Where the desire sprang from (named ``spring`` to avoid the ``source`` column).
+
+    ``GENESIS`` is the one spring that is NOT an appraisal of the being's situation but
+    of the being itself (Phase 4, spec §6.2): it wants to reach out because it is nobody
+    yet. It exists so that wake can never be mistaken for a DRIVE-sprung longing — a
+    newborn has no relationship to have a deficit in, so its ``u`` is 0 and must stay 0.
+    Marking the desire honestly is what keeps the contact model clean downstream: the
+    pure-longing anti-repeat counter (``unanswered_outbound_count``) does not count it,
+    the async staleness rule does not judge it by pressure it never had, and the
+    wake-packet carries the ``<genesis>`` ritual instead of "I miss them".
+    """
 
     DRIVE = "drive"
     THOUGHT = "thought"
     MIXED = "mixed"
+    GENESIS = "genesis"
 
 
 #: The explicit transition table (held by the registry). Terminal states are
