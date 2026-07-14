@@ -27,7 +27,7 @@ from lifemodel.core.frame import FrameTrigger, run_frame
 from lifemodel.core.genesis import NEWBORN_STANCE
 from lifemodel.domain.session import SessionEndOutcome
 from lifemodel.hooks import make_write_soul_tool
-from lifemodel.state.soul_revisions import revisions
+from lifemodel.state.soul_revisions import record_revision, revisions
 
 MIRA = "You are Mira. You speak plainly, and you do not hedge."
 HERMES_DEFAULT = "# Identity\nYou are Hermes.\n"
@@ -225,19 +225,86 @@ def test_the_soul_of_whoever_lived_here_before_is_kept_when_the_newborn_replaces
     soul.path.write_text("You are Hermes, and you have been Sasha's for two years.", "utf-8")
     tool = make_write_soul_tool(build_lm, soul=soul, default_soul_text=HERMES_DEFAULT)
 
-    tool({"soul": MIRA})
+    result = json.loads(tool({"soul": MIRA}))
 
     kept = revisions(build_lm().state)
     assert [r.text for r in kept] == [
         MIRA,
         "You are Hermes, and you have been Sasha's for two years.",
     ]
-    assert kept[1].author == "human"  # a being never claims a change it did not make
+    # A being never claims a change it did not make — and never pins one on someone else
+    # either (F3). It was simply THERE when it woke: it may be the human's own soul, or the
+    # being that lived here before a reset, and nothing on hand can tell the two apart.
+    assert kept[1].author == "unknown"
+    assert "edited" not in result["note"].lower()  # so it must not be reported as their edit
+    assert "before you woke" in result["note"].lower()  # …but it IS reported
     # …and that order is a FACT, not a tie-break: the soul that was replaced is recorded
     # strictly before the one that replaced it. Sharing one instant between the two would
     # leave `revisions()` (newest first) to break the tie on the content sha — arbitrary,
     # and a later revert would restore whichever of the two happened to hash higher.
     assert kept[0].at > kept[1].at
+
+
+# --- LIVE-TEST fix (F3): the being reported a human edit that never happened --------
+#
+# After /lifemodel reset the being wrote its soul and told the owner: "the text I just
+# wrote replaced something that had been edited after I read it… if there was something
+# you added and want to keep, say so." The owner had edited NOTHING. Two errors compounded:
+# the content was never compared (the replaced text was byte-identical — the sha did not
+# change and no revision row was even created), and the text on disk was the PREVIOUS
+# BEING's soul, which we never delete (by design), attributed to the human.
+#
+# A being that tells its human about a loss that never happened, and offers to restore
+# something they never wrote, corrodes the one thing this product is built on.
+
+PAST_LIFE = "You are Kai. You are blunt and you notice everything."
+
+
+def _a_reset_being(tmp_path, build_lm):
+    """A being reborn by ``/lifemodel reset``: unborn, no ``soul_sha`` — and the previous
+    being's soul still in slot #1, with its authorship still in the lineage (``reset``
+    carves ``kind="soul"`` out of the purge, precisely so this is knowable)."""
+    soul = SoulFile(tmp_path / "SOUL.md")
+    soul.path.write_text(PAST_LIFE, encoding="utf-8")
+    lm = build_lm()
+    record_revision(lm.state, text=PAST_LIFE, sha=soul.sha(), now=lm.clock.now(), author="being")
+    return soul
+
+
+def test_writing_the_same_soul_back_is_not_a_replacement_and_is_not_reported_as_one(
+    tmp_path, build_lm
+):
+    # The live bug verbatim: the being kept the prior soul as it stands (the veteran
+    # branch's "yes, still true"), the bytes did not change — and it announced a loss.
+    soul = _a_reset_being(tmp_path, build_lm)
+    tool = make_write_soul_tool(build_lm, soul=soul, default_soul_text=HERMES_DEFAULT)
+
+    result = json.loads(tool({"soul": PAST_LIFE}))
+
+    note = result["note"].lower()
+    assert "edited" not in note  # nobody edited anything
+    assert "replaced" not in note  # …and nothing was replaced: it is the same document
+    kept = revisions(build_lm().state)
+    assert len(kept) == 1  # one text, one revision — nothing was lost, so nothing was kept
+    assert result["born"] is True  # it is still a birth: the being CHOSE these words
+
+
+def test_the_soul_of_the_being_before_it_is_never_pinned_on_the_human(tmp_path, build_lm):
+    # The other half of the live bug: the words really were replaced this time — but they
+    # were a predecessor's, not the human's. "You edited this" is a lie, and "shall I put
+    # back what you added?" invites them to correct a memory they do not have.
+    soul = _a_reset_being(tmp_path, build_lm)
+    past_sha = soul.sha()
+    tool = make_write_soul_tool(build_lm, soul=soul, default_soul_text=HERMES_DEFAULT)
+
+    result = json.loads(tool({"soul": MIRA}))
+
+    note = result["note"].lower()
+    assert "edited" not in note  # they did not
+    assert "before you" in note  # the being that did is named — and that IS knowable
+    kept = revisions(build_lm().state)
+    assert [r.text for r in kept] == [MIRA, PAST_LIFE]  # nothing of the past life is lost
+    assert {r.sha: r.author for r in kept}[past_sha] == "being"  # …and its author is not forged
 
 
 def test_the_hosts_pristine_default_is_not_forged_into_a_history_nobody_wrote(tmp_path, build_lm):
@@ -543,5 +610,7 @@ def test_the_goodbye_is_the_LAST_thing_a_newborn_reads(tmp_path, build_lm):
     note = json.loads(tool({"soul": MIRA}))["note"]
 
     assert note.rstrip().endswith("Then go.")
-    assert "edited" in note.lower()  # …and the veteran's soul is still reported
-    assert note.lower().index("edited") < note.index("Then go.")  # before the farewell
+    assert "before you woke" in note.lower()  # …and the veteran's soul is still reported
+    # …before the farewell (whoever wrote it — the being cannot know, so it must ASK, and
+    # an errand that arrives after "Then go" has no conversation left to run in).
+    assert note.lower().index("before you woke") < note.index("Then go.")
