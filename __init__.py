@@ -522,6 +522,12 @@ def register(ctx: Any) -> None:
             handler=make_write_soul_tool(
                 lambda: build_lifemodel(base_dir=sdir),
                 soul=soul,
+                # The SAME pristine-seed comparator the genesis injector reads (§6.4).
+                # The tool keeps whatever soul it REPLACES, so that a human's hand-edit
+                # is recoverable even when the being's write lands on top of it — but
+                # Hermes ALWAYS seeds SOUL.md, and nobody wrote that seed: recording it
+                # would forge a past life. This is how the tool tells them apart.
+                default_soul_text=_default_soul_text(),
                 metrics=metrics,
             ),
             description=_WRITE_SOUL_DESCRIPTION,

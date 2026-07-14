@@ -437,6 +437,12 @@ sentence a co-authored soul writes without trying. Validate before writing."
 
 ### Task 4: `soul_file` — the only thing that touches `SOUL.md`
 
+> **AMENDED after adversarial review (2026-07-14) — the compare-and-swap below was built and then removed. Do not rebuild it.**
+>
+> Every `expect_sha` / `SoulConflict` snippet in this task and in Task 6 is superseded. The design assumed we hand the being its soul text and hash it *at that moment*. We never do: the being reads its soul from **system-prompt slot #1, assembled by Hermes at turn start** — a moment this plugin does not see. The CAS that shipped therefore took its "expected" sha at WRITE time, microseconds before `SoulFile.write` re-hashed the same file under the same lock: **it compared the file against itself and could never fail**, while a human's 12:00 edit was still clobbered by a soul composed from the 11:59 text. And `SoulConflict`'s message told the being to "re-read and retry" — it has no tool with which to read `SOUL.md`.
+>
+> What is there instead: `write(text) -> SoulWrite`, which never refuses on account of a change underneath it and instead **reports the text it replaced**, read under the same lock that replaced it. `write_soul` records anything that was not ours as a `"human"` revision *before* it can be lost, and tells the being someone had edited it. Nothing a human writes is lost, even when it loses — which is what §4.2's undo was always for. See `adapters/soul_file.py` and `hooks.make_write_soul_tool`.
+
 Read, hash, and write the soul: atomically, under a lock, always taking the file on disk as the base. The human may have edited it, and if they did, that was intentional — their text is simply the input.
 
 **Files:**
@@ -792,6 +798,12 @@ paraphrases and the human's prose is gone, with no single write looking broken."
 ---
 
 ### Task 6: `write_soul` — the act of birth
+
+> **AMENDED after adversarial review (2026-07-14).** The handler sketched below is superseded in three ways, each of which cost the being something real:
+>
+> 1. **No `expect_sha` / `SoulConflict`** — see the amendment on Task 4. The write reports what it replaced; anything not ours is kept as a `"human"` revision before it can be lost, and the being is told.
+> 2. **The birth stamps are MERGED, not committed, and under `core.frame.state_actor_lock()`** — `lm.state.commit(replace(state, …))` from a tool handler is a lost update against the ~60s tick: agent turns run on an executor thread, the tick runs on the gateway loop with its own `load()`→`commit()` of a whole `State`. A tick that loaded before the birth committed it away again (`genesis_completed_at`/`soul_sha` back to `None`: a being with a soul on disk and no birth, re-running the ritual and reading its own soul as a stranger's); the reverse ordering discarded the tick's `u`/`energy`/`affect`. The soul path now holds the ONE state-actor lock across load→stamp and stamps through the store's field-level `stamp_soul` merge (the precedent is `stamp_affect_display`).
+> 3. **The failure path must never say "it is unchanged"** once `SOUL.md` has been replaced — the being would report a failure to its human and then wake up as someone else.
 
 The tool IS the ritual's ending, and its **description** is where the instruction lives — tools sit in every prompt for free, so nothing has to be re-injected and nothing goes stale. Phase 5's becoming reuses this tool unchanged.
 

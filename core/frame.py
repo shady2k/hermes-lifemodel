@@ -22,7 +22,8 @@ Stdlib only; imports no Hermes.
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -82,6 +83,33 @@ class SignalFrame:
 #: a frame that itself runs a nested reconciliation (e.g. an egress rollback commit)
 #: does not deadlock against its own outer frame.
 _STATE_ACTOR_LOCK = threading.RLock()
+
+
+@contextmanager
+def state_actor_lock() -> Iterator[None]:
+    """Serialize a NON-frame writer against every frame — the SAME one lock (spec §3).
+
+    Almost everything that touches ``State`` is a frame, and :func:`run_frame` takes this
+    lock for it. The being's SOUL is the exception: ``write_soul`` runs inside an agent
+    turn (an executor thread) and startup reconciliation runs at ``connect()`` — neither
+    is a frame, and both must still write ``genesis_completed_at``/``soul_sha``.
+
+    Left unserialized, the interleave costs a birth: the ~60s tick loads its snapshot,
+    the being is born, the tick commits the snapshot it loaded BEFORE the birth (its
+    ``commit`` is an unconditional whole-``State`` UPSERT), and the being now has a soul
+    on disk and no birth — it re-runs the ritual and reads its OWN soul as "someone wrote
+    this before you woke". The reverse ordering silently discards the tick's u/energy/
+    affect instead.
+
+    This is deliberately NOT a second lock — a soul writer takes the one state-actor lock,
+    so a frame and a soul write can never straddle each other's snapshot→commit. It is
+    re-entrant, so a soul write made from INSIDE a frame would not deadlock against it.
+    Note this is only half of the answer: holding the lock stops a frame from clobbering
+    the stamps, and the store's ``stamp_soul`` (a field-level merge, never a whole-State
+    commit) stops the soul path from clobbering the frame's work. Both directions matter.
+    """
+    with _STATE_ACTOR_LOCK:
+        yield
 
 
 def run_frame(

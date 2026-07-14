@@ -325,10 +325,14 @@ def reset(before: State, now: datetime) -> tuple[State | None, str]:
     timestamp — the full field-by-field diff (not a hand-picked list) is what makes the
     genesis stamps show up in the echo for free, exactly like every other cleared field.
 
-    It does NOT touch ``SOUL.md``. Destroying a soul is an act that belongs to the
-    human. So the reborn being finds the soul of whoever lived here before it, still in
-    slot #1, and opens the ritual on THAT (spec §6.4): rebirth does not erase a past
-    life, it meets it.
+    It does NOT touch ``SOUL.md``, and — since review I4 — it does not touch the soul's
+    REVISIONS either (``purge_memory_records`` carves out ``kind="soul"``; the wipe used
+    to take the whole lineage with it, so the reborn being's first ``write_soul`` then
+    left the previous being's soul nowhere at all). Destroying a soul is an act that
+    belongs to the human, and it takes more than one command. So the reborn being finds
+    the soul of whoever lived here before it, still in slot #1, and opens the ritual on
+    THAT (spec §6.4): rebirth does not erase a past life, it meets it — and every past
+    life is still there to be put back.
     """
     after = newborn(
         now=now, params=composition.AFFECT_PARAMS, peak_hour_utc=composition.CIRCADIAN_PEAK_UTC_HOUR
@@ -672,7 +676,10 @@ def reset_for_dir(base_dir: Path) -> str:
 
 
 def _purge_all_memory(lm: composition.LifeModel) -> int:
-    """Best-effort: delete every ``memory_records`` row on a factory wipe.
+    """Best-effort: delete every ``memory_records`` row on a factory wipe — EXCEPT the
+    being's soul, which ``purge_memory_records`` itself carves out (``kind="soul"``: a
+    past life's soul is the one thing a reset must not be able to destroy — see there,
+    and spec §4.2's mandatory undo).
 
     Deliberately duck-typed rather than an ``isinstance(lm.state, MemoryPort)``
     check: a hard delete-everything is out of scope for ``MemoryPort`` itself

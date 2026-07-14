@@ -33,6 +33,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from ..composition import LifeModel, build_lifemodel
+from ..core.frame import state_actor_lock
 from ..core.genesis import needs_adoption
 from ..core.metrics import get_metric_registry
 from ..core.proactive import proactive_tick
@@ -185,6 +186,15 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         soul is "in conflict"; if it notices at all, it notices that someone rewrote
         it — an event in its life, not a merge.
 
+        **Serialized like every other soul write (review C4).** This runs at
+        ``connect()``, not inside a frame, so it takes the ONE state-actor lock across
+        its load→stamp (``core.frame.state_actor_lock``) and stamps through the store's
+        field-level ``stamp_soul`` merge rather than committing a whole ``State``. A
+        plain ``load()`` → ``commit(replace(state, …))`` here is the same lost-update as
+        the one that could erase a birth: it would roll back whatever a tick had advanced
+        between the two. ``born_at=None`` — adopting a soul someone ELSE wrote must never
+        be able to birth an unborn being.
+
         ``None`` soul (no ``SoulFile`` wired — a bare-constructed adapter, e.g. in
         tests without genesis wiring) and a non-``MemoryPort`` store both degrade to a
         no-op: there is nowhere to record a revision, so reconciling would either
@@ -198,14 +208,19 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         memory = lm.state if isinstance(lm.state, MemoryPort) else None
         if memory is None:  # pragma: no cover - the live store is always a MemoryPort
             return
-        current = self._soul.sha()
-        state = lm.state.load()
-        if not needs_adoption(state, disk_sha=current):
-            return
-        record_revision(
-            memory, text=self._soul.read(), sha=current, now=lm.clock.now(), author="human"
-        )
-        lm.state.commit(replace(state, soul_sha=current))
+        with state_actor_lock():
+            current = self._soul.sha()
+            state = lm.state.load()
+            if not needs_adoption(state, disk_sha=current):
+                return
+            record_revision(
+                memory, text=self._soul.read(), sha=current, now=lm.clock.now(), author="human"
+            )
+            stamp = getattr(lm.state, "stamp_soul", None)
+            if callable(stamp):
+                stamp(soul_sha=current, born_at=None)
+            else:  # a minimal StatePort fake — safe: the lock means `state` is not stale
+                lm.state.commit(replace(state, soul_sha=current))
         _LOG.info("soul_adopted_from_disk sha=%s", current[:8])
 
     def _on_loop_death(self, exc: BaseException | None) -> None:

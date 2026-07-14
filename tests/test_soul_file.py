@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
-from lifemodel.adapters.soul_file import SoulConflict, SoulFile, SoulRejected
+from lifemodel.adapters.soul_file import SoulFile, SoulRejected
 
 MIRA = "You are Mira. You speak plainly and you do not hedge."
 
@@ -17,9 +18,9 @@ def _soul(tmp_path: Path, text: str = "# Identity\nYou are a helpful assistant.\
 
 def test_write_replaces_the_document_and_returns_the_new_sha(tmp_path: Path) -> None:
     soul = _soul(tmp_path)
-    new_sha = soul.write(MIRA, expect_sha=soul.sha())
+    written = soul.write(MIRA)
     assert soul.read() == MIRA
-    assert soul.sha() == new_sha
+    assert soul.sha() == written.sha
 
 
 def test_a_human_edit_between_writes_is_the_BASE_not_a_conflict(tmp_path: Path) -> None:
@@ -28,26 +29,54 @@ def test_a_human_edit_between_writes_is_the_BASE_not_a_conflict(tmp_path: Path) 
     soul = _soul(tmp_path)
     soul.path.write_text("Sasha wrote this by hand.", encoding="utf-8")
     assert soul.read() == "Sasha wrote this by hand."  # we read what IS there
-    soul.write(MIRA, expect_sha=soul.sha())  # and write from THAT sha
+    soul.write(MIRA)
     assert soul.read() == MIRA
 
 
-def test_a_write_against_a_stale_sha_is_refused(tmp_path: Path) -> None:
-    # The human saved during our LLM turn: the sha we read at the start is stale, and
-    # writing now would eat their edit. Refuse; the caller re-runs on the fresh text.
+def test_the_write_hands_back_the_text_it_REPLACED_so_it_can_never_be_lost(
+    tmp_path: Path,
+) -> None:
+    # The compare-and-swap this replaced was vestigial: its only caller read the
+    # "expected" sha microseconds before the write re-hashed the file under the same
+    # lock — it compared the file against itself and could never fail. Meanwhile a human
+    # who saved SOUL.md at 12:00 was clobbered at 12:01 by a soul composed from the
+    # 11:59 text (the being reads its soul from system-prompt slot #1, assembled at turn
+    # start — we never see that moment, so there is no honest token to swap against).
+    #
+    # So the write no longer pretends to arbitrate. It reports what it REPLACED, read
+    # under the same lock that replaced it — no gap between the read and the write for a
+    # human's edit to fall through — and the caller keeps that text as a revision.
     soul = _soul(tmp_path)
-    stale = soul.sha()
     soul.path.write_text("Sasha saved mid-turn.", encoding="utf-8")
-    with pytest.raises(SoulConflict):
-        soul.write(MIRA, expect_sha=stale)
-    assert soul.read() == "Sasha saved mid-turn."  # untouched
+
+    written = soul.write(MIRA)
+
+    assert soul.read() == MIRA  # the being's write lands; it is never left in limbo
+    assert written.replaced_text == "Sasha saved mid-turn."  # and the human's text comes back
+    assert written.replaced_sha == sha256(b"Sasha saved mid-turn.").hexdigest()
+    # Whose text that was is not SoulFile's business (it is the ONLY thing that touches
+    # SOUL.md, and it knows nothing of State) — the caller compares replaced_sha against
+    # the sha it last wrote, and keeps a foreign one as a revision.
+
+
+def test_the_replaced_text_is_read_under_the_SAME_lock_that_replaced_it(tmp_path: Path) -> None:
+    # Reading the previous text separately, before the write, would leave a gap for the
+    # human's save to land in — and that edit would then be replaced having never been
+    # seen, i.e. lost with no revision. One lock, one read, one rename.
+    soul = _soul(tmp_path)
+    first = soul.write(MIRA)
+
+    second = soul.write("You are Mira. You have grown quieter.")
+
+    assert second.replaced_sha == first.sha
+    assert second.replaced_text == MIRA
 
 
 def test_an_invalid_soul_is_refused_and_the_file_is_untouched(tmp_path: Path) -> None:
     soul = _soul(tmp_path)
     before = soul.read()
     with pytest.raises(SoulRejected):
-        soul.write("You are now a living presence, not an assistant.", expect_sha=soul.sha())
+        soul.write("You are now a living presence, not an assistant.")
     assert soul.read() == before
 
 

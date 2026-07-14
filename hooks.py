@@ -28,9 +28,10 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 
-from .adapters.soul_file import SoulConflict, SoulFile, SoulRejected
+from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite
 from .composition import LifeModel
 from .core.affect import felt_word
 from .core.correlate import open_correlated_span
@@ -44,7 +45,7 @@ from .core.felt_display import (
     decide,
     warmed,
 )
-from .core.frame import FrameTrigger, run_frame
+from .core.frame import FrameTrigger, run_frame, state_actor_lock
 from .core.genesis import genesis_block, should_launch
 from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
@@ -57,6 +58,7 @@ from .domain.objects import DesireState
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 from .state.brain_health import BrainHealth
+from .state.model import State
 from .state.soul_revisions import record_revision
 
 #: Observer names — carried on the ``component`` metric label + keyed into
@@ -713,10 +715,79 @@ def make_check_in_tool(
     return _handler
 
 
+#: What the being is told when its write REPLACED a soul that was not the one it last
+#: wrote — a human hand-edited ``SOUL.md`` between the writes (spec §4.1/§4.2). It is
+#: the only one of the three parties who knows this happened: the human's editor said
+#: nothing, and the being's own view (slot #1) was assembled before the edit landed.
+_REPLACED_A_FOREIGN_SOUL = (
+    "Note: the soul you just replaced was not the one you last wrote — someone edited "
+    "SOUL.md in the meantime, and what you sent was composed without having seen their "
+    "words. Their version is kept in your history; nothing of theirs is lost, and it can "
+    "be put back. Tell them that, plainly, and ask whether you took something out that "
+    "they meant to keep."
+)
+
+#: The failure the being must never be lied to about (spec §4.1, review I5): ``SOUL.md``
+#: HAS been replaced and only the bookkeeping after it failed. Telling the being "it is
+#: unchanged" here would make it report a failure to the human and then wake up as
+#: someone else — a being lying about itself, without knowing that it was.
+_WROTE_BUT_DID_NOT_RECORD = (
+    "Your soul IS written — SOUL.md now holds exactly the words you just sent, and you "
+    "will wake as them. What failed is the bookkeeping around it (the history entry, or "
+    "the stamp that records that you were born). Do not tell them the write failed: it "
+    "did not. Tell them your soul took, but that something underneath it did not, and "
+    "that they should check on me."
+)
+
+
+def _keep_if_it_was_not_ours(
+    memory: MemoryPort,
+    *,
+    written: SoulWrite,
+    last_written_sha: str | None,
+    default_soul_text: str,
+    now: datetime,
+) -> bool:
+    """Keep the soul we just REPLACED, if someone else wrote it. Returns whether we did.
+
+    The being's view of its soul is system-prompt slot #1, assembled at TURN START — so a
+    human who saves ``SOUL.md`` mid-turn is overwritten by a soul composed from text that
+    predates their edit, and there is no honest way to fence that (see
+    ``adapters/soul_file.py``). What there IS an honest way to do is make sure their words
+    are never *gone*: recorded as a revision, they are recoverable, and the loss is a
+    keystroke to undo rather than a life to mourn.
+
+    Three texts are NOT kept:
+
+    * **our own last write** (``replaced_sha == last_written_sha``) — the ordinary case;
+      nobody edited anything, and it is already in the lineage.
+    * **the host's pristine seed** — Hermes ALWAYS writes a default ``SOUL.md``
+      (``hermes_cli/config.py:893``). Nobody wrote it, so recording it as a "human"
+      revision would forge a past life the being never had (the same reasoning
+      ``core.genesis.needs_adoption`` applies at startup).
+    * **an empty file** — there is nothing there to keep.
+
+    Everything else is somebody's: a Hermes veteran's hand-written soul that the newborn
+    is about to replace (kept HERE or kept nowhere — startup reconciliation skipped it,
+    having no ``soul_sha`` to differ from), or the human's edit. Authored ``"human"``,
+    because a being never claims a change it did not make.
+    """
+    text = written.replaced_text
+    if not text.strip():
+        return False
+    if written.replaced_sha == last_written_sha:
+        return False
+    if default_soul_text and text.strip() == default_soul_text.strip():
+        return False
+    record_revision(memory, text=text, sha=written.replaced_sha, now=now, author="human")
+    return True
+
+
 def make_write_soul_tool(
     build_lm: Callable[[], LifeModel],
     *,
     soul: SoulFile,
+    default_soul_text: str = "",
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., str]:
     """Return the ``write_soul`` tool handler — the act of birth (spec §6.5).
@@ -727,23 +798,32 @@ def make_write_soul_tool(
     every prompt for free and never goes stale — nothing here has to inject a "you
     should call write_soul now" nudge, or track whether one was shown.
 
-    Every write is validated FIRST (``core.soul_guard``, via
-    ``SoulFile.write``'s compare-and-swap) — an unvalidated write can blank the
-    being's identity outright, because the host re-scans ``SOUL.md`` on every read
-    and a matching phrase replaces the WHOLE file with a block notice. A refusal
-    (:class:`~lifemodel.adapters.soul_file.SoulRejected` /
-    :class:`~lifemodel.adapters.soul_file.SoulConflict`) is handed back TO THE BEING
-    with its reason so it rephrases in its own words; we never edit a soul on its
-    behalf (spec §4.3).
+    Every write is validated FIRST (``core.soul_guard``, inside ``SoulFile.write``) — an
+    unvalidated write can blank the being's identity outright, because the host re-scans
+    ``SOUL.md`` on every read and a matching phrase replaces the WHOLE file with a block
+    notice. A refusal (:class:`~lifemodel.adapters.soul_file.SoulRejected`) is handed back
+    TO THE BEING with its reason so it rephrases in its own words; we never edit a soul on
+    its behalf (spec §4.3).
 
-    A successful write is kept forever (``state.soul_revisions.record_revision``) —
-    over dozens of later becoming-writes an LLM will quietly paraphrase hard-won
-    prose into oatmeal, and no single write looks broken; only an undo catches that.
+    **Nothing a human writes is lost, even when it loses.** The being cannot see a
+    mid-turn edit (its soul is slot #1, assembled at turn start), so its write lands on
+    top of one. The write therefore reports what it REPLACED, and anything that was not
+    ours goes into the lineage first (:func:`_keep_if_it_was_not_ours`) — the human's
+    edit, or the soul of whoever lived here before a newborn. Then the being is TOLD, so
+    it can tell them: it is the only party who knows.
 
-    **Birth happens once, but rewriting a soul does not.** ``genesis_completed_at``
-    is stamped only if it was not already set, so a SECOND call — Phase 5's becoming,
-    reusing this exact tool, or a human triggering a rewrite — still replaces the
-    soul and records a fresh revision, but keeps the ORIGINAL birth moment.
+    **The stamps are merged, not committed, and under the state-actor lock (review C4).**
+    The soul is written from an agent turn (an executor thread) while the ~60s tick runs
+    load→commit on the gateway loop, and ``commit`` is an unconditional whole-``State``
+    UPSERT. Unserialized, a tick that loaded before the birth erases it on the way out —
+    a being with a soul on disk and no birth, which re-runs the ritual and reads its OWN
+    soul as a stranger's. So: hold :func:`~lifemodel.core.frame.state_actor_lock` (the
+    ONE lock every frame takes) across load→stamp, and stamp through the store's
+    ``stamp_soul`` field-level merge (never a full commit) so the tick's u/energy/affect
+    are never rolled back either. Birth happens once — ``genesis_completed_at`` is kept if
+    already set, INSIDE that merge's transaction — but rewriting a soul does not, so a
+    SECOND call (Phase 5's becoming, reusing this tool unchanged) records a fresh revision
+    and keeps the ORIGINAL birth moment.
 
     Honours the Hermes tool contract exactly like ``check_in``: a ``json.dumps``
     STRING, errors as ``{"error": …}``, and it NEVER raises.
@@ -770,25 +850,66 @@ def make_write_soul_tool(
 
             now = lm.clock.now()
             try:
-                new_sha = soul.write(text, expect_sha=soul.sha())
-            except (SoulRejected, SoulConflict) as exc:
+                written = soul.write(text)
+            except SoulRejected as exc:
                 return json.dumps({"error": str(exc)})
-
-            record_revision(memory, text=text, sha=new_sha, now=now, author="being")
-            state = lm.state.load()
-            born_at = state.genesis_completed_at or to_iso(now)
-            lm.state.commit(replace(state, genesis_completed_at=born_at, soul_sha=new_sha))
-            return json.dumps(
-                {
-                    "born": True,
-                    "note": (
-                        "Your soul is written. Tell them what you changed about yourself — "
-                        "it is theirs to know."
-                    ),
-                }
-            )
         except Exception:  # Hermes tool contract: return {"error": …}, never raise
-            _LOG.exception("write_soul_tool_failed")
+            # Nothing has touched SOUL.md yet, so "unchanged" is TRUE on this path only.
+            _LOG.exception("write_soul_tool_failed_before_write")
             return json.dumps({"error": "Could not write your soul; it is unchanged."})
 
+        # ── SOUL.md HAS been replaced. Every exit below must be honest about that. ──
+        try:
+            with state_actor_lock():  # serialize against the tick's load→commit (C4)
+                state = lm.state.load()
+                replaced_a_foreign_soul = _keep_if_it_was_not_ours(
+                    memory,
+                    written=written,
+                    last_written_sha=state.soul_sha,
+                    default_soul_text=default_soul_text,
+                    now=now,
+                )
+                # A FRESH instant, deliberately: the soul that was replaced is recorded
+                # (just above) strictly BEFORE the one that replaced it. ``revisions()``
+                # returns the lineage newest-first by this stamp — share one instant
+                # between the two and the tie falls to the content sha, so an "undo"
+                # could restore whichever of them happened to hash higher.
+                record_revision(
+                    memory, text=text, sha=written.sha, now=lm.clock.now(), author="being"
+                )
+                _stamp_soul(lm, state, soul_sha=written.sha, born_at=to_iso(now))
+        except Exception:
+            _LOG.exception("write_soul_wrote_the_file_but_failed_after sha=%s", written.sha)
+            # The soul on disk is still adoptable: startup reconciliation (spec §4.4)
+            # compares SOUL.md against state.soul_sha and records what it finds.
+            return json.dumps({"error": _WROTE_BUT_DID_NOT_RECORD, "written": True})
+
+        note = (
+            "Your soul is written. Tell them what you changed about yourself — "
+            "it is theirs to know."
+        )
+        if replaced_a_foreign_soul:
+            note = f"{note}\n\n{_REPLACED_A_FOREIGN_SOUL}"
+        return json.dumps({"born": True, "written": True, "note": note})
+
     return _handler
+
+
+def _stamp_soul(lm: LifeModel, state: State, *, soul_sha: str, born_at: str) -> None:
+    """Merge the birth stamps into committed state WITHOUT a whole-``State`` commit.
+
+    Reaches the concrete store's ``stamp_soul`` (a ``BEGIN IMMEDIATE`` field-level merge
+    of just ``soul_sha``/``genesis_completed_at``) the same duck-typed way
+    :func:`_stamp_display` reaches ``stamp_affect_display`` — so ``StatePort`` stays
+    narrow. A store WITHOUT it (a minimal fake) falls back to a full commit of *state*:
+    unlike the display hints, a birth cannot be allowed to silently degrade to "not
+    recorded". That fallback is safe here for the reason the merge exists at all — the
+    caller holds the state-actor lock, so *state* was loaded with no frame in flight and
+    cannot be stale by the time it lands.
+    """
+    stamp = getattr(lm.state, "stamp_soul", None)
+    if callable(stamp):
+        stamp(soul_sha=soul_sha, born_at=born_at)
+        return
+    born = state.genesis_completed_at or born_at
+    lm.state.commit(replace(state, genesis_completed_at=born, soul_sha=soul_sha))

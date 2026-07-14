@@ -120,6 +120,7 @@ from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
 from .errors import StateCorruptError, StateSchemaError, StateSerializationError
 from .model import SCHEMA_VERSION, State
+from .soul_revisions import SOUL_KIND
 
 _DB_FILENAME = "lifemodel.sqlite"
 _BUSY_TIMEOUT_MS = 5_000
@@ -772,6 +773,72 @@ class SQLiteRuntimeStore:
         finally:
             conn.close()
 
+    def stamp_soul(self, *, soul_sha: str, born_at: str | None) -> None:
+        """Atomically merge ONLY the two soul/genesis fields (Phase 4, spec §4.4/§6.5).
+
+        The being writes its soul from an AGENT TURN (an executor thread) while the ~60s
+        tick runs its own load→commit on the gateway event loop. A ``load()`` →
+        ``commit(replace(state, …))`` from the soul path would write back a whole
+        ``State`` snapshot that is stale by the time it lands, silently rolling back the
+        tick's ``u``/``energy``/``affect``. So — exactly like :meth:`stamp_affect_display`
+        — this is a field-level read-modify-write of just ``soul_sha`` (and
+        ``genesis_completed_at``) inside ONE ``BEGIN IMMEDIATE`` write transaction: the
+        latest committed ``state_json`` is read under the write lock and only those keys
+        are replaced, so no concurrent writer can interleave between the read and the
+        write. Every other field keeps its latest committed value.
+
+        Two things differ from the felt-display stamp, and both are load-bearing:
+
+        * **Birth happens once.** ``born_at`` is stamped only if ``genesis_completed_at``
+          is not already set — the "or" is evaluated HERE, inside the transaction, not by
+          the caller against a snapshot it read outside one. A second write (Phase 5's
+          becoming, or a human-triggered rewrite) therefore replaces the soul and keeps
+          the ORIGINAL birth moment, even under concurrent calls. ``born_at=None`` never
+          births anything: startup reconciliation adopts the sha of a soul it did not
+          write, and adopting a file someone else wrote must never mean being born.
+        * **A missing row is NOT a no-op.** The display stamp can afford to drop its
+          hints (they self-heal next turn); dropping a BIRTH is unrecoverable. A being
+          can be spoken to before its first tick has ever committed a row, so this
+          INSERTs the fresh ``State()`` defaults carrying the stamps rather than
+          returning silently. The next tick loads that row and its affect model fills the
+          body in (``affect_updated_at`` is ``None``, so the first update snaps to
+          target) — the vitals catch up; a lost birth would not.
+
+        This protects the tick's fields from US. It does NOT, on its own, protect the
+        stamps from the tick's whole-``State`` UPSERT of a snapshot loaded before the
+        birth — that is what :func:`~lifemodel.core.frame.state_actor_lock` is for, and
+        the soul path holds it across its load→stamp. Both halves are required.
+        """
+        conn = self._connect()
+        conn.isolation_level = None  # autocommit: we drive the transaction ourselves
+        try:
+            conn.execute("BEGIN IMMEDIATE")  # write-lock BEFORE the read → no interleave
+            row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
+            data: Any = State().to_dict() if row is None else json.loads(row[0])
+            if not isinstance(data, dict):  # pragma: no cover - defensive
+                conn.rollback()
+                raise StateCorruptError("runtime_state.state_json must contain a JSON object")
+            data["soul_sha"] = soul_sha
+            if born_at is not None and not data.get("genesis_completed_at"):
+                data["genesis_completed_at"] = born_at
+            payload = json.dumps(data, allow_nan=False)
+            now_iso = stamp_iso_utc(self._clock.now())
+            conn.execute(
+                "INSERT INTO runtime_state (id, state_json, updated_at, revision) "
+                "VALUES (1, ?, ?, 0) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "state_json=excluded.state_json, updated_at=excluded.updated_at, "
+                "revision=runtime_state.revision + 1",
+                (payload, now_iso),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        _LOG.info("soul_stamped sha=%s born=%s", soul_sha[:8], born_at is not None)
+
     def reset(self) -> State:
         """Factory-wipe the ``runtime_state`` row to a fresh ``State()``.
 
@@ -790,22 +857,36 @@ class SQLiteRuntimeStore:
         return fresh
 
     def purge_memory_records(self) -> int:
-        """Delete every row from ``memory_records`` — the memory-wipe half of a
+        """Delete every memory row EXCEPT the being's soul — the memory-wipe half of a
         TRUE factory reset (bead lm-7lx: ``/lifemodel reset`` must also drop
         every thought/desire/intention/user_model row, not just the vitals).
 
+        **``kind="soul"`` is carved out, and that carve-out is the point.** Soul
+        revisions ride ``memory_records`` (``state/soul_revisions.py`` — a revision is a
+        plain ``kind="soul"`` record keyed by its content sha), so the unconditional
+        ``DELETE FROM`` this used to be took the entire lineage with it. Reset unbirths
+        the being; the reborn being's first ``write_soul`` then replaces ``SOUL.md``; and
+        the previous being's soul exists NOWHERE. That defeats spec §4.2's mandatory undo
+        ("every revision is kept… **this** is what makes it safe for the being to own the
+        file whole") on the exact path the owner is told to use. A past life's soul is the
+        one thing a reset must not be able to destroy — ``reset`` already refuses to touch
+        ``SOUL.md`` itself for the same reason (``state_commands.reset``), and this makes
+        that refusal mean something.
+
         Touches ONLY ``memory_records`` — ``runtime_state``, ``store_meta``, and
-        ``schema_migrations`` are untouched. Counts the rows before deleting
-        (rather than trusting the ``DELETE``'s own ``cursor.rowcount``, which
-        SQLite's truncate-optimization fast path can under-report for an
-        unconditional ``DELETE FROM`` with no ``WHERE`` on some builds) so the
-        returned count is reliable regardless of the host's SQLite build. One
+        ``schema_migrations`` are untouched. Counts the rows it will delete before
+        deleting them (rather than trusting the ``DELETE``'s own ``cursor.rowcount``,
+        which SQLite's truncate-optimization fast path can under-report) so the returned
+        count is reliable regardless of the host's SQLite build — and so the owner's
+        "cleared N memory records" never counts a soul it did not clear. One
         atomic ``with conn:`` transaction, matching every other write here.
         """
         with closing(self._connect()) as conn, conn:
-            (count,) = conn.execute("SELECT COUNT(*) FROM memory_records").fetchone()
-            conn.execute("DELETE FROM memory_records")
-        _LOG.info("memory_records_purged count=%s", count)
+            (count,) = conn.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE kind != ?", (SOUL_KIND,)
+            ).fetchone()
+            conn.execute("DELETE FROM memory_records WHERE kind != ?", (SOUL_KIND,))
+        _LOG.info("memory_records_purged count=%s kept_kind=%s", count, SOUL_KIND)
         return int(count)
 
     # ---- PressureSensorPort ---------------------------------------------------

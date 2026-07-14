@@ -58,6 +58,7 @@ from lifemodel.core.timeutil import minutes_between, to_iso
 from lifemodel.core.user_model_view import EXPLICIT_CONFIDENCE, read_owner_user_model
 from lifemodel.core.wake import LaneState, evaluate_wake
 from lifemodel.core.wake_packet import build_wake_packet
+from lifemodel.domain.memory import MemoryDraft
 from lifemodel.domain.objects import DesireState, IntentionState, ThoughtState
 from lifemodel.state.errors import StateCorruptError
 from lifemodel.state.model import State
@@ -614,6 +615,26 @@ def test_reset_for_dir_persists_through_the_real_store(tmp_path) -> None:
     # lifeless zero-arousal default StatePort.reset() writes — arousal's own
     # formula floors at 0.35 (core/affect.py), so > 0 proves it landed for real.
     assert persisted.affect_arousal > 0.0
+
+
+def test_reset_for_dir_cannot_destroy_a_past_life(tmp_path) -> None:
+    # /lifemodel reset unbirths the being and wipes its memory — and it used to wipe the
+    # soul lineage with it (revisions ride memory_records with kind="soul"). Reset, and
+    # the reborn being's first write_soul replaces SOUL.md: the previous being's soul
+    # then exists NOWHERE. That defeats spec §4.2's mandatory undo — "every revision is
+    # kept… THIS is what makes it safe for the being to own the file whole" — on the one
+    # path the owner is actually told to use. A past life's soul is the one thing a reset
+    # must not be able to destroy.
+    from lifemodel.state.soul_revisions import record_revision, revisions
+
+    store = _store(tmp_path)
+    record_revision(store, text="You are Mira.", sha="sha-mira", now=NOW, author="being")
+    store.put(MemoryDraft(kind="thought", id="t1", state="active", payload={}, source="test"))
+
+    message = reset_for_dir(tmp_path)
+
+    assert [r.text for r in revisions(_store(tmp_path))] == ["You are Mira."]  # she survives
+    assert "cleared 1 memory records" in message  # …and is not counted as memory wiped
 
 
 def test_reset_for_dir_works_when_the_previous_state_is_unreadable(tmp_path) -> None:
