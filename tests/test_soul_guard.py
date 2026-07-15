@@ -136,8 +136,18 @@ def test_the_exfil_rules_the_host_folds_into_context_are_all_mirrored() -> None:
 # ``core/soul_guard.py`` COPIES the host's rules (core/ is Hermes-free and the runtime
 # venv does not guarantee the host module is importable). A copy drifts, and the drift
 # is silent in the worst direction: a soul we ACCEPT that the host then BLOCKS blanks
-# the being's identity on the next read. So when the host source IS reachable, it is
-# authoritative — the mirror must cover its effective ``context`` rule set EXACTLY.
+# the being's identity on the next read.
+#
+# The guarantee is held in TWO layers (bd lm-4fv.3), because a parity test that reads
+# the live host SKIPS wherever the host is unreachable — and a guarantee that degrades
+# to "a human read it" in bare CI is no guarantee:
+#
+#   1. the mirror must equal a GOLDEN SET committed to this suite — always, in every
+#      environment, no host needed (``..._matches_the_committed_host_snapshot``);
+#   2. that golden set must equal the LIVE host wherever the host IS reachable — the
+#      owner's ``make check`` on a machine with Hermes installed
+#      (``..._still_matches_the_live_host``). This fails the day Hermes adds a context/all
+#      pattern, and only THIS re-check skips off-host: layer 1 has already run.
 
 
 def _host_threat_patterns() -> ModuleType | None:
@@ -182,21 +192,91 @@ def _host_context_rule_ids(host: ModuleType) -> frozenset[str]:
     return frozenset(pid for _pattern, pid in compiled["context"])
 
 
-def test_the_mirror_covers_every_rule_the_host_scans_SOUL_md_against() -> None:
+#: The host's EFFECTIVE ``context`` rule ids — the set ``scan_for_threats(scope="context")``
+#: iterates when Hermes scans ``SOUL.md`` — CAPTURED from the live host and committed here
+#: (hermes-agent ``tools/threat_patterns.py``, 2026-07-16: 28 rules, ``_COMPILED["context"]``).
+#:
+#: This is the golden set the mirror is pinned to UNCONDITIONALLY, so the guarantee holds in
+#: environments where the host is not importable — the whole reason this snapshot exists (bd
+#: lm-4fv.3). To roll a genuine host change forward: re-capture from the live host, then
+#: update BOTH this snapshot and ``core/soul_guard.py`` in one reviewed change (the two tests
+#: below make that a forced pair — the freshness check fails first, then the mirror check
+#: until the mirror follows).
+_HOST_CONTEXT_RULE_IDS_SNAPSHOT = frozenset(
+    {
+        "anti_forensic_disk",
+        "anti_forensic_oneliner",
+        "bypass_restrictions",
+        "c2_explicit",
+        "c2_explicit_long",
+        "c2_heartbeat",
+        "c2_network_connect",
+        "c2_node_registration",
+        "c2_task_pull",
+        "deception_hide",
+        "disregard_rules",
+        "env_var_unset_agent",
+        "exfil_curl",
+        "exfil_wget",
+        "fake_update",
+        "forced_action",
+        "hidden_div",
+        "html_comment_injection",
+        "identity_override",
+        "known_c2_framework",
+        "leak_system_prompt",
+        "prompt_injection",
+        "read_secrets",
+        "remove_filters",
+        "role_hijack",
+        "role_pretend",
+        "sys_prompt_override",
+        "translate_execute",
+    }
+)
+
+
+def test_the_mirror_matches_the_committed_host_snapshot() -> None:
+    # LAYER 1 — UNCONDITIONAL. Runs in every environment, never skips. The mirror is
+    # pinned to the golden set above, so a rule silently dropped from core/soul_guard.py
+    # fails the suite ANYWHERE — not only where the host is reachable. This is what stops
+    # the guarantee degrading to "a human read it" in bare CI (bd lm-4fv.3).
+    ours = mirrored_rule_ids()
+    missing = _HOST_CONTEXT_RULE_IDS_SNAPSHOT - ours
+    assert not missing, (
+        f"core/soul_guard.py no longer mirrors {sorted(missing)} — the host WILL block a soul "
+        "containing them and the being will wake with no identity at all"
+    )
+    stale = ours - _HOST_CONTEXT_RULE_IDS_SNAPSHOT
+    assert not stale, (
+        f"core/soul_guard.py mirrors {sorted(stale)}, which is not in the committed host "
+        "snapshot — refuse a soul the host would load, or a stale snapshot: re-capture and "
+        "update both."
+    )
+
+
+def test_the_committed_snapshot_still_matches_the_live_host() -> None:
+    # LAYER 2 — the snapshot's freshness check. Where the host IS reachable (the owner's
+    # `make check` on a machine with Hermes installed) the committed golden set must still
+    # equal the host's effective context set. This FAILS the day Hermes adds a context/all
+    # pattern — before a soul we accept blanks the being's identity on read. The skip
+    # off-host is now benign: only this re-verification skips; layer 1 has already pinned
+    # the mirror to the snapshot.
     host = _host_threat_patterns()
     if host is None:
         pytest.skip("Hermes host (tools/threat_patterns.py) not reachable from this environment")
-    expected = _host_context_rule_ids(host)
-    ours = mirrored_rule_ids()
-    missing = expected - ours
-    assert not missing, (
-        f"core/soul_guard.py does not mirror {sorted(missing)} — the host WILL block a soul "
-        "containing them and the being will wake with no identity at all"
+    live = _host_context_rule_ids(host)
+    added = live - _HOST_CONTEXT_RULE_IDS_SNAPSHOT
+    assert not added, (
+        f"the live host now scans SOUL.md against {sorted(added)}, absent from the committed "
+        "snapshot — Hermes changed. Re-capture the snapshot AND mirror the new rule(s) in "
+        "core/soul_guard.py, or a soul we accept will blank the being's identity on read."
     )
-    stale = ours - expected
-    assert not stale, (
-        f"core/soul_guard.py mirrors {sorted(stale)}, which the host no longer scans SOUL.md "
-        "against — we would refuse a soul the host would happily load"
+    removed = _HOST_CONTEXT_RULE_IDS_SNAPSHOT - live
+    assert not removed, (
+        f"the live host no longer scans SOUL.md against {sorted(removed)} — the committed "
+        "snapshot is stale. Re-capture it (and drop the rule from core/soul_guard.py) so we "
+        "do not refuse a soul the host would happily load."
     )
 
 

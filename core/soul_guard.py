@@ -41,13 +41,23 @@ that module is importable.
 revision of this docstring asserted that the exfil rules were "strict-only" and so
 "correctly absent" — a plain factual error about the host, and the mirror was three
 rules short for exactly as long as that sentence went unchecked. So the mirror is no
-longer defended by a claim; it is defended by a TEST:
-``tests/test_soul_guard.py::test_the_mirror_covers_every_rule_the_host_scans_SOUL_md_against``
-reads the host's own ``_COMPILED["context"]`` (the very list it iterates when it scans
-``SOUL.md``) and asserts it equals :func:`mirrored_rule_ids` exactly. It FAILS the day
-Hermes adds a ``context``/``all`` pattern we have not mirrored, and skips only where the
-host source is unreachable. The invisible-character list has the same protection (an
-independent re-transcription in that suite).
+longer defended by a claim; it is defended by a two-layer TEST (``tests/
+test_soul_guard.py``, bd lm-4fv.3):
+
+- ``test_the_mirror_matches_the_committed_host_snapshot`` pins :func:`mirrored_rule_ids`
+  to a golden set captured from the live host and committed to the suite. It runs in
+  EVERY environment and never skips — so a rule silently dropped from this module fails
+  the suite anywhere, not only where Hermes is importable. This is what stops the
+  guarantee degrading to "a human read it" off-host.
+- ``test_the_committed_snapshot_still_matches_the_live_host`` reads the host's own
+  ``_COMPILED["context"]`` (the very list it iterates when it scans ``SOUL.md``) and
+  asserts it equals that golden set. It FAILS the day Hermes adds a ``context``/``all``
+  pattern we have not captured — wherever the host source is reachable, i.e. the owner's
+  ``make check`` on a machine with Hermes installed — and only THIS freshness re-check
+  skips where it is not.
+
+The invisible-character list has the same protection (an independent re-transcription in
+that suite).
 
 What the effective rule set actually is: ``load_soul_md`` scans with
 ``scope="context"``, and the host's ``_compile()`` folds every ``scope="all"`` pattern
@@ -243,11 +253,13 @@ _THREAT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 def mirrored_rule_ids() -> frozenset[str]:
     """Every host rule id this module mirrors — the parity test's half of the contract.
 
-    ``tests/test_soul_guard.py`` derives the host's EFFECTIVE ``context`` rule set from
-    the live ``tools/threat_patterns.py`` (its own ``_COMPILED["context"]``, not our
-    restatement of the scope-fold, which is what was wrong before) and asserts it equals
-    this. So the day Hermes adds a ``context``/``all`` pattern, the suite fails HERE —
-    not months later, when a soul we accepted blanks the being's identity on read.
+    ``tests/test_soul_guard.py`` pins this to a golden set captured from the live host
+    (``test_the_mirror_matches_the_committed_host_snapshot``, unconditional) and holds
+    that golden set to the host's own ``_COMPILED["context"]`` — not our restatement of
+    the scope-fold, which is what was wrong before — wherever the host is reachable
+    (``test_the_committed_snapshot_still_matches_the_live_host``). So the day Hermes adds
+    a ``context``/``all`` pattern, the suite fails — not months later, when a soul we
+    accepted blanks the being's identity on read.
     """
     return frozenset(label for _pattern, label in _THREAT_PATTERNS)
 

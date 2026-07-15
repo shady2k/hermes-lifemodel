@@ -941,21 +941,39 @@ separate design with its own privacy story (NFR8).
 | `adapters/being_platform.py` | Hosts the brain loop (which is what wakes the newborn) and reconciles the soul. **Nothing genesis-specific**: it must not greet from `connect()` — see §6.2. |
 | `state_commands.py` | `reset` additionally clears the genesis stamps and builds the body via `newborn()`. Never touches `SOUL.md`. |
 
-## 8. Open question left for the owner
+## 8. Temperament — resolved: chosen by living, not by birth (2026-07-16)
 
-**Temperament.** Genesis as specified co-authors the being's *prose* but not its
+The question this section left open: Genesis co-authors the being's *prose* but not its
 *numbers* — `α` (how fast solitude accrues), `θ`, the affect constants. Two beings born
-from utterly different conversations, with different people, would still have identical
-physiology and differ only in the text they carry about themselves.
+from utterly different conversations would still have identical physiology and differ only
+in the text they carry. That looks like the preset BRD §32 forbids, and prose is what the
+model *reads and may ignore* while numbers are what the being **is**.
 
-That is a preset, and BRD §32 exists to forbid presets. Prose is what the model *reads
-and may ignore*; numbers are what the being **is**. "Don't cling to me" should not be a
-sentence the model may reinterpret — it should be a lower `α` and a higher `θ`, so the
-being *physically* longs less often.
+**Decision (owner, 2026-07-16): the being is born on the current defaults; its numbers
+change by *living*, not by a birth ritual.** `lm-4fv.1` closed won't-do.
 
-Not specified here because it needs its own design (bounded ranges vs. named temperament
-presets; how a conversation maps onto constants; how to guarantee a being cannot be born
-that never reaches out, or one that pesters). Filed as **lm-4fv.1** under this epic.
+The reasoning, from the brainstorm:
+
+- **Moving the whole physiology at birth is premature and low-value.** No default has been
+  calibrated on a live being over a long horizon, and there is exactly one being. Picking
+  points in a ~20-dimensional space nobody can yet feel by hand is guessing, not authoring.
+  Born-on-defaults *is* FR1's floor ("минимум — уже живое существо") — and it is already
+  the status quo: the constants are module literals in `composition.py`, and `newborn()`
+  already computes the body from them, so there is nothing to build.
+- **There is exactly one axis where "same number for everyone" fails the promise:** how
+  much silence the being tolerates before it reaches out — `τ* = 1/α` (θ is normalised to
+  1), currently ~4h. It is the one contact trait a human has an opinion about and can state
+  ("don't message me much" / "I love hearing from you"), and prose alone lets the model
+  reinterpret it.
+- **But `τ*` is exactly the variable `lm-ocx` learns** (the learned social set-point, hard-
+  clamped `[τ_min, τ_max]`). So it belongs to *lifetime learning*, which starts from a
+  stated preference and refines it — not to a birth-time choice that would then fight the
+  learner over the same knob. A human's stated boundary is honoured immediately by learning
+  seeded from it, not by a preset dialled at birth.
+
+So temperament-variation moves to **`lm-ocx`** (Phase 5), and this phase ships no birth-time
+constant selection. The being is born itself in *prose*; it becomes itself in *number* by
+living.
 
 ## 9. Prior art (verified, not recalled)
 
