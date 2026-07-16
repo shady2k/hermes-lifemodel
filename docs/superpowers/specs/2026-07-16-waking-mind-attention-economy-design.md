@@ -5,7 +5,7 @@
 drives) as a shippable slice. Roadmap chain:
 `lm-4fv (Genesis, done) → [Phase 5a: waking mind] → lm-adz (rest of Phase 5) → lm-0od (Phase 6)`.
 **Date:** 2026-07-16
-**Status:** design under review — **v3.1, slice-3 redesigned by the owner + codex-reviewed `019f6c40` (2026-07-16)**; v2 was codex `019f69d3` (§10)
+**Status:** **v3.1.1 — ready to plan.** Slice-3 redesigned by the owner + codex-reviewed twice (`019f6c40`, 2026-07-16); v2 was codex `019f69d3` (§10)
 **Product source:** BRD FR3 (желания — plural, compete by salience, resolve, leave
 residue), FR4 (внутренняя жизнь — thoughts, Zeigarnik), FR5 (взросление — opinions as
 residue), FR20 (configurable hard cost ceiling), S5 (idle → 0-LLM). Principle §9.2 (model
@@ -28,10 +28,13 @@ The cure is to give the being **other things to want**. The being has no world y
 **inner life**, and the honest inner life it can have now is **thinking**.
 
 **Goal of this phase:** the being acquires a **bounded waking inner life**. It *creates*
-thoughts from what happens, *processes* them later, and a processed thought can become a
-warm, specific **reason to reach out** — as opposed to the bare "I'm lonely". After this
-phase the being is richer to talk to in *every* conversation, and its proactive contact
-has a content-bearing source, not only a threshold.
+thoughts from what happens and *processes* them later, and a processed thought **crystallizes
+into a durable "reason" object** — most naturally a `Commitment` (a follow-up it owes) — as
+opposed to the bare "I'm lonely". *(v3.1 — codex: Phase 5a builds these durable **initiation
+reasons**; turning one into an actual warm outreach is the later **contact** work — §7. The
+end-state is proactive contact with a content-bearing source, but this phase produces the
+**source**, not the send.)* After this phase the being is richer to talk to in *every*
+conversation.
 
 ### 1.1 Why a separate phase, not the first task of Phase 5
 
@@ -104,8 +107,9 @@ certify theory" ethos.
    non-delivering cognition path** (§4.1) — the existing `CognitionLauncher` only delivers.
 3. **Thought crystallization** *(redesigned v3 — owner, 2026-07-16)* — a processed thought
    **crystallizes into a durable catalog object** (§4.2): rumination decides what the thought
-   *becomes* — **any `kind`** — emitted through the generic `PutRecord` door, and the slice
-   **stops there** (no contact, no send). The first new type built is **`Commitment`** (a
+   *becomes* — a **registered** catalog `kind` (a closed, discriminated set; this slice ships
+   `Commitment`) — emitted through the registry + `PutRecord` door, and the slice **stops
+   there** (no contact, no send). The first new type built is **`Commitment`** (a
    follow-up the being holds — HLA's "strongest non-intrusive reason, serving the other").
    Turning a crystallized object into an actual outreach is a **separate, later** concern (the
    contact pipeline / arbiter reads it as a source). The old "thought mints a contact desire
@@ -135,10 +139,11 @@ exchange today: `make_post_llm_observer` returns immediately unless the turn is 
 timestamp, no content. **Required:** a bounded appraisal of a completed dialogue turn that
 seeds a Thought via the intent bus (`PutRecord`, `kind=thought`, `trigger=event`). A hook
 **must never write the store directly**; it seeds a frame with a bounded appraisal result,
-and a core component emits the `PutRecord`. **Appraisal form (decided — codex v3.1):** *not* a
-keyword heuristic — a cognition-grade judgment (a cheap classifier pass, or riding the dialogue
-turn's own tail). No concrete appraiser is wired live yet, so thought **creation is dormant**
-until it lands (**lm-705.11**); slice 3 is exercised by seeded thoughts meanwhile.
+and a core component emits the `PutRecord`. **Appraisal form:** *not* a keyword heuristic — a
+cognition-grade judgment; its exact form is **settled in lm-705.11** (the single authority — this
+spec does not pick classifier-vs-tail vs the noticing design's idle pass). Creation is **not**
+slice 3's concern (slice 3 *processes* existing thoughts); and it is **dormant live** until
+lm-705.11 lands, so slice 3 is exercised by **seeded** thoughts meanwhile.
 
 **Processing (expensive) needs a new non-delivering cognition path.**
 `CognitionLauncher` only launches a *delivered* proactive turn and reads back `SENT` /
@@ -149,8 +154,9 @@ distinct internal-cognition protocol:
 - correlation + pending-idempotency **distinct** from outbound contact;
 - an async completion frame carrying a **typed thought outcome** (deterministic schema +
   validation);
-- atomic application of the thought transition **and** any crystallized object's `PutRecord`
-  (§4.2, v3 — any catalog `kind`, not a hard-wired desire) in one commit.
+- atomic application of the thought transition **and** the crystallized object's `PutRecord`
+  (§4.2 — a *registered* kind via its builder, not a hard-wired desire and not an arbitrary
+  runtime kind) in one commit.
 
 **Bounded lifecycle (required — snapshot-per-tick is not enough).** Processing develops
 **one** selected thought by one layer (top-K, **K=1**, by salience). The Thought schema
@@ -331,21 +337,27 @@ enum in `core/suppression.py` stays for genuine holds; a new positive-decision r
 is added). **Crystallization (v3.1 — codex):** the closed reason set gains
 **`processed_crystallize`**, and *what the thought became* rides as **separate span fields**
 — `thought_id`, `crystallized_kind`, `crystallized_id` (never a reason-per-object-id; the
-qualified provenance carries the same source-thought link) — stamped **only after** the
-builder + registry encode succeed. The being answers *«почему промолчал / что тебя занимает»*
+qualified provenance carries the same source-thought link) — stamped once the builder + encode
+succeed. **Encode ≠ durable commit** (codex): the component span persists **before** the
+end-of-frame `StateActor` commit, so `processed_crystallize` records the crystallization
+*decision*, not proof of durability — a rolled-back frame leaves the span but **no** row.
+Durable success is the committed row + the tick's commit span; read them together (do not treat
+`processed_crystallize` alone as "it landed"). The being answers *«почему промолчал / что тебя занимает»*
 (FR24) by reading its own recent spans, not by confabulating.
 
 ## 6. Simulation (mechanism recovery, not human calibration)
 
 The sim vivifies the real code through the existing fake-port harness
-(`testing/harness.py`) and asserts: **emergence** (contact hazard varies with inner
-context, not a clock) · **backlog health** (seeded thoughts get processed; no starve, no
-spiral; no-progress decays; attempt/park bounds terminate) · **crystallization** (v3 —
+(`testing/harness.py`). For the **crystallization slices (1–3)** it asserts: **backlog health**
+(seeded thoughts get processed; no starve, no spiral; no-progress decays; attempt/park bounds
+terminate) · **crystallization** (v3 —
 slice 3: a processed thought produces the right durable object via `PutRecord`, provenance-
 linked, and the source thought discharges; the `[SILENT]`-cure **contact liveness** invariant
 moves with the deferred contact/arbiter work) · **safety** (every fixed-floor invariant, incl.
 `repeat_pure_longing`, holds throughout) · **cost** (idle default 0-LLM; a bounded backlog
-stays within the FR20 quota). No "calibrated to humans" claims.
+stays within the FR20 quota). **Deferred to the contact/arbiter slices (4 + the object→contact
+adapter):** **emergence** (contact hazard varies with inner context, not a clock) — *not* a
+crystallization-slice measure. No "calibrated to humans" claims.
 
 ## 7. Boundaries (recap)
 
@@ -459,3 +471,12 @@ Fixes folded in:
 - **Observability:** `processed_crystallize` reason + `crystallized_kind`/`crystallized_id` span
   fields, stamped only after encode (§5).
 - **Minor:** appraisal form decided (judgment, not heuristic; unwired → lm-705.11) (§4.1, §8).
+
+**codex `019f6c40` re-review → v3.1.1 consistency pass.** The re-review confirmed I2/I3/I4/I5/M2
+**closed** and flagged 4 residual slips (C1/I1/I6/M1 partial), all now fixed: the phase-goal
+promise reframed to "durable initiation reasons, not the send" (§1); the last "any kind" wording
+tightened to "a registered kind" (§3 item 3, §4.1); the appraisal form deferred to lm-705.11 as
+the single authority (§4.1); `processed_crystallize` marked as the crystallization *decision*
+(component span persists **before** the `StateActor` commit — encode ≠ durable) (§5); and
+**emergence / contact-hazard** relabelled a deferred contact/arbiter measure, not a
+crystallization-slice one (§6). **Verdict: ready to hand to the implementation plan.**
