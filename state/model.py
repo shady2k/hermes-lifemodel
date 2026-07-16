@@ -242,8 +242,13 @@ class State:
     #: :class:`~lifemodel.adapters.internal_runner.InternalCognitionRunner` when it
     #: launches an aux call; cleared by
     #: :func:`~lifemodel.core.internal_cognition.run_internal_completion` on the
-    #: completion frame (success, timeout, or failure — a strand here would block
-    #: every future internal launch, mirroring the proactive gate).
+    #: completion frame (success, timeout, or failure). NB (lm-705.6 review): today
+    #: this is a correlation marker read ONLY by
+    #: :meth:`~lifemodel.adapters.internal_runner.InternalCognitionRunner.recover_stale`
+    #: at connect — it is NOT yet a single-flight gate (``launch`` does not check it
+    #: before setting it, and the completion clears it unconditionally). The first live
+    #: emitter (lm-705.5) MUST add that guard, else concurrent internal passes can run
+    #: bounded only by the FR20 daily ceiling.
     pending_internal_id: str | None = None
     #: FR20 durable daily call ceiling (lm-705.6, design §3.4): how many
     #: internal-cognition calls have been reserved so far on :attr:`internal_calls_day`.
@@ -253,7 +258,8 @@ class State:
     #: created. Resets to 1 (not 0) the first reservation of a new day — see that
     #: function. Additive: ``from_dict`` defaults it to 0 when absent.
     internal_calls_today: int = 0
-    #: The ISO-8601 UTC *date* (``YYYY-MM-DD``, no time) :attr:`internal_calls_today`
+    #: The ISO-8601 *date* (``YYYY-MM-DD``, no time; server-local, via ``SystemClock``,
+    #: like every other lifemodel timestamp) :attr:`internal_calls_today`
     #: was counted against — the day-rollover key
     #: :func:`~lifemodel.core.budget.reserve_internal_call` compares its ``now``
     #: against. ``""`` before the first reservation ever made (never matches a real

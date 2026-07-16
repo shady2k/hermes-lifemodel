@@ -418,7 +418,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # construction, or a host build with no `ctx.llm`) skips it entirely: the
         # being ticks exactly as it did before this bead.
         with wire("internal_cognition_runner", required=False, health=health, logger=_LOG):
-            if self._llm is not None:
+            if self._internal_runner is None and self._llm is not None:
                 self._internal_runner = InternalCognitionRunner(
                     self._build_lm,
                     self._llm,
@@ -477,6 +477,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # has a live sink for however briefly it runs after cancellation.
         if self._internal_runner is not None:
             await self._internal_runner.cancel_all()
+            # Null it (mirroring the trace_writer / metrics_sampler releases below) so a
+            # reconnect-WITH-disconnect rebuilds a fresh runner bound to the new gateway
+            # loop, while the connect-side ``is None`` guard makes a reconnect that SKIPS
+            # disconnect keep the EXISTING runner + its still-live tasks — never orphaning
+            # them (they were never cancel_all'd on that path).
+            self._internal_runner = None
         # Release the trace writer (flush + stop on the last release, §4.2).
         if self._trace_writer is not None:
             release_trace_writer(observability_db_path(self._base_dir))
