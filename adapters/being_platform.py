@@ -6,17 +6,26 @@ the gateway owns its lifecycle: it calls ``connect()`` at startup and — when t
 adapter signals a fatal error — its reconnect watcher re-dials ``connect()``.
 
 ``connect()`` starts a :class:`SupervisedLoop` that drives the Hermes-free
-decision path (``build_lifemodel`` → :func:`proactive_tick`) every interval and
+decision path (``build_lifemodel`` → one ``ExecutionFrame`` →
+:func:`~lifemodel.core.proactive.dispatch_launches`) every interval and
 delivers a surfaced launch into the user's real Telegram lane via reach-in. If
 the loop dies, :meth:`_on_loop_death` converts that into
 ``_set_fatal_error(retryable=True)`` + ``_notify_fatal_error()`` — the load-bearing
 detail: gateway supervision is notification-based, so a silently-dying task is
 invisible without this (the previous failure mode; cf. IRC ``_receive_loop``).
 
+The SAME tick also owns the non-delivered internal-cognition seam (lm-705.6,
+design §3.1): any ``LaunchInternalCognition`` the frame surfaced is handed to
+the adapter-owned :class:`~lifemodel.adapters.internal_runner.InternalCognitionRunner`,
+built here (on the gateway loop `connect()` itself already runs on) and torn
+down in :meth:`disconnect`. This bead ships no live emitter of that intent yet
+(noticing/processing do, later) — the wiring exists so the seam is exercised
+end-to-end without waiting for its first real consumer.
+
 Because it imports ``gateway.*`` at module load, this file is NOT importable
 off-host; it is exercised at runtime in the gateway, never by the unit suite.
 All of its logic lives in tested Hermes-free units (``core/supervised_loop``,
-``core/proactive``).
+``core/proactive``, ``core/internal_cognition``, ``adapters/internal_runner``).
 """
 
 from __future__ import annotations
@@ -33,10 +42,12 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from ..composition import LifeModel, build_lifemodel
-from ..core.frame import state_actor_lock
+from ..core.frame import FrameTrigger, run_frame, state_actor_lock
 from ..core.genesis import needs_adoption
+from ..core.internal_cognition import NullInternalApply
+from ..core.llm_port import InternalCognitionRequest, LlmPort
 from ..core.metrics import get_metric_registry
-from ..core.proactive import proactive_tick
+from ..core.proactive import dispatch_launches
 from ..core.supervised_loop import SupervisedLoop
 from ..core.timeutil import to_iso
 from ..events import EventRing
@@ -57,6 +68,7 @@ from ..state.trace_store import (
 )
 from ..state.wiring import wire
 from .clock import SystemClock
+from .internal_runner import InternalCognitionRunner
 from .owner_tz import resolve_owner_tz
 from .reachin import ReachInEgress, default_runner_accessor
 from .session_end import GatewayBirthVoice
@@ -67,6 +79,23 @@ PLATFORM_NAME = "lifemodel"
 #: single source the loop interval and the ``/lifemodel status`` staleness threshold both
 #: derive from) so the two never drift.
 LOOP_INTERVAL_SEC = DEFAULT_TICK_INTERVAL_SECONDS
+
+#: FR20's v1 default (design §3.4 — "simplest reliable form", no product-specified
+#: number yet). A generous-but-real ceiling: idle ticks stay 0-LLM (S5) since
+#: nothing emits ``LaunchInternalCognition`` without a real trigger (lm-705.5), so
+#: this only bounds the SPIKE once a trigger exists. Tune once noticing/processing
+#: are live and the actual call cadence is known.
+DEFAULT_DAILY_INTERNAL_CALL_CEILING = 50
+
+#: The internal-cognition pass's fixed system framing (design §3.3) — content-free
+#: on purpose: THIS bead's own consumer is
+#: :class:`~lifemodel.core.internal_cognition.NullInternalApply` (ignores the
+#: result), so the instructions only need to keep a real call honest about
+#: non-delivery; noticing/processing (lm-705.5/.2) will pass their own.
+_INTERNAL_COGNITION_INSTRUCTIONS = (
+    "This is the being's own private, non-delivered internal thinking. Nothing you "
+    "produce here is shown to anyone."
+)
 
 _LOG = logging.getLogger("lifemodel.being")
 
@@ -83,12 +112,19 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         interval_sec: float = LOOP_INTERVAL_SEC,
         soul: SoulFile | None = None,
         default_soul_text: str = "",
+        llm: LlmPort | None = None,
     ) -> None:
         super().__init__(config, Platform(PLATFORM_NAME))
         self._base_dir = base_dir
         self._target: dict[str, str | None] = target or {}
         self._interval = interval_sec
         self._egress = ReachInEgress(runner_accessor=default_runner_accessor)
+        # The internal-cognition seam's LlmPort (lm-705.6) — the real adapter
+        # (`PluginLlmPort` over `ctx.llm`) wired by `register()`. `None` degrades
+        # the seam off cleanly (no runner built in `connect()`, see there): a
+        # bare-constructed adapter (every existing test) or a host build without
+        # `ctx.llm` still boots and ticks exactly as before this bead.
+        self._llm = llm
         # The SAME SoulFile instance `register()` built for the genesis pre_llm_call
         # injector (spec §6.4) — reused here (never a second instance) so the veteran
         # read behind the WAKE PACKET's ritual and the injector's own read go through
@@ -132,6 +168,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # acquisition fails we keep the brain alive but flip this, so the degradation
         # is observable rather than silent. Cleared once the sampler comes up.
         self._metrics_degraded = False
+        # The internal-cognition seam's runner (lm-705.6) — built in :meth:`connect`
+        # ONLY when a LlmPort was injected (``self._llm is not None``); ``None``
+        # otherwise, and :meth:`_tick`/:meth:`disconnect` both guard on that so the
+        # seam degrades off cleanly rather than ever blocking the proactive brain loop.
+        self._internal_runner: InternalCognitionRunner | None = None
 
     @property
     def metrics_degraded(self) -> bool:
@@ -166,8 +207,29 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         UNBORN being must not reach out of a system prompt that is not it. See
         :class:`~lifemodel.adapters.session_end.GatewayBirthVoice` — it is a no-op for a
         being that already speaks as its own soul, which is every being after its birth.
+
+        Runs ONE ``ExecutionFrame`` (never :func:`~lifemodel.core.proactive.proactive_tick`
+        directly, lm-705.6): the SAME frame's report feeds BOTH the proactive delivery
+        path (:func:`~lifemodel.core.proactive.dispatch_launches`, behavior-identical to
+        the old ``proactive_tick`` call) and the internal-cognition seam
+        (``report.internal_launches`` →
+        :meth:`~lifemodel.adapters.internal_runner.InternalCognitionRunner.launch`) —
+        a second ``run_frame`` call here would double-tick (a second bookkeeping bump,
+        a second energy/fatigue recovery pass).
         """
-        proactive_tick(self._build_lm(), self._egress, self._target, voice=self._voice)
+        lm = self._build_lm()
+        assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+        report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+        dispatch_launches(lm, report, self._egress, self._target, voice=self._voice)
+        if self._internal_runner is not None:
+            for launch in report.internal_launches:
+                self._internal_runner.launch(
+                    InternalCognitionRequest(
+                        instructions=_INTERNAL_COGNITION_INSTRUCTIONS,
+                        input_text=launch.prompt,
+                    ),
+                    launch.correlation_id,
+                )
 
     def _prior_soul(self) -> str | None:
         """The soul someone wrote before this being woke, or ``None`` for a blank page.
@@ -345,6 +407,29 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
                 )
         self._metrics_degraded = self._metrics_sampler is None
 
+        # The internal-cognition seam's runner (lm-705.6) is OPTIONAL/DEGRADED, like
+        # the metrics sampler above: it is not yet exercised by any live emitter
+        # (noticing/processing land later) and must never be able to block boot or
+        # the proactive brain loop. Built + recovered BEFORE `brain_loop_start`
+        # below creates the loop's task — `connect()` has no `await` before that
+        # point, so the loop's first tick genuinely cannot run until this whole
+        # method returns (mirrors the soul-reconciliation ordering note further
+        # down). `self._llm is None` (no LlmPort injected — an off-host/bare test
+        # construction, or a host build with no `ctx.llm`) skips it entirely: the
+        # being ticks exactly as it did before this bead.
+        with wire("internal_cognition_runner", required=False, health=health, logger=_LOG):
+            if self._llm is not None:
+                self._internal_runner = InternalCognitionRunner(
+                    self._build_lm,
+                    self._llm,
+                    self._egress,
+                    self._target,
+                    daily_ceiling=DEFAULT_DAILY_INTERNAL_CALL_CEILING,
+                    gateway_loop=asyncio.get_running_loop(),
+                    apply=NullInternalApply(),
+                )
+                self._internal_runner.recover_stale(self._build_lm())
+
         # The brain loop itself is REQUIRED — a failure to start it is the outage.
         with wire("brain_loop_start", required=True, health=health, logger=_LOG):
             self._loop = SupervisedLoop(
@@ -386,6 +471,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
             self._loop_task = None
+        # Cancel + await every in-flight internal-cognition call (lm-705.6) — AFTER
+        # the main loop is stopped (no new launches) and BEFORE the trace
+        # writer/metrics sampler release below, so a task's fail-loud logging still
+        # has a live sink for however briefly it runs after cancellation.
+        if self._internal_runner is not None:
+            await self._internal_runner.cancel_all()
         # Release the trace writer (flush + stop on the last release, §4.2).
         if self._trace_writer is not None:
             release_trace_writer(observability_db_path(self._base_dir))
@@ -445,6 +536,7 @@ def register_being_platform(
     target: dict[str, str | None] | None,
     soul: SoulFile | None = None,
     default_soul_text: str = "",
+    llm: LlmPort | None = None,
 ) -> None:
     """Register the being as a gateway platform (call from ``register(ctx)``).
 
@@ -454,6 +546,11 @@ def register_being_platform(
     PACKET goes through the one shared soul-file writer-lock, never a second instance.
     Both default to unset for callers (chiefly tests) that don't wire a soul: the ritual
     then degrades to the blank-page opening rather than crashing.
+
+    *llm* (lm-705.6) is the internal-cognition seam's :class:`~lifemodel.core.llm_port.LlmPort`
+    — ``register()`` resolves the real :class:`~lifemodel.adapters.plugin_llm_adapter.PluginLlmPort`
+    over ``ctx.llm`` and passes it through; ``None`` (the default, and every caller
+    that doesn't wire one) leaves the seam degraded off in :meth:`BeingAdapter.connect`.
     """
     ctx.register_platform(
         PLATFORM_NAME,
@@ -464,6 +561,7 @@ def register_being_platform(
             target=target,
             soul=soul,
             default_soul_text=default_soul_text,
+            llm=llm,
         ),
         check_fn=make_check_fn(),
         emoji="🫀",

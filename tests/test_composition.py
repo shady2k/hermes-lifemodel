@@ -406,3 +406,18 @@ def test_build_lifemodel_registers_thought_capture(tmp_path: Path) -> None:
     lm = build_lifemodel(base_dir=tmp_path)
     ids = {m.id for m in lm.registry.manifests()}
     assert THOUGHT_CAPTURE_ID in ids
+
+
+# --- lm-705.6: the internal-cognition seam has no live emitter YET -----------
+
+
+def test_default_pipeline_never_emits_launch_internal_cognition(tmp_path: Path) -> None:
+    # This bead (lm-705.6) ships only the SEAM — no registered component emits
+    # LaunchInternalCognition (noticing/processing, lm-705.5/.2, are the real
+    # emitters). Pinning this now means a future regression that accidentally
+    # wakes the seam on the default pipeline is caught here, not live.
+    lm = build_lifemodel(base_dir=tmp_path)
+    lm.state.commit(_born(u=3.0, energy=1.0, last_tick_at="2026-07-06T03:59:00+00:00"))
+    _seed_active_desire(lm.state)
+    report = lm.coreloop.tick()
+    assert report.internal_launches == ()

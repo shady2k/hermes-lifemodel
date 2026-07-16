@@ -650,6 +650,33 @@ def register(ctx: Any) -> None:
             description=_WRITE_SOUL_DESCRIPTION,
         )
 
+    # --- Internal-cognition seam wiring (lm-705.6) — OPTIONAL/DEGRADED --------
+    # The non-delivered internal-cognition seam's two host touchpoints: the aux-task
+    # config surface (so ``auxiliary.lifemodel_internal`` exists in the picker/config,
+    # even though — see adapters/plugin_llm_adapter.py's docstring — the CURRENT
+    # ``ctx.llm.acomplete_structured`` facade does not yet thread a ``task=`` key
+    # through to it) and the ``LlmPort`` itself (over ``ctx.llm``). Both are NEWER host
+    # surfaces (``register_auxiliary_task`` may not exist on an older build; a duck-typed
+    # test ``ctx`` — see the register-smoke tests — has neither), and NEITHER is
+    # exercised by a live emitter yet (noticing/processing land later, lm-705.5/.2) — so
+    # this is OPTIONAL/DEGRADED, unlike the REQUIRED platform wiring below: a missing or
+    # failing host surface here must never take the being's boot down with it.
+    internal_llm: Any = None
+    with wire("internal_cognition_aux_task", required=False, health=health, logger=_LOG):
+        register_aux_task = getattr(ctx, "register_auxiliary_task", None)
+        if callable(register_aux_task):
+            register_aux_task(
+                "lifemodel_internal",
+                display_name="Lifemodel inner cognition",
+                description="The being's private, non-delivered thinking (noticing/rumination).",
+                defaults={"provider": "auto", "model": "", "timeout": 30},
+            )
+        ctx_llm = getattr(ctx, "llm", None)
+        if ctx_llm is not None:
+            from .adapters.plugin_llm_adapter import PluginLlmPort
+
+            internal_llm = PluginLlmPort(ctx_llm)
+
     # --- Proactive brain wiring (the being as a gateway platform) — REQUIRED --
     # The autonomic brain is hosted as a gateway-supervised platform adapter: its
     # connect() runs the tick loop, and the gateway's reconnect watcher restarts it on
@@ -672,6 +699,7 @@ def register(ctx: Any) -> None:
             target=resolve_home_origin(),
             soul=soul,
             default_soul_text=_default_soul_text(),
+            llm=internal_llm,
         )
 
     # All REQUIRED wiring for this process succeeded → wipe any stale durable
