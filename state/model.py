@@ -266,6 +266,22 @@ class State:
     #: date, so the first call always rolls over cleanly). Additive: ``from_dict``
     #: defaults it to ``""`` when absent.
     internal_calls_day: str = ""
+    #: The durable object a *currently in-flight* internal-cognition pass concerns
+    #: (lm-705.2): for a processing pass, the ``kind='thought'`` id being ruminated
+    #: on, so the completion frame's
+    #: :class:`~lifemodel.core.thought_processing.ThoughtProcessingApply` knows WHICH
+    #: thought the typed outcome applies to. ``None`` when no pass is in
+    #: flight, or the pass has no single durable subject (e.g. noticing, lm-705.5).
+    #: Set atomically with :attr:`pending_internal_id` in the runner's reserve frame,
+    #: cleared with it on completion. Additive: ``from_dict`` defaults it to ``None``.
+    pending_internal_subject_id: str | None = None
+    #: When the being last LAUNCHED an internal-cognition pass (lm-705.2) — the
+    #: min-inter-processing-interval key (spec §4.5). Server-local ISO-8601 (like every
+    #: lifemodel timestamp). Stamped in the runner's reserve frame on a successful
+    #: launch (never on a denied/gated one, so the interval clock only advances when a
+    #: pass really started). ``None`` before the first pass ever. Additive: ``from_dict``
+    #: defaults it to ``None``.
+    last_internal_call_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -393,6 +409,12 @@ class State:
                 data.get("internal_calls_today", 0), "internal_calls_today"
             ),
             internal_calls_day=_as_str(data.get("internal_calls_day", ""), "internal_calls_day"),
+            pending_internal_subject_id=_as_opt_str(
+                data.get("pending_internal_subject_id"), "pending_internal_subject_id"
+            ),
+            last_internal_call_at=_as_opt_str(
+                data.get("last_internal_call_at"), "last_internal_call_at"
+            ),
         )
 
 

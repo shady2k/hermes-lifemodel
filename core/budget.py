@@ -16,14 +16,51 @@ the aux LLM call itself runs off the state-actor lock).
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from ..core.timeutil import from_iso
 from ..state.model import State
 
 
 def _day(now: datetime) -> str:
     """The plain ISO date (``YYYY-MM-DD``) *now* falls on — the day-rollover key."""
     return now.date().isoformat()
+
+
+#: FR20 v1 default daily ceiling (spec §4.5) — the ONE source of truth, imported by
+#: both the runner (the atomic reserve) and the selector (the pre-check), so the two
+#: can never drift. A generous-but-real cap: idle ticks stay 0-LLM, this only bounds
+#: the spike once a live emitter (lm-705.2) exists. Tune against live traces.
+DEFAULT_DAILY_INTERNAL_CALL_CEILING = 50
+
+#: Min wall-clock gap between two internal-cognition launches (spec §4.5) — paces
+#: rumination so a live backlog is chewed a little at a time, not all at once.
+DEFAULT_MIN_INTERPROCESSING_INTERVAL = timedelta(minutes=30)
+
+
+def internal_budget_available(state: State, *, now: datetime, daily_ceiling: int) -> bool:
+    """True iff another internal-cognition call fits under today's FR20 ceiling.
+
+    The read-only pre-check the selector runs so it never emits a launch the runner's
+    atomic :func:`reserve_internal_call` would just deny (and to log the honest
+    ``skipped_no_budget`` reason). Shares the day-rollover convention with
+    ``reserve_internal_call``: a call on a new day counts against 0."""
+    used = state.internal_calls_today if state.internal_calls_day == _day(now) else 0
+    return used < daily_ceiling
+
+
+def internal_interval_elapsed(state: State, *, now: datetime, min_interval: timedelta) -> bool:
+    """True iff at least *min_interval* has passed since the last launch (spec §4.5).
+
+    ``True`` when no pass has ever run (``last_internal_call_at is None``). Fail-open:
+    an unparseable stored timestamp reads as elapsed rather than wedging processing."""
+    if state.last_internal_call_at is None:
+        return True
+    try:
+        last = from_iso(state.last_internal_call_at)
+    except (ValueError, TypeError):
+        return True
+    return now - last >= min_interval
 
 
 def reserve_internal_call(state: State, *, now: datetime, daily_ceiling: int) -> State | None:
