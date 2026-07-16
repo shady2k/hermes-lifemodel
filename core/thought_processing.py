@@ -21,9 +21,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import cast
 
-from ..domain.memory import JsonObject, MemoryPatch, TransitionOp
-from ..domain.objects import Thought, ThoughtState
+from ..domain.memory import JsonObject, MemoryPatch, PutOp, TransitionOp
+from ..domain.objects import (
+    CommitmentBasis,
+    CommitmentTriggerKind,
+    InvalidPayload,
+    Thought,
+    ThoughtState,
+)
 from ..ports.tracer import format_traceparent
 from .budget import (
     DEFAULT_DAILY_INTERNAL_CALL_CEILING,
@@ -31,11 +38,13 @@ from .budget import (
     internal_budget_available,
     internal_interval_elapsed,
 )
+from .commitment_view import build_commitment, crystallized_commitment_id, encode_commitment
 from .component import TickContext
-from .intents import Intent, LaunchInternalCognition, TransitionRecord
+from .intents import Intent, LaunchInternalCognition, PutRecord, TransitionRecord
 from .taxonomy import KIND_INTERNAL_RESULT, read_internal_result
 from .thought_view import live_thoughts
 from .timeutil import from_iso, to_iso
+from .trace import creation_provenance
 
 #: How many non-progress (malformed/no-parse) attempts a thought tolerates before it
 #: is ``drop``ped (spec §4.1 "max total processing attempts"). Distinct from park.
@@ -355,16 +364,60 @@ class ThoughtProcessingApply:
         decision = decide_processing_transition(
             thought, parsed=result.parsed, raw=result.raw, now=ctx.now
         )
+        self._maybe_log_reflection(ctx, result.parsed)
+        if decision.crystallize is not None:
+            return self._crystallize(ctx, thought, decision.crystallize)
         self._log(ctx, decision.reason, subject_id)
+        return [TransitionRecord(op=decision.transition)] if decision.transition is not None else []
+
+    def _crystallize(
+        self, ctx: TickContext, thought: Thought, fields: JsonObject
+    ) -> Sequence[Intent]:
+        """Build the Commitment + emit its PutRecord alongside the thought's resolve; a
+        builder/registry failure falls back to the bounded no-progress path (codex I2)."""
+        try:
+            commitment = build_commitment(
+                id=crystallized_commitment_id(thought.id, str(fields["content"])),
+                content=str(fields["content"]),
+                basis=CommitmentBasis(str(fields["basis"])),
+                trigger_kind=CommitmentTriggerKind(str(fields["trigger_kind"])),
+                trigger_value=str(fields["trigger_value"]),
+                due_at=(str(fields["due_at"]) if fields.get("due_at") is not None else None),
+                source_thought_ids=(thought.id,),
+                other_regarding_value=float(
+                    cast("float | int | str", fields.get("other_regarding_value") or 0.0)
+                ),
+                salience=thought.salience,
+                provenance=creation_provenance(
+                    ctx.trace,
+                    created_by=self.id,
+                    component="cognition",
+                    reason="thought crystallized into a commitment",
+                    source_object_ids=(thought.id,),
+                ),
+            )
+            draft = encode_commitment(commitment)  # registry-validates → InvalidPayload on bad data
+        except (InvalidPayload, ValueError, KeyError, TypeError):
+            fallback = _park_or_terminate(thought, now=ctx.now, no_progress=True)
+            self._log(ctx, fallback.reason, thought.id)
+            return [TransitionRecord(op=fallback.transition)] if fallback.transition else []
+        if ctx.logger is not None:
+            ctx.logger.span.set(
+                processing_reason=ProcessingReason.CRYSTALLIZED_COMMITMENT.value,
+                thought_id=thought.id,
+                crystallized_kind=commitment.KIND,
+                crystallized_id=commitment.id,
+            )
+        return [
+            TransitionRecord(op=_transition(thought, ThoughtState.RESOLVED, {})),
+            PutRecord(op=PutOp(draft=draft)),
+        ]
+
+    def _maybe_log_reflection(self, ctx: TickContext, parsed: JsonObject | None) -> None:
         # The model's first-person reflection rides the span, never the thought (spec
         # §4.1 — no residue field) — this is the ONE place it is read at all.
-        if (
-            ctx.logger is not None
-            and isinstance(result.parsed, dict)
-            and "reflection" in result.parsed
-        ):
-            ctx.logger.span.set(reflection=str(result.parsed.get("reflection", ""))[:500])
-        return [TransitionRecord(op=decision.transition)] if decision.transition is not None else []
+        if ctx.logger is not None and isinstance(parsed, dict) and "reflection" in parsed:
+            ctx.logger.span.set(reflection=str(parsed.get("reflection", ""))[:500])
 
     def _live_subject(self, ctx: TickContext, subject_id: str) -> Thought | None:
         for t in live_thoughts(ctx.objects):
