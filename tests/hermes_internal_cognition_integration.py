@@ -91,6 +91,7 @@ async def main_async() -> dict[str, Any]:
     from lifemodel.adapters.internal_runner import InternalCognitionRunner
     from lifemodel.adapters.plugin_llm_adapter import PluginLlmPort
     from lifemodel.composition import build_lifemodel
+    from lifemodel.core.commitment_view import read_live_commitments
     from lifemodel.core.component import ComponentLayer, TickContext
     from lifemodel.core.intents import Intent, LaunchProactive, PutRecord
     from lifemodel.core.internal_cognition import NullInternalApply
@@ -438,6 +439,75 @@ async def main_async() -> dict[str, Any]:
     result["bp_egress_never_called"] = egress_bp.calls == []  # non-delivery is structural
     _log(f"[BP] {result}")
 
+    # ---- Part B-crystallize: a real thought crystallized into a real Commitment ----
+    bc_dir = home / "seam-bc"
+    bc_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(bc_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_bc = _build_lm_factory(bc_dir)
+    build_lm_bc().state.put(
+        encode_thought(
+            build_thought(
+                id="thought:seed:bc",
+                content="the owner mentioned a job interview on Friday",
+                state=ThoughtState.ACTIVE,
+                salience=0.8,
+            )
+        )
+    )
+
+    async def _async_caller_bc(**kwargs: Any) -> Any:
+        return (
+            "fake-provider",
+            "fake-model",
+            _fake_openai_response(
+                '{"outcome": "crystallize_commitment", '
+                '"reflection": "I want to check in on that", '
+                '"commitment": {"content": "ask how their interview went", '
+                '"basis": "follow_up", "trigger_kind": "event", '
+                '"trigger_value": "next time we talk"}}'
+            ),
+        )
+
+    plugin_llm_bc = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_async_caller_bc,
+    )
+    egress_bc = FakeEgress()
+    runner_bc = InternalCognitionRunner(
+        build_lm_bc,
+        PluginLlmPort(plugin_llm_bc),
+        egress_bc,
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=ThoughtProcessingApply(),
+        timeout=10.0,
+    )
+    runner_bc.launch(
+        InternalCognitionRequest(
+            instructions="ruminate", input_text="the thought", json_schema={"type": "object"}
+        ),
+        "c-cryst",
+        subject_id="thought:seed:bc",
+    )
+    for task in list(runner_bc._tasks):
+        await task
+    commitments_bc = read_live_commitments(build_lm_bc().state)
+    result["bc_commitment_created"] = any(
+        c.content == "ask how their interview went" for c in commitments_bc
+    )
+    commitment_bc = next(
+        (c for c in commitments_bc if c.content == "ask how their interview went"), None
+    )
+    result["bc_commitment_links_source"] = commitment_bc is not None and (
+        "thought:seed:bc" in commitment_bc.source_thought_ids
+    )
+    result["bc_thought_resolved"] = read_thought(build_lm_bc().state, "thought:seed:bc") is None
+    result["bc_egress_never_called"] = egress_bc.calls == []  # non-delivery is structural
+    result["bc_pending_cleared"] = build_lm_bc().state.load().pending_internal_id is None
+    _log(f"[BC] {result}")
+
     return result
 
 
@@ -468,6 +538,11 @@ _REQUIRED_TRUE_KEYS = (
     "bp_subject_cleared",
     "bp_thought_resolved",
     "bp_egress_never_called",
+    "bc_commitment_created",
+    "bc_commitment_links_source",
+    "bc_thought_resolved",
+    "bc_egress_never_called",
+    "bc_pending_cleared",
 )
 
 
