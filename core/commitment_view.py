@@ -40,8 +40,18 @@ _REGISTRY = default_registry()
 
 def crystallized_commitment_id(source_thought_id: str, content: str) -> str:
     """A deterministic id scoping a content fingerprint to its source thought (never
-    random; never a bare global content hash — distinct episodes must not conflate)."""
-    digest = hashlib.sha256(f"{source_thought_id}\x00{content.strip()}".encode()).hexdigest()[:16]
+    random; never a bare global content hash — distinct episodes must not conflate).
+
+    Model-supplied ``content`` may hold a lone Unicode surrogate (not UTF-8-encodable);
+    the fingerprint ``.encode()`` then raises ``UnicodeEncodeError``, which is translated
+    to :class:`InvalidPayload` so a crystallize caller's narrow ``except InvalidPayload``
+    still bounds it as bad model data (lm-705.3 review I1c), never an uncaught strand."""
+    try:
+        digest = hashlib.sha256(f"{source_thought_id}\x00{content.strip()}".encode()).hexdigest()[
+            :16
+        ]
+    except UnicodeEncodeError as exc:
+        raise InvalidPayload("content is not UTF-8 encodable") from exc
     return derive_id(COMMITMENT_KIND, "seed", digest)
 
 
