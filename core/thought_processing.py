@@ -33,6 +33,7 @@ from .budget import (
 )
 from .component import TickContext
 from .intents import Intent, LaunchInternalCognition, TransitionRecord
+from .taxonomy import KIND_INTERNAL_RESULT, read_internal_result
 from .thought_view import live_thoughts
 from .timeutil import from_iso, to_iso
 
@@ -265,3 +266,54 @@ class ThoughtProcessingSelector:
         if not internal_budget_available(ctx.state, now=ctx.now, daily_ceiling=self._daily_ceiling):
             return ProcessingReason.SKIPPED_NO_BUDGET, None
         return ProcessingReason.CHOSE_PROCESS, actives[0]  # live_thoughts is salience-desc
+
+
+THOUGHT_PROCESSING_APPLY_ID = "thought-processing-apply"
+
+
+class ThoughtProcessingApply:
+    """Turn a completed processing pass's typed result into the thought's next state.
+
+    The runner's injected ``apply`` (lm-705.6): it runs only inside the
+    ``ASYNC_COMPLETION`` frame :func:`~lifemodel.core.internal_cognition.run_internal_completion`
+    seeds, so it guards on an ``internal_result`` signal + a matching in-flight subject
+    and no-ops otherwise (a subjectless noticing pass, a cleared/terminal subject, or a
+    non-completion frame all fall through to ``[]``). Emits at most one
+    ``TransitionRecord`` (the atomic committer applies it under the lock)."""
+
+    id: str = THOUGHT_PROCESSING_APPLY_ID
+
+    def step(self, ctx: TickContext) -> Sequence[Intent]:
+        subject_id = ctx.state.pending_internal_subject_id
+        if subject_id is None:
+            return []
+        result = next(
+            (
+                read_internal_result(s)
+                for s in ctx.signals
+                if s.kind == KIND_INTERNAL_RESULT
+                and s.payload.get("correlation_id") == ctx.state.pending_internal_id
+            ),
+            None,
+        )
+        if result is None:
+            return []
+        thought = self._live_subject(ctx, subject_id)
+        if thought is None:
+            self._log(ctx, ProcessingReason.NO_SUBJECT, subject_id)
+            return []
+        decision = decide_processing_transition(
+            thought, parsed=result.parsed, raw=result.raw, now=ctx.now
+        )
+        self._log(ctx, decision.reason, subject_id)
+        return [TransitionRecord(op=decision.transition)] if decision.transition is not None else []
+
+    def _live_subject(self, ctx: TickContext, subject_id: str) -> Thought | None:
+        for t in live_thoughts(ctx.objects):
+            if t.id == subject_id and t.state == ThoughtState.ACTIVE.value:
+                return t
+        return None
+
+    def _log(self, ctx: TickContext, reason: ProcessingReason, thought_id: str) -> None:
+        if ctx.logger is not None:
+            ctx.logger.span.set(processing_reason=reason.value, thought_id=thought_id)
