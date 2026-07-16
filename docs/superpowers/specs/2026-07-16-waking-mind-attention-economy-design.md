@@ -5,7 +5,7 @@
 drives) as a shippable slice. Roadmap chain:
 `lm-4fv (Genesis, done) → [Phase 5a: waking mind] → lm-adz (rest of Phase 5) → lm-0od (Phase 6)`.
 **Date:** 2026-07-16
-**Status:** design under review — **v2, revised after codex review `019f69d3`** (§10)
+**Status:** design under review — **v3, slice-3 redesigned by the owner (2026-07-16)**; v2 was the codex review `019f69d3` (§10)
 **Product source:** BRD FR3 (желания — plural, compete by salience, resolve, leave
 residue), FR4 (внутренняя жизнь — thoughts, Zeigarnik), FR5 (взросление — opinions as
 residue), FR20 (configurable hard cost ceiling), S5 (idle → 0-LLM). Principle §9.2 (model
@@ -99,9 +99,15 @@ certify theory" ethos.
    the **appraisal seam** (§4.1) — no such seam exists today.
 2. **Private thought processing** — one-shot, under a hard FR20 quota, via a **new
    non-delivering cognition path** (§4.1) — the existing `CognitionLauncher` only delivers.
-3. **Thought-origin contact desire** — a processed thought mints a contact desire through
-   the **existing** safety/cognition pipeline (§4.2). This is the structural `[SILENT]`
-   cure and it ships **without** the arbiter.
+3. **Thought crystallization** *(redesigned v3 — owner, 2026-07-16)* — a processed thought
+   **crystallizes into a durable catalog object** (§4.2): rumination decides what the thought
+   *becomes* — **any `kind`** — emitted through the generic `PutRecord` door, and the slice
+   **stops there** (no contact, no send). The first new type built is **`Commitment`** (a
+   follow-up the being holds — HLA's "strongest non-intrusive reason, serving the other").
+   Turning a crystallized object into an actual outreach is a **separate, later** concern (the
+   contact pipeline / arbiter reads it as a source). The old "thought mints a contact desire
+   and delivers" framing is **superseded** — that is now merely *one* possible crystallization
+   (`kind=desire`, `spring=THOUGHT`), and its delivery is out of this slice.
 4. **The arbiter** *(only after live traces from 1–3 show a reliably populated, healthy
    backlog)* — the 3-axis homeostatic selection, with the liveness + cost + feasibility
    contracts of §4.4. May be split off into its own bead if slices 1–3 teach us it should.
@@ -109,9 +115,10 @@ certify theory" ethos.
 **Deferred → Phase 6 (lm-0od):** spontaneous mind-wandering, deep/multi-branch thought
 trees, sleep/consolidation.
 **Deferred → rest of Phase 5 (lm-adz):** full SDT vector + temperament weights (FR7),
-trigger/commitment neurons, **opinions/predictions as first-class** (see §4.1 — the
-"resolve → opinion" residue is *not* built here; Thought has no residue field yet), open
-loops + receptivity, learned set-point (lm-ocx).
+trigger/commitment *neurons* (the `Commitment` **type** now ships in slice 3, v3 — but
+*arbitrating / acting on* commitments, and the contact pipeline reading them, is deferred),
+**opinions/predictions as first-class** (added later by slice 3's generic crystallization
+mechanism — same door, new builder), open loops + receptivity, learned set-point (lm-ocx).
 **Not reworked:** the v1 contact drive (lm-x43) is correct as an isolated organ and
 becomes **one axis** — untouched.
 
@@ -137,7 +144,8 @@ distinct internal-cognition protocol:
 - correlation + pending-idempotency **distinct** from outbound contact;
 - an async completion frame carrying a **typed thought outcome** (deterministic schema +
   validation);
-- atomic application of the thought transition **and** any minted desire in one commit.
+- atomic application of the thought transition **and** any crystallized object's `PutRecord`
+  (§4.2, v3 — any catalog `kind`, not a hard-wired desire) in one commit.
 
 **Bounded lifecycle (required — snapshot-per-tick is not enough).** Processing develops
 **one** selected thought by one layer (top-K, **K=1**, by salience). The Thought schema
@@ -150,42 +158,52 @@ thought.py`); this phase **defines their rules**:
 - **park backoff** and a **max park cycles** bound;
 - terminal behaviour after repeated malformed LLM output.
 
-Outcomes (a `TransitionRecord`): **mint a contact-desire** (§4.2) · **park** · **drop** ·
-**resolve** (plain — *no* opinion/residue is written here; the residue field and the
-"opinion" outcome belong to the deferred becoming work, lm-adz). Processing discharges the
-nag; an unprocessed thought decays slowly.
+Outcomes *(v3)*: **crystallize** (§4.2 — the rumination emits a `PutRecord` for the durable
+object the thought *became*: any catalog `kind`; the source thought transitions terminal with
+a provenance link) · **park** · **drop** · **resolve** (plain — the thought produced nothing
+durable). Processing discharges the nag; an unprocessed thought decays slowly. *(v3 note:
+"mint a contact-desire" is no longer a distinct outcome — a contact `Desire` is simply one
+`kind` a thought may crystallize into, and producing it does **not** deliver anything here;
+the atomic commit is the thought transition **plus** the crystallized `PutRecord`.)*
 
-### 4.2 The top-down contact desire — the structural `[SILENT]` cure (ships without the arbiter)
+### 4.2 Crystallization — a processed thought becomes durable objects *(redesigned v3 — owner, 2026-07-16)*
 
-A processed thought can mint a **thought-origin** contact desire ("I thought about X and
-want to share it"). The domain already supports `DRIVE` / `THOUGHT` / `MIXED` springs
-(`domain/objects/desire.py`). This is the heart of non-intrusive contact (HLA §4.1) and it
-goes through the **existing** pipeline, so it is deliverable in slices 1–3 with no arbiter.
+**The model.** Processing a thought is **rumination that crystallizes**: the being thinks a
+thought over and it *becomes* a durable catalog object — **any `kind`** (D8: "cognition mints
+Desire / Thought / Intention"). The typed processing outcome names *what the thought became*;
+`ThoughtProcessingApply` builds that object via its registered builder, emits the corresponding
+`PutRecord(kind)` through the registry door (**never** a direct store write), and transitions
+the source thought terminal, provenance-linked (`source_thought_ids` / `parent_id`), in **one
+atomic commit**. A thought crystallizes into **one** object here (K=1). The mechanism is
+**generic over the catalog**: a new target type is *only* a new outcome variant + its builder,
+never a mechanism change — that is exactly what "a thought can produce any type" means. **The
+slice stops at producing the object — no contact, no send, no arbiter.**
 
-**Collision semantics (required — the contact desire is a singleton).** A thought may want
-to mint contact while a DRIVE-origin desire is already live. Decide before plan:
+**First new type — `Commitment`.** The catalog (D8) declares `Commitment · Opinion ·
+Prediction` as extensions; **none exists in code yet** (`domain/objects/` has only
+`Desire / Intention / Thought / UserModel`). This slice builds the first: **`Commitment`** —
+*what the being decided to do, having thought it over* (a follow-up / obligation: "ask how
+their interview went", "come back to the moving-house topic"). HLA §4.1 names it "the strongest
+non-intrusive reason, **serving the other**", so it is the natural crystallization for the
+epic's goal (content-bearing *initiation*) — whereas `Opinion` / `Prediction` shape *replies*,
+not initiation, and are added later by the **same** mechanism. Shape (finalized in the plan):
+`content` (1st-person what), `trigger` (when to honour — time/event, Gollwitzer if-then),
+`source_thought_ids`, `other_regarding_value` (it serves the other), `salience`; state machine
+`active → honoured | dropped | expired` (+ `deferred`), transitions guarded by the registry.
 
-- **merge** the thought reason into the live desire, converting it to `MIXED` (leaning
-  this — preserves provenance and lifecycle);
-- vs queue vs replace.
-
-**Interaction with `repeat_pure_longing` (the liveness answer).** The floor HOLDs
-*pure-longing* (DRIVE) bids after one unanswered outreach, regardless of `u`. A
-`THOUGHT`/`MIXED` spring is **not** pure longing, so it is the legitimate way a
-long-silent being reaches again — *with something to say*, which is exactly the
-non-pestering form we want. **Decide:** does a thought reason merging into a held
-DRIVE desire lift the hold (becoming `MIXED`)? And **when** is the source thought
-discharged — at proposal, desire creation, launch, or actual send? (Leaning: discharge on
-**delivered send**, so a lost/`[SILENT]` outcome does not silently consume the thought.)
-
-**Liveness invariant (stated on real outcomes).** Under clean silence — no in-flight turn,
-no active backoff, FR20 budget available — the real pipeline must launch **at least one**
-contact judgment by a deadline. With the floor as-is, that judgment must be **reachable
-via a thought-origin spring**; if the backlog is empty, liveness falls back to the
-existing certified DRIVE wake **subject to** `repeat_pure_longing` (i.e. after the *first*
-unanswered bid, further pure-longing HOLDs by design — the being waits for a real event or
-the human, which is the intended non-pestering behaviour, **not** a regression). This is
-the honest statement; v1's "u ceiling always fires" was not true.
+**The `[SILENT]` cure is now one crystallization, and it is decoupled from delivery.** A thought
+crystallizing into a contact `Desire` (`kind=desire`, `spring=THOUGHT` / `MIXED`) is still the
+structural `[SILENT]` cure, and the domain + floor are already pre-wired for it
+(`build_contact_desire`, the **DRIVE-only** `repeat_pure_longing` hold — `aggregation.py:346` —
+and the unanswered-counter's THOUGHT/MIXED "materially-new reason" branch). But **producing an
+object and turning it into an outreach are separate**: this slice enables neither the
+desire-crystallization nor any send. The contact-side questions it raised — collision with a
+live DRIVE desire (**merge → `MIXED`, lifting the hold** — the non-pestering "reach with
+something to say"), *when* a source object is discharged, and the liveness invariant (under
+clean silence the real pipeline must launch at least one contact judgment; a `THOUGHT`/`MIXED`
+spring is the reachable path, else it falls back to the certified DRIVE wake *subject to*
+`repeat_pure_longing`) — all move to the deferred **contact / arbiter** work. *(This supersedes
+v2's §4.2, which had slice 3 mint a contact desire and deliver it through the existing pipeline.)*
 
 ### 4.3 Internal state: a 3-axis vector (built with slice 4)
 
@@ -262,11 +280,12 @@ its own recent spans, not by confabulating.
 The sim vivifies the real code through the existing fake-port harness
 (`testing/harness.py`) and asserts: **emergence** (contact hazard varies with inner
 context, not a clock) · **backlog health** (seeded thoughts get processed; no starve, no
-spiral; no-progress decays; attempt/park bounds terminate) · **liveness** (the §4.2
-invariant holds; the thought-origin spring reaches under prolonged silence) · **safety**
-(every fixed-floor invariant, incl. `repeat_pure_longing`, holds throughout) · **cost**
-(idle default 0-LLM; a bounded backlog stays within the FR20 quota). No "calibrated to
-humans" claims.
+spiral; no-progress decays; attempt/park bounds terminate) · **crystallization** (v3 —
+slice 3: a processed thought produces the right durable object via `PutRecord`, provenance-
+linked, and the source thought discharges; the `[SILENT]`-cure **contact liveness** invariant
+moves with the deferred contact/arbiter work) · **safety** (every fixed-floor invariant, incl.
+`repeat_pure_longing`, holds throughout) · **cost** (idle default 0-LLM; a bounded backlog
+stays within the FR20 quota). No "calibrated to humans" claims.
 
 ## 7. Boundaries (recap)
 
@@ -274,7 +293,7 @@ humans" claims.
 |---|---|---|
 | event-seeded thought create+process | spontaneous mind-wandering | full SDT vector + temperament weights |
 | private (non-delivering) cognition path | deep multi-branch thought trees | trigger / commitment neurons |
-| thought-origin contact desire (`[SILENT]` cure) | sleep / consolidation | opinions/predictions + Thought **residue** field |
+| thought **crystallization** → durable object; `Commitment` type *(v3)* | sleep / consolidation | thought→**contact** + arbiter (the deferred `[SILENT]` delivery); opinions/predictions + Thought **residue** field |
 | FR20 cost quota; forced observability | | open loops + receptivity |
 | arbiter *(slice 4, evidence-gated)* | | learned set-point (lm-ocx) |
 
@@ -332,4 +351,19 @@ guarded transition). Outcome schema `{resolve|park|drop}`; bounds `no_progress_c
 birth-voice thread (prereq #1) and the single-flight gate (prereq #2). Deferred as beads:
 shared FR20 (**lm-705.7**), launch↔completion trace-weave (**lm-705.8**), refund-on-transient
 (**lm-705.9**), cheap-model routing — host-blocked (**lm-705.10**). No residue/opinion is
-written (that stays lm-adz); minting a contact desire is slice 3 (lm-705.3).
+written (that stays lm-adz); slice 3 (lm-705.3) extends the outcome to **crystallization** (v3).
+
+**v3 slice-3 redesign (owner, 2026-07-16) — "a thought can produce any type".** The owner
+replaced v2's fixed slice-3 outcome ("a processed thought mints a *contact desire* and delivers
+it through the existing pipeline") with a **generic crystallization** model: rumination decides
+*what durable catalog object the thought becomes* — **any `kind`** — via the generic `PutRecord`
+door, and the slice **stops at producing the object** (no contact, no send, no arbiter). The
+first new type built is **`Commitment`** (HLA's follow-up/obligation, "serving the other" — the
+initiation-reason, where Opinion/Prediction shape replies). Consequences threaded through the
+doc: §3 build-order item 3, §4.1 outcomes, §4.2 (rewritten), §6 sim, §7 boundaries. The
+`[SILENT]` cure is **not abandoned** — a thought→contact-`Desire` crystallization is now *one*
+case, and its collision/discharge/liveness questions + the actual send move to the deferred
+**contact / arbiter** work (the domain + `repeat_pure_longing` floor are already pre-wired for
+it). Motivation: the being's inner life should crystallize thinking into durable BDI objects
+generically (D8: "cognition mints Desire/Thought/Intention"), not be hard-wired to one outcome
+coupled to delivery. Bead **lm-705.3** re-scoped to match.
