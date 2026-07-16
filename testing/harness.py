@@ -35,6 +35,7 @@ from ..core.quality import Actor, Label
 from ..core.registry import ComponentManifest, UnknownComponent
 from ..core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from ..core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
+from ..core.thought_processing import THOUGHT_PROCESSING_SELECTOR_ID, ThoughtProcessingSelector
 from ..core.timeutil import to_iso
 from ..domain.egress import ProactiveOutcome, ReachOutcome
 from ..domain.memory import MemoryDraft, MemoryRecord
@@ -295,6 +296,62 @@ def build_capture_lifemodel(
                 id=THOUGHT_CAPTURE_ID,
                 type="thought-capture",
                 layer=ComponentLayer.AGGREGATION,
+                metric_surface=(),
+                accepts_signals=True,
+            ),
+        )
+    return lm
+
+
+def build_processing_lifemodel(
+    *, base_dir: Path | None = None, clock: ClockPort | None = None
+) -> LifeModel:
+    """A real-code ``LifeModel`` with
+    :class:`~lifemodel.core.thought_processing.ThoughtProcessingSelector` registered —
+    the slice-2 (lm-705.2) thought-processing sim seam (spec §6: backlog health,
+    bounds terminate, idle 0-LLM, cost <= FR20 ceiling).
+
+    Mirrors :func:`build_capture_lifemodel` exactly (see its docstring for why this
+    builds the ordinary real graph over a fresh on-disk
+    :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` rather than a fake-ports
+    harness): ``build_lifemodel`` already registers ``ThoughtProcessingSelector``
+    itself (lm-705.2 Task 7); the ``try``/``UnknownComponent`` guard below only
+    backfills it for a registry that somehow lacks it, mirroring every idempotent
+    registration in ``composition.py``.
+
+    ``base_dir`` defaults to a fresh temp directory so a caller can write
+    ``build_processing_lifemodel()`` bare. The being is committed BORN
+    (:data:`BORN_AT`) before return, same reasoning as ``build_capture_lifemodel``:
+    a thought-processing sim scenario is an ordinary tick inside an existing
+    relationship, never the genesis wake.
+    """
+    resolved_base_dir = (
+        base_dir
+        if base_dir is not None
+        else Path(tempfile.mkdtemp(prefix="lifemodel-thought-processing-"))
+    )
+    resolved_clock: ClockPort = (
+        clock if clock is not None else FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    )
+    lm = build_lifemodel(base_dir=resolved_base_dir, clock=resolved_clock)
+    lm.state.commit(
+        State(
+            u=0.0,
+            energy=1.0,
+            fatigue=0.0,
+            last_tick_at=resolved_clock.now().isoformat(),
+            genesis_completed_at=BORN_AT,
+        )
+    )
+    try:
+        lm.registry.manifest(THOUGHT_PROCESSING_SELECTOR_ID)
+    except UnknownComponent:
+        lm.registry.register(
+            ThoughtProcessingSelector(),
+            ComponentManifest(
+                id=THOUGHT_PROCESSING_SELECTOR_ID,
+                type="thought-processing-selector",
+                layer=ComponentLayer.COGNITION,
                 metric_surface=(),
                 accepts_signals=True,
             ),
