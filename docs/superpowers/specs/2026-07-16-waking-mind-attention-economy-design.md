@@ -235,6 +235,18 @@ an idle tick with no budget-permitted work is **0-LLM**, and a fully dormant day
 backlog, no events) trends to **$0**; a day with a live backlog costs **≤ the FR20
 ceiling**. *(This amendment is a product decision — see §10 hand-off.)*
 
+**lm-705.2 implementation notes (what shipped vs. what deferred).** Slice 2 caps the
+FR20 quota over **internal rumination only** — the genuinely-unbounded new spend. Proactive
+contact is left bounded by its **own** drive/backstop dynamics (`repeat_pure_longing` HOLDs
+after one unanswered outreach, §2), so total spend is bounded even though the two paths do
+not yet share **one** counter; unifying them is **lm-705.7** (deferred: it touches the
+load-bearing proactive path, so it waits on live traces). Cheap-model routing is **blocked
+on the host** — `ctx.llm.acomplete_structured` hard-codes `task=None`, so the sanctioned
+plugin lane cannot reach a registered aux-model slot; internal cognition therefore routes to
+the **main** model and the FR20 **call** ceiling (not a token budget) is the cost bound,
+with `model=`/`provider=` override tracked as **lm-705.10**. The min inter-processing
+interval + **single-flight** gate pace the spend below the daily ceiling in practice.
+
 ## 5. Observability
 
 Every arbiter/processing decision is a span with a **closed** `reason` enum
@@ -309,3 +321,15 @@ showed they are architecture, not plan-time detail.)*
 - **Retained (codex-affirmed sound):** thought records fit the typed BDI store;
   `PutRecord`/committer + end-of-frame atomicity are real seams; the real-code harness
   exists; thought-origin Desire is the strongest idea; event-seeded-only is an honest cut.
+
+**lm-705.2 build (2026-07-16) — slice 2 shipped (§3.2/§4.1/§4.5).** Private thought
+processing over the lm-705.6 seam: `ThoughtProcessingSelector` (heartbeat: re-arm expired
+parks `parked→active`, emit one FR20/interval/single-flight-gated `LaunchInternalCognition`
+for the top-salience active thought) + `ThoughtProcessingApply` (completion: typed outcome →
+guarded transition). Outcome schema `{resolve|park|drop}`; bounds `no_progress_count`
+(cap→drop) and `park_count` (6h/24h/72h backoff, cap→expire); a **transient** call failure
+(empty raw) never penalizes the thought. As the **first live emitter**, it also landed the
+birth-voice thread (prereq #1) and the single-flight gate (prereq #2). Deferred as beads:
+shared FR20 (**lm-705.7**), launch↔completion trace-weave (**lm-705.8**), refund-on-transient
+(**lm-705.9**), cheap-model routing — host-blocked (**lm-705.10**). No residue/opinion is
+written (that stays lm-adz); minting a contact desire is slice 3 (lm-705.3).
