@@ -1,0 +1,172 @@
+"""The waking mind's rumination brain (lm-705.2, spec §3.2/§4.1/§4.5).
+
+Two 0-LLM cognition components ride the non-delivering internal-cognition seam
+(lm-705.6): :class:`ThoughtProcessingSelector` (heartbeat) picks ONE live thought
+and emits a :class:`~lifemodel.core.intents.LaunchInternalCognition`;
+:class:`ThoughtProcessingApply` (completion-frame) turns the typed aux result into
+the thought's next state. The lifecycle rules — attempt/park bounds — live here
+(spec §4.1: "a required contract, not a hope"), so a thought is chewed a bounded
+number of times and then terminates (``resolve``/``drop``/``expire``), never spirals.
+
+Non-delivery is structural (the seam calls the ``LlmPort``, never egress). No
+residue/opinion is written (spec §4.1) — the ``reflection`` rides the span for FR24
+debug, never the thought. Every from-state is ``active`` (the selector re-arms
+expired-parked thoughts to ``active`` first), so no transition is a forbidden
+``active→active``/``parked→parked`` self-loop (``domain/objects/thought.py``).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import StrEnum
+
+from ..domain.memory import JsonObject, MemoryPatch, TransitionOp
+from ..domain.objects import Thought, ThoughtState
+from .timeutil import to_iso
+
+#: How many non-progress (malformed/no-parse) attempts a thought tolerates before it
+#: is ``drop``ped (spec §4.1 "max total processing attempts"). Distinct from park.
+MAX_NO_PROGRESS_COUNT = 3
+#: How many park cycles before a thought ``expire``s rather than re-arming (spec §4.1).
+MAX_PARK_CYCLES = 3
+#: The widening park backoff (spec §4.1) — the 6h/24h/72h ladder the Thought schema's
+#: ``park_count`` docstring already names (``domain/objects/thought.py``). Indexed by
+#: the pre-increment ``park_count``, clamped to the last rung.
+PARK_BACKOFFS: tuple[timedelta, ...] = (
+    timedelta(hours=6),
+    timedelta(hours=24),
+    timedelta(hours=72),
+)
+
+THOUGHT_KIND = "thought"
+
+#: The processing pass's typed result contract (spec §4.1 "deterministic schema +
+#: validation"). ``outcome`` is the disposition; ``reflection`` is a short first-person
+#: note that rides the span (FR24 debug), never persisted.
+PROCESSING_JSON_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "outcome": {"type": "string", "enum": ["resolve", "park", "drop"]},
+        "reflection": {"type": "string"},
+    },
+    "required": ["outcome"],
+    "additionalProperties": False,
+}
+
+#: The pass's system framing — first-person, private, non-delivered.
+PROCESSING_INSTRUCTIONS = (
+    "You are the being's own private mind, quietly turning over one of your thoughts. "
+    "Nothing you write here is shown to anyone — this is rumination, not a message. "
+    "Reflect briefly, in the first person, then decide the thought's disposition: "
+    "'resolve' if you have thought it through and it needs nothing more; "
+    "'park' if it is worth returning to later but not now; "
+    "'drop' if it no longer matters. "
+    "Answer as JSON: an 'outcome' of resolve/park/drop and a short 'reflection'."
+)
+
+
+class ProcessingReason(StrEnum):
+    """The closed set of processing-decision reasons (spec §5) — positive choices, NOT
+    suppressions. Logged as a span field alongside ``thought_id``, never in a string."""
+
+    # selector
+    CHOSE_PROCESS = "chose_process"
+    UNPARKED = "unparked"
+    SKIPPED_EMPTY_BACKLOG = "skipped_empty_backlog"
+    SKIPPED_IN_FLIGHT = "skipped_in_flight"
+    SKIPPED_NO_BUDGET = "skipped_no_budget"
+    SKIPPED_INTERVAL = "skipped_interval"
+    # apply
+    RESOLVED = "processed_resolve"
+    PARKED = "processed_park"
+    DROPPED = "processed_drop"
+    EXPIRED_PARK_CAP = "processed_expired_park_cap"
+    PARKED_NO_PROGRESS = "processed_park_no_progress"
+    DROPPED_NO_PROGRESS = "processed_drop_no_progress"
+    TRANSIENT_FAILURE = "processed_transient_failure"
+    NO_SUBJECT = "processed_no_subject"
+
+
+@dataclass(frozen=True)
+class ProcessingDecision:
+    """A pure decision: the guarded transition to apply (or ``None`` for a transient
+    failure that leaves the thought untouched) plus the closed reason for the span."""
+
+    transition: TransitionOp | None
+    reason: ProcessingReason
+
+
+def build_processing_prompt(thought: Thought) -> str:
+    """The bounded input_text handed to the aux call — the thought and its history."""
+    revisited = (
+        f"\n\n(You have revisited this {thought.no_progress_count} time(s) without resolving it.)"
+        if thought.no_progress_count
+        else ""
+    )
+    return f"The thought you are turning over:\n\n{thought.content}{revisited}"
+
+
+def _transition(thought: Thought, to: ThoughtState, merge: JsonObject) -> TransitionOp:
+    return TransitionOp(
+        kind=THOUGHT_KIND,
+        id=thought.id,
+        from_state=ThoughtState.ACTIVE.value,
+        to_state=to.value,
+        patch=MemoryPatch(payload_merge=merge),
+    )
+
+
+def _park_or_terminate(thought: Thought, *, now: datetime, no_progress: bool) -> ProcessingDecision:
+    """Park with a widening backoff, or terminate at a bound. Bumps ``no_progress_count``
+    when *no_progress* (a malformed attempt), always bumps ``park_count``."""
+    new_np = thought.no_progress_count + (1 if no_progress else 0)
+    new_park = thought.park_count + 1
+    if no_progress and new_np >= MAX_NO_PROGRESS_COUNT:
+        return ProcessingDecision(
+            _transition(thought, ThoughtState.DROPPED, {"no_progress_count": new_np}),
+            ProcessingReason.DROPPED_NO_PROGRESS,
+        )
+    if new_park > MAX_PARK_CYCLES:
+        return ProcessingDecision(
+            _transition(
+                thought,
+                ThoughtState.EXPIRED,
+                {"no_progress_count": new_np, "park_count": new_park},
+            ),
+            ProcessingReason.EXPIRED_PARK_CAP,
+        )
+    backoff = PARK_BACKOFFS[min(thought.park_count, len(PARK_BACKOFFS) - 1)]
+    merge: JsonObject = {
+        "no_progress_count": new_np,
+        "park_count": new_park,
+        "parked_until": to_iso(now + backoff),
+    }
+    reason = ProcessingReason.PARKED_NO_PROGRESS if no_progress else ProcessingReason.PARKED
+    return ProcessingDecision(_transition(thought, ThoughtState.PARKED, merge), reason)
+
+
+def decide_processing_transition(
+    thought: Thought, *, parsed: JsonObject | None, raw: str, now: datetime
+) -> ProcessingDecision:
+    """Map an aux result to the thought's next state (pure; spec §4.1).
+
+    ``resolve``/``drop`` are terminal. ``park`` backs off (or expires at the park cap).
+    A malformed result (no valid ``outcome``, but the model DID respond) is a
+    no-progress attempt → park+bump (or drop at the no-progress cap). A TRANSIENT
+    failure (empty ``raw`` — the call itself failed/timed out) leaves the thought
+    untouched, so provider flakiness never drops a good thought (refund-of-attempt)."""
+    outcome = parsed.get("outcome") if isinstance(parsed, dict) else None
+    if outcome == "resolve":
+        return ProcessingDecision(
+            _transition(thought, ThoughtState.RESOLVED, {}), ProcessingReason.RESOLVED
+        )
+    if outcome == "drop":
+        return ProcessingDecision(
+            _transition(thought, ThoughtState.DROPPED, {}), ProcessingReason.DROPPED
+        )
+    if outcome == "park":
+        return _park_or_terminate(thought, now=now, no_progress=False)
+    if not raw.strip():
+        return ProcessingDecision(None, ProcessingReason.TRANSIENT_FAILURE)
+    return _park_or_terminate(thought, now=now, no_progress=True)
