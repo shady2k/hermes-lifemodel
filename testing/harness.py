@@ -35,7 +35,9 @@ from ..core.quality import Actor, Label
 from ..core.registry import ComponentManifest, UnknownComponent
 from ..core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from ..core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
+from ..core.timeutil import to_iso
 from ..domain.egress import ProactiveOutcome, ReachOutcome
+from ..domain.memory import MemoryDraft, MemoryRecord
 from ..domain.signal import Signal
 from ..events import EventRing
 from ..ports.clock import ClockPort
@@ -46,6 +48,32 @@ from .fakes import FakeClock
 #: The default harness being was born long ago — see :meth:`IntegrationHarness.__post_init__`
 #: for why a drive scenario must not open on an unborn being.
 BORN_AT = "2025-12-01T10:00:00+00:00"
+
+
+def draft_to_record(draft: MemoryDraft, *, now: datetime) -> MemoryRecord:
+    """Encode a :class:`~lifemodel.domain.memory.MemoryDraft` into the
+    :class:`~lifemodel.domain.memory.MemoryRecord` a store's first ``put`` would
+    hand back — the start-of-tick snapshot a component test's ``TickContext.objects``
+    carries. Stamps ``created_at``/``updated_at`` from *now* and ``revision=0`` (what
+    a fresh row gets on insert); every other field is copied straight from the draft.
+    A test fixture only — a real tick reads this back through the store, never this
+    helper."""
+    stamped = to_iso(now)
+    return MemoryRecord(
+        kind=draft.kind,
+        id=draft.id,
+        state=draft.state,
+        payload=draft.payload,
+        source=draft.source,
+        recipient_id=draft.recipient_id,
+        salience=draft.salience,
+        confidence=draft.confidence,
+        expires_at=draft.expires_at,
+        created_at=stamped,
+        updated_at=stamped,
+        revision=0,
+        schema_version=draft.schema_version,
+    )
 
 
 @dataclass(frozen=True)

@@ -17,13 +17,24 @@ expired-parked thoughts to ``active`` first), so no transition is a forbidden
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
 from ..domain.memory import JsonObject, MemoryPatch, TransitionOp
 from ..domain.objects import Thought, ThoughtState
-from .timeutil import to_iso
+from ..ports.tracer import format_traceparent
+from .budget import (
+    DEFAULT_DAILY_INTERNAL_CALL_CEILING,
+    DEFAULT_MIN_INTERPROCESSING_INTERVAL,
+    internal_budget_available,
+    internal_interval_elapsed,
+)
+from .component import TickContext
+from .intents import Intent, LaunchInternalCognition, TransitionRecord
+from .thought_view import live_thoughts
+from .timeutil import from_iso, to_iso
 
 #: How many non-progress (malformed/no-parse) attempts a thought tolerates before it
 #: is ``drop``ped (spec §4.1 "max total processing attempts"). Distinct from park.
@@ -170,3 +181,87 @@ def decide_processing_transition(
     if not raw.strip():
         return ProcessingDecision(None, ProcessingReason.TRANSIENT_FAILURE)
     return _park_or_terminate(thought, now=now, no_progress=True)
+
+
+THOUGHT_PROCESSING_SELECTOR_ID = "thought-processing-selector"
+
+
+class ThoughtProcessingSelector:
+    """Pick ONE live thought to ruminate on this tick, and re-arm expired parks (§4.1).
+
+    0-LLM: it only emits intents. Re-arms every parked thought past its ``parked_until``
+    (``parked→active``) so parking means "return later", not "shelve till expiry". Then,
+    if the gates pass (single-flight, FR20 budget, min interval), emits ONE
+    ``LaunchInternalCognition`` for the top-salience ACTIVE thought — the being's private,
+    non-delivered pass. Emits no launch (idle 0-LLM, S5) when the active backlog is empty
+    or any gate holds; the reason is a span field either way (spec §5)."""
+
+    id: str = THOUGHT_PROCESSING_SELECTOR_ID
+
+    def __init__(
+        self,
+        *,
+        daily_ceiling: int = DEFAULT_DAILY_INTERNAL_CALL_CEILING,
+        min_interval: timedelta = DEFAULT_MIN_INTERPROCESSING_INTERVAL,
+    ) -> None:
+        self._daily_ceiling = daily_ceiling
+        self._min_interval = min_interval
+
+    def step(self, ctx: TickContext) -> Sequence[Intent]:
+        thoughts = live_thoughts(ctx.objects)
+        intents: list[Intent] = []
+        actives = []
+        for t in thoughts:
+            if t.state == ThoughtState.PARKED.value:
+                if self._parked_is_due(t, ctx.now):
+                    intents.append(
+                        TransitionRecord(
+                            op=TransitionOp(
+                                kind=THOUGHT_KIND,
+                                id=t.id,
+                                from_state=ThoughtState.PARKED.value,
+                                to_state=ThoughtState.ACTIVE.value,
+                            )
+                        )
+                    )
+            elif t.state == ThoughtState.ACTIVE.value:
+                actives.append(t)
+
+        reason, subject = self._pick(ctx, actives)
+        if subject is not None:
+            intents.append(
+                LaunchInternalCognition(
+                    prompt=build_processing_prompt(subject),
+                    correlation_id=f"process-{subject.id}@{to_iso(ctx.now)}",
+                    origin_traceparent=format_traceparent(ctx.trace),
+                    subject_id=subject.id,
+                    instructions=PROCESSING_INSTRUCTIONS,
+                    json_schema=PROCESSING_JSON_SCHEMA,
+                )
+            )
+        if ctx.logger is not None:
+            ctx.logger.span.set(processing_reason=reason.value)
+            if subject is not None:
+                ctx.logger.span.set(thought_id=subject.id)
+        return intents
+
+    def _parked_is_due(self, thought: Thought, now: datetime) -> bool:
+        if not thought.parked_until:
+            return True  # parked with no window set → treat as due (defensive)
+        try:
+            return from_iso(thought.parked_until) <= now
+        except (ValueError, TypeError):
+            return True
+
+    def _pick(
+        self, ctx: TickContext, actives: list[Thought]
+    ) -> tuple[ProcessingReason, Thought | None]:
+        if not actives:
+            return ProcessingReason.SKIPPED_EMPTY_BACKLOG, None
+        if ctx.state.pending_internal_id is not None:
+            return ProcessingReason.SKIPPED_IN_FLIGHT, None
+        if not internal_interval_elapsed(ctx.state, now=ctx.now, min_interval=self._min_interval):
+            return ProcessingReason.SKIPPED_INTERVAL, None
+        if not internal_budget_available(ctx.state, now=ctx.now, daily_ceiling=self._daily_ceiling):
+            return ProcessingReason.SKIPPED_NO_BUDGET, None
+        return ProcessingReason.CHOSE_PROCESS, actives[0]  # live_thoughts is salience-desc
