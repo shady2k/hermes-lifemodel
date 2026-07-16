@@ -25,6 +25,7 @@ from .harness import (
     TickRecord,
 )
 from .intentions import contact_intention_objects, contact_intention_record
+from .llm import FakeLlmPort
 from .thoughts import thought_objects, thought_record
 from .user_model import owner_user_model_objects, owner_user_model_record
 
@@ -32,6 +33,7 @@ __all__ = [
     "FakeActiveSpan",
     "FakeClock",
     "FakeDelivery",
+    "FakeLlmPort",
     "FakeMemoryStore",
     "FakePressureSensor",
     "FakeSpanLogger",
