@@ -5,268 +5,307 @@
 drives) as a shippable slice. Roadmap chain:
 `lm-4fv (Genesis, done) → [Phase 5a: waking mind] → lm-adz (rest of Phase 5) → lm-0od (Phase 6)`.
 **Date:** 2026-07-16
-**Status:** design under review
+**Status:** design under review — **v2, revised after codex review `019f69d3`** (§10)
 **Product source:** BRD FR3 (желания — plural, compete by salience, resolve, leave
 residue), FR4 (внутренняя жизнь — thoughts, Zeigarnik), FR5 (взросление — opinions as
-residue), Principle §9.2 (model on humans, cut baroque). HLA §4.1 (Thought as a bounded
-generative stream; Desire's two sources; the energy layer), D8 (BDI core), D10 (rebuild
-discipline: sim on real code, forced observability, safety fail-closed).
+residue), FR20 (configurable hard cost ceiling), S5 (idle → 0-LLM). Principle §9.2 (model
+on humans, cut baroque). HLA §4.1 (Thought as a bounded generative stream; Desire's two
+sources; the energy layer), D8 (BDI core), D10 (rebuild discipline: sim on real code,
+forced observability, safety fail-closed, certified wake).
 
 ## 1. Context and goal
 
 Today the being has exactly **one** internal drive: contact (`u` — loneliness,
 integrated by an AUTONOMIC drive-integrator; `u ≥ θ` wakes cognition). One drive plus a
-threshold is a **timer**, however it is dressed (jitter, backoff, quiet hours). Worse:
-because the being has nothing else to want, the only way to stop it pestering its human
-is to *forbid* contact with hard gates. A human is silent because they are **busy
-living**; our being is silent because it is **forbidden**. That asymmetry — silence
-imposed rather than emergent — is the mechanistic feel the owner named on 2026-07-05
-(epic lm-egg).
+threshold is a **timer**, however it is dressed. Worse: because the being has nothing else
+to want, the only way to stop it pestering its human is to *forbid* contact with hard
+gates. A human is silent because they are **busy living**; our being is silent because it
+is **forbidden**. That asymmetry — silence imposed rather than emergent — is the
+mechanistic feel the owner named on 2026-07-05 (epic lm-egg).
 
-The cure is not a better contact formula. It is to give the being **other things to
-want**, competing for one limited budget, so that silence becomes a *byproduct of a full
-inner life* rather than a rule. The catch: the being has no world yet (text-only until
-Phase 7), so its "other things" cannot be errands. They must be its **inner life** — and
-the honest inner life it can have now is **thinking**.
+The cure is to give the being **other things to want**. The being has no world yet
+(text-only until Phase 7), so its "other things" cannot be errands — they must be its
+**inner life**, and the honest inner life it can have now is **thinking**.
 
-**Goal of this phase:** the being acquires a **bounded waking inner life**. It thinks
-(processes thoughts it created), rests, or reaches out, and behavior **emerges from the
-competition** between them. After this phase, "didn't write" no longer means "a gate
-blocked it" but "curiosity or rest won this time" — organically, differently each time.
-And the being is richer to talk to in *every* conversation, not only in the timing of its
-pings.
+**Goal of this phase:** the being acquires a **bounded waking inner life**. It *creates*
+thoughts from what happens, *processes* them later, and a processed thought can become a
+warm, specific **reason to reach out** — as opposed to the bare "I'm lonely". After this
+phase the being is richer to talk to in *every* conversation, and its proactive contact
+has a content-bearing source, not only a threshold.
 
 ### 1.1 Why a separate phase, not the first task of Phase 5
 
 Teaching the being to think and giving it competing drives are **one foundation seen from
-two ends**, and it is load-bearing for everything else in Phase 5:
+two ends**:
 
-- **Thinking without an economy runs away.** The previous thought mechanism
-  (`ThoughtGeneration`) generated thoughts freely, with its own triggers and its own
-  rate-limit, and produced — live — a **silence spiral and duplicate thoughts**. It was
-  torn out in the D9/D10 rebuild. Rumination without cost either spirals
-  (Nolen-Hoeksema; §4.1 is a wall of warnings about this) or must be strangled by ad-hoc
-  limits, which is a timer again, on thoughts.
+- **Thinking without an economy runs away.** The previous mechanism (`ThoughtGeneration`)
+  generated thoughts freely and produced — live — a **silence spiral and duplicate
+  thoughts**; it was torn out in the D9/D10 rebuild (and the thought machinery was
+  explicitly **moved to Phase 6**, see `core/cognition.py:122`). Rumination without cost
+  either spirals (Nolen-Hoeksema) or is strangled by ad-hoc limits — a timer on thoughts.
 - **An economy over hollow drives is noise in a costume.** An arbiter over abstract
-  "curiosity" with no real object and no real satiation is just a random number
-  suppressing contact — the exact "garnish pretending to be the meal" the epic warns
-  against.
+  "curiosity" with no real object and no real satiation is a random number suppressing
+  contact — the "garnish pretending to be the meal" the epic warns against.
 
-They need each other: the shared budget is what *bounds* thinking; thinking is what gives
-the arbiter something real to arbitrate. Everything else in Phase 5 — the full SDT drive
-vector with temperament weights (FR7), trigger/commitment neurons, opinions/predictions,
-open loops, receptivity, the learned set-point (lm-ocx) — is **superstructure** on this
-foundation. The roadmap's own rule sanctions carving it out: *«Фазы 3–8 ещё крупноваты —
-дробим перед планированием каждой»*.
+They need each other: the shared budget *bounds* thinking; thinking is what the arbiter
+*arbitrates*. Everything else in Phase 5 (full SDT vector + temperament weights, trigger/
+commitment neurons, opinions, open loops, receptivity, learned set-point) is
+**superstructure** on this foundation. The roadmap's own rule sanctions carving it out:
+*«Фазы 3–8 ещё крупноваты — дробим перед планированием каждой»*.
 
 ## 2. Invariants (do not reopen)
 
-- **Create ≠ process.** A thought is *created* cheaply, **inside the dialogue turn**, as
-  appraisal of what came up ("worth returning to"). It is *processed* — ruminated on —
-  **later, on an idle tick**, and only if the arbiter spends budget on it. No rumination
-  inside a live turn: **the reply is the thinking.**
-- **Snapshot-per-tick** (HLA §4.1). A tick processes only what was on its input; new
-  thoughts are emitted as intents at end of tick and picked up **next** tick. The tree
-  grows one layer per tick; **no in-tick recursion.** This is the structural
-  anti-rumination guard.
-- **Competition is the meal; noise is garnish.** Behavior emerges from several *real*
-  axes reducing a shared drive, not from randomness sprinkled on one threshold. A little
-  principled noise (σdW) only breaks the clockwork; it is never the source of variety.
-- **The safety floor is unchanged and fail-closed.** Backstop rate-limit,
-  no-wake-in-flight, dedup, reject-backoff, per-window send-cap stay exactly as they are
-  (D10 kept them; the `[SILENT]` rebuild proved they matter). The arbiter is a **new soft
-  layer above** the floor, never a replacement.
-- **Certified wake is preserved.** The D9/D10 invariant — no relative filter suppresses
-  `u ≥ θ` — stays. The arbiter's softness governs the *normal* range; at the certified
-  `u` ceiling, contact wins unconditionally (§4.3).
-- **Event-seeded thoughts only.** Thoughts arise from something *real* that happened (a
-  conversation event). Spontaneous mind-wandering — thoughts from nothing — is **deferred
-  to Phase 6**: we do not yet know where the topic comes from, and we will not guess.
-- **Observability is forced** (D10). Every arbiter decision — *including* "rested" and
-  "thought about X" — is a span with a `reason` from a **closed enum**. A silence with no
-  logged reason is a bug.
-- **Sim runs the real code** (D10). No parallel model of the tick. The sim vivifies the
-  real drive/arbiter/thought code through fake ports and asserts emergence + invariants
-  before any live rollout.
-- **Text-only and S5 hold.** No world actions. Most idle ticks remain **zero-LLM**:
-  rumination is rare and earned, never per-tick.
+- **Create ≠ process.** A thought is *created* cheaply, from a real event; it is
+  *processed* — ruminated on — later, and only under budget. **The reply is the thinking**
+  during a live turn; no rumination inside a dialogue turn.
+- **Snapshot-per-tick** (HLA §4.1) prevents in-frame recursion. It does **not**, by
+  itself, bound rumination across ticks — that needs explicit per-thought attempt/park
+  bounds (§4.1, a **required** contract, not a hope).
+- **Competition is the meal; noise is garnish.** Variety must come from a genuinely
+  competing vector, not from randomness on one threshold. Honest limit (§4.4): with
+  **event-only** thoughts a dormant relationship has an empty backlog, so competition
+  alone **cannot permanently** dissolve timer behaviour — it makes contact
+  context-sensitive *while a backlog exists*.
+- **The safety floor is unchanged and fail-closed** — including `repeat_pure_longing`
+  (`core/aggregation.py:346`), which HOLDs a *pure-longing* (DRIVE-spring) bid once an
+  earlier one is unanswered, **regardless of `u`**. The arbiter never weakens the floor.
+- **Liveness is an invariant over real outcomes, not over arbitration.** (Replaces the v1
+  "certified ceiling wins unconditionally" claim, which was false against the floor
+  above — §4.2.) Winning arbitration ≠ a desire ≠ a launched turn ≠ a delivered message.
+  The invariant is stated on the **pipeline output** (§4.2), and the answer to prolonged
+  deprivation is the **thought-origin** spring (not a bigger `u`).
+- **Cost is bounded by a hard FR20 ceiling, independent of energy** (§4.5). Energy is
+  physiology, not the billing boundary (`core/personality.py:47` refills every tick,
+  cheaply). A day with nothing to process still trends to **$0** (S5 preserved for the
+  genuinely-idle case); a day with a live backlog spends **at most** the FR20 ceiling.
+- **Event-seeded thoughts only.** Spontaneous mind-wandering (thoughts from nothing) is
+  **deferred to Phase 6**.
+- **Observability is forced** (D10), with a **closed** reason enum: the thought id is a
+  span *field*, never embedded in the reason string; positive choices (`rest`/`think`/
+  `reach`) are distinct from suppressions (§5).
+- **Sim runs the real code** (D10) through the existing real-code harness
+  (`testing/harness.py`). No parallel model of the tick.
+- **Text-only holds.** No world actions.
 
-## 3. Scope
+## 3. Scope and build order
 
-**In:**
-1. **Energy from fuse → spendable resource / rest-drive.** It already exists in the core,
-   gating the upper layers when depleted; here it becomes an axis whose deficit the being
-   can choose to reduce by *resting* — and rest can **win**.
-2. **A minimal thought lifecycle:** event-seeded creation (cheap, in-turn) + idle
-   processing (one layer, energy-gated), with a small closed set of outcomes (§4.2).
-3. **The 3-axis internal-state vector** (energy / curiosity / contact) and **the arbiter**
-   over {rest, process-a-thought, reach-out} (§4.1, §4.3).
-4. **The top-down desire path:** a processed thought may mint a contact-desire — HLA's
-   "Desire born from a thought", the structural `[SILENT]` cure (§4.5).
-5. **Forced observability** (the reason enum, §5) and a **mechanism-recovery sim** (§6).
+The value is delivered in **ordered slices**. The stochastic arbiter — the riskiest,
+least-validated part — is the **last** slice and is **evidence-gated**: we do not put D10
+liveness behind an unvalidated controller before live traces prove a healthy backlog
+exists. This is codex's re-decomposition and it matches the project's "observe live, don't
+certify theory" ethos.
 
-**Deferred → Phase 6 (lm-0od, the offline half of inner life):** spontaneous
-mind-wandering, deep/multi-branch thought trees, sleep/consolidation.
+1. **Thought capture** — event-seeded creation with a bounded, durable lifecycle. Needs
+   the **appraisal seam** (§4.1) — no such seam exists today.
+2. **Private thought processing** — one-shot, under a hard FR20 quota, via a **new
+   non-delivering cognition path** (§4.1) — the existing `CognitionLauncher` only delivers.
+3. **Thought-origin contact desire** — a processed thought mints a contact desire through
+   the **existing** safety/cognition pipeline (§4.2). This is the structural `[SILENT]`
+   cure and it ships **without** the arbiter.
+4. **The arbiter** *(only after live traces from 1–3 show a reliably populated, healthy
+   backlog)* — the 3-axis homeostatic selection, with the liveness + cost + feasibility
+   contracts of §4.4. May be split off into its own bead if slices 1–3 teach us it should.
 
-**Deferred → rest of Phase 5 (lm-adz):** full SDT drive vector + temperament weights
-(FR7), trigger/commitment neurons, opinions/predictions as first-class, open loops +
-receptivity, learned set-point (lm-ocx, v2 adaptation).
-
-**Relationship to existing work:** the v1 contact drive (lm-x43) is **correct as an
-isolated organ** and becomes **one axis** of the vector — *not* reworked (per lm-egg and
-lm-ocx: "v1 contact drive slots into the vector as one dimension"). This phase is lm-egg
-delivered as a shippable slice rather than a standing design epic.
+**Deferred → Phase 6 (lm-0od):** spontaneous mind-wandering, deep/multi-branch thought
+trees, sleep/consolidation.
+**Deferred → rest of Phase 5 (lm-adz):** full SDT vector + temperament weights (FR7),
+trigger/commitment neurons, **opinions/predictions as first-class** (see §4.1 — the
+"resolve → opinion" residue is *not* built here; Thought has no residue field yet), open
+loops + receptivity, learned set-point (lm-ocx).
+**Not reworked:** the v1 contact drive (lm-x43) is correct as an isolated organ and
+becomes **one axis** — untouched.
 
 ## 4. Design
 
-### 4.1 Internal state: a 3-axis vector
+### 4.1 The thought lifecycle
 
-Replace the single scalar `u`-as-sole-driver with a small internal-state vector `H`, each
-axis a **bounded deviation-from-setpoint** on the §4 scale (`0..100`):
+**Creation (cheap) needs a new appraisal seam.** No seam appraises an ordinary completed
+exchange today: `make_post_llm_observer` returns immediately unless the turn is a pending
+*proactive* one (`hooks.py:386`), and the inbound observer emits only actor/quality/
+timestamp, no content. **Required:** a bounded appraisal of a completed dialogue turn that
+seeds a Thought via the intent bus (`PutRecord`, `kind=thought`, `trigger=event`). A hook
+**must never write the store directly**; it seeds a frame with a bounded appraisal result,
+and a core component emits the `PutRecord`. Design decision (before plan): whether the
+appraisal is a cheap classifier or rides the dialogue turn's own tail.
 
-| Axis | Deviation grows with | Reduced by | Notes |
-|---|---|---|---|
-| **energy** | thinking / acting | resting (later, sleep) | today only a fuse; here an axis that can win |
-| **curiosity** | unprocessed thoughts nagging (Zeigarnik) | processing a thought | the honest source of "curiosity" |
-| **contact** (`u`) | silence (existing integrator) | a real exchange | unchanged integration; now one axis of three |
+**Processing (expensive) needs a new non-delivering cognition path.**
+`CognitionLauncher` only launches a *delivered* proactive turn and reads back `SENT` /
+`[SILENT]` (`core/cognition.py:100–214`) — unsafe for private rumination. **Required:** a
+distinct internal-cognition protocol:
 
-The **curiosity** axis is the aggregate Zeigarnik pressure of the unprocessed-thought
-backlog: an open thought nags; a larger / more salient backlog raises the pull to process
-it. This is the grounded answer to *"where does curiosity come from for a being with no
-world"* — not an abstract appetite but the nagging of one's own unfinished thoughts
-(FR4). An unprocessed thought **is** an open loop; this axis is where the two halves of
-Phase 5 meet.
+- a **non-delivering** launch intent/port (delivery suppressed by construction);
+- correlation + pending-idempotency **distinct** from outbound contact;
+- an async completion frame carrying a **typed thought outcome** (deterministic schema +
+  validation);
+- atomic application of the thought transition **and** any minted desire in one commit.
 
-The relative **weights** of the axes are fixed sensible defaults here. Making them a
-per-being **temperament** (FR7) is the deferred superstructure — but the vector they
-weight is born here.
+**Bounded lifecycle (required — snapshot-per-tick is not enough).** Processing develops
+**one** selected thought by one layer (top-K, **K=1**, by salience). The Thought schema
+already carries `no_progress_count` / `park_count` / `parked_until` (`domain/objects/
+thought.py`); this phase **defines their rules**:
 
-### 4.2 The thought lifecycle
+- **max total processing attempts** per thought → terminal `drop`;
+- **durable increment** of `no_progress_count` on a failed/malformed/no-progress outcome
+  (else an async failure is an unbounded retry loop);
+- **park backoff** and a **max park cycles** bound;
+- terminal behaviour after repeated malformed LLM output.
 
-**Creation (cheap, in-turn).** During or just after a dialogue turn, the being may
-*appraise* what came up and emit a Thought via the intent bus (`PutRecord`,
-`kind=thought`, `trigger=event`) — a **seed**, "return to this." No rumination happens in
-the turn; this rides the existing post-turn writeback seam.
+Outcomes (a `TransitionRecord`): **mint a contact-desire** (§4.2) · **park** · **drop** ·
+**resolve** (plain — *no* opinion/residue is written here; the residue field and the
+"opinion" outcome belong to the deferred becoming work, lm-adz). Processing discharges the
+nag; an unprocessed thought decays slowly.
 
-**Processing (expensive, on idle).** When the arbiter spends the budget on "think",
-cognition wakes for an **internal** turn and develops **one** selected thought by **one
-layer** (snapshot-per-tick; top-K selection with **K=1** by salience). Outcome is a
-`TransitionRecord`, one of:
+### 4.2 The top-down contact desire — the structural `[SILENT]` cure (ships without the arbiter)
 
-- **resolve** → a conclusion / opinion — the **residue** that feeds взросление ("identity
-  is the residue of successful actions");
-- **mint a contact-desire** → the top-down Desire path (§4.5);
-- **park** (`parked_until`) → set aside; stops nagging for a while;
-- **drop** → let go.
+A processed thought can mint a **thought-origin** contact desire ("I thought about X and
+want to share it"). The domain already supports `DRIVE` / `THOUGHT` / `MIXED` springs
+(`domain/objects/desire.py`). This is the heart of non-intrusive contact (HLA §4.1) and it
+goes through the **existing** pipeline, so it is deliverable in slices 1–3 with no arbiter.
 
-Processing **discharges** the nag (curiosity pressure drops); an unprocessed thought keeps
-nagging and **decays slowly**. This is the anti-rumination loop: healthy reflection
-**converges or parks**; repetition without progress lowers salience and eventually drops.
+**Collision semantics (required — the contact desire is a singleton).** A thought may want
+to mint contact while a DRIVE-origin desire is already live. Decide before plan:
 
-### 4.3 The arbiter (the heart)
+- **merge** the thought reason into the live desire, converting it to `MIXED` (leaning
+  this — preserves provenance and lifecycle);
+- vs queue vs replace.
 
-Each idle tick with budget, the arbiter chooses among **{rest, process-a-thought,
-reach-out}**:
+**Interaction with `repeat_pure_longing` (the liveness answer).** The floor HOLDs
+*pure-longing* (DRIVE) bids after one unanswered outreach, regardless of `u`. A
+`THOUGHT`/`MIXED` spring is **not** pure longing, so it is the legitimate way a
+long-silent being reaches again — *with something to say*, which is exactly the
+non-pestering form we want. **Decide:** does a thought reason merging into a held
+DRIVE desire lift the hold (becoming `MIXED`)? And **when** is the source thought
+discharged — at proposal, desire creation, launch, or actual send? (Leaning: discharge on
+**delivered send**, so a lost/`[SILENT]` outcome does not silently consume the thought.)
 
-- **Homeostatic soft selection.** Score each action by how much it reduces the **total**
-  drive across `H` (Keramati–Gutkin: act to reduce the summed deviation); select **softly**
-  (a temperature'd choice, **not argmax**) with a small noise term (σdW). The *same*
-  contact pressure yields *different* outcomes because the rest of the vector differs
-  (backlog size, energy). Contact often **loses** — not to randomness, but because the
-  budget went to thinking or resting *before* `u` would have crossed, exactly like a busy
-  person.
-- **Why not argmax:** deterministic argmax on the strongest drive is a timer again (as
-  soon as `u` is highest, contact always wins). Softness **plus a genuinely competing
-  vector** is what dissolves the clock — the vector does the work, the noise only removes
-  the last tick of the second hand.
-- **Two layers, safety intact.** The arbiter is a new *soft* layer **above** the
-  unchanged hard floor. Even when it chooses "reach out", the safety envelope (backstop /
-  in-flight / backoff / send-cap) can still veto or defer delivery, **fail-closed**. We
-  weaken nothing; we add a positive choice above proven guards.
-- **Certified wake preserved — the key to not reintroducing `[SILENT]`.** The arbiter's
-  softness applies in the *normal* range of `u`. At the **certified ceiling** (genuine,
-  prolonged neglect — the `sim/wake` absolute bound), contact wins **unconditionally**, no
-  matter what the arbiter would prefer. The middle is de-mechanised (contact competes,
-  often loses to inner life); the extreme is guaranteed (deep loneliness always surfaces).
-  This resolves the tension between *"de-mechanise — contact can lose"* and *"never go
-  silent into the void."* A human at the extreme of loneliness also reaches out regardless
-  of what else they were doing; the timer-feel came from contact firing at a **modest**
-  threshold with nothing to compete, not from this safety net at the extreme.
+**Liveness invariant (stated on real outcomes).** Under clean silence — no in-flight turn,
+no active backoff, FR20 budget available — the real pipeline must launch **at least one**
+contact judgment by a deadline. With the floor as-is, that judgment must be **reachable
+via a thought-origin spring**; if the backlog is empty, liveness falls back to the
+existing certified DRIVE wake **subject to** `repeat_pure_longing` (i.e. after the *first*
+unanswered bid, further pure-longing HOLDs by design — the being waits for a real event or
+the human, which is the intended non-pestering behaviour, **not** a regression). This is
+the honest statement; v1's "u ceiling always fires" was not true.
 
-### 4.4 What "rest" and "0 LLM" mean
+### 4.3 Internal state: a 3-axis vector (built with slice 4)
 
-"**Rest wins**" = the being spends nothing this tick (**0 LLM**) — the default outcome of
-most idle ticks, so **S5 holds**. Rest is not a no-op we *impose*; it is an axis that
-**wins on its merits** when energy is low or nothing else is salient enough. This is why
-the economy also *self*-rate-limits rumination: thinking costs energy, so a tired being
-rests and a rested being can afford to think or reach out. The old ad-hoc rate-limit
-becomes a physiological consequence.
+`H = (energy, curiosity, contact)`, each a bounded deviation on the §4 scale:
 
-### 4.5 The top-down desire path — the structural `[SILENT]` cure
+| Axis | Deviation grows with | Reduced by |
+|---|---|---|
+| **energy** | thinking / acting | resting (later, sleep) |
+| **curiosity** | unprocessed thoughts nagging (Zeigarnik) | processing a thought |
+| **contact** (`u`) | silence (existing integrator) | a real exchange |
 
-HLA §4.1 names a Desire born *from a thought* "the heart of non-intrusive contact and the
-real cure for `[SILENT]`." This phase **delivers** it: a processed thought can mint a
-contact-desire ("I thought about X and want to share it") — a warm, specific, **earned**
-reason to reach out, as opposed to the bare "I'm lonely (`u` crossed)." The `[SILENT]`
-pathology (the being always chose silence) is cured **structurally** — contact now has a
-positive, content-bearing source — not by re-calibrating a threshold.
+**Curiosity is a derived projection, never a persisted scalar** (a second ledger would
+drift and violate the single-store rule, HLA §4.1). It is computed by a **bounded query**
+over the existing thought backlog in `memory_records`, with explicit semantics: **exclude
+parked** thoughts until `parked_until` (they are in the live snapshot but must not nag),
+and **deterministic truncation** (the per-state snapshot is capped at 256 — a naive sum
+could omit the true top thought). Axis **weights** are fixed defaults here; per-being
+temperament (FR7) is deferred.
+
+### 4.4 The arbiter (slice 4 — evidence-gated; required contracts)
+
+Each idle tick with budget, choose among `{rest, process-a-thought, reach-out}` by
+**homeostatic soft selection** — score each action by how much it reduces the **total**
+drive across `H` (Keramati–Gutkin), select softly (not argmax) with a small noise term.
+Required contracts (v1 omitted these; without them the arbiter is a stochastic timer):
+
+- **A no-action baseline + feasibility masks.** A softmax always chooses *something*; with
+  empty backlog, full energy and `u≈0`, `reach-out` must **not** get ~⅓ probability. Score
+  **expected drive-reduction minus action + opportunity cost**, with an explicit
+  do-nothing option, so zero need → rest.
+- **Contact eligibility below `θ`** must be defined; if eligible, the minimum evidence
+  that prevents random low-`u` wakes.
+- **Liveness + cost invariants (§4.2, §4.5) hold *through* the arbiter** — it selects
+  above the floor and within the FR20 quota; it can never bypass either.
+- **Narrowed claim:** the arbiter makes contact **context-sensitive while a backlog
+  exists**; it does not abolish timer behaviour for a dormant relationship (that would
+  need spontaneous thoughts — Phase 6). Acceptance tests assert on **conditional hazard
+  distributions**, not merely "same `u` gave varied outcomes".
+
+### 4.5 Cost governance (FR20) + S5
+
+Rumination is real LLM spend, and energy does not bound it. **Required:** a hard **FR20
+quota** — a token/call budget, configurable, **independent of energy** — shared by
+rumination *and* proactive contact, with a conservative default. Define **min inter-
+processing interval** and **max attempts per thought** (§4.1). **S5 is amended honestly:**
+an idle tick with no budget-permitted work is **0-LLM**, and a fully dormant day (empty
+backlog, no events) trends to **$0**; a day with a live backlog costs **≤ the FR20
+ceiling**. *(This amendment is a product decision — see §10 hand-off.)*
 
 ## 5. Observability
 
-A **closed `reason` enum** on every arbiter-decision span, e.g.:
-`rested_low_energy` · `rested_nothing_salient` · `chose_think:<thought_id>` ·
-`chose_reach_out` · `floor_vetoed_send` · `certified_wake_contact`.
-Every silence carries a reason; a silence without one is a bug (D10). This is also what
-lets the being answer *«почему промолчал / что тебя занимает»* (FR24) **truthfully** — it
-reads its own recent spans rather than confabulating.
+Every arbiter/processing decision is a span with a **closed** `reason` enum
+(`rested_low_energy`, `rested_nothing_salient`, `chose_think`, `chose_reach_out`,
+`floor_held_*`, …); the thought id rides as a **field** (`thought_id=…`), never inside the
+reason string. Positive choices are **not** suppressions (the existing `SuppressionReason`
+enum in `core/suppression.py` stays for genuine holds; a new positive-decision reason set
+is added). The being answers *«почему промолчал / что тебя занимает»* (FR24) by reading
+its own recent spans, not by confabulating.
 
 ## 6. Simulation (mechanism recovery, not human calibration)
 
-Per D10 and the lm-ocx discipline, the sim **vivifies the real** drive/arbiter/thought
-code through fake ports (no parallel tick model) and asserts:
-
-- **Emergence:** the same contact pressure produces **varied** outcomes across inner
-  contexts; silence correlates with thinking/rest winning, not with a clock.
-- **Backlog health:** seeded thoughts get processed; the backlog neither **starves** (never
-  processed) nor **spirals** (endless rumination); repetition-without-progress decays.
-- **Safety throughout:** every fixed-floor invariant holds for the whole run; the
-  certified-wake ceiling always fires.
-- **Cost:** idle ticks are zero-LLM by default; rumination frequency stays within a bound.
-
-No "calibrated to humans" claims — the sim proves the **mechanism** behaves; the **live
-being** is the real acceptance.
+The sim vivifies the real code through the existing fake-port harness
+(`testing/harness.py`) and asserts: **emergence** (contact hazard varies with inner
+context, not a clock) · **backlog health** (seeded thoughts get processed; no starve, no
+spiral; no-progress decays; attempt/park bounds terminate) · **liveness** (the §4.2
+invariant holds; the thought-origin spring reaches under prolonged silence) · **safety**
+(every fixed-floor invariant, incl. `repeat_pure_longing`, holds throughout) · **cost**
+(idle default 0-LLM; a bounded backlog stays within the FR20 quota). No "calibrated to
+humans" claims.
 
 ## 7. Boundaries (recap)
 
-| Belongs here (Phase 5a) | → Phase 6 (lm-0od) | → rest of Phase 5 (lm-adz) |
+| Phase 5a (this) | → Phase 6 (lm-0od) | → rest of Phase 5 (lm-adz) |
 |---|---|---|
-| energy as rest-drive | sleep / consolidation | full SDT vector + temperament weights |
-| event-seeded thought create+process | spontaneous mind-wandering | trigger / commitment neurons |
-| 3-axis arbiter, contact as one axis | deep multi-branch thought trees | opinions / predictions first-class |
-| top-down contact-desire from a thought | | open loops + receptivity |
-| forced observability + mechanism sim | | learned set-point (lm-ocx) |
+| event-seeded thought create+process | spontaneous mind-wandering | full SDT vector + temperament weights |
+| private (non-delivering) cognition path | deep multi-branch thought trees | trigger / commitment neurons |
+| thought-origin contact desire (`[SILENT]` cure) | sleep / consolidation | opinions/predictions + Thought **residue** field |
+| FR20 cost quota; forced observability | | open loops + receptivity |
+| arbiter *(slice 4, evidence-gated)* | | learned set-point (lm-ocx) |
 
-## 8. Open questions (for the plan / sim to resolve)
+## 8. Open questions (genuinely undecided after the review)
 
-- **Commensurability & weights:** the normalization that makes energy/curiosity/contact
-  comparable on one scale, and the default axis weights.
-- **Curiosity representation:** a single aggregate vs per-thought salience summed (leaning
-  aggregate for the vector, per-thought for selection).
-- **Energy model:** the accounting for how much thinking/acting costs and how rest
-  restores — reuse `core/energy` as-is or extend.
-- **Noise magnitude:** how much σ before variety becomes flakiness — tune in sim.
-- **Selection form:** softmax-over-drive-reduction vs a basal-ganglia WTA with lateral
-  inhibition — both fit; pick the simplest that shows emergence.
-- **Seams (verify against code in planning):** the exact in-turn thought-creation seam
-  (post-turn writeback vs an in-turn tool); how "reach-out won" hands off to the existing
-  `CognitionLauncher` / wake-packet path.
+- Appraisal form: cheap classifier vs riding the dialogue turn's tail.
+- Homeostatic score shape and default axis weights / normalization (commensurability).
+- Arbiter selection form: softmax-over-drive-reduction vs basal-ganglia WTA — simplest
+  that shows emergence.
+- FR20 default budget and how rumination and proactive contact share it.
+- Noise magnitude (tune in sim).
+
+*(Seams, rumination bounds, collision semantics, curiosity-as-projection, closed enum, and
+the liveness/cost invariants moved from "open" to **required contracts** above — the review
+showed they are architecture, not plan-time detail.)*
 
 ## 9. Acceptance
 
-- **Felt (owner's judgment — the chair only he sits in):** the being no longer reads as a
-  timer; its silences feel like a life happening elsewhere; it can tell you what it has
-  been chewing on.
-- **Structural:** proactive contact can originate from a *thought*, not only from `u`; a
-  silence always has a logged reason.
-- **Measured (sim + early live):** same-`u` outcomes vary with inner context; idle default
-  is 0-LLM; all safety invariants hold; the certified ceiling always fires.
+- **Felt (owner's judgment):** the being no longer reads as a timer; it can tell you what
+  it has been chewing on; silences feel like a life elsewhere.
+- **Structural:** proactive contact can originate from a *thought*; every silence has a
+  logged reason; no fixed-floor invariant is weakened.
+- **Measured (sim + early live):** the §4.2 liveness invariant holds; idle default 0-LLM
+  and daily cost ≤ FR20; contact hazard is context-sensitive while a backlog exists.
+
+## 10. Review log
+
+**codex `019f69d3` (2026-07-16), verified against source.** Reshaped v1 → v2:
+- **Liveness (critical):** v1's "certified `u` ceiling wins unconditionally" was **false**
+  against `repeat_pure_longing` (`aggregation.py:346`, HOLDs pure longing regardless of
+  `u`). Replaced with a liveness invariant over real pipeline outcomes; the thought-origin
+  spring is the real answer to prolonged silence (§4.2).
+- **Cost/S5 (critical):** v1 processed thoughts on idle, violating S5, with energy as a
+  non-existent cost bound (`personality.py:47`). Added a hard FR20 quota independent of
+  energy and an honest S5 amendment (§4.5). **← product decision handed to the owner.**
+- **Scope (critical):** v1 bundled ~11 subsystems and put D10 liveness behind an
+  unvalidated arbiter. Re-decomposed into ordered, evidence-gated slices; the arbiter is
+  last (§3).
+- **Seams:** the appraisal seam and a non-delivering cognition path **do not exist**
+  (`hooks.py:386`, `cognition.py:100`) — promoted from open question to required
+  architecture (§4.1).
+- **Rumination bounds, thought→desire collision, curiosity-as-projection, closed
+  observability enum:** promoted from hopes to required contracts (§4.1, §4.2, §4.3, §5).
+- **Retained (codex-affirmed sound):** thought records fit the typed BDI store;
+  `PutRecord`/committer + end-of-frame atomicity are real seams; the real-code harness
+  exists; thought-origin Desire is the strongest idea; event-seeded-only is an honest cut.
