@@ -5,7 +5,7 @@
 drives) as a shippable slice. Roadmap chain:
 `lm-4fv (Genesis, done) → [Phase 5a: waking mind] → lm-adz (rest of Phase 5) → lm-0od (Phase 6)`.
 **Date:** 2026-07-16
-**Status:** design under review — **v3, slice-3 redesigned by the owner (2026-07-16)**; v2 was the codex review `019f69d3` (§10)
+**Status:** design under review — **v3.1, slice-3 redesigned by the owner + codex-reviewed `019f6c40` (2026-07-16)**; v2 was codex `019f69d3` (§10)
 **Product source:** BRD FR3 (желания — plural, compete by salience, resolve, leave
 residue), FR4 (внутренняя жизнь — thoughts, Zeigarnik), FR5 (взросление — opinions as
 residue), FR20 (configurable hard cost ceiling), S5 (idle → 0-LLM). Principle §9.2 (model
@@ -73,7 +73,10 @@ commitment neurons, opinions, open loops, receptivity, learned set-point) is
   "certified ceiling wins unconditionally" claim, which was false against the floor
   above — §4.2.) Winning arbitration ≠ a desire ≠ a launched turn ≠ a delivered message.
   The invariant is stated on the **pipeline output** (§4.2), and the answer to prolonged
-  deprivation is the **thought-origin** spring (not a bigger `u`).
+  deprivation is the **thought-origin** spring (not a bigger `u`). *(v3.1 — codex: this is a
+  **contact** invariant, and slice 3 no longer builds contact; it moves with the deferred
+  contact/arbiter work. Slice 3 makes **no** liveness claim — only crystallization. Slice 4's
+  arbiter preserves contact-liveness **only once** the deferred object→contact adapter exists.)*
 - **Cost is bounded by a hard FR20 ceiling, independent of energy** (§4.5). Energy is
   physiology, not the billing boundary (`core/personality.py:47` refills every tick,
   cheaply). A day with nothing to process still trends to **$0** (S5 preserved for the
@@ -82,7 +85,7 @@ commitment neurons, opinions, open loops, receptivity, learned set-point) is
   **deferred to Phase 6**.
 - **Observability is forced** (D10), with a **closed** reason enum: the thought id is a
   span *field*, never embedded in the reason string; positive choices (`rest`/`think`/
-  `reach`) are distinct from suppressions (§5).
+  `crystallize`) are distinct from suppressions (§5).
 - **Sim runs the real code** (D10) through the existing real-code harness
   (`testing/harness.py`). No parallel model of the tick.
 - **Text-only holds.** No world actions.
@@ -132,8 +135,10 @@ exchange today: `make_post_llm_observer` returns immediately unless the turn is 
 timestamp, no content. **Required:** a bounded appraisal of a completed dialogue turn that
 seeds a Thought via the intent bus (`PutRecord`, `kind=thought`, `trigger=event`). A hook
 **must never write the store directly**; it seeds a frame with a bounded appraisal result,
-and a core component emits the `PutRecord`. Design decision (before plan): whether the
-appraisal is a cheap classifier or rides the dialogue turn's own tail.
+and a core component emits the `PutRecord`. **Appraisal form (decided — codex v3.1):** *not* a
+keyword heuristic — a cognition-grade judgment (a cheap classifier pass, or riding the dialogue
+turn's own tail). No concrete appraiser is wired live yet, so thought **creation is dormant**
+until it lands (**lm-705.11**); slice 3 is exercised by seeded thoughts meanwhile.
 
 **Processing (expensive) needs a new non-delivering cognition path.**
 `CognitionLauncher` only launches a *delivered* proactive turn and reads back `SENT` /
@@ -158,38 +163,73 @@ thought.py`); this phase **defines their rules**:
 - **park backoff** and a **max park cycles** bound;
 - terminal behaviour after repeated malformed LLM output.
 
-Outcomes *(v3)*: **crystallize** (§4.2 — the rumination emits a `PutRecord` for the durable
-object the thought *became*: any catalog `kind`; the source thought transitions terminal with
-a provenance link) · **park** · **drop** · **resolve** (plain — the thought produced nothing
-durable). Processing discharges the nag; an unprocessed thought decays slowly. *(v3 note:
-"mint a contact-desire" is no longer a distinct outcome — a contact `Desire` is simply one
-`kind` a thought may crystallize into, and producing it does **not** deliver anything here;
-the atomic commit is the thought transition **plus** the crystallized `PutRecord`.)*
+Outcomes *(v3, tightened v3.1 — codex)* — a **closed, discriminated** set, **not** a
+runtime-arbitrary kind: **`crystallize_<kind>`** (§4.2 — a per-kind *trusted builder* produces
+the object, `default_registry().encode()` validates it, and the completion emits the `PutRecord`;
+the source thought transitions terminal with a provenance link, in **one** atomic commit) ·
+**park** · **drop** · **resolve** (plain — nothing durable). This slice registers exactly one
+variant, **`crystallize_commitment`**; a new target is a **new registered variant + builder**,
+never an accepted arbitrary `kind` string (`PutRecord` does **not** validate a kind — only
+`KindRegistry.encode` of a typed object does, so a free kind+payload would bypass the typed
+boundary or overwrite a singleton). **A crystallization whose payload fails the builder/registry
+is a no-progress outcome** — caught and routed through the same `no_progress_count` bound as a
+malformed result (never an uncaught exception that strands the thought without incrementing its
+cap); only an empty-`raw` transport failure stays transient/unpenalized. Processing discharges
+the nag; an unprocessed thought decays slowly. *(v3: "mint a contact-desire" is gone as a
+distinct outcome — a contact `Desire` is just one crystallization variant, and producing it
+delivers nothing here.)*
 
 ### 4.2 Crystallization — a processed thought becomes durable objects *(redesigned v3 — owner, 2026-07-16)*
 
 **The model.** Processing a thought is **rumination that crystallizes**: the being thinks a
-thought over and it *becomes* a durable catalog object — **any `kind`** (D8: "cognition mints
-Desire / Thought / Intention"). The typed processing outcome names *what the thought became*;
-`ThoughtProcessingApply` builds that object via its registered builder, emits the corresponding
-`PutRecord(kind)` through the registry door (**never** a direct store write), and transitions
-the source thought terminal, provenance-linked (`source_thought_ids` / `parent_id`), in **one
-atomic commit**. A thought crystallizes into **one** object here (K=1). The mechanism is
-**generic over the catalog**: a new target type is *only* a new outcome variant + its builder,
-never a mechanism change — that is exactly what "a thought can produce any type" means. **The
-slice stops at producing the object — no contact, no send, no arbiter.**
+thought over and it *becomes* a durable catalog object (D8: "cognition mints Desire / Thought /
+Intention"). The typed processing outcome is a **closed, discriminated** choice —
+`crystallize_<kind>` for a kind this slice has *registered a builder for* — **not** an arbitrary
+runtime `kind` (**codex v3.1**: `PutRecord` carries a mutation but does **not** validate a kind;
+only a *trusted per-kind builder* + `default_registry().encode()` yields the typed object the
+registry will accept, so a free kind+payload could bypass the typed boundary or clobber a
+singleton — `desire`/`intention`/`user_model`). `ThoughtProcessingApply` runs the builder,
+encodes, emits the `PutRecord`, and transitions the source thought terminal, provenance-linked
+(`source_thought_ids` / `parent_id`), in **one atomic commit** (`StateActor` batches the
+thought-transition + object-`PutOp` under one `BEGIN IMMEDIATE`). A thought crystallizes into
+**one** object here (K=1). "A thought can produce any type" is the **direction**: the mechanism
+is extensible by *registering another variant*, so adding `Opinion` / `Prediction` later is a new
+builder, not a mechanism change. **The slice stops at producing the object — no contact, no send,
+no arbiter.**
 
 **First new type — `Commitment`.** The catalog (D8) declares `Commitment · Opinion ·
 Prediction` as extensions; **none exists in code yet** (`domain/objects/` has only
 `Desire / Intention / Thought / UserModel`). This slice builds the first: **`Commitment`** —
-*what the being decided to do, having thought it over* (a follow-up / obligation: "ask how
-their interview went", "come back to the moving-house topic"). HLA §4.1 names it "the strongest
+*what the being decided it **owes**, having thought it over* (a follow-up: "ask how their
+interview went", "come back to the moving-house topic"). HLA §4.1 names it "the strongest
 non-intrusive reason, **serving the other**", so it is the natural crystallization for the
 epic's goal (content-bearing *initiation*) — whereas `Opinion` / `Prediction` shape *replies*,
-not initiation, and are added later by the **same** mechanism. Shape (finalized in the plan):
-`content` (1st-person what), `trigger` (when to honour — time/event, Gollwitzer if-then),
-`source_thought_ids`, `other_regarding_value` (it serves the other), `salience`; state machine
-`active → honoured | dropped | expired` (+ `deferred`), transitions guarded by the registry.
+not initiation (added later by the same mechanism).
+
+**`Commitment` model** *(finalized here — codex v3.1; the plan only fills field types)*:
+- **Non-singleton** — the being holds *many* commitments at once (unlike the contact `Desire`
+  singleton); a **deterministic** id from the source episode **+ a semantic fingerprint**
+  (mirroring `seed_thought_id`), never random (HLA), never a bare global content hash (distinct
+  episodes must not conflate).
+- Semantic payload: `content` (1st-person), a **typed trigger** (`trigger_kind ∈ time|event|
+  condition`, `trigger_value`, optional `due_at` — Gollwitzer if-then), `source_thought_ids`,
+  `other_regarding_value`, and **`basis`** (`promised | follow_up | self_assumed`, so an ordinary
+  interesting thought cannot masquerade as a debt). `salience` / `expires_at` ride the **base
+  envelope**, not the payload.
+- State machine (full, registry-guarded): `active → honoured | dropped | expired | deferred`,
+  `deferred → active | honoured | dropped | expired`; terminals `honoured` / `dropped` /
+  `expired`.
+- **Boundary vs `Intention`** (must not blur): a `Commitment` is an **enduring owed follow-up /
+  source object**; an `Intention` (Bratman) is an executable, send-gating plan. A commitment only
+  *later* becomes a `Desire`, which crystallizes into an `Intention` — that whole chain is the
+  deferred contact work, not this slice.
+- **Catalog registration:** register `Commitment` in the registry `_CATALOG` + export from
+  `domain.objects`; update the exact-kind tests and **extend the terminal/live-state consistency
+  test** (`CoreLoop` snapshots by the union of all live-state strings — no string may be terminal
+  for one kind and live for another; prefer moving that check into registry construction).
+- **Provenance direction:** the link is **target → source** — the `Commitment` carries
+  `source_thought_ids` (+ qualified `provenance.source_object_ids`); the source Thought gets **no**
+  new `crystallized_object_id` field (the registry rejects unknown payload keys).
 
 **The `[SILENT]` cure is now one crystallization, and it is decoupled from delivery.** A thought
 crystallizing into a contact `Desire` (`kind=desire`, `spring=THOUGHT` / `MIXED`) is still the
@@ -204,6 +244,18 @@ clean silence the real pipeline must launch at least one contact judgment; a `TH
 spring is the reachable path, else it falls back to the certified DRIVE wake *subject to*
 `repeat_pure_longing`) — all move to the deferred **contact / arbiter** work. *(This supersedes
 v2's §4.2, which had slice 3 mint a contact desire and deliver it through the existing pipeline.)*
+
+**The "no send" guarantee, stated precisely** *(codex v3.1)*. "No send" is **causal**, not a
+literal claim about the completion frame: `run_internal_completion` runs every registered
+component and still dispatches an *incidental* `LaunchProactive` another component returns (the
+birth-voice-threaded strand-fix), so a completion frame **can** send if an unrelated active
+contact `Desire` already existed. The structural guarantee this slice makes is narrower:
+**(1) crystallization emits no `LaunchProactive`**, and **(2) no current component consumes a
+`Commitment` as a contact source** — aggregation reads only the contact `Desire`/`Intention`
+(`aggregation.py:149`), `CognitionLauncher` launches only from the singleton active contact
+`Desire` (`cognition.py:100`), and snapshot-per-frame means a freshly-inserted object is not read
+in the same frame. **Acceptance test:** a completion frame with **no** pre-existing contact
+desire produces **zero** `LaunchProactive`.
 
 ### 4.3 Internal state: a 3-axis vector (built with slice 4)
 
@@ -237,7 +289,11 @@ Required contracts (v1 omitted these; without them the arbiter is a stochastic t
 - **Contact eligibility below `θ`** must be defined; if eligible, the minimum evidence
   that prevents random low-`u` wakes.
 - **Liveness + cost invariants (§4.2, §4.5) hold *through* the arbiter** — it selects
-  above the floor and within the FR20 quota; it can never bypass either.
+  above the floor and within the FR20 quota; it can never bypass either. *(v3.1 — codex: the
+  **contact**-liveness half is conditional — it holds only once the deferred object→contact
+  adapter (a `Commitment`/thought-origin `Desire` becoming an outreach) exists; until then the
+  arbiter preserves only the invariants actually implemented — cost, and the fixed floor. Do
+  not gate slice-4 acceptance on a contact path that is not yet built.)*
 - **Narrowed claim:** the arbiter makes contact **context-sensitive while a backlog
   exists**; it does not abolish timer behaviour for a dormant relationship (that would
   need spontaneous thoughts — Phase 6). Acceptance tests assert on **conditional hazard
@@ -272,8 +328,12 @@ Every arbiter/processing decision is a span with a **closed** `reason` enum
 `floor_held_*`, …); the thought id rides as a **field** (`thought_id=…`), never inside the
 reason string. Positive choices are **not** suppressions (the existing `SuppressionReason`
 enum in `core/suppression.py` stays for genuine holds; a new positive-decision reason set
-is added). The being answers *«почему промолчал / что тебя занимает»* (FR24) by reading
-its own recent spans, not by confabulating.
+is added). **Crystallization (v3.1 — codex):** the closed reason set gains
+**`processed_crystallize`**, and *what the thought became* rides as **separate span fields**
+— `thought_id`, `crystallized_kind`, `crystallized_id` (never a reason-per-object-id; the
+qualified provenance carries the same source-thought link) — stamped **only after** the
+builder + registry encode succeed. The being answers *«почему промолчал / что тебя занимает»*
+(FR24) by reading its own recent spans, not by confabulating.
 
 ## 6. Simulation (mechanism recovery, not human calibration)
 
@@ -299,7 +359,8 @@ stays within the FR20 quota). No "calibrated to humans" claims.
 
 ## 8. Open questions (genuinely undecided after the review)
 
-- Appraisal form: cheap classifier vs riding the dialogue turn's tail.
+- ~~Appraisal form: cheap classifier vs riding the dialogue turn's tail.~~ *(decided — §4.1:
+  a cognition-grade judgment, not a keyword heuristic; unwired live → **lm-705.11**.)*
 - Homeostatic score shape and default axis weights / normalization (commensurability).
 - Arbiter selection form: softmax-over-drive-reduction vs basal-ganglia WTA — simplest
   that shows emergence.
@@ -314,10 +375,16 @@ showed they are architecture, not plan-time detail.)*
 
 - **Felt (owner's judgment):** the being no longer reads as a timer; it can tell you what
   it has been chewing on; silences feel like a life elsewhere.
-- **Structural:** proactive contact can originate from a *thought*; every silence has a
-  logged reason; no fixed-floor invariant is weakened.
-- **Measured (sim + early live):** the §4.2 liveness invariant holds; idle default 0-LLM
-  and daily cost ≤ FR20; contact hazard is context-sensitive while a backlog exists.
+- **Structural:** every silence has a logged reason; no fixed-floor invariant is weakened.
+  *(v3.1 — codex: acceptance is split by slice.)* **Slice 3 (crystallization):** a processed
+  thought produces the right typed durable object (atomically, provenance-linked, bounds
+  terminate) and crystallization causes **zero** launch. **Deferred contact work:** proactive
+  contact can originate from a *thought* (via the object→contact adapter) — the goal, not a
+  slice-3 assertion.
+- **Measured (sim + early live):** idle default 0-LLM and daily cost ≤ FR20 *(slice-3 measure)*.
+  The §4.2 contact-liveness invariant and "contact hazard context-sensitive while a backlog
+  exists" are **deferred** measures — they hold only once the contact path is built, not for the
+  crystallization-only slices.
 
 ## 10. Review log
 
@@ -367,3 +434,28 @@ case, and its collision/discharge/liveness questions + the actual send move to t
 it). Motivation: the being's inner life should crystallize thinking into durable BDI objects
 generically (D8: "cognition mints Desire/Thought/Intention"), not be hard-wired to one outcome
 coupled to delivery. Bead **lm-705.3** re-scoped to match.
+
+**codex `019f6c40` (2026-07-16), verified against source — reshaped v3 → v3.1.** Verdict:
+*ready-with-changes*; the atomic crystallization seam (`StateActor` batches thought-transition +
+object-`PutOp` under one `BEGIN IMMEDIATE`) and `Commitment`-as-first-type are affirmed sound.
+Fixes folded in:
+- **Critical — stranded contact/liveness acceptance:** §2/§4.4/§9 still demanded contact-liveness
+  that v3 defers. Acceptance is now **split by slice** — slice 3 = crystallization + zero-launch;
+  contact-liveness is a **deferred** measure, conditional on the object→contact adapter (§2, §4.4,
+  §9).
+- **"Any kind" was too dynamic** → a **closed, discriminated** outcome (`crystallize_<kind>`,
+  this slice only `crystallize_commitment`); `PutRecord` does not validate a kind — a trusted
+  per-kind builder + `default_registry().encode()` does, so a free kind+payload could clobber a
+  singleton (§4.1, §4.2).
+- **Invalid crystallization must not evade the bounds** → a builder/registry failure is a
+  no-progress outcome routed through `no_progress_count`, never an uncaught strand (§4.1).
+- **`Commitment` model finalized:** non-singleton, deterministic id (source + fingerprint), full
+  transition table (`+deferred`), typed trigger (`trigger_kind`/`trigger_value`/`due_at`),
+  `basis`, explicit `Intention` boundary, base-envelope `salience`/`expires_at`, `_CATALOG`
+  registration + terminal/live-consistency test, target→source provenance (§4.2).
+- **"No send" stated precisely:** crystallization emits no `LaunchProactive` and no component
+  consumes a `Commitment` as a contact source (a completion frame can still dispatch an
+  *incidental* proactive launch from an unrelated live desire) (§4.2).
+- **Observability:** `processed_crystallize` reason + `crystallized_kind`/`crystallized_id` span
+  fields, stamped only after encode (§5).
+- **Minor:** appraisal form decided (judgment, not heuristic; unwired → lm-705.11) (§4.1, §8).
