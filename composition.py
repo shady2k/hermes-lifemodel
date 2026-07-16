@@ -53,7 +53,7 @@ from .adapters.tracer import StdlibTracer
 from .core.affect import AFFECT_AROUSAL_SPEC, AFFECT_VALENCE_SPEC, AffectParams, AffectSense
 from .core.aggregation import ContactAggregation
 from .core.cognition import CognitionLauncher, PriorSoulReader
-from .core.component import layer_for_type
+from .core.component import ComponentLayer, layer_for_type
 from .core.contact_sensor import ContactSensor
 from .core.coreloop import CoreLoop
 from .core.metrics import MetricRegistry, MetricSpec, get_metric_registry
@@ -61,6 +61,7 @@ from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.solitude_drive import CONTACT_DRIVE_U_SPEC, SolitudeDrive
 from .core.state_actor import StateActor
+from .core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
 from .core.wake import GateParams
 from .domain.objects import default_registry
 from .events import EventRing
@@ -332,6 +333,29 @@ def build_lifemodel(
         )
         resolved_registry.register(
             launcher, _component_manifest(launcher.id, "launcher", accepts_signals=False)
+        )
+    try:
+        resolved_registry.manifest(THOUGHT_CAPTURE_ID)
+    except UnknownComponent:
+        # Waking mind slice 1 (lm-705.1, spec §4.1): a 0-LLM AGGREGATION-tier
+        # component, independent of the drive/wake spine above — it only turns a
+        # ``thought_seed`` signal (seeded by the ``post_llm`` appraisal seam, never
+        # written by the tick itself) into a durable ``PutRecord(thought)``. Registered
+        # LAST so the drive spine's own relative order stays exactly the five links
+        # (personality -> contact -> solitude-drive -> contact-aggregation ->
+        # cognition-launcher) — this component never reads/writes anything the wake
+        # decision depends on. ``"thought-capture"`` has no entry in ``LAYER_BY_TYPE``
+        # (it is not one of the closed, general-purpose type strings), so its layer is
+        # passed explicitly rather than through ``_component_manifest``/``layer_for_type``.
+        resolved_registry.register(
+            ThoughtCapture(),
+            ComponentManifest(
+                id=THOUGHT_CAPTURE_ID,
+                type="thought-capture",
+                layer=ComponentLayer.AGGREGATION,
+                metric_surface=(),
+                accepts_signals=True,
+            ),
         )
     resolved_state_actor = StateActor(resolved_state, committer=resolved_committer)
     resolved_coreloop = CoreLoop(

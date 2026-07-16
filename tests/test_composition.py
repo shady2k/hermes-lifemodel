@@ -317,7 +317,8 @@ def test_cognition_registered_after_aggregation(tmp_path: Path) -> None:
     assert any(isinstance(c, CognitionLauncher) for c in lm.registry.enabled())
 
 
-# --- T7: the single-spine tick order (thought machinery removed → Phase 6) ---
+# --- T7: the single-spine tick order (thought machinery cut; lm-705.1 re-seeds
+# --- ONE capture-only component, see the assertion below) -------------------
 
 
 def test_full_pipeline_order_is_asserted(tmp_path: Path) -> None:
@@ -335,8 +336,13 @@ def test_full_pipeline_order_is_asserted(tmp_path: Path) -> None:
     ]
     positions = [ids.index(cid) for cid in spine]
     assert positions == sorted(positions), ids
-    # no thought component remains in the frame
-    assert not any("thought" in cid for cid in ids), ids
+    # T7 cut every thought component; lm-705.1 (waking mind slice 1) re-seeds
+    # exactly ONE — ThoughtCapture, capture-only (no processing/rumination/desire/
+    # arbiter, spec §4.1's boundary) — so the pin is no longer "never", it is
+    # "no thought component OTHER than the capture-only one".
+    from lifemodel.core.thought_capture import THOUGHT_CAPTURE_ID
+
+    assert [cid for cid in ids if "thought" in cid] == [THOUGHT_CAPTURE_ID], ids
 
 
 # --- lm-27n.4: the Intention decision record, end-to-end through the store ---
@@ -389,3 +395,14 @@ def test_pipeline_exchange_resolves_desire_and_intention_atomically(tmp_path: Pa
     assert read_live_contact_intention(store) is None  # intention terminalized in lockstep
     assert store.get("desire", "contact:owner").state == "satisfied"
     assert store.get("intention", "contact:owner").state == "completed"
+
+
+# --- lm-705.1: ThoughtCapture wiring (waking mind slice 1) -------------------
+
+
+def test_build_lifemodel_registers_thought_capture(tmp_path: Path) -> None:
+    from lifemodel.core.thought_capture import THOUGHT_CAPTURE_ID
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = {m.id for m in lm.registry.manifests()}
+    assert THOUGHT_CAPTURE_ID in ids

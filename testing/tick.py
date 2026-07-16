@@ -30,6 +30,11 @@ _TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 #: deterministic, timezone-aware one.
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
+#: The neutral "nothing pressing" pressure index (frozen/immutable, so one shared
+#: instance is safe to default to) — a module-level singleton rather than a call in
+#: the signature default (ruff B008), mirroring :data:`_TRACE`/:data:`_NOW` above.
+_PRESSURE = PressureIndex()
+
 
 def make_tick_context(
     *,
@@ -37,7 +42,7 @@ def make_tick_context(
     now: datetime = _NOW,
     signals: Iterable[Signal] = (),
     objects: Iterable[MemoryRecord] = (),
-    pressure: PressureIndex = PressureIndex(),
+    pressure: PressureIndex = _PRESSURE,
     trace: TraceContext = _TRACE,
 ) -> TickContext:
     """A bare :class:`TickContext` for unit-testing ONE component in isolation.

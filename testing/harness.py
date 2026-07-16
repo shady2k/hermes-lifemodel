@@ -32,7 +32,7 @@ from ..core.desire_view import read_live_contact_desire
 from ..core.frame import FrameTrigger
 from ..core.proactive import proactive_tick
 from ..core.quality import Actor, Label
-from ..core.registry import ComponentManifest
+from ..core.registry import ComponentManifest, UnknownComponent
 from ..core.taxonomy import contact_observed_signal, proactive_outcome_signal
 from ..core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
 from ..domain.egress import ProactiveOutcome, ReachOutcome
@@ -226,8 +226,11 @@ def build_capture_lifemodel(
     one. The REAL :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` — exactly
     what :class:`IntegrationHarness` and ``tests/test_frame_acceptance.py`` already use
     for a "real code, honest prediction" sim — satisfies every port at once, so this
-    builds the ordinary real graph (:func:`build_lifemodel`) over a fresh on-disk store
-    and adds ONLY the ``ThoughtCapture`` registration on top.
+    builds the ordinary real graph (:func:`build_lifemodel`) over a fresh on-disk store.
+    ``build_lifemodel`` registers ``ThoughtCapture`` itself (lm-705.1 Task 5); the
+    ``try``/``UnknownComponent`` guard below only backfills it for a registry that
+    somehow lacks it (mirroring every idempotent registration in ``composition.py``),
+    so this stays correct even if that default ever changes.
 
     ``base_dir`` defaults to a fresh temp directory (stdlib ``tempfile``) so a caller
     can write ``build_capture_lifemodel()`` bare, with no ``tmp_path`` fixture to
@@ -255,14 +258,17 @@ def build_capture_lifemodel(
             genesis_completed_at=BORN_AT,
         )
     )
-    lm.registry.register(
-        ThoughtCapture(),
-        ComponentManifest(
-            id=THOUGHT_CAPTURE_ID,
-            type="thought-capture",
-            layer=ComponentLayer.AGGREGATION,
-            metric_surface=(),
-            accepts_signals=True,
-        ),
-    )
+    try:
+        lm.registry.manifest(THOUGHT_CAPTURE_ID)
+    except UnknownComponent:
+        lm.registry.register(
+            ThoughtCapture(),
+            ComponentManifest(
+                id=THOUGHT_CAPTURE_ID,
+                type="thought-capture",
+                layer=ComponentLayer.AGGREGATION,
+                metric_surface=(),
+                accepts_signals=True,
+            ),
+        )
     return lm

@@ -27,6 +27,7 @@ from .adapters.session_end import (
 from .adapters.soul_file import SoulFile, seed_newborn_stance
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
+from .core.appraisal import HeuristicAppraiser
 from .core.metrics import get_metric_registry
 from .core.tick_metrics import register_universal_metrics
 from .debug import render_dump_for_dir
@@ -483,6 +484,10 @@ def register(ctx: Any) -> None:
                 lambda: build_lifemodel(
                     base_dir=sdir, trace_writer=_outcome_writer, event_ring=_outcome_ring
                 ),
+                # The waking-mind appraisal seam (lm-705.1, spec §4.1): the slice-1
+                # deterministic, no-LLM appraiser — judges a completed reactive
+                # exchange and, on a seed, the hook starts the capture EVENT frame.
+                appraiser=HeuristicAppraiser(),
                 health=health,
                 metrics=metrics,
             ),
