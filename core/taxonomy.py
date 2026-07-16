@@ -24,6 +24,13 @@ from ..domain.signal import Signal
 from .quality import Actor, Label
 
 KIND_CONTACT = "contact"
+#: The waking-mind appraisal result (lm-705.1, spec §4.1): the ``post_llm`` seam
+#: seeds this ONE-SHOT signal on a genuine reactive exchange the deterministic/LLM
+#: appraiser judged worth returning to; :class:`~lifemodel.core.thought_capture.ThoughtCapture`
+#: is its sole consumer, turning it into a durable ``PutRecord(thought)``. Never
+#: persisted itself — a hook never writes the store directly (spec §4.1), only a
+#: signal a core component reads.
+KIND_THOUGHT_SEED = "thought_seed"
 KIND_CONTACT_OBSERVED = "contact_observed"
 KIND_PROACTIVE_OUTCOME = "proactive_outcome"
 KIND_IN_FLIGHT = "in_flight"
@@ -153,6 +160,56 @@ def read_proactive_outcome_correlation(signal: Signal) -> str:
         raise ValueError(f"not a proactive_outcome signal: kind={signal.kind!r}")
     raw = signal.payload.get("correlation_id", "")
     return raw if isinstance(raw, str) else ""
+
+
+@dataclass(frozen=True)
+class ThoughtSeedRead:
+    """The validated payload of a ``thought_seed`` signal — the appraisal result a
+    completed exchange produced, on its way to a captured ``Thought`` (slice 1)."""
+
+    content: str
+    salience: float
+    actionability: float
+    other_regarding_value: float
+
+
+def thought_seed_signal(
+    *,
+    origin_id: str,
+    content: str,
+    salience: float,
+    actionability: float = 0.0,
+    other_regarding_value: float = 0.0,
+    timestamp: str | None,
+) -> Signal:
+    """Build a ``thought_seed`` signal — a bounded appraisal result seeded by the
+    ``post_llm`` appraisal seam, consumed by ``ThoughtCapture`` (spec §4.1)."""
+    return Signal(
+        origin_id=origin_id,
+        kind=KIND_THOUGHT_SEED,
+        payload={
+            "content": content,
+            "salience": float(salience),
+            "actionability": float(actionability),
+            "other_regarding_value": float(other_regarding_value),
+        },
+        timestamp=timestamp,
+    )
+
+
+def read_thought_seed(signal: Signal) -> ThoughtSeedRead:
+    """Validate and extract a :class:`ThoughtSeedRead` from a ``thought_seed`` signal."""
+    if signal.kind != KIND_THOUGHT_SEED:
+        raise ValueError(f"not a thought_seed signal: kind={signal.kind!r}")
+    content = signal.payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"invalid thought_seed payload: {signal.payload!r}")
+    return ThoughtSeedRead(
+        content=content,
+        salience=float(signal.payload.get("salience", 0.0)),
+        actionability=float(signal.payload.get("actionability", 0.0)),
+        other_regarding_value=float(signal.payload.get("other_regarding_value", 0.0)),
+    )
 
 
 def in_flight_signal(*, origin_id: str, value: bool, timestamp: str | None) -> Signal:
