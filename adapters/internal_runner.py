@@ -31,6 +31,8 @@ from ..core.frame import state_actor_lock
 from ..core.intents import UpdateState
 from ..core.internal_cognition import run_internal_completion
 from ..core.llm_port import InternalCognitionRequest, InternalCognitionResult, LlmPort
+from ..core.timeutil import to_iso
+from ..domain.session import VoiceCheck
 from ..ports.proactive import ProactiveEgressPort
 
 _LOG = logging.getLogger("lifemodel.internal_runner")
@@ -54,6 +56,7 @@ class InternalCognitionRunner:
         daily_ceiling: int,
         gateway_loop: asyncio.AbstractEventLoop,
         apply: Component,
+        voice: VoiceCheck | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._build_lm = build_lm
@@ -63,24 +66,38 @@ class InternalCognitionRunner:
         self._daily_ceiling = daily_ceiling
         self._gateway_loop = gateway_loop
         self._apply = apply
+        self._voice = voice
         self._timeout = timeout
         #: The tracked task set (design §3.1) — retained so a launched task is
         #: never garbage-collected mid-flight, and so :meth:`cancel_all` can find
         #: every in-flight call at shutdown.
         self._tasks: set[asyncio.Task[None]] = set()
 
-    def launch(self, request: InternalCognitionRequest, correlation_id: str) -> bool:
-        """Reserve FR20 + set ``pending_internal_id`` (one frame, under the lock);
-        on success, create + retain the async task that runs the aux call OFF the
-        lock. Returns ``False`` (no task created) when the daily ceiling denies
-        the reservation."""
+    def launch(
+        self,
+        request: InternalCognitionRequest,
+        correlation_id: str,
+        *,
+        subject_id: str | None = None,
+    ) -> bool:
+        """Single-flight gate + reserve FR20 + set ``pending_internal_id``/subject/
+        interval (one frame, under the lock); on success, create + retain the async
+        task that runs the aux call OFF the lock.
+
+        Returns ``False`` (no task created, budget untouched) when EITHER an
+        internal pass is already in flight (``pending_internal_id`` is already set
+        — single-flight, prereq #2) OR the daily ceiling denies the reservation.
+        Single-flight is checked FIRST, before ``reserve_internal_call`` — a
+        denied-by-single-flight launch must never consume a day's budget slot for
+        a call that never runs."""
         lm = self._build_lm()
         assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
+        now = lm.clock.now()
         with state_actor_lock():
             state = lm.state_actor.state
-            reserved = reserve_internal_call(
-                state, now=lm.clock.now(), daily_ceiling=self._daily_ceiling
-            )
+            if state.pending_internal_id is not None:
+                return False  # single-flight: an internal pass is already in flight
+            reserved = reserve_internal_call(state, now=now, daily_ceiling=self._daily_ceiling)
             if reserved is None:
                 return False
             lm.state_actor.apply(
@@ -90,6 +107,8 @@ class InternalCognitionRunner:
                             "internal_calls_today": reserved.internal_calls_today,
                             "internal_calls_day": reserved.internal_calls_day,
                             "pending_internal_id": correlation_id,
+                            "pending_internal_subject_id": subject_id,
+                            "last_internal_call_at": to_iso(now),
                         }
                     )
                 ]
@@ -122,6 +141,7 @@ class InternalCognitionRunner:
                 correlation_id=correlation_id,
                 result=result,
                 apply=self._apply,
+                voice=self._voice,
             )
         except asyncio.CancelledError:
             raise  # clean shutdown — recover_stale cleans up the pending marker at next connect
@@ -157,7 +177,13 @@ class InternalCognitionRunner:
             lm = self._build_lm()
             assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
             with state_actor_lock():
-                lm.state_actor.apply([UpdateState({"pending_internal_id": None})])
+                lm.state_actor.apply(
+                    [
+                        UpdateState(
+                            {"pending_internal_id": None, "pending_internal_subject_id": None}
+                        )
+                    ]
+                )
         except Exception as exc:  # noqa: BLE001 - recover_stale is the final backstop
             _LOG.exception(
                 "internal_cognition_pending_clear_failed correlation_id=%s error=%r",
@@ -173,7 +199,9 @@ class InternalCognitionRunner:
         if lm.state_actor.state.pending_internal_id is None:
             return
         with state_actor_lock():
-            lm.state_actor.apply([UpdateState({"pending_internal_id": None})])
+            lm.state_actor.apply(
+                [UpdateState({"pending_internal_id": None, "pending_internal_subject_id": None})]
+            )
 
     async def cancel_all(self) -> None:
         """Cancel + await every tracked task (called from ``disconnect``)."""

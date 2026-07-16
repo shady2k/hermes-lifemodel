@@ -24,6 +24,7 @@ from collections.abc import Mapping
 
 from ..composition import LifeModel
 from ..domain.egress import ReachOutcome
+from ..domain.session import VoiceCheck
 from ..ports.proactive import ProactiveEgressPort
 from .component import Component, ComponentLayer, TickContext
 from .frame import FrameTrigger, run_frame
@@ -63,6 +64,7 @@ def run_internal_completion(
     correlation_id: str,
     result: InternalCognitionResult,
     apply: Component,
+    voice: VoiceCheck | None = None,
 ) -> ReachOutcome | None:
     """Apply *result* + dispatch any launches + clear ``pending_internal_id``.
 
@@ -73,6 +75,14 @@ def run_internal_completion(
     *result* seeds the frame as an ``internal_result`` signal keyed by
     *correlation_id*; *apply* turns it into intents (or nothing, on a failed/empty
     *result* — see :class:`NullInternalApply`).
+
+    *voice* is forwarded verbatim to :func:`~lifemodel.core.proactive.dispatch_launches`
+    (the birth pre-flight, spec §6.2/lm-4fv.4): an unborn being's INCIDENTAL
+    proactive launch on THIS completion frame — surfaced by some other
+    already-registered component, never this seam itself (the strand fix,
+    codex #2) — must not be able to skip the same voice gate a native
+    ``proactive_tick`` launch goes through. ``None`` (the default) reproduces
+    the prior no-gate behaviour for a caller that has no voice check to offer.
 
     Returns whatever :func:`~lifemodel.core.proactive.dispatch_launches` returns —
     ``None`` unless some OTHER component (never this seam) also surfaced a
@@ -103,9 +113,14 @@ def run_internal_completion(
         timestamp=to_iso(lm.clock.now()),
     )
     report = run_frame(lm.coreloop, [signal], trigger=FrameTrigger.ASYNC_COMPLETION)
-    outcome = dispatch_launches(lm, report, egress, target)
+    outcome = dispatch_launches(lm, report, egress, target, voice=voice)
     # A second, small commit — clearing the correlation is NOT part of the frame's
     # own intent set (no component "owns" pending_internal_id), mirroring how
     # core/proactive.py's _rollback commits its own follow-up patch after a frame.
-    lm.state_actor.apply([UpdateState({"pending_internal_id": None})])
+    # The subject anchor clears in lockstep — it is set alongside
+    # pending_internal_id by the runner's reserve frame, so it must clear alongside
+    # it too, on every path (success, failure, or an empty result alike).
+    lm.state_actor.apply(
+        [UpdateState({"pending_internal_id": None, "pending_internal_subject_id": None})]
+    )
     return outcome
