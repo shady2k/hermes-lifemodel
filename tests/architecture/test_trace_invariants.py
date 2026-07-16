@@ -53,9 +53,12 @@ _EXCLUDE_PARTS = {"tests", "testing", "__pycache__", "docs", ".git", ".beads", "
 #: one thing that must never be swallowed: ``soul revert`` replaced ``SOUL.md`` and the
 #: bookkeeping after it failed), the session-end boundary (``adapters/session_end.py`` — the
 #: same no-ambient-span adapter case, logging a host that changed shape underneath a
-#: completed soul write), and the adapters
-#: that have no ambient span. Everything else — every ``core/`` tick component above
-#: all — must log ONLY through a ``SpanBoundLogger``.
+#: completed soul write), the internal-cognition runner (``adapters/internal_runner.py``,
+#: lm-705.6 — an adapter-owned asyncio task with no ambient span either: the aux call and
+#: its completion frame run off the gateway loop, not inside a tick, so a call/completion
+#: failure has nowhere to bind a ``SpanBoundLogger`` and is logged here instead), and the
+#: adapters that have no ambient span. Everything else — every ``core/`` tick component
+#: above all — must log ONLY through a ``SpanBoundLogger``.
 _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
     {
         "log.py",
@@ -67,6 +70,7 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "adapters/being_platform.py",
         "adapters/delivery.py",
         "adapters/session_end.py",
+        "adapters/internal_runner.py",
         "state/sqlite_store.py",
         "state/trace_store.py",
         "state/metrics_store.py",
