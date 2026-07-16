@@ -59,8 +59,24 @@ THOUGHT_KIND = "thought"
 PROCESSING_JSON_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
-        "outcome": {"type": "string", "enum": ["resolve", "park", "drop"]},
+        "outcome": {
+            "type": "string",
+            "enum": ["resolve", "park", "drop", "crystallize_commitment"],
+        },
         "reflection": {"type": "string"},
+        "commitment": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "basis": {"type": "string", "enum": ["promised", "follow_up", "self_assumed"]},
+                "trigger_kind": {"type": "string", "enum": ["time", "event", "condition"]},
+                "trigger_value": {"type": "string"},
+                "due_at": {"type": "string"},
+                "other_regarding_value": {"type": "number"},
+            },
+            "required": ["content", "basis", "trigger_kind", "trigger_value"],
+            "additionalProperties": False,
+        },
     },
     "required": ["outcome"],
     "additionalProperties": False,
@@ -73,8 +89,12 @@ PROCESSING_INSTRUCTIONS = (
     "Reflect briefly, in the first person, then decide the thought's disposition: "
     "'resolve' if you have thought it through and it needs nothing more; "
     "'park' if it is worth returning to later but not now; "
-    "'drop' if it no longer matters. "
-    "Answer as JSON: an 'outcome' of resolve/park/drop and a short 'reflection'."
+    "'drop' if it no longer matters; "
+    "'crystallize_commitment' if thinking it over left you with a follow-up you OWE them — "
+    "something to come back to for their sake — and fill 'commitment' with what you will do "
+    "('content'), why you hold it ('basis': promised/follow_up/self_assumed), and when to honour "
+    "it ('trigger_kind': time/event/condition + 'trigger_value'). "
+    "Answer as JSON: an 'outcome', a short 'reflection', and 'commitment' only when crystallizing."
 )
 
 
@@ -97,6 +117,7 @@ class ProcessingReason(StrEnum):
     DROPPED_NO_PROGRESS = "processed_drop_no_progress"
     TRANSIENT_FAILURE = "processed_transient_failure"
     NO_SUBJECT = "processed_no_subject"
+    CRYSTALLIZED_COMMITMENT = "processed_crystallize"
 
 
 @dataclass(frozen=True)
@@ -106,6 +127,7 @@ class ProcessingDecision:
 
     transition: TransitionOp | None
     reason: ProcessingReason
+    crystallize: JsonObject | None = None  # the validated commitment sub-object (apply builds it)
 
 
 def build_processing_prompt(thought: Thought) -> str:
@@ -175,6 +197,16 @@ def decide_processing_transition(
     if outcome == "drop":
         return ProcessingDecision(
             _transition(thought, ThoughtState.DROPPED, {}), ProcessingReason.DROPPED
+        )
+    if outcome == "crystallize_commitment":
+        commitment = parsed.get("commitment") if isinstance(parsed, dict) else None
+        if not isinstance(commitment, dict):
+            # schema said crystallize but no valid commitment object → no progress (codex I2)
+            return _park_or_terminate(thought, now=now, no_progress=True)
+        return ProcessingDecision(
+            transition=None,
+            reason=ProcessingReason.CRYSTALLIZED_COMMITMENT,
+            crystallize=commitment,
         )
     if outcome == "park":
         return _park_or_terminate(thought, now=now, no_progress=False)
