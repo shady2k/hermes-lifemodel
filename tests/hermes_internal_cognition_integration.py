@@ -1,0 +1,426 @@
+"""Real-Hermes driver — proves the non-delivered internal-cognition seam (lm-705.6).
+
+Not a pytest module (its name does not match ``test_*``): a standalone driver run
+under **Hermes' own interpreter** by the guarded wrapper
+:mod:`tests.test_internal_cognition_integration` against an **isolated, throwaway
+``HERMES_HOME``** — never ``~/.hermes``, never a real channel, never a real LLM
+call (mirrors ``hermes_genesis_prompt_integration.py``'s house rule).
+
+**What "real" means here, and where the line is drawn:**
+
+* **Part A — aux-task registration against the REAL host validation.** Builds a
+  genuine ``hermes_cli.plugins.PluginContext`` (real ``PluginManifest`` +
+  ``PluginManager`` — both cheap, no I/O) and runs the plugin's REAL
+  ``lifemodel.register(ctx)`` against it. Proves ``ctx.register_auxiliary_task
+  ("lifemodel_internal", ...)`` succeeds against the host's real key-format /
+  builtin-shadow validation (``hermes_cli/plugins.py:1047``) and that
+  ``register()`` resolves a real ``ctx.llm`` without raising. This is as far as
+  "custom-slot routing" can be proven honestly: as documented in
+  ``adapters/plugin_llm_adapter.py``, the CURRENT ``ctx.llm.acomplete_structured``
+  hard-codes ``task=None`` — a registered aux-task key is not yet reachable
+  through it. Nothing here calls a model.
+* **Part B — the seam's real mechanics, over a REAL SQLite store, driven by the
+  REAL host's structured-completion code path with a SCRIPTED transport.** Uses
+  ``agent.plugin_llm.make_plugin_llm_for_test(..., async_caller=...)` — a
+  host-provided test seam — to build a genuine ``PluginLlm`` whose message
+  building / JSON-schema handling / response parsing (``_build_structured_messages``,
+  ``_parse_structured_text``, ``_extract_text``/``_extract_usage``) all run for
+  real, but the actual network hop is a scripted async function. Proves, against
+  the real store and the real completion-frame code:
+  non-delivery (the egress is never called for the internal path itself);
+  gateway-loop task execution + retention;
+  typed re-entry under the lock (the scripted JSON round-trips through
+  ``PluginLlmPort`` into the injected ``apply`` component);
+  timeout/failure → pending still clears (no strand);
+  stale-pending recovery at "connect";
+  clean shutdown cancellation (``cancel_all``);
+  the FR20 hard-budget ceiling denying the N+1 call;
+  and the codex-#2 regression — a completion frame whose (unrelated) proactive
+  launch reaches the egress, dispatched, while the internal call itself never did.
+
+Human-readable evidence to **stderr**; one line of JSON to **stdout**. Exit 0 =
+every assertion held.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+_TARGET: dict[str, str | None] = {"platform": "test", "chat_id": "1", "thread_id": None}
+_BORN_AT = "2026-01-01T10:00:00+00:00"
+_ORIGIN_TP = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+def _fake_openai_response(text: str, *, model: str = "fake-model") -> Any:
+    class _Msg:
+        content = text
+
+    class _Choice:
+        message = _Msg()
+
+    class _Usage:
+        prompt_tokens = 5
+        completion_tokens = 5
+        total_tokens = 10
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = _Usage()
+
+    _Resp.model = model  # type: ignore[attr-defined]
+    return _Resp()
+
+
+async def main_async() -> dict[str, Any]:
+    import asyncio
+
+    from agent.plugin_llm import _TrustPolicy, make_plugin_llm_for_test
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    from lifemodel import register
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.adapters.internal_runner import InternalCognitionRunner
+    from lifemodel.adapters.plugin_llm_adapter import PluginLlmPort
+    from lifemodel.composition import build_lifemodel
+    from lifemodel.core.component import ComponentLayer, TickContext
+    from lifemodel.core.intents import Intent, LaunchProactive, PutRecord
+    from lifemodel.core.internal_cognition import NullInternalApply
+    from lifemodel.core.llm_port import InternalCognitionRequest
+    from lifemodel.core.registry import ComponentManifest
+    from lifemodel.core.taxonomy import KIND_INTERNAL_RESULT, read_internal_result
+    from lifemodel.domain.egress import ReachOutcome
+    from lifemodel.domain.memory import MemoryDraft, PutOp
+    from lifemodel.state.model import State
+
+    result: dict[str, Any] = {}
+
+    # ---- Part A: aux-task registration against the REAL host validation ----
+    home = Path(os.environ["HERMES_HOME"]).resolve()
+    sdir = home / "workspace" / "lifemodel"
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    manager = PluginManager()
+    manifest = PluginManifest(name="lifemodel")
+    ctx = PluginContext(manifest, manager)
+    register(ctx)  # the REAL register() — real aux-task registration, real ctx.llm
+
+    result["aux_task_registered"] = "lifemodel_internal" in manager._aux_tasks
+    aux_entry = manager._aux_tasks.get("lifemodel_internal") or {}
+    result["aux_task_display_name"] = aux_entry.get("display_name")
+    result["aux_task_plugin"] = aux_entry.get("plugin")
+    result["ctx_llm_resolved"] = ctx.llm is not None
+    _log(f"[A] aux_task_registered={result['aux_task_registered']} entry={aux_entry}")
+
+    class FakeEgress:
+        def __init__(self, outcome: ReachOutcome = ReachOutcome.DELIVERED) -> None:
+            self.outcome = outcome
+            self.calls: list[tuple[Any, str]] = []
+
+        def reach_out(self, target: Any, impulse: str) -> ReachOutcome:
+            self.calls.append((target, impulse))
+            return self.outcome
+
+    class RecordingApply:
+        id = "recording-apply"
+
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        def step(self, tick_ctx: TickContext) -> list[Intent]:
+            intents: list[Intent] = []
+            for sig in tick_ctx.signals:
+                if sig.kind == KIND_INTERNAL_RESULT:
+                    read = read_internal_result(sig)
+                    self.seen.append(read.raw)
+                    intents.append(
+                        PutRecord(
+                            op=PutOp(
+                                draft=MemoryDraft(
+                                    kind="note",
+                                    id=f"n-{read.correlation_id}",
+                                    state="active",
+                                    payload={"raw": read.raw},
+                                    source="integration-driver",
+                                )
+                            )
+                        )
+                    )
+            return intents
+
+    def _build_lm_factory(base_dir: Path):
+        def _build():
+            return build_lifemodel(base_dir=base_dir, clock=SystemClock())
+
+        return _build
+
+    def _commit_born(base_dir: Path, **fields: object) -> None:
+        base: dict[str, object] = dict(genesis_completed_at=_BORN_AT)
+        base.update(fields)
+        _build_lm_factory(base_dir)().state.commit(State(**base))  # type: ignore[arg-type]
+
+    # ---- Part B1: non-delivery + gateway-loop execution + typed re-entry ----
+    b1_dir = home / "seam-b1"
+    b1_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(b1_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_b1 = _build_lm_factory(b1_dir)
+
+    calls_b1: list[dict[str, Any]] = []
+
+    async def _async_caller_b1(**kwargs: Any) -> Any:
+        calls_b1.append(kwargs)
+        # PluginLlm._invoke_async's injected async_caller contract (agent/plugin_llm.py):
+        # returns (provider, model, response) — a bare response raises inside the host's
+        # own `real_provider, real_model, response = await self._invoke_async(...)` unpack.
+        return (
+            "fake-provider",
+            "fake-model",
+            _fake_openai_response('{"gist": "noticed something real"}'),
+        )
+
+    plugin_llm_b1 = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_async_caller_b1,
+    )
+    egress_b1 = FakeEgress()
+    apply_b1 = RecordingApply()
+    runner_b1 = InternalCognitionRunner(
+        build_lm_b1,
+        PluginLlmPort(plugin_llm_b1),
+        egress_b1,
+        _TARGET,
+        daily_ceiling=1,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=apply_b1,
+        timeout=10.0,
+    )
+    ok_first = runner_b1.launch(
+        InternalCognitionRequest(instructions="notice", input_text="the segment"), "c-1"
+    )
+    result["b1_launch_within_budget_accepted"] = ok_first
+    result["b1_pending_set_synchronously"] = build_lm_b1().state.load().pending_internal_id == "c-1"
+    for task in list(runner_b1._tasks):
+        await task
+    result["b1_host_call_used_real_message_building"] = bool(calls_b1 and calls_b1[0]["messages"])
+    result["b1_apply_saw_typed_result"] = apply_b1.seen == ['{"gist": "noticed something real"}']
+    result["b1_pending_cleared_after_completion"] = (
+        build_lm_b1().state.load().pending_internal_id is None
+    )
+    result["b1_note_persisted"] = build_lm_b1().state.get("note", "n-c-1") is not None
+    result["b1_egress_never_called"] = egress_b1.calls == []  # non-delivery is structural
+
+    # ---- Part B1b: FR20 hard-budget ceiling denies the N+1 call ----
+    ok_second = runner_b1.launch(
+        InternalCognitionRequest(instructions="notice", input_text="another segment"), "c-2"
+    )
+    result["b1_second_call_denied_over_budget"] = ok_second is False
+    result["b1_budget_consumed_exactly_once"] = build_lm_b1().state.load().internal_calls_today == 1
+    _log(f"[B1] {result}")
+
+    # ---- Part B2: a failed/timed-out call still clears pending (no strand) ----
+    b2_dir = home / "seam-b2"
+    b2_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(b2_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_b2 = _build_lm_factory(b2_dir)
+
+    async def _async_caller_b2(**kwargs: Any) -> Any:
+        raise RuntimeError("simulated provider failure")
+
+    plugin_llm_b2 = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_async_caller_b2,
+    )
+    apply_b2 = RecordingApply()
+    runner_b2 = InternalCognitionRunner(
+        build_lm_b2,
+        PluginLlmPort(plugin_llm_b2),
+        FakeEgress(),
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=apply_b2,
+        timeout=10.0,
+    )
+    runner_b2.launch(InternalCognitionRequest(instructions="i", input_text="t"), "c-fail")
+    for task in list(runner_b2._tasks):
+        await task
+    result["b2_failed_call_still_clears_pending"] = (
+        build_lm_b2().state.load().pending_internal_id is None
+    )
+    result["b2_apply_saw_empty_result_on_failure"] = apply_b2.seen == [""]
+    _log(f"[B2] {result['b2_failed_call_still_clears_pending']=} {apply_b2.seen=}")
+
+    # ---- Part B3: stale-pending recovery at "connect" ----
+    b3_dir = home / "seam-b3"
+    b3_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(b3_dir, pending_internal_id="stale-from-a-dead-process")
+    build_lm_b3 = _build_lm_factory(b3_dir)
+    runner_b3 = InternalCognitionRunner(
+        build_lm_b3,
+        PluginLlmPort(plugin_llm_b2),  # unused here — recover_stale never calls it
+        FakeEgress(),
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=NullInternalApply(),
+    )
+    runner_b3.recover_stale(build_lm_b3())
+    result["b3_stale_pending_cleared_at_connect"] = (
+        build_lm_b3().state.load().pending_internal_id is None
+    )
+    _log(f"[B3] {result['b3_stale_pending_cleared_at_connect']=}")
+
+    # ---- Part B4: clean shutdown cancellation ----
+    b4_dir = home / "seam-b4"
+    b4_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(b4_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_b4 = _build_lm_factory(b4_dir)
+
+    async def _hanging_caller(**kwargs: Any) -> Any:
+        await asyncio.sleep(3600)
+        raise AssertionError("should have been cancelled first")
+
+    plugin_llm_b4 = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_hanging_caller,
+    )
+    runner_b4 = InternalCognitionRunner(
+        build_lm_b4,
+        PluginLlmPort(plugin_llm_b4),
+        FakeEgress(),
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=NullInternalApply(),
+        timeout=3600.0,
+    )
+    runner_b4.launch(InternalCognitionRequest(instructions="i", input_text="t"), "c-hang")
+    await asyncio.sleep(0)
+    result["b4_task_actually_running_before_cancel"] = len(runner_b4._tasks) == 1
+    await asyncio.wait_for(runner_b4.cancel_all(), timeout=10.0)
+    result["b4_no_leaked_task_after_cancel_all"] = runner_b4._tasks == set()
+    _log(
+        f"[B4] {result['b4_task_actually_running_before_cancel']=} "
+        f"{result['b4_no_leaked_task_after_cancel_all']=}"
+    )
+
+    # ---- Part B5: codex #2 — an unrelated proactive launch is still dispatched ----
+    b5_dir = home / "seam-b5"
+    b5_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(b5_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_b5 = _build_lm_factory(b5_dir)
+
+    class FakeProactiveLauncher:
+        id = "fake-proactive-launcher"
+
+        def step(self, tick_ctx: TickContext) -> list[Intent]:
+            return [
+                LaunchProactive(
+                    prompt="an unrelated proactive impulse",
+                    correlation_id="proactive-from-b5",
+                    origin_traceparent=_ORIGIN_TP,
+                )
+            ]
+
+    lm_b5 = build_lm_b5()
+    lm_b5.registry.register(
+        FakeProactiveLauncher(),
+        ComponentManifest(
+            id=FakeProactiveLauncher.id,
+            type="cognition",
+            layer=ComponentLayer.COGNITION,
+            metric_surface=(),
+            accepts_signals=False,
+        ),
+    )
+    egress_b5 = FakeEgress()
+
+    async def _async_caller_b5(**kwargs: Any) -> Any:
+        return "fake-provider", "fake-model", _fake_openai_response("")
+
+    plugin_llm_b5 = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_async_caller_b5,
+    )
+    runner_b5 = InternalCognitionRunner(
+        lambda: lm_b5,  # SAME registry every call, so the fake launcher stays registered
+        PluginLlmPort(plugin_llm_b5),
+        egress_b5,
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=NullInternalApply(),
+        timeout=10.0,
+    )
+    runner_b5.launch(InternalCognitionRequest(instructions="i", input_text="t"), "c-b5")
+    for task in list(runner_b5._tasks):
+        await task
+    result["b5_unrelated_proactive_launch_was_dispatched"] = len(egress_b5.calls) == 1 and (
+        egress_b5.calls[0][1] == "an unrelated proactive impulse"
+    )
+    result["b5_internal_pending_still_cleared"] = lm_b5.state.load().pending_internal_id is None
+    _log(f"[B5] {result['b5_unrelated_proactive_launch_was_dispatched']=}")
+
+    return result
+
+
+#: Every result key that MUST be ``True`` for the driver to report success —
+#: kept explicit (not "every bool key") so a new descriptive (non-assertion)
+#: field can be added to ``result`` later without silently becoming a gate.
+_REQUIRED_TRUE_KEYS = (
+    "aux_task_registered",
+    "ctx_llm_resolved",
+    "b1_launch_within_budget_accepted",
+    "b1_pending_set_synchronously",
+    "b1_host_call_used_real_message_building",
+    "b1_apply_saw_typed_result",
+    "b1_pending_cleared_after_completion",
+    "b1_note_persisted",
+    "b1_egress_never_called",
+    "b1_second_call_denied_over_budget",
+    "b1_budget_consumed_exactly_once",
+    "b2_failed_call_still_clears_pending",
+    "b2_apply_saw_empty_result_on_failure",
+    "b3_stale_pending_cleared_at_connect",
+    "b4_task_actually_running_before_cancel",
+    "b4_no_leaked_task_after_cancel_all",
+    "b5_unrelated_proactive_launch_was_dispatched",
+    "b5_internal_pending_still_cleared",
+)
+
+
+def main() -> int:
+    import asyncio
+
+    home = Path(os.environ["HERMES_HOME"]).resolve()
+    src = os.environ["LIFEMODEL_SRC"]
+    if home == (Path.home() / ".hermes").resolve():
+        _log("REFUSING to run against the default ~/.hermes — set an isolated HERMES_HOME")
+        return 2
+
+    sys.path.insert(0, src)
+
+    result = asyncio.run(main_async())
+    print(json.dumps(result), flush=True)
+
+    failed = [k for k in _REQUIRED_TRUE_KEYS if result.get(k) is not True]
+    if failed:
+        _log(f"FAILED assertions: {failed}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised as a subprocess
+    raise SystemExit(main())
