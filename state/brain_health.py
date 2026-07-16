@@ -4,9 +4,9 @@ The backbone of the fail-loud invariant (spec §4.2): one small, thread-safe,
 per-``base_dir`` object whose :attr:`~BrainHealth.state` answers "did the being's
 brain boot, connect, keep ticking, or die?". It is WRITTEN by the wiring path
 (:func:`lifemodel.register`, :meth:`BeingAdapter.connect`, ``_on_loop_death``, the
-observer hooks) and READ by the platform ``check_fn`` and (Slice 3)
-``/lifemodel status``. Because the same gateway process hosts BOTH the being
-adapter AND the ``/lifemodel`` command handler, a per-base_dir singleton
+observer hooks) and READ by ``/lifemodel status`` (:meth:`check`). Because the same
+gateway process hosts BOTH the being adapter AND the ``/lifemodel`` command handler,
+a per-base_dir singleton
 (:func:`get_brain_health`, mirroring
 :func:`~lifemodel.core.metrics.get_metric_registry` /
 :func:`~lifemodel.state.trace_store.acquire_trace_writer`) is shared between them.
@@ -57,9 +57,9 @@ BrainState = Literal["never_started", "connecting", "connected", "loop_dead", "b
 
 #: The brain's nominal tick cadence (mirrors :class:`BeingAdapter`'s loop interval),
 #: the baseline the staleness threshold derives from. Kept HERE — the leaf health
-#: module, Hermes-free and with no heavy deps — so BOTH the adapter's ``check_fn``
-#: (:func:`~lifemodel.adapters.being_platform.make_check_fn`) AND ``/lifemodel status``
-#: read ONE threshold and can never drift.
+#: module, Hermes-free and with no heavy deps — so BOTH the adapter's loop
+#: (``LOOP_INTERVAL_SEC``) AND ``/lifemodel status`` read ONE baseline and can never
+#: drift. (The enablement ``check_fn`` reads no state at all — lm-54i.)
 DEFAULT_TICK_INTERVAL_SECONDS = 60.0
 #: How stale the durable ``last_tick_at`` may get before the brain reads unhealthy
 #: (spec §4.2, "a few intervals"). Generous so a slow tick — or a just-connected loop
@@ -263,9 +263,9 @@ class BrainHealth:
         *enablement* gate — a False there would brick the being at boot (the state is
         ``never_started`` at the registry pass) and block the gateway's reconnect after
         a loop death — so it is permissive/always-True (see
-        :func:`~lifemodel.adapters.being_platform.make_check_fn`). This verdict instead
-        drives where a False cannot brick anything: ``/lifemodel status`` and the
-        poll-cadence DEBUG log. So it reports the TRUTH — genuine post-start unhealth
+        :func:`~lifemodel.adapters.being_platform.make_check_fn`, which reads no state at
+        all — lm-54i). This verdict instead drives where a False cannot brick anything:
+        ``/lifemodel status``. So it reports the TRUTH — genuine post-start unhealth
         (``boot_failed`` / ``loop_dead`` / a ``connected`` brain whose ticks went stale)
         returns ``(False, reason)`` — while the *pre-connect transients*
         (``never_started`` / ``connecting``) are "not a failure, just not up yet" and

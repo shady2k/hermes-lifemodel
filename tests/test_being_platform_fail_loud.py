@@ -100,7 +100,8 @@ def _make_adapter(bp: types.ModuleType, base_dir: Path):
 # re-evaluates it to drive reconnect-after-death; a False for loop_dead/stale/
 # boot_failed would brick the being at boot OR block the gateway's own reconnect.
 # So enablement is PERMISSIVE (always True); liveness is surfaced via /lifemodel
-# status + logs (BrainHealth.check()), never as this gate.
+# status (BrainHealth.check()), never as this gate — which reads NO state at all
+# (lm-54i: a stale non-gateway host must not poll a DB it does not own).
 # --------------------------------------------------------------------------- #
 
 
@@ -145,6 +146,48 @@ def test_brain_health_check_still_reports_unhealth_for_the_status_surface(tmp_pa
     ok, reason = health.check(last_tick_at=None, now=datetime.now(UTC), stale_after_seconds=300.0)
     assert ok is False
     assert "loop_dead" in reason
+
+
+def test_check_fn_polls_no_state_so_a_stale_build_never_reads_the_being_db(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # lm-54i: `make deploy` restarts ONLY the gateway, so `hermes serve` keeps a stale
+    # plugin build. check_fn used to read runtime_state on every poll — and once the
+    # gateway had migrated the DB forward, ``.load()`` raised StateSchemaError, which
+    # check_fn caught and logged as a ``check_fn_state_read_failed`` WARNING+traceback
+    # every ~15s (813 of them in one incident, against a DB this process does not own).
+    # An ENABLEMENT gate has no business reading the being's state: it must poll NOTHING,
+    # so a DB whose schema is newer than this build never makes it touch the DB.
+    import json
+    import sqlite3
+
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.state.model import SCHEMA_VERSION, State
+    from lifemodel.state.sqlite_store import SQLiteRuntimeStore
+
+    # Commit a row, then force its persisted schema_version ABOVE this build's — exactly
+    # what a stale serve sees after the fresh gateway migrated the store forward.
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(State())
+    conn = sqlite3.connect(tmp_path / "lifemodel.sqlite")
+    try:
+        (raw,) = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
+        blob = json.loads(raw)
+        blob["schema_version"] = SCHEMA_VERSION + 1
+        conn.execute("UPDATE runtime_state SET state_json = ? WHERE id = 1", (json.dumps(blob),))
+        conn.commit()
+    finally:
+        conn.close()
+
+    bp = _fresh_being_platform()
+    ctx = _FakeCtx()
+    bp.register_being_platform(ctx, base_dir=tmp_path, target=None)
+    check_fn = ctx.platforms[0][1]["check_fn"]
+
+    with caplog.at_level(logging.WARNING):
+        assert check_fn() is True  # enablement stays permissive
+    # the fix: check_fn reads nothing, so the schema skew produces no spam and no trace
+    assert "check_fn_state_read_failed" not in caplog.text
+    assert "StateSchemaError" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #

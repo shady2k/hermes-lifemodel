@@ -1,7 +1,7 @@
 """``BrainHealth`` — the process-local single source of brain liveness (spec §4.2).
 
-The backbone the fail-loud wiring writes and ``check_fn`` / ``/lifemodel status``
-read: one small, thread-safe, per-base_dir singleton whose ``state`` is the truth
+The backbone the fail-loud wiring writes and ``/lifemodel status`` reads: one small,
+thread-safe, per-base_dir singleton whose ``state`` is the truth
 about whether the being's brain booted, connected, is ticking, or died. A SMALL
 durable ``brain_boot.json`` record survives a gateway restart so the owner can
 still read *why* a boot failed after the process is revived (spec §4.2/§4.3).
@@ -161,7 +161,7 @@ def test_singleton_shares_state_across_readers(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# check() — the enablement-safe liveness predicate feeding check_fn
+# check() — the enablement-safe liveness predicate feeding /lifemodel status
 # --------------------------------------------------------------------------- #
 
 
@@ -313,7 +313,7 @@ def test_tick_staleness_uses_the_freshest_anchor(tmp_path: Path) -> None:
 
 
 def test_shared_staleness_threshold_constants(tmp_path: Path) -> None:
-    # The threshold lives HERE (Hermes-free) so both the adapter's check_fn and
+    # The threshold lives HERE (Hermes-free) so both the adapter's loop and
     # /lifemodel status read ONE value — "a few intervals" (spec §4.2).
     assert DEFAULT_TICK_INTERVAL_SECONDS == 60.0
     assert STALE_AFTER_SECONDS == 300.0

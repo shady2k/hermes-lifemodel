@@ -42,19 +42,13 @@ from ..core.timeutil import to_iso
 from ..events import EventRing
 from ..gateway_core import home_session_key
 from ..ports.memory import MemoryPort
-from ..state.brain_health import (
-    DEFAULT_TICK_INTERVAL_SECONDS,
-    STALE_AFTER_SECONDS,
-    BrainHealth,
-    get_brain_health,
-)
+from ..state.brain_health import DEFAULT_TICK_INTERVAL_SECONDS, get_brain_health
 from ..state.metrics_store import (
     MetricsSampler,
     acquire_metrics_sampler,
     release_metrics_sampler,
 )
 from ..state.soul_revisions import record_revision, revisions
-from ..state.sqlite_store import SQLiteRuntimeStore
 from ..state.trace_store import (
     TraceWriter,
     acquire_trace_writer,
@@ -69,10 +63,9 @@ from .session_end import GatewayBirthVoice
 from .soul_file import SoulFile, prior_soul
 
 PLATFORM_NAME = "lifemodel"
-#: The adapter's tick cadence — the SAME baseline the (Hermes-free) staleness
-#: threshold derives from, imported from :mod:`lifemodel.state.brain_health` so the
-#: adapter loop, ``check_fn``, and ``/lifemodel status`` never drift. ``STALE_AFTER_SECONDS``
-#: is re-exported from here for back-compat with existing call sites.
+#: The adapter's tick cadence — imported from :mod:`lifemodel.state.brain_health` (the
+#: single source the loop interval and the ``/lifemodel status`` staleness threshold both
+#: derive from) so the two never drift.
 LOOP_INTERVAL_SEC = DEFAULT_TICK_INTERVAL_SECONDS
 
 _LOG = logging.getLogger("lifemodel.being")
@@ -282,7 +275,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         Fail-loud (spec §4.3/MAJOR-7): a death carrying an exception is logged
         **ERROR with the traceback** (never INFO), and drives :class:`BrainHealth`
         to ``loop_dead`` with the death detail + a bumped ``death_count`` so
-        ``check_fn`` / ``/lifemodel status`` reflect it until a clean reconnect.
+        ``/lifemodel status`` reflects it until a clean reconnect.
         """
         if self._shutting_down:
             return
@@ -417,52 +410,29 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         return {"id": chat_id, "platform": PLATFORM_NAME, "type": "internal"}
 
 
-def _read_last_tick_at(base_dir: Path) -> str | None:
-    """Read the durable ``last_tick_at`` for the staleness check (spec §4.2).
+def make_check_fn() -> Any:
+    """The platform ``check_fn`` — Hermes' ENABLEMENT gate, always True, reads NOTHING.
 
-    This is the PRIMARY liveness signal — advanced every tick by the CoreLoop into
-    ``AgentState`` (never a parallel counter). Defensive: a locked/corrupt read must
-    never crash ``check_fn`` (the gateway polls it), so it logs a WARNING with the
-    traceback (observable) and degrades to ``None`` (unknown → not-stale), letting
-    the primary loud channels (the register re-raise, the loop-death ERROR) carry
-    the signal instead.
-    """
-    try:
-        return SQLiteRuntimeStore(base_dir, clock=SystemClock()).load().last_tick_at
-    except Exception:  # noqa: BLE001 - check_fn must never raise on a flaky read
-        _LOG.warning("check_fn_state_read_failed base_dir=%s", base_dir, exc_info=True)
-        return None
+    ``check_fn`` is Hermes' *enablement/instantiation* predicate ("are my dependencies
+    available?"), re-evaluated to drive **reconnect-after-death** recovery — NOT a liveness
+    probe. Ours is unconditionally True: a False would (a) prevent the being from EVER
+    booting — at the registry pass the brain is necessarily ``never_started`` — and (b)
+    block the gateway's own reconnect after a loop death, the exact silent-death class this
+    epic exists to kill, self-inflicted.
 
-
-def make_check_fn(base_dir: Path, health: BrainHealth) -> Any:
-    """Build the platform ``check_fn`` — Hermes' ENABLEMENT gate, NOT liveness (spec §5).
-
-    ``check_fn`` is Hermes' *enablement/instantiation* gate: Hermes adds the platform
-    to ``cfg.platforms`` only when this returns True, AND re-evaluates it to drive the
-    **reconnect-after-death** recovery. At the registry pass the brain is necessarily
-    ``never_started``, so a liveness-derived gate that returned False for
-    ``never_started`` / ``loop_dead`` / stale / ``boot_failed`` would (a) prevent the
-    being from EVER booting and (b) block the gateway's own reconnect after a loop
-    death — the exact silent-death class this epic exists to kill, self-inflicted.
-
-    So enablement is **permissive: always True**. The rich liveness verdict
-    (:meth:`BrainHealth.check`) is NOT this gate — it is surfaced where a False cannot
-    brick the being: ``/lifemodel status`` (the display) and the poll-cadence DEBUG log
-    below. The loud channels stay the register re-raise, the loop-death ERROR, and the
-    status block.
+    **It reads no state, on purpose (lm-54i).** An earlier version read ``last_tick_at`` for
+    a DEBUG liveness line. But ``register()`` runs this gate into EVERY plugin-hosting
+    process — including a ``hermes serve`` that never ticks — and Hermes polls it there too.
+    ``make deploy`` restarts only the gateway, so a stale ``serve`` kept polling; once the
+    fresh gateway had migrated the store forward, its ``.load()`` raised ``StateSchemaError``
+    every ~15s (813 ``check_fn_state_read_failed`` WARNINGs in one incident) against a DB it
+    does not own. An enablement gate has no business reading the being's state. The rich
+    liveness verdict (:meth:`BrainHealth.check`) lives where a stale reader cannot reach it
+    and a False cannot brick the being: ``/lifemodel status``, ``metrics.sqlite``, and the
+    gateway-owned loop-death ERROR.
     """
 
     def _check() -> bool:
-        # Compute the liveness verdict for OBSERVABILITY ONLY (a DEBUG line at the
-        # gateway poll cadence) — it never gates enablement. Returning False here would
-        # brick boot / block reconnect (codex MAJOR); the truth is surfaced by
-        # /lifemodel status + this log, not by refusing enablement.
-        ok, reason = health.check(
-            last_tick_at=_read_last_tick_at(base_dir),
-            now=SystemClock().now(),
-            stale_after_seconds=STALE_AFTER_SECONDS,
-        )
-        _LOG.debug("being_check enablement=True liveness_ok=%s reason=%s", ok, reason)
         return True
 
     return _check
@@ -495,6 +465,6 @@ def register_being_platform(
             soul=soul,
             default_soul_text=default_soul_text,
         ),
-        check_fn=make_check_fn(base_dir, get_brain_health(base_dir)),
+        check_fn=make_check_fn(),
         emoji="🫀",
     )
