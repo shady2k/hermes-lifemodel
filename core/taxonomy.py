@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from ..domain.egress import ProactiveOutcome
 from ..domain.signal import Signal
@@ -53,6 +53,14 @@ KIND_CONTACT_PRESENCE = "contact_presence"
 #: this transient signal, not ``ctx.state.u``). Created in T2; ContactAggregation
 #: migrates from the legacy ``contact`` kind onto this one in T3.
 KIND_CONTACT_PRESSURE = "contact_pressure"
+#: The typed re-entry of a non-delivered internal-cognition aux call (lm-705.6,
+#: design §3.3): seeds the completion frame the runner drives once
+#: :class:`~lifemodel.core.llm_port.LlmPort` returns/fails. Consumed by whatever
+#: result-applying :class:`~lifemodel.core.component.Component` the caller injects
+#: into :func:`~lifemodel.core.internal_cognition.run_internal_completion` (for
+#: lm-705.6 itself, a trivial no-op pass — noticing/processing supply the real
+#: ones). Never persisted itself — like every signal, it lives ``<=`` one frame.
+KIND_INTERNAL_RESULT = "internal_result"
 
 Lane = Literal["control", "sensor"]
 
@@ -210,6 +218,52 @@ def read_thought_seed(signal: Signal) -> ThoughtSeedRead:
         actionability=float(signal.payload.get("actionability", 0.0)),
         other_regarding_value=float(signal.payload.get("other_regarding_value", 0.0)),
     )
+
+
+@dataclass(frozen=True)
+class InternalResultRead:
+    """The validated payload of an ``internal_result`` signal — one non-delivered
+    aux call's typed re-entry (lm-705.6): which correlation it resolves, plus the
+    raw text and optional parsed JSON the :class:`~lifemodel.core.llm_port.LlmPort`
+    call produced (or the empty/absent pair on a failed call — see
+    :func:`~lifemodel.core.internal_cognition.run_internal_completion`)."""
+
+    correlation_id: str
+    raw: str
+    parsed: dict[str, Any] | None
+
+
+def internal_result_signal(
+    *,
+    origin_id: str,
+    correlation_id: str,
+    raw: str,
+    parsed: dict[str, Any] | None,
+    timestamp: str | None,
+) -> Signal:
+    """Build an ``internal_result`` signal — the completion frame's typed re-entry
+    seed (lm-705.6, design §3.3)."""
+    return Signal(
+        origin_id=origin_id,
+        kind=KIND_INTERNAL_RESULT,
+        payload={"correlation_id": correlation_id, "raw": raw, "parsed": parsed},
+        timestamp=timestamp,
+    )
+
+
+def read_internal_result(signal: Signal) -> InternalResultRead:
+    """Validate and extract an :class:`InternalResultRead` from an ``internal_result``
+    signal."""
+    if signal.kind != KIND_INTERNAL_RESULT:
+        raise ValueError(f"not an internal_result signal: kind={signal.kind!r}")
+    correlation_id = signal.payload.get("correlation_id")
+    raw = signal.payload.get("raw")
+    if not isinstance(correlation_id, str) or not isinstance(raw, str):
+        raise ValueError(f"invalid internal_result payload: {signal.payload!r}")
+    parsed = signal.payload.get("parsed")
+    if parsed is not None and not isinstance(parsed, dict):
+        raise ValueError(f"invalid internal_result payload: {signal.payload!r}")
+    return InternalResultRead(correlation_id=correlation_id, raw=raw, parsed=parsed)
 
 
 def in_flight_signal(*, origin_id: str, value: bool, timestamp: str | None) -> Signal:
