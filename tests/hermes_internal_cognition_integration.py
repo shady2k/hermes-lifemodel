@@ -97,8 +97,11 @@ async def main_async() -> dict[str, Any]:
     from lifemodel.core.llm_port import InternalCognitionRequest
     from lifemodel.core.registry import ComponentManifest
     from lifemodel.core.taxonomy import KIND_INTERNAL_RESULT, read_internal_result
+    from lifemodel.core.thought_processing import ThoughtProcessingApply
+    from lifemodel.core.thought_view import build_thought, encode_thought, read_thought
     from lifemodel.domain.egress import ReachOutcome
     from lifemodel.domain.memory import MemoryDraft, PutOp
+    from lifemodel.domain.objects import ThoughtState
     from lifemodel.state.model import State
 
     result: dict[str, Any] = {}
@@ -373,6 +376,68 @@ async def main_async() -> dict[str, Any]:
     result["b5_internal_pending_still_cleared"] = lm_b5.state.load().pending_internal_id is None
     _log(f"[B5] {result['b5_unrelated_proactive_launch_was_dispatched']=}")
 
+    # ---- Part B-processing: a real thought seeded, processed, and resolved ----
+    bp_dir = home / "seam-bp"
+    bp_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(bp_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_bp = _build_lm_factory(bp_dir)
+    build_lm_bp().state.put(
+        encode_thought(
+            build_thought(
+                id="thought:seed:p",
+                content="the owner mentioned a trip on Friday",
+                state=ThoughtState.ACTIVE,
+                salience=0.8,
+            )
+        )
+    )
+
+    async def _async_caller_bp(**kwargs: Any) -> Any:
+        return (
+            "fake-provider",
+            "fake-model",
+            _fake_openai_response('{"outcome": "resolve", "reflection": "thought it through"}'),
+        )
+
+    plugin_llm_bp = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_async_caller_bp,
+    )
+    egress_bp = FakeEgress()
+    runner_bp = InternalCognitionRunner(
+        build_lm_bp,
+        PluginLlmPort(plugin_llm_bp),
+        egress_bp,
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=ThoughtProcessingApply(),
+        timeout=10.0,
+    )
+    runner_bp.launch(
+        InternalCognitionRequest(
+            instructions="ruminate", input_text="the thought", json_schema={"type": "object"}
+        ),
+        "c-proc",
+        subject_id="thought:seed:p",
+    )
+    # Single-flight (checked BEFORE awaiting the first task, so a denial here can
+    # only be the in-flight gate — daily_ceiling=5 rules out the budget instead).
+    ok_bp_second = runner_bp.launch(
+        InternalCognitionRequest(instructions="x", input_text="y"),
+        "c-proc-2",
+        subject_id="thought:seed:p",
+    )
+    result["bp_single_flight_denied_concurrent"] = ok_bp_second is False
+    for task in list(runner_bp._tasks):
+        await task
+    result["bp_pending_cleared"] = build_lm_bp().state.load().pending_internal_id is None
+    result["bp_subject_cleared"] = build_lm_bp().state.load().pending_internal_subject_id is None
+    result["bp_thought_resolved"] = read_thought(build_lm_bp().state, "thought:seed:p") is None
+    result["bp_egress_never_called"] = egress_bp.calls == []  # non-delivery is structural
+    _log(f"[BP] {result}")
+
     return result
 
 
@@ -398,6 +463,11 @@ _REQUIRED_TRUE_KEYS = (
     "b4_no_leaked_task_after_cancel_all",
     "b5_unrelated_proactive_launch_was_dispatched",
     "b5_internal_pending_still_cleared",
+    "bp_single_flight_denied_concurrent",
+    "bp_pending_cleared",
+    "bp_subject_cleared",
+    "bp_thought_resolved",
+    "bp_egress_never_called",
 )
 
 
