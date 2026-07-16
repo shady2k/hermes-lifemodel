@@ -20,20 +20,25 @@ tree that makes a quiet frame as debuggable as a loud one (spec §5).
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ..composition import build_lifemodel
+from ..composition import LifeModel, build_lifemodel
+from ..core.component import ComponentLayer
 from ..core.desire_view import read_live_contact_desire
 from ..core.frame import FrameTrigger
 from ..core.proactive import proactive_tick
 from ..core.quality import Actor, Label
+from ..core.registry import ComponentManifest
 from ..core.taxonomy import contact_observed_signal, proactive_outcome_signal
+from ..core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
 from ..domain.egress import ProactiveOutcome, ReachOutcome
 from ..domain.signal import Signal
 from ..events import EventRing
+from ..ports.clock import ClockPort
 from ..ports.memory import MemoryPort
 from ..state.model import State
 from .fakes import FakeClock
@@ -205,3 +210,59 @@ class IntegrationHarness:
             suppressions=suppressions,
             u=final.u,
         )
+
+
+def build_capture_lifemodel(
+    *, base_dir: Path | None = None, clock: ClockPort | None = None
+) -> LifeModel:
+    """A real-code ``LifeModel`` with :class:`~lifemodel.core.thought_capture.ThoughtCapture`
+    registered — the slice-1 (lm-705.1) thought-capture sim seam.
+
+    Deliberately NOT a fake-ports harness: :class:`~lifemodel.testing.fakes.FakeStateStore`
+    is a ``StatePort``/``TickCommitPort`` but NOT a ``MemoryPort`` (it exposes no
+    ``get``/``find``/``put``/``transition`` of its own — only an INJECTED
+    ``FakeMemoryStore`` does), so ``read_live_thoughts(lm.state)`` and the ``post_llm``
+    seam's own ``isinstance(lm.state, MemoryPort)`` narrowing would both fail against
+    one. The REAL :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` — exactly
+    what :class:`IntegrationHarness` and ``tests/test_frame_acceptance.py`` already use
+    for a "real code, honest prediction" sim — satisfies every port at once, so this
+    builds the ordinary real graph (:func:`build_lifemodel`) over a fresh on-disk store
+    and adds ONLY the ``ThoughtCapture`` registration on top.
+
+    ``base_dir`` defaults to a fresh temp directory (stdlib ``tempfile``) so a caller
+    can write ``build_capture_lifemodel()`` bare, with no ``tmp_path`` fixture to
+    thread through — every call gets its own store, so concurrent tests never collide.
+    The being is committed BORN (:data:`BORN_AT`) before return: an unborn being's very
+    first frame is the genesis wake (spec §6.2), an entirely different path this
+    capture-pipeline seam has nothing to do with — every thought-capture scenario is an
+    ordinary owner↔being exchange, inside an existing relationship.
+    """
+    resolved_base_dir = (
+        base_dir
+        if base_dir is not None
+        else Path(tempfile.mkdtemp(prefix="lifemodel-thought-capture-"))
+    )
+    resolved_clock: ClockPort = (
+        clock if clock is not None else FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    )
+    lm = build_lifemodel(base_dir=resolved_base_dir, clock=resolved_clock)
+    lm.state.commit(
+        State(
+            u=0.0,
+            energy=1.0,
+            fatigue=0.0,
+            last_tick_at=resolved_clock.now().isoformat(),
+            genesis_completed_at=BORN_AT,
+        )
+    )
+    lm.registry.register(
+        ThoughtCapture(),
+        ComponentManifest(
+            id=THOUGHT_CAPTURE_ID,
+            type="thought-capture",
+            layer=ComponentLayer.AGGREGATION,
+            metric_surface=(),
+            accepts_signals=True,
+        ),
+    )
+    return lm

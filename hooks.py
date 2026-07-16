@@ -35,6 +35,7 @@ from .adapters.session_end import sleep_soft
 from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite, prior_soul
 from .composition import LifeModel
 from .core.affect import felt_word
+from .core.appraisal import Appraiser
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.felt_display import (
@@ -56,7 +57,8 @@ from .core.genesis import (
 )
 from .core.metrics import MetricRegistry
 from .core.suppression import SuppressionReason, emit_suppression_span
-from .core.taxonomy import contact_observed_signal, proactive_outcome_signal
+from .core.taxonomy import contact_observed_signal, proactive_outcome_signal, thought_seed_signal
+from .core.thought_view import seed_thought_id
 from .core.tick_metrics import CHECK_IN_TOTAL, FELT_DISPLAY_TOTAL, OBSERVER_ERRORS
 from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
@@ -362,10 +364,17 @@ def _emit_async_outcome(
 def make_post_llm_observer(
     build_lm: Callable[[], LifeModel],
     *,
+    appraiser: Appraiser | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., None]:
     """Return a ``post_llm_call`` handler that starts an ASYNC_COMPLETION frame (§3/§5).
+
+    Also the waking-mind appraisal seam (lm-705.1, spec §4.1): on a genuine REACTIVE
+    exchange (i.e. NOT the pending-proactive read-back this hook otherwise resolves),
+    an injected *appraiser* judges whether the turn is worth a thought. ``appraiser``
+    is optional and defaults to ``None`` (a no-op) so every existing caller keeps its
+    prior behaviour unchanged; the live wiring (``__init__.py``) passes a real one.
 
     The whole body is plugin-owned fail-loud (spec §4.3/MAJOR-4): a throw anywhere
     in it (even in ``build_lm``) is logged ERROR + traceback, recorded on
@@ -384,6 +393,11 @@ def make_post_llm_observer(
             lm = build_lm()
             state = lm.state.load()
             if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
+                # NOT a proactive read-back → an ordinary owner↔being exchange.
+                # Appraise it (out-of-band) and, on a seed, capture a thought via a
+                # core component in its own EVENT frame (spec §4.1). This hook never
+                # writes the store itself; it only seeds a signal.
+                _maybe_capture_thought(lm, appraiser, user_message, assistant_response)
                 return
             memory = lm.state if isinstance(lm.state, MemoryPort) else None
             desire = read_live_contact_desire(memory) if memory is not None else None
@@ -431,6 +445,51 @@ def make_post_llm_observer(
             )
 
     return _observer
+
+
+def _maybe_capture_thought(
+    lm: LifeModel,
+    appraiser: Appraiser | None,
+    user_message: str,
+    assistant_response: str,
+) -> None:
+    """Appraise a completed reactive exchange; on a seed, run an EVENT frame that
+    carries a ``thought_seed`` signal for ``ThoughtCapture`` (spec §4.1).
+
+    Runs INSIDE the caller's fail-loud ``try`` (so a throw here is logged + swallowed
+    like any other observer failure, never crashes the host turn). ``appraiser is
+    None`` is the documented no-op (no live wiring passed yet, or the caller chose to
+    opt out) — every other guard mirrors the sensor band-pass the inbound observer
+    already applies (``hooks.py``'s ``_is_own_impulse``/``_is_control_command``): our
+    own composed impulse and a slash command are not dialogue, and an empty/declined
+    reply is not a genuine exchange either.
+    """
+    if appraiser is None:
+        return
+    text = user_message.strip()
+    if not text or _is_own_impulse(text) or _is_control_command(text):
+        return
+    if _is_no_reply(assistant_response):
+        return
+    seed = appraiser.appraise(user_message=user_message, assistant_response=assistant_response)
+    if seed is None:
+        return
+    assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+    now = lm.clock.now()
+    run_frame(
+        lm.coreloop,
+        [
+            thought_seed_signal(
+                origin_id=f"thought-seed-{seed_thought_id(seed.content)}",
+                content=seed.content,
+                salience=seed.salience,
+                actionability=seed.actionability,
+                other_regarding_value=seed.other_regarding_value,
+                timestamp=to_iso(now),
+            )
+        ],
+        trigger=FrameTrigger.EVENT,
+    )
 
 
 def _is_own_impulse(text: str) -> bool:
