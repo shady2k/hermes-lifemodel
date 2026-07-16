@@ -41,6 +41,7 @@ from ..ports.memory import MemoryPort
 from ..ports.proactive import ProactiveEgressPort
 from ..ports.tracer import parse_traceparent
 from .backstop import allow_send
+from .coreloop import TickReport
 from .correlate import open_correlated_span
 from .desire_view import read_live_contact_desire
 from .frame import FrameTrigger, run_frame
@@ -68,6 +69,39 @@ def proactive_tick(
     (empty world), while a test driver may inject a ``contact_observed`` /
     ``proactive_outcome`` reading to exercise the whole pipeline in one frame.
 
+    The pipeline run and the backstop/egress dispatch are two separate steps
+    (:func:`dispatch_launches`, lm-705.6/codex #2) so that ANY frame's
+    ``report.launches`` — not just this function's own — gets dispatched; see
+    that function's docstring for the full "why" (suppression spans, the birth
+    pre-flight, the return contract)."""
+    assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+    assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
+    # One ExecutionFrame, serialized through the one process-wide state-actor lock
+    # (spec §3): pipeline runs + state committed by the state-actor.
+    report = run_frame(lm.coreloop, initial_signals, trigger=trigger)
+    return dispatch_launches(lm, report, egress, target, voice=voice)
+
+
+def dispatch_launches(
+    lm: LifeModel,
+    report: TickReport,
+    egress: ProactiveEgressPort,
+    target: Mapping[str, str | None],
+    *,
+    voice: VoiceCheck | None = None,
+) -> ReachOutcome | None:
+    """Backstop → (birth pre-flight) → deliver *report*'s FIRST launch, if any.
+
+    Extracted from :func:`proactive_tick` (lm-705.6, codex #2) so it is generic
+    over the report's ORIGIN: a completion frame that is not itself a
+    ``proactive_tick`` call (e.g. the internal-cognition completion frame,
+    :mod:`lifemodel.core.internal_cognition`) still runs every enabled component
+    (``core/coreloop.py`` — a frame is trigger-agnostic about which components
+    run), so ``CognitionLauncher`` can incidentally also surface a
+    ``LaunchProactive`` on that frame. This function is the ONE place that
+    dispatches ``report.launches``, so no caller can strand one by only applying
+    its own completion intents and ignoring what the frame separately returned.
+
     Every "why" is a span under the launch's ORIGIN TRACE (§4.4), never a bare
     log line: the core stayed quiet → its suppression span was logged in-tick by
     aggregation/CognitionLauncher; the backstop held → a ``BACKSTOP_RATE_LIMITED``
@@ -89,16 +123,11 @@ def proactive_tick(
     the next tick asks again.
 
     Returns a :class:`ReachOutcome` ONLY for a real delivery attempt (delivered /
-    failed / unavailable — the egress boundary, spec §9). A QUIET tick (no launch,
+    failed / unavailable — the egress boundary, spec §9). A QUIET call (no launch,
     the backstop held, or the birth pre-flight held) returns ``None``. ``DELIVERED``
     means the turn was queued — whether the being actually spoke is the async
     ``proactive_outcome`` read-back, not this return."""
-    assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
     assert lm.state_actor is not None, "state_actor must be wired by build_lifemodel"
-    # One ExecutionFrame, serialized through the one process-wide state-actor lock
-    # (spec §3): pipeline runs + state committed by the state-actor.
-    report = run_frame(lm.coreloop, initial_signals, trigger=trigger)
-
     # No reach attempted — the core stayed quiet. This is a core DECISION, not a
     # delivery outcome: aggregation/CognitionLauncher already logged the reason as a
     # suppression span during the tick (spec §5). No egress outcome to report.
