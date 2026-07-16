@@ -397,3 +397,39 @@ def test_a_state_file_from_the_greeting_era_still_loads() -> None:
     )
     assert state.genesis_completed_at == "2026-07-13T10:00:00+00:00"
     assert not hasattr(state, "genesis_greeted_at")
+
+
+def test_pending_internal_id_defaults_none_and_roundtrips() -> None:
+    # lm-705.6: separate from pending_proactive_id — its own correlation space.
+    assert State().pending_internal_id is None
+    assert State.from_dict({}).pending_internal_id is None  # additive
+    s = State(pending_internal_id="internal-abc")
+    assert State.from_dict(s.to_dict()).pending_internal_id == "internal-abc"
+
+
+def test_pending_internal_id_rejects_non_str() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"pending_internal_id": 123})
+
+
+def test_internal_calls_budget_defaults_and_roundtrips() -> None:
+    # lm-705.6 FR20: a durable daily call ceiling, additive like every other field —
+    # an older runtime_state file without these keys loads as "never called today".
+    assert State().internal_calls_today == 0
+    assert State().internal_calls_day == ""
+    assert State.from_dict({}).internal_calls_today == 0
+    assert State.from_dict({}).internal_calls_day == ""
+    s = State(internal_calls_today=2, internal_calls_day="2026-07-16")
+    loaded = State.from_dict(s.to_dict())
+    assert loaded.internal_calls_today == 2
+    assert loaded.internal_calls_day == "2026-07-16"
+
+
+def test_internal_calls_today_rejects_non_int() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"internal_calls_today": "x"})
+
+
+def test_internal_calls_day_rejects_non_str() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"internal_calls_day": 20260716})

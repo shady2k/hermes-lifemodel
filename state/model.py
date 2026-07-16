@@ -233,6 +233,33 @@ class State:
     #: rewrite is stamped (a new event is a new thing to notice). Opaque opt-str, and a
     #: hint (it self-heals: the worst a lost stamp does is tell the being twice).
     soul_rewrite_told_at: str | None = None
+    #: Correlation id of the in-flight NON-DELIVERED internal-cognition call awaiting
+    #: its async result (lm-705.6, waking-mind design §3.3), or ``None`` when none is
+    #: outstanding. Deliberately SEPARATE from :attr:`pending_proactive_id`: an
+    #: internal pass never reaches the human, is never read back as ``[SILENT]``/
+    #: ``SENT``, and never occupies the proactive in-flight gate — the two correlation
+    #: spaces must never collide. Set by
+    #: :class:`~lifemodel.adapters.internal_runner.InternalCognitionRunner` when it
+    #: launches an aux call; cleared by
+    #: :func:`~lifemodel.core.internal_cognition.run_internal_completion` on the
+    #: completion frame (success, timeout, or failure — a strand here would block
+    #: every future internal launch, mirroring the proactive gate).
+    pending_internal_id: str | None = None
+    #: FR20 durable daily call ceiling (lm-705.6, design §3.4): how many
+    #: internal-cognition calls have been reserved so far on :attr:`internal_calls_day`.
+    #: The aux model *slot* is routing, not a cost ceiling — this is the atomically
+    #: reserved quota WE enforce, checked/incremented by
+    #: :func:`~lifemodel.core.budget.reserve_internal_call` BEFORE the async task is
+    #: created. Resets to 1 (not 0) the first reservation of a new day — see that
+    #: function. Additive: ``from_dict`` defaults it to 0 when absent.
+    internal_calls_today: int = 0
+    #: The ISO-8601 UTC *date* (``YYYY-MM-DD``, no time) :attr:`internal_calls_today`
+    #: was counted against — the day-rollover key
+    #: :func:`~lifemodel.core.budget.reserve_internal_call` compares its ``now``
+    #: against. ``""`` before the first reservation ever made (never matches a real
+    #: date, so the first call always rolls over cleanly). Additive: ``from_dict``
+    #: defaults it to ``""`` when absent.
+    internal_calls_day: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -350,6 +377,16 @@ class State:
             soul_rewrite_told_at=_as_opt_str(
                 data.get("soul_rewrite_told_at"), "soul_rewrite_told_at"
             ),
+            # The internal-cognition correlation anchor (lm-705.6) — opaque opt-str,
+            # like pending_proactive_id, never parsed as time.
+            pending_internal_id=_as_opt_str(data.get("pending_internal_id"), "pending_internal_id"),
+            # The FR20 quota pair (lm-705.6): a plain count and an opaque ISO *date*
+            # string (never parsed as an aware instant — reserve_internal_call compares
+            # it as a bare string against `now.date().isoformat()`).
+            internal_calls_today=_as_int(
+                data.get("internal_calls_today", 0), "internal_calls_today"
+            ),
+            internal_calls_day=_as_str(data.get("internal_calls_day", ""), "internal_calls_day"),
         )
 
 
@@ -383,6 +420,12 @@ def _as_opt_str(value: object, field_name: str) -> str | None:
     if value is None or isinstance(value, str):
         return value
     raise StateCorruptError(f"field {field_name!r} must be a string or null, got {_type(value)}")
+
+
+def _as_str(value: object, field_name: str) -> str:
+    if isinstance(value, str):
+        return value
+    raise StateCorruptError(f"field {field_name!r} must be a string, got {_type(value)}")
 
 
 def _as_str_list(data: Mapping[str, Any], key: str, default: list[str]) -> list[str]:
