@@ -1,13 +1,19 @@
 from datetime import UTC, datetime
 
+from lifemodel.core.component import TickContext
 from lifemodel.core.intents import LaunchInternalCognition, TransitionRecord
 from lifemodel.core.thought_processing import ThoughtProcessingSelector
 from lifemodel.core.thought_view import build_thought, encode_thought
 from lifemodel.domain.objects import ThoughtState
+from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
+from lifemodel.testing import FakeActiveSpan, FakeSpanLogger
 from lifemodel.testing.tick import make_tick_context
 
 NOW = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
+
+# ctx.trace is non-optional (spec §4.1) — a literal span's ids for span-field fixtures.
+_TRACE = TraceContext(trace_id="a" * 32, span_id="b" * 16)
 
 
 def _rec(thought):
@@ -102,3 +108,29 @@ def test_still_parked_thought_is_not_rearmed():
     )
     ctx = make_tick_context(state=State(), now=NOW, objects=[_rec(parked)])
     assert list(ThoughtProcessingSelector().step(ctx)) == []
+
+
+def test_rearm_is_recorded_as_an_observable_unparked_count_on_the_span():  # M1
+    # make_tick_context leaves logger=None (bare unit-test default) — build the
+    # TickContext directly with a FakeSpanLogger so the span field is assertable,
+    # mirroring the pattern in tests/test_suppression.py / tests/test_cognition.py.
+    parked = build_thought(
+        id="thought:seed:p",
+        content="cp",
+        state=ThoughtState.PARKED,
+        salience=0.9,
+        park_count=1,
+        parked_until="2026-07-16T06:00:00+00:00",  # past → re-eligible
+    )
+    logger = FakeSpanLogger(FakeActiveSpan(_TRACE, component="cognition", tick=1))
+    ctx = TickContext(state=State(), now=NOW, trace=_TRACE, objects=(_rec(parked),), logger=logger)
+    list(ThoughtProcessingSelector().step(ctx))
+    assert logger.span.attrs["unparked"] == 1
+
+
+def test_no_rearm_stamps_no_unparked_field():
+    active = _active("thought:seed:a", 0.9)
+    logger = FakeSpanLogger(FakeActiveSpan(_TRACE, component="cognition", tick=1))
+    ctx = TickContext(state=State(), now=NOW, trace=_TRACE, objects=(_rec(active),), logger=logger)
+    list(ThoughtProcessingSelector().step(ctx))
+    assert "unparked" not in logger.span.attrs

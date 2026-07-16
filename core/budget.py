@@ -18,8 +18,8 @@ from __future__ import annotations
 import dataclasses
 from datetime import datetime, timedelta
 
-from ..core.timeutil import from_iso
 from ..state.model import State
+from .timeutil import from_iso
 
 
 def _day(now: datetime) -> str:

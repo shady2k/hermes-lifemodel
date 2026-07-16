@@ -84,7 +84,6 @@ class ProcessingReason(StrEnum):
 
     # selector
     CHOSE_PROCESS = "chose_process"
-    UNPARKED = "unparked"
     SKIPPED_EMPTY_BACKLOG = "skipped_empty_backlog"
     SKIPPED_IN_FLIGHT = "skipped_in_flight"
     SKIPPED_NO_BUDGET = "skipped_no_budget"
@@ -195,7 +194,19 @@ class ThoughtProcessingSelector:
     if the gates pass (single-flight, FR20 budget, min interval), emits ONE
     ``LaunchInternalCognition`` for the top-salience ACTIVE thought — the being's private,
     non-delivered pass. Emits no launch (idle 0-LLM, S5) when the active backlog is empty
-    or any gate holds; the reason is a span field either way (spec §5)."""
+    or any gate holds; the reason is a span field either way (spec §5).
+
+    **Heartbeat-only coupling is enforced by the DISPATCH SITE, not this component.**
+    This selector is a normal registered component: it runs on EVERY frame the
+    CoreLoop schedules it for and emits ``LaunchInternalCognition`` on every frame it
+    runs, gates permitting — ``TickContext`` carries no trigger/frame-kind, so the
+    selector cannot self-restrict to heartbeats. "No rumination during a live dialogue
+    turn" holds SOLELY because only ``being_platform._tick`` (the HEARTBEAT tick) reads
+    ``report.internal_launches`` and drives it into the runner; the EVENT,
+    ASYNC_COMPLETION, and ADMIN callers ignore that field and drop the launch on the
+    floor. If a future change wires ``internal_launches`` into a non-heartbeat
+    dispatch path, this component will silently start ruminating mid-dialogue — that
+    invariant lives entirely at the dispatch site, not here."""
 
     id: str = THOUGHT_PROCESSING_SELECTOR_ID
 
@@ -212,6 +223,7 @@ class ThoughtProcessingSelector:
         thoughts = live_thoughts(ctx.objects)
         intents: list[Intent] = []
         actives = []
+        rearmed_count = 0
         for t in thoughts:
             if t.state == ThoughtState.PARKED.value:
                 if self._parked_is_due(t, ctx.now):
@@ -225,6 +237,7 @@ class ThoughtProcessingSelector:
                             )
                         )
                     )
+                    rearmed_count += 1
             elif t.state == ThoughtState.ACTIVE.value:
                 actives.append(t)
 
@@ -244,6 +257,11 @@ class ThoughtProcessingSelector:
             ctx.logger.span.set(processing_reason=reason.value)
             if subject is not None:
                 ctx.logger.span.set(thought_id=subject.id)
+            if rearmed_count:
+                # Re-arms (parked→active) are a separate observable event from the
+                # tick's pick *reason* (§5) — a count, not a reason code, since more
+                # than one thought can re-arm in the same tick the pick decides.
+                ctx.logger.span.set(unparked=rearmed_count)
         return intents
 
     def _parked_is_due(self, thought: Thought, now: datetime) -> bool:
@@ -306,6 +324,14 @@ class ThoughtProcessingApply:
             thought, parsed=result.parsed, raw=result.raw, now=ctx.now
         )
         self._log(ctx, decision.reason, subject_id)
+        # The model's first-person reflection rides the span, never the thought (spec
+        # §4.1 — no residue field) — this is the ONE place it is read at all.
+        if (
+            ctx.logger is not None
+            and isinstance(result.parsed, dict)
+            and "reflection" in result.parsed
+        ):
+            ctx.logger.span.set(reflection=str(result.parsed.get("reflection", ""))[:500])
         return [TransitionRecord(op=decision.transition)] if decision.transition is not None else []
 
     def _live_subject(self, ctx: TickContext, subject_id: str) -> Thought | None:
