@@ -18,9 +18,12 @@ The SAME tick also owns the non-delivered internal-cognition seam (lm-705.6,
 design §3.1): any ``LaunchInternalCognition`` the frame surfaced is handed to
 the adapter-owned :class:`~lifemodel.adapters.internal_runner.InternalCognitionRunner`,
 built here (on the gateway loop `connect()` itself already runs on) and torn
-down in :meth:`disconnect`. This bead ships no live emitter of that intent yet
-(noticing/processing do, later) — the wiring exists so the seam is exercised
-end-to-end without waiting for its first real consumer.
+down in :meth:`disconnect`. Processing (lm-705.2, waking mind slice 2) is the
+seam's first live emitter — its
+:class:`~lifemodel.core.thought_processing.ThoughtProcessingSelector` picks the
+launch, its :class:`~lifemodel.core.thought_processing.ThoughtProcessingApply`
+is the runner's injected completion-only ``apply`` (noticing, lm-705.5, is a
+later, subjectless emitter over the SAME seam).
 
 Because it imports ``gateway.*`` at module load, this file is NOT importable
 off-host; it is exercised at runtime in the gateway, never by the unit suite.
@@ -42,13 +45,14 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from ..composition import LifeModel, build_lifemodel
+from ..core.budget import DEFAULT_DAILY_INTERNAL_CALL_CEILING
 from ..core.frame import FrameTrigger, run_frame, state_actor_lock
 from ..core.genesis import needs_adoption
-from ..core.internal_cognition import NullInternalApply
 from ..core.llm_port import InternalCognitionRequest, LlmPort
 from ..core.metrics import get_metric_registry
 from ..core.proactive import dispatch_launches
 from ..core.supervised_loop import SupervisedLoop
+from ..core.thought_processing import ThoughtProcessingApply
 from ..core.timeutil import to_iso
 from ..events import EventRing
 from ..gateway_core import home_session_key
@@ -80,18 +84,12 @@ PLATFORM_NAME = "lifemodel"
 #: derive from) so the two never drift.
 LOOP_INTERVAL_SEC = DEFAULT_TICK_INTERVAL_SECONDS
 
-#: FR20's v1 default (design §3.4 — "simplest reliable form", no product-specified
-#: number yet). A generous-but-real ceiling: idle ticks stay 0-LLM (S5) since
-#: nothing emits ``LaunchInternalCognition`` without a real trigger (lm-705.5), so
-#: this only bounds the SPIKE once a trigger exists. Tune once noticing/processing
-#: are live and the actual call cadence is known.
-DEFAULT_DAILY_INTERNAL_CALL_CEILING = 50
-
-#: The internal-cognition pass's fixed system framing (design §3.3) — content-free
-#: on purpose: THIS bead's own consumer is
-#: :class:`~lifemodel.core.internal_cognition.NullInternalApply` (ignores the
-#: result), so the instructions only need to keep a real call honest about
-#: non-delivery; noticing/processing (lm-705.5/.2) will pass their own.
+#: The internal-cognition pass's GENERIC fallback system framing (design §3.3) —
+#: content-free on purpose, used only when a launch's own ``instructions`` is empty
+#: (see :meth:`_tick`). Processing (lm-705.2) already supplies its own
+#: (:data:`~lifemodel.core.thought_processing.PROCESSING_INSTRUCTIONS`); this stays
+#: the seam's generic non-delivery notice for any future subjectless/opinionless
+#: launch (e.g. noticing, lm-705.5) that doesn't need bespoke framing.
 _INTERNAL_COGNITION_INSTRUCTIONS = (
     "This is the being's own private, non-delivered internal thinking. Nothing you "
     "produce here is shown to anyone."
@@ -225,10 +223,12 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             for launch in report.internal_launches:
                 self._internal_runner.launch(
                     InternalCognitionRequest(
-                        instructions=_INTERNAL_COGNITION_INSTRUCTIONS,
+                        instructions=launch.instructions or _INTERNAL_COGNITION_INSTRUCTIONS,
                         input_text=launch.prompt,
+                        json_schema=launch.json_schema,
                     ),
                     launch.correlation_id,
+                    subject_id=launch.subject_id,
                 )
 
     def _prior_soul(self) -> str | None:
@@ -426,7 +426,8 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
                     self._target,
                     daily_ceiling=DEFAULT_DAILY_INTERNAL_CALL_CEILING,
                     gateway_loop=asyncio.get_running_loop(),
-                    apply=NullInternalApply(),
+                    apply=ThoughtProcessingApply(),
+                    voice=self._voice,
                 )
                 self._internal_runner.recover_stale(self._build_lm())
 

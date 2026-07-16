@@ -62,6 +62,7 @@ from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponen
 from .core.solitude_drive import CONTACT_DRIVE_U_SPEC, SolitudeDrive
 from .core.state_actor import StateActor
 from .core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
+from .core.thought_processing import THOUGHT_PROCESSING_SELECTOR_ID, ThoughtProcessingSelector
 from .core.wake import GateParams
 from .domain.objects import default_registry
 from .events import EventRing
@@ -353,6 +354,25 @@ def build_lifemodel(
                 id=THOUGHT_CAPTURE_ID,
                 type="thought-capture",
                 layer=ComponentLayer.AGGREGATION,
+                metric_surface=(),
+                accepts_signals=True,
+            ),
+        )
+    try:
+        resolved_registry.manifest(THOUGHT_PROCESSING_SELECTOR_ID)
+    except UnknownComponent:
+        # Waking mind slice 2 (lm-705.2, spec §4.1): a 0-LLM COGNITION-tier component
+        # that re-arms due parks and, gated (single-flight/interval/FR20 budget),
+        # emits ONE LaunchInternalCognition for the top-salience active thought — the
+        # non-delivered rumination pass. ``ThoughtProcessingApply`` is NOT registered
+        # here: it is the runner's injected completion-only apply, wired into the
+        # ephemeral registry ``run_internal_completion`` builds for that one frame.
+        resolved_registry.register(
+            ThoughtProcessingSelector(),
+            ComponentManifest(
+                id=THOUGHT_PROCESSING_SELECTOR_ID,
+                type="thought-processing-selector",
+                layer=ComponentLayer.COGNITION,
                 metric_surface=(),
                 accepts_signals=True,
             ),

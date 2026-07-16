@@ -336,13 +336,18 @@ def test_full_pipeline_order_is_asserted(tmp_path: Path) -> None:
     ]
     positions = [ids.index(cid) for cid in spine]
     assert positions == sorted(positions), ids
-    # T7 cut every thought component; lm-705.1 (waking mind slice 1) re-seeds
-    # exactly ONE — ThoughtCapture, capture-only (no processing/rumination/desire/
-    # arbiter, spec §4.1's boundary) — so the pin is no longer "never", it is
-    # "no thought component OTHER than the capture-only one".
+    # T7 cut every thought component; lm-705.1/.2 (waking mind slices 1/2) re-seed
+    # exactly TWO — ThoughtCapture (capture-only) and ThoughtProcessingSelector
+    # (the 0-LLM rumination picker; its completion-only ``apply`` half is NOT
+    # registered here, spec §4.1's boundary) — so the pin is no longer "never", it
+    # is "no thought component OTHER than these two, in registration order".
     from lifemodel.core.thought_capture import THOUGHT_CAPTURE_ID
+    from lifemodel.core.thought_processing import THOUGHT_PROCESSING_SELECTOR_ID
 
-    assert [cid for cid in ids if "thought" in cid] == [THOUGHT_CAPTURE_ID], ids
+    assert [cid for cid in ids if "thought" in cid] == [
+        THOUGHT_CAPTURE_ID,
+        THOUGHT_PROCESSING_SELECTOR_ID,
+    ], ids
 
 
 # --- lm-27n.4: the Intention decision record, end-to-end through the store ---
@@ -408,14 +413,25 @@ def test_build_lifemodel_registers_thought_capture(tmp_path: Path) -> None:
     assert THOUGHT_CAPTURE_ID in ids
 
 
-# --- lm-705.6: the internal-cognition seam has no live emitter YET -----------
+# --- lm-705.2: ThoughtProcessingSelector wiring (waking mind slice 2) --------
+
+
+def test_build_lifemodel_registers_processing_selector(tmp_path: Path) -> None:
+    from lifemodel.core.thought_processing import THOUGHT_PROCESSING_SELECTOR_ID
+
+    lm = build_lifemodel(base_dir=tmp_path)
+    ids = {m.id for m in lm.registry.manifests()}
+    assert THOUGHT_PROCESSING_SELECTOR_ID in ids
+
+
+# --- lm-705.6: the internal-cognition seam's default pipeline behaviour -----
 
 
 def test_default_pipeline_never_emits_launch_internal_cognition(tmp_path: Path) -> None:
-    # This bead (lm-705.6) ships only the SEAM — no registered component emits
-    # LaunchInternalCognition (noticing/processing, lm-705.5/.2, are the real
-    # emitters). Pinning this now means a future regression that accidentally
-    # wakes the seam on the default pipeline is caught here, not live.
+    # Processing (lm-705.2) is now a LIVE emitter of LaunchInternalCognition — but
+    # it is correctly GATED OFF here: this pipeline seeds an active DESIRE, not a
+    # thought, so the processing selector's backlog is empty and it emits nothing
+    # (ProcessingReason.SKIPPED_EMPTY_BACKLOG). Idle stays 0-LLM (S5).
     lm = build_lifemodel(base_dir=tmp_path)
     lm.state.commit(_born(u=3.0, energy=1.0, last_tick_at="2026-07-06T03:59:00+00:00"))
     _seed_active_desire(lm.state)
