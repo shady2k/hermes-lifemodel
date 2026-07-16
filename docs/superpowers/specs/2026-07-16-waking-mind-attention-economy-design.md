@@ -480,3 +480,19 @@ the single authority (§4.1); `processed_crystallize` marked as the crystallizat
 (component span persists **before** the `StateActor` commit — encode ≠ durable) (§5); and
 **emergence / contact-hazard** relabelled a deferred contact/arbiter measure, not a
 crystallization-slice one (§6). **Verdict: ready to hand to the implementation plan.**
+
+**lm-705.3 build (2026-07-17) — slice 3 shipped (§4.1/§4.2/§5, v3.1.1).** Thought crystallization:
+a new `Commitment` BDI type (non-singleton, deterministic source-scoped id, typed
+`basis`/`trigger`, full registry-guarded state machine — `domain/objects/commitment.py`) +
+`commitment_view`; the processing outcome gained the closed `crystallize_commitment` variant;
+`ThoughtProcessingApply` **strictly parses** the model's commitment fields
+(`commitment_from_crystallize_fields` — no coercion; every bad-data mode → `InvalidPayload`),
+builds the `Commitment`, and emits its `PutRecord` **plus** the source-thought
+`TransitionRecord(active→resolved)` atomically; a validation failure is a bounded
+`crystallize_malformed` no-progress; provenance is target→source (qualified). Reviewed by opus
+(whole-branch) + codex `019f6cf8` ×2 (0 Critical; the coercion/overflow/surrogate bounded-failure
+holes and the qualified-provenance link all fixed). Host-integration ran a real crystallization
+against real Hermes. **Deferred as beads:** registry-transition enforcement at the persistence
+boundary (**lm-1w2.1**, all kinds), and `Commitment` expiry/discharge + snapshot-eviction
+(**lm-705.12**). **Not built:** commitment→contact (the deferred contact/arbiter work);
+`Opinion`/`Prediction` (same mechanism, later); thought creation/appraiser (**lm-705.11**).
