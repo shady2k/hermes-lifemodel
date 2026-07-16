@@ -50,7 +50,7 @@ TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
 SPAN_ID = "00f067aa0ba902b7"
 PARENT_SPAN_ID = "00f067aa0ba902b8"
 
-EXPECTED_KINDS = frozenset({"desire", "intention", "user_model", "thought"})
+EXPECTED_KINDS = frozenset({"desire", "intention", "user_model", "thought", "commitment"})
 
 
 def _provenance(**overrides: object) -> Provenance:
@@ -172,7 +172,7 @@ class TestErrorTaxonomy:
 
 
 class TestClosedCatalog:
-    def test_kinds_are_exactly_the_four(self) -> None:
+    def test_kinds_are_exactly_the_expected_set(self) -> None:
         assert default_registry().kinds() == EXPECTED_KINDS
 
     def test_is_known(self) -> None:

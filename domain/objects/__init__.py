@@ -1,12 +1,13 @@
 """The BDI object-core substrate — typed kinds over the memory envelope (§4.1).
 
 A typed Belief-Desire-Intention layer sitting *on top of* the generic
-``memory_records`` envelope (:mod:`lifemodel.domain.memory`). Four kinds
-(:class:`Desire`, :class:`Intention`, :class:`UserModel`, :class:`Thought`)
-subclass a shared :class:`BaseObject`; the :class:`KindRegistry` is the single
-door for every encode/decode/transition. :func:`default_registry` is the blessed
-factory for the closed four-kind catalog — feature code takes one and cannot add
-kinds. (The ``KindRegistry(specs)`` constructor stays as the extension/test seam,
+``memory_records`` envelope (:mod:`lifemodel.domain.memory`). Four foundation
+kinds (:class:`Desire`, :class:`Intention`, :class:`UserModel`, :class:`Thought`)
+plus the first catalog extension type, :class:`Commitment` (lm-705.3), subclass
+a shared :class:`BaseObject`; the :class:`KindRegistry` is the single door for
+every encode/decode/transition. :func:`default_registry` is the blessed factory
+for the closed catalog — feature code takes one and cannot add kinds. (The
+``KindRegistry(specs)`` constructor stays as the extension/test seam,
 imported from :mod:`lifemodel.domain.objects.registry` directly, but is not part
 of this package's advertised surface.) Provenance carries W3C-traceparent-
 compatible creation context (definitions + validation only — task .1; minting
@@ -24,6 +25,7 @@ from .base import (
     derive_id,
     qualified_id,
 )
+from .commitment import Commitment, CommitmentBasis, CommitmentState, CommitmentTriggerKind
 from .desire import Desire, DesireSpring, DesireState
 from .errors import (
     InvalidPayload,
@@ -49,6 +51,10 @@ __all__ = [
     "OWNER_USER_MODEL_ID",
     "UNKNOWN",
     "BaseObject",
+    "Commitment",
+    "CommitmentBasis",
+    "CommitmentState",
+    "CommitmentTriggerKind",
     "Desire",
     "DesireSpring",
     "DesireState",

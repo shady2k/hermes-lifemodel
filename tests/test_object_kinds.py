@@ -34,6 +34,7 @@ from lifemodel.domain.objects import (
     UserModelState,
     default_registry,
 )
+from lifemodel.domain.objects.commitment import COMMITMENT_TRANSITIONS
 from lifemodel.domain.objects.desire import DESIRE_TRANSITIONS
 from lifemodel.domain.objects.intention import INTENTION_TRANSITIONS
 from lifemodel.domain.objects.thought import THOUGHT_TRANSITIONS
@@ -169,6 +170,7 @@ TRANSITION_TABLES: dict[str, Mapping[str, frozenset[str]]] = {
     "intention": INTENTION_TRANSITIONS,
     "user_model": USER_MODEL_TRANSITIONS,
     "thought": THOUGHT_TRANSITIONS,
+    "commitment": COMMITMENT_TRANSITIONS,
 }
 
 
