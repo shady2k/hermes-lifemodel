@@ -21,16 +21,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import cast
 
 from ..domain.memory import JsonObject, MemoryPatch, PutOp, TransitionOp
-from ..domain.objects import (
-    CommitmentBasis,
-    CommitmentTriggerKind,
-    InvalidPayload,
-    Thought,
-    ThoughtState,
-)
+from ..domain.objects import InvalidPayload, Thought, ThoughtState, qualified_id
 from ..ports.tracer import format_traceparent
 from .budget import (
     DEFAULT_DAILY_INTERNAL_CALL_CEILING,
@@ -38,7 +31,7 @@ from .budget import (
     internal_budget_available,
     internal_interval_elapsed,
 )
-from .commitment_view import build_commitment, crystallized_commitment_id, encode_commitment
+from .commitment_view import commitment_from_crystallize_fields, encode_commitment
 from .component import TickContext
 from .intents import Intent, LaunchInternalCognition, PutRecord, TransitionRecord
 from .taxonomy import KIND_INTERNAL_RESULT, read_internal_result
@@ -127,6 +120,10 @@ class ProcessingReason(StrEnum):
     TRANSIENT_FAILURE = "processed_transient_failure"
     NO_SUBJECT = "processed_no_subject"
     CRYSTALLIZED_COMMITMENT = "processed_crystallize"
+    #: A crystallize completion whose model-supplied ``commitment`` fields failed
+    #: strict validation — distinct from the generic ``PARKED_NO_PROGRESS`` so a
+    #: bad crystallize is telemetrically distinguishable (lm-705.3 review I1).
+    CRYSTALLIZE_MALFORMED = "processed_crystallize_malformed"
 
 
 @dataclass(frozen=True)
@@ -373,34 +370,33 @@ class ThoughtProcessingApply:
     def _crystallize(
         self, ctx: TickContext, thought: Thought, fields: JsonObject
     ) -> Sequence[Intent]:
-        """Build the Commitment + emit its PutRecord alongside the thought's resolve; a
-        builder/registry failure falls back to the bounded no-progress path (codex I2)."""
+        """Build the Commitment + emit its PutRecord alongside the thought's resolve.
+
+        The provenance build is INFRA (not model-dependent) so it happens outside the
+        try — a bug there must surface loudly, never masquerade as no-progress. Only
+        the strict model-data parse (:func:`commitment_from_crystallize_fields`) and
+        the registry-validating encode are guarded, and only :class:`InvalidPayload`
+        is caught — narrowed from the former broad ``except`` (lm-705.3 review I1)."""
+        provenance = creation_provenance(
+            ctx.trace,
+            created_by=self.id,
+            component="cognition",
+            reason="thought crystallized into a commitment",
+            source_object_ids=(qualified_id(THOUGHT_KIND, thought.id),),  # I2 — qualified link
+        )
         try:
-            commitment = build_commitment(
-                id=crystallized_commitment_id(thought.id, str(fields["content"])),
-                content=str(fields["content"]),
-                basis=CommitmentBasis(str(fields["basis"])),
-                trigger_kind=CommitmentTriggerKind(str(fields["trigger_kind"])),
-                trigger_value=str(fields["trigger_value"]),
-                due_at=(str(fields["due_at"]) if fields.get("due_at") is not None else None),
-                source_thought_ids=(thought.id,),
-                other_regarding_value=float(
-                    cast("float | int | str", fields.get("other_regarding_value") or 0.0)
-                ),
+            commitment = commitment_from_crystallize_fields(
+                source_thought_id=thought.id,
+                fields=fields,
                 salience=thought.salience,
-                provenance=creation_provenance(
-                    ctx.trace,
-                    created_by=self.id,
-                    component="cognition",
-                    reason="thought crystallized into a commitment",
-                    source_object_ids=(thought.id,),
-                ),
+                provenance=provenance,
             )
             draft = encode_commitment(commitment)  # registry-validates → InvalidPayload on bad data
-        except (InvalidPayload, ValueError, KeyError, TypeError):
+        except InvalidPayload:  # model-data validation failure ONLY — narrow (I1)
             fallback = _park_or_terminate(thought, now=ctx.now, no_progress=True)
-            self._log(ctx, fallback.reason, thought.id)
-            return [TransitionRecord(op=fallback.transition)] if fallback.transition else []
+            assert fallback.transition is not None  # _park_or_terminate always parks/drops/expires
+            self._log(ctx, ProcessingReason.CRYSTALLIZE_MALFORMED, thought.id)
+            return [TransitionRecord(op=fallback.transition)]
         if ctx.logger is not None:
             ctx.logger.span.set(
                 processing_reason=ProcessingReason.CRYSTALLIZED_COMMITMENT.value,

@@ -11,16 +11,18 @@ from __future__ import annotations
 
 import hashlib
 
-from ..domain.memory import MemoryDraft, MemoryRecord
+from ..domain.memory import JsonObject, MemoryDraft, MemoryRecord
 from ..domain.objects import (
     Commitment,
     CommitmentBasis,
     CommitmentState,
     CommitmentTriggerKind,
+    InvalidPayload,
     Provenance,
     default_registry,
     derive_id,
 )
+from ..domain.objects.base import opt_float, opt_str, req_enum, req_str
 from ..ports.memory import MemoryPort
 
 COMMITMENT_KIND = "commitment"
@@ -71,6 +73,44 @@ def build_commitment(
         due_at=due_at,
         source_thought_ids=source_thought_ids,
         other_regarding_value=other_regarding_value,
+    )
+
+
+def commitment_from_crystallize_fields(
+    *,
+    source_thought_id: str,
+    fields: JsonObject,
+    salience: float,
+    provenance: Provenance | None = None,
+) -> Commitment:
+    """Strictly parse the model-supplied ``commitment`` sub-object and build the
+    :class:`Commitment` — the ONE place a crystallize completion's untrusted fields
+    are decoded (lm-705.3 review I1). Every failure mode (wrong type, missing key,
+    bad enum, non-finite/overflowing number) raises :class:`InvalidPayload` — never
+    a silent ``str(...)``/``float(...)`` coercion — so the caller's narrow ``except
+    InvalidPayload`` catches exactly "the model sent bad data", nothing else."""
+    content = req_str(fields, "content").strip()
+    basis = req_enum(fields, "basis", CommitmentBasis)
+    trigger_kind = req_enum(fields, "trigger_kind", CommitmentTriggerKind)
+    trigger_value = req_str(fields, "trigger_value")
+    due_at = opt_str(fields, "due_at")
+    try:
+        other_regarding_value = opt_float(fields, "other_regarding_value") or 0.0
+    except OverflowError as exc:
+        # opt_float's float(int) can overflow on a huge model-supplied integer;
+        # opt_float itself does not catch it, so this call site must (codex I1b).
+        raise InvalidPayload("other_regarding_value overflows float") from exc
+    return build_commitment(
+        id=crystallized_commitment_id(source_thought_id, content),
+        content=content,
+        basis=basis,
+        trigger_kind=trigger_kind,
+        trigger_value=trigger_value,
+        due_at=due_at,
+        source_thought_ids=(source_thought_id,),
+        other_regarding_value=other_regarding_value,
+        salience=salience,
+        provenance=provenance,
     )
 
 
