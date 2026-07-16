@@ -461,8 +461,11 @@ def _maybe_capture_thought(
     None`` is the documented no-op (no live wiring passed yet, or the caller chose to
     opt out) — every other guard mirrors the sensor band-pass the inbound observer
     already applies (``hooks.py``'s ``_is_own_impulse``/``_is_control_command``): our
-    own composed impulse and a slash command are not dialogue, and an empty/declined
-    reply is not a genuine exchange either.
+    own composed impulse and a slash command are not dialogue, an empty ``user_message``
+    is not an exchange to appraise, and a declined (``[SILENT]``/``NO_REPLY``, per
+    ``_is_no_reply``) ``assistant_response`` is not a genuine exchange either. Note
+    ``_is_no_reply`` matches those explicit markers only — a merely EMPTY
+    ``assistant_response`` is not itself treated as a decline and is still appraised.
     """
     if appraiser is None:
         return

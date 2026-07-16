@@ -16,7 +16,7 @@ from ..domain.memory import PutOp
 from .component import TickContext
 from .intents import Intent, PutRecord
 from .taxonomy import KIND_THOUGHT_SEED, read_thought_seed
-from .thought_view import build_thought, encode_thought, seed_thought_id
+from .thought_view import build_thought, encode_thought, live_thoughts, seed_thought_id
 from .trace import creation_provenance
 
 THOUGHT_CAPTURE_ID = "thought-capture"
@@ -28,6 +28,16 @@ class ThoughtCapture:
     id: str = THOUGHT_CAPTURE_ID
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
+        # Creation provenance is IMMUTABLE per episode (core/trace.py:8-16). The
+        # thought id is a stable content digest (seed_thought_id), so a host
+        # post_llm retry — or the same user text recurring — re-runs this EVENT
+        # frame with the SAME id, and the store UPSERT
+        # (payload_json=excluded.payload_json) would otherwise overwrite the
+        # original birth lineage. Read the start-of-tick snapshot ONCE and reuse a
+        # live row's provenance instead of minting fresh, mirroring how
+        # CognitionLauncher preserves the contact intention's provenance
+        # (core/cognition.py, existing_intention.provenance).
+        existing_by_id = {t.id: t for t in live_thoughts(ctx.objects)}
         seen: set[str] = set()
         intents: list[Intent] = []
         for signal in ctx.signals:
@@ -38,12 +48,17 @@ class ThoughtCapture:
             if thought_id in seen:
                 continue  # collapse duplicate seeds this frame → one upsert
             seen.add(thought_id)
-            provenance = creation_provenance(
-                ctx.trace,
-                created_by=self.id,
-                component="aggregation",
-                reason="event-seeded thought capture",
-                source_signal_ids=(signal.origin_id,),
+            existing = existing_by_id.get(thought_id)
+            provenance = (
+                existing.provenance
+                if existing is not None
+                else creation_provenance(
+                    ctx.trace,
+                    created_by=self.id,
+                    component="aggregation",
+                    reason="event-seeded thought capture",
+                    source_signal_ids=(signal.origin_id,),
+                )
             )
             thought = build_thought(
                 id=thought_id,

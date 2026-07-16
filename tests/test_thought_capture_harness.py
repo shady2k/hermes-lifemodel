@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from lifemodel.core.appraisal import ThoughtSeed
 from lifemodel.core.thought_view import read_live_thoughts, seed_thought_id
 from lifemodel.hooks import make_post_llm_observer
@@ -9,8 +11,8 @@ from lifemodel.testing.appraisal import FakeAppraiser
 from lifemodel.testing.harness import build_capture_lifemodel
 
 
-def test_exchange_to_thought_row_end_to_end():
-    lm = build_capture_lifemodel()
+def test_exchange_to_thought_row_end_to_end(tmp_path: Path):
+    lm = build_capture_lifemodel(base_dir=tmp_path)
     content = "the owner said: interview on Monday"
     observer = make_post_llm_observer(
         lambda: lm, appraiser=FakeAppraiser(ThoughtSeed(content=content, salience=0.7))
@@ -21,8 +23,8 @@ def test_exchange_to_thought_row_end_to_end():
     assert live[0].salience == 0.7
 
 
-def test_retry_of_same_exchange_upserts_one_row():
-    lm = build_capture_lifemodel()
+def test_retry_of_same_exchange_upserts_one_row(tmp_path: Path):
+    lm = build_capture_lifemodel(base_dir=tmp_path)
     content = "the owner said: interview on Monday"
     observer = make_post_llm_observer(
         lambda: lm, appraiser=FakeAppraiser(ThoughtSeed(content=content, salience=0.7))
@@ -34,9 +36,9 @@ def test_retry_of_same_exchange_upserts_one_row():
     assert live[0].id == seed_thought_id(content)
 
 
-def test_idle_heartbeat_is_still_zero_capture():
+def test_idle_heartbeat_is_still_zero_capture(tmp_path: Path):
     from lifemodel.core.frame import FrameTrigger, run_frame
 
-    lm = build_capture_lifemodel()
+    lm = build_capture_lifemodel(base_dir=tmp_path)
     run_frame(lm.coreloop, [], trigger=FrameTrigger.HEARTBEAT)  # empty world
     assert read_live_thoughts(lm.state) == ()
