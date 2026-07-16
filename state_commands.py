@@ -162,6 +162,15 @@ _SET_PROTECTED: dict[str, str] = {
         "list; a hand-set value would either hide the ritual from an unborn being or "
         "restart it mid-birth. Use `reset` to make the being unborn again."
     ),
+    "pending_internal_id": (
+        "lm-705.6: in-flight internal-cognition correlation — hand-setting desyncs the "
+        "runner's completion tracking, mirroring pending_proactive_id"
+    ),
+    "internal_calls_today": (
+        "lm-705.6: FR20's durable daily call ceiling — hand-editing without its paired "
+        "internal_calls_day would desync the quota rollover; never hand-edit either half"
+    ),
+    "internal_calls_day": "FR20 quota bookkeeping (see internal_calls_today)",
 }
 
 #: Field TYPE -> coercion kind. A field whose type is absent here (``list``/``dict``) has no

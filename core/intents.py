@@ -70,6 +70,30 @@ class LaunchProactive(Intent):
 
 
 @dataclass(frozen=True)
+class LaunchInternalCognition(Intent):
+    """Launch a NON-DELIVERED internal-cognition aux call (lm-705.6, design §3.3).
+
+    Mirrors :class:`LaunchProactive` minus every delivery field: there is no
+    ``reserved_energy`` (FR20's call-quota, not the being's energy vitals, gates
+    this) and no read-back into ``[SILENT]``/``SENT`` — the runner that consumes
+    this intent (:class:`~lifemodel.adapters.internal_runner.InternalCognitionRunner`)
+    calls the :class:`~lifemodel.core.llm_port.LlmPort` directly, never
+    ``egress.reach_out``/``inject_proactive_turn``, so delivery is structurally
+    impossible. ``correlation_id`` anchors :attr:`~lifemodel.state.model.State.pending_internal_id`
+    — its OWN correlation space, never the proactive one.
+
+    ``origin_traceparent`` is the same MANDATORY async-correlation anchor as
+    :class:`LaunchProactive` (spec §4.4): the full W3C ``traceparent`` of the
+    launch span, so the async aux call + its completion frame can continue the
+    SAME trace.
+    """
+
+    prompt: str
+    correlation_id: str
+    origin_traceparent: str
+
+
+@dataclass(frozen=True)
 class PutRecord(Intent):
     """Request a memory ``put``. The :class:`~lifemodel.core.state_actor.StateActor`
     collects these (in emission order) and hands them to the tick's atomic

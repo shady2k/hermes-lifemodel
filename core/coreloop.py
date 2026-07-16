@@ -42,6 +42,7 @@ from .idempotency import filter_external_events, record_external_events
 from .intents import (
     EmitSignal,
     Intent,
+    LaunchInternalCognition,
     LaunchProactive,
     PutRecord,
     TransitionRecord,
@@ -94,6 +95,12 @@ class TickReport:
     failed: tuple[str, ...]
     committed: bool
     launches: tuple[LaunchProactive, ...] = ()
+    #: Non-delivered internal-cognition launches this frame (lm-705.6), collected
+    #: SEPARATELY from :attr:`launches` — the proactive delivery channel. Never
+    #: dispatched to an egress; the adapter-owned
+    #: :class:`~lifemodel.adapters.internal_runner.InternalCognitionRunner` drives
+    #: each one to :class:`~lifemodel.core.llm_port.LlmPort` off the state-actor lock.
+    internal_launches: tuple[LaunchInternalCognition, ...] = ()
     trigger: FrameTrigger = FrameTrigger.HEARTBEAT
 
 
@@ -295,6 +302,7 @@ class CoreLoop:
 
         intents: list[Intent] = []
         launches: list[LaunchProactive] = []
+        internal_launches: list[LaunchInternalCognition] = []
         ran: list[str] = []
         failed: list[str] = []
 
@@ -364,6 +372,8 @@ class CoreLoop:
                     frame.emit(intent.signal)
                 elif isinstance(intent, LaunchProactive):
                     launches.append(intent)
+                elif isinstance(intent, LaunchInternalCognition):
+                    internal_launches.append(intent)
                 else:
                     intents.append(intent)
             ran.append(component.id)
@@ -411,6 +421,7 @@ class CoreLoop:
             failed=tuple(failed),
             committed=new_state is not state or had_mutation,
             launches=tuple(launches),
+            internal_launches=tuple(internal_launches),
             trigger=trigger,
         )
         # Ship the finished tick to the (optional) trace backend AFTER the commit —
