@@ -91,6 +91,18 @@ class LaunchInternalCognition(Intent):
     prompt: str
     correlation_id: str
     origin_traceparent: str
+    #: The durable object this pass concerns (lm-705.2), threaded to
+    #: :attr:`~lifemodel.state.model.State.pending_internal_subject_id` by the runner
+    #: so the completion frame's apply knows its subject. ``None`` for a subjectless
+    #: pass (noticing, lm-705.5).
+    subject_id: str | None = None
+    #: The aux call's system framing. ``""`` → the adapter's generic default (the
+    #: seam's content-free non-delivery notice). An emitter that needs specific framing
+    #: (processing) supplies its own, so the adapter never has to know the pass type.
+    instructions: str = ""
+    #: The typed-result JSON Schema for a structured pass (processing's outcome), or
+    #: ``None`` for a plain-text pass. Carried onto the ``InternalCognitionRequest``.
+    json_schema: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
