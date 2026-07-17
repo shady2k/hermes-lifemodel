@@ -263,3 +263,12 @@ rebuilt graph's own heartbeat still notices it and completes into a real thought
 later pass; and a genuine pass's `claimed()` reads empty from the SAME commit that seeds the
 thought. Also driven against real Hermes (`tests/hermes_internal_cognition_integration.py`,
 Part B-noticing) with the buffer switched to the durable store. Beads closed.
+
+**lm-705.19 (2026-07-17) — noticing also produces `belief`s (belief-track v1).** A carried seed
+may now be classified `belief` (a defeasible, confidence+evidence-bearing proposition, floored to
+at least `Sensitivity.SENSITIVE`) instead of `thought` — same anti-hallucination/dedup grounding,
+routed to the new `belief` kind (`domain/objects/belief.py`, `core/belief_view.py`) rather than a
+`Thought` row, and surfaced into a live turn by a gated, cooldown-bounded `pre_llm_call` injector
+(`make_belief_injector`). Proven end-to-end in `tests/test_belief_harness.py`, including the D10
+redaction (id/subject/confidence/sensitivity + reflection on the span/log — never the belief's
+full `content`). See `docs/superpowers/plans/2026-07-17-belief-track-v1.md` for the design/plan.
