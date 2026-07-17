@@ -160,3 +160,68 @@ def read_live_commitments(
         )
     )
     return live if limit is None else live[:limit]
+
+
+def live_commitment_id(content: str) -> str:
+    """A deterministic id for a commitment the being AUTHORS in the moment — content-
+    scoped in the ``live`` namespace (no source thought), mirroring
+    :func:`crystallized_commitment_id`'s digest exactly. Distinct from crystallization's
+    thought-scoped ``commitment:seed:…`` so the two birth paths (lm-705.21) never collide
+    on id, and re-authoring the same content upserts one row (create-if-absent, §19).
+
+    A lone Unicode surrogate is not UTF-8-encodable → ``UnicodeEncodeError`` → translated
+    to :class:`InvalidPayload` so the tool's narrow ``except InvalidPayload`` bounds it."""
+    try:
+        digest = hashlib.sha256(content.strip().encode()).hexdigest()[:16]
+    except UnicodeEncodeError as exc:
+        raise InvalidPayload("content is not UTF-8 encodable") from exc
+    return derive_id(COMMITMENT_KIND, "live", digest)
+
+
+def commitment_from_live_fields(*, fields: JsonObject) -> Commitment:
+    """Strictly parse the ``commitment`` tool's ``create`` args into a :class:`Commitment`
+    born in-the-moment (lm-705.21): a content-scoped ``live`` id, ``source="commitment-tool"``,
+    ``salience=0.5`` (a real, just-made intention — §18), no source thought. Mirrors
+    :func:`commitment_from_crystallize_fields`' strict parse — every wrong-type/missing/
+    bad-enum/non-finite value raises :class:`InvalidPayload`, never a silent coercion."""
+    content = req_str(fields, "content").strip()
+    if not content:
+        raise InvalidPayload("commitment content must be a non-empty string")
+    basis = req_enum(fields, "basis", CommitmentBasis)
+    trigger_kind = req_enum(fields, "trigger_kind", CommitmentTriggerKind)
+    trigger_value = req_str(fields, "trigger_value").strip()
+    if not trigger_value:
+        raise InvalidPayload("commitment trigger_value must be a non-empty string")
+    due_at = opt_str(fields, "due_at")
+    try:
+        other_regarding_value = opt_float(fields, "other_regarding_value") or 0.0
+    except OverflowError as exc:
+        raise InvalidPayload("other_regarding_value overflows float") from exc
+    return build_commitment(
+        id=live_commitment_id(content),
+        content=content,
+        basis=basis,
+        trigger_kind=trigger_kind,
+        trigger_value=trigger_value,
+        due_at=due_at,
+        source_thought_ids=(),
+        other_regarding_value=other_regarding_value,
+        salience=0.5,
+        source="commitment-tool",
+    )
+
+
+def read_active_commitments(memory: MemoryPort, *, limit: int) -> list[Commitment]:
+    """The ``active`` commitments most-salient-first, BOUNDED to ``limit+1`` — a real SQL
+    ``LIMIT`` (never the scan-all shape of :func:`read_live_commitments`, which decodes
+    every row then slices). ``active`` is the only live state surfaced into a live turn
+    (§17); the ``+1`` is the honest overflow probe (the injector sees >``limit`` rows and
+    knows at least one was dropped). No sensitivity filter (§17/§18): a commitment is the
+    being's own directive to the owner, and nothing sets a commitment ``PRIVATE`` today."""
+    records = memory.find(
+        kind=COMMITMENT_KIND,
+        state=CommitmentState.ACTIVE.value,
+        order_by="salience_desc",
+        limit=limit + 1,
+    )
+    return [c for record in records if (c := _decode_live(record)) is not None]
