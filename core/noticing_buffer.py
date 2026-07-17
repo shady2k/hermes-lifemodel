@@ -1,8 +1,8 @@
 """``NoticingBuffer`` — the process-owned conversation buffer (design §4.1, lm-705.5).
 
-A **single process-owned, lock-protected** service — injected into the hooks
-*and* the adapter (Task 3), NOT a field on a freshly-built ``LifeModel`` (graphs
-are rebuilt per call, so a per-graph buffer would lose every in-flight turn).
+A **single process-owned service** — injected into the hooks *and* the adapter
+(Task 3), NOT a field on a freshly-built ``LifeModel`` (graphs are rebuilt per
+call, so a per-graph buffer would lose every in-flight turn).
 
 Per **session** ("lane") there is at most ONE open ``pending`` slot — a turn in
 flight. ``open_pending``/``stamp_source`` build it up; ``complete`` moves it
@@ -14,64 +14,53 @@ never survey mid-turn (a long tool-heavy reply must not be read before its
 turn) ages to ``abandoned`` and is dropped the moment it is next observed, so
 one lost turn can never wedge a lane shut forever.
 
-Pure, stdlib-only (``threading``, ``collections.deque``, ``datetime``) — no
-Hermes, no ``LifeModel``. The only intra-repo import is :mod:`.timeutil`, for
-the same fixed-width UTC ISO stamp every other durable timestamp in this
-codebase uses (`ts` on :class:`BufferEntry`), which is why *now* must always be
-an aware ``datetime`` (:func:`~lifemodel.core.timeutil.to_iso` rejects a naive
-one) — the same convention the ``ClockPort`` boundary already enforces
-elsewhere, so no caller should ever be passing a naive one anyway.
+**Delegation (lm-705.14 Task 2).** ``NoticingBuffer`` itself holds NO buffer
+state and no lock of its own anymore — every method is a thin pass-through to
+an injected :class:`~lifemodel.core.buffer_store.BufferStore`, which owns the
+actual pending/complete/claimed data and its own lock-guarded mutation. The
+default store (``store=None``) is
+:class:`~lifemodel.core.buffer_store.InMemoryBufferStore` — the exact
+dict/deque logic this class used to own directly, moved verbatim — so every
+existing caller (today's production wiring, and the whole existing test suite)
+sees byte-identical behaviour. Injecting
+:class:`~lifemodel.state.sqlite_store.SqliteBufferStore` instead makes the SAME
+API durable: the captured-but-not-yet-noticed conversation survives a
+plugin/gateway restart.
+
+Pure, stdlib-only (``datetime``) — no Hermes, no ``LifeModel``. The only
+intra-repo import is :mod:`.buffer_store`, for :class:`BufferEntry` and the
+:class:`BufferStore` port/default fake.
 """
 
 from __future__ import annotations
 
-import threading
-from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .timeutil import to_iso
+from .buffer_store import BufferEntry, BufferStore, InMemoryBufferStore
 
-
-@dataclass(frozen=True)
-class BufferEntry:
-    """One completed conversation turn, eligible for a closed-prefix segment."""
-
-    session_id: str
-    turn_id: str
-    source_ids: tuple[str, ...]
-    user_text: str
-    assistant_text: str
-    ts: str
-
-
-@dataclass
-class _PendingTurn:
-    """A session's single in-flight turn — at most one per lane."""
-
-    user_text: str
-    opened_at: datetime
-    source_ids: list[str] = field(default_factory=list)
+__all__ = ["BufferEntry", "NoticingBuffer"]
 
 
 class NoticingBuffer:
-    """Per-session pending→complete ring, one :class:`threading.Lock` for all mutation.
+    """Per-session pending→complete API, delegating all persistence to an
+    injected :class:`BufferStore` (lm-705.14 Task 2).
 
     Two sessions are fully independent: each has its own optional pending slot
-    and its own bounded ``complete`` ring (``max_entries`` applies per session).
+    and its own bounded ``complete`` ring (``max_entries`` applies per session,
+    for the default in-memory store).
     """
 
     def __init__(
         self,
         *,
+        store: BufferStore | None = None,
         max_entries: int = 256,
         pending_ttl: timedelta = timedelta(minutes=30),
     ) -> None:
-        self._max_entries = max_entries
+        self._store: BufferStore = (
+            store if store is not None else InMemoryBufferStore(max_entries=max_entries)
+        )
         self._pending_ttl = pending_ttl
-        self._lock = threading.Lock()
-        self._pending: dict[str, _PendingTurn] = {}
-        self._complete: dict[str, deque[BufferEntry]] = {}
 
     def open_pending(self, session_id: str, *, user_text: str, now: datetime) -> None:
         """Open (or refresh) *session_id*'s single pending slot.
@@ -80,71 +69,35 @@ class NoticingBuffer:
         supersedes whatever was there — the platform never opens two turns on
         one lane at once).
         """
-        with self._lock:
-            self._pending[session_id] = _PendingTurn(user_text=user_text, opened_at=now)
+        self._store.open_pending(session_id, user_text=user_text, now=now)
 
     def stamp_source(self, session_id: str, message_id: str) -> None:
         """Append a platform message id to the open pending slot; no-op if none."""
-        with self._lock:
-            pending = self._pending.get(session_id)
-            if pending is not None:
-                pending.source_ids.append(message_id)
+        self._store.stamp_source(session_id, message_id)
 
     def complete(
         self, session_id: str, turn_id: str, *, assistant_text: str, now: datetime
     ) -> None:
-        """Move the pending slot into a ``complete`` ring entry; no-op if none open.
+        """Move the pending slot into a ``complete`` entry; no-op if none open.
 
         Defensive: a ``complete`` with no matching ``open_pending`` (e.g. a
         duplicate/late callback) does nothing rather than fabricate an entry
-        with no real user turn behind it.
-
-        *now* is validated (via :func:`~lifemodel.core.timeutil.to_iso`) BEFORE
-        the pending slot is popped (review minor M3): a tz-naive *now* would
-        otherwise be rejected only AFTER the pop already ran, silently
-        destroying the pending turn on the way to raising. Validating first
-        means a bad clock call fails loud with the pending still intact for a
-        later, valid retry.
+        with no real user turn behind it. *now* is validated (rejecting a
+        tz-naive value) BEFORE the pending slot is popped (M3) — a bad clock
+        call fails loud with the pending still intact for a later, valid
+        retry. Enforced by the store implementation.
         """
-        with self._lock:
-            pending = self._pending.get(session_id)
-            if pending is None:
-                return
-            ts = to_iso(now)  # validate BEFORE mutating anything (M3)
-            del self._pending[session_id]
-            entry = BufferEntry(
-                session_id=session_id,
-                turn_id=turn_id,
-                source_ids=tuple(pending.source_ids),
-                user_text=pending.user_text,
-                assistant_text=assistant_text,
-                ts=ts,
-            )
-            ring = self._complete.get(session_id)
-            if ring is None:
-                ring = deque(maxlen=self._max_entries)
-                self._complete[session_id] = ring
-            ring.append(entry)
+        self._store.complete(session_id, turn_id, assistant_text=assistant_text, now=now)
 
     def closed_segment(self, session_id: str, *, now: datetime) -> list[BufferEntry]:
         """The ordered ``complete`` entries for *session_id*, iff its lane is closed.
 
-        FIRST ages a stale pending (``now - opened_at > pending_ttl``) to
-        abandoned, dropping it, so a turn that never completes can't wedge the
-        lane shut forever. THEN applies the closed-prefix rule: any pending
-        still open (fresh, within TTL) yields ``[]`` — never survey mid-turn.
+        FIRST ages a stale pending (older than ``pending_ttl``) to abandoned,
+        dropping it, so a turn that never completes can't wedge the lane shut
+        forever. THEN applies the closed-prefix rule: any pending still open
+        (fresh, within TTL) yields ``[]`` — never survey mid-turn.
         """
-        with self._lock:
-            pending = self._pending.get(session_id)
-            if pending is not None and now - pending.opened_at > self._pending_ttl:
-                del self._pending[session_id]
-                pending = None
-            if pending is not None:
-                return []
-            ring = self._complete.get(session_id)
-            if ring is None:
-                return []
-            return list(ring)
+        return self._store.completed(session_id, now=now, ttl=self._pending_ttl)
 
     def abandon_pending(self, session_id: str) -> None:
         """Drop *session_id*'s pending slot, if any; a no-op otherwise (review-2 G2).
@@ -156,21 +109,68 @@ class NoticingBuffer:
         only clear via :meth:`closed_segment`'s stale-pending aging, silently
         blocking the WHOLE lane (the closed-prefix rule) for up to
         ``pending_ttl`` even though nothing is actually in flight on it
-        anymore. Lock-guarded like every other mutation here.
+        anymore.
         """
-        with self._lock:
-            self._pending.pop(session_id, None)
+        self._store.abandon_pending(session_id)
 
     def session_ids(self) -> list[str]:
         """Every session lane the buffer currently knows of (an open pending, a
-        non-empty ``complete`` ring, or both), lock-guarded and sorted for a
-        deterministic iteration order. There is no separate "live sessions"
-        registry elsewhere — a caller that needs to sweep every lane (e.g.
+        non-empty ``complete`` ring, or both), sorted for a deterministic
+        iteration order. There is no separate "live sessions" registry
+        elsewhere — a caller that needs to sweep every lane (e.g.
         :class:`~lifemodel.core.noticing.NoticingTrigger`) reads this rather
         than track session ids itself.
         """
-        with self._lock:
-            return sorted(set(self._pending) | set(self._complete))
+        return self._store.session_ids()
+
+    # ---- claim / finalize / release lifecycle (lm-705.13, wired from Task 3) -
+
+    def claim(self, session_id: str, turn_ids: tuple[str, ...], survey_id: str) -> None:
+        """Mark the given ``complete`` *turn_ids* ``claimed`` under *survey_id*
+        — see :meth:`~lifemodel.core.buffer_store.BufferStore.claim`."""
+        self._store.claim(session_id, turn_ids, survey_id)
+
+    def claimed(self, survey_id: str) -> list[BufferEntry]:
+        """The ordered entries claimed under *survey_id* — the immutable
+        snapshot a noticing pass actually surveyed, regardless of any
+        ring/store pressure since the claim. See
+        :meth:`~lifemodel.core.buffer_store.BufferStore.claimed`."""
+        return self._store.claimed(survey_id)
+
+    def finalize(self, survey_id: str) -> None:
+        """Drop the rows claimed under *survey_id* — the durable half of a
+        successful noticing pass's atomic commit. See
+        :meth:`~lifemodel.core.buffer_store.BufferStore.finalize`."""
+        self._store.finalize(survey_id)
+
+    def release(self, survey_id: str) -> None:
+        """Return the rows claimed under *survey_id* to ``complete`` (un-claim)
+        — a transient noticing failure, so the segment is re-surveyed later.
+        See :meth:`~lifemodel.core.buffer_store.BufferStore.release`."""
+        self._store.release(survey_id)
+
+    def recover_stale_claims(self) -> None:
+        """Release every outstanding claim — boot recovery for a noticing pass
+        that died mid-flight with the process. See
+        :meth:`~lifemodel.core.buffer_store.BufferStore.recover_stale_claims`."""
+        self._store.recover_stale_claims()
+
+    # ---- legacy surveyed-prefix cursor (lm-705.5) ---------------------------
+    # `segment_through`/`clear_through` are the OLD complete-ring cursor
+    # `core/noticing.py`'s `NoticingApply` still calls directly (keyed by
+    # session_id + a turn_id anchor). lm-705.13 Task 3/4 replace this cursor
+    # with the claim/claimed/finalize lifecycle above and rewire `NoticingApply`
+    # onto it; until then these two stay in place, unchanged in behaviour, so
+    # the live noticing path is never broken.
+    #
+    # They only work when this buffer is backed by the default
+    # `InMemoryBufferStore` — today's only production backing. No `BufferStore`
+    # method reads "the raw complete prefix, ignoring the pending gate"
+    # without risking silently abandoning a live pending turn (`completed`'s
+    # only path past the gate ages out — and drops — a non-stale pending would
+    # otherwise never touch). A `NoticingBuffer` over any OTHER store (e.g.
+    # the durable `SqliteBufferStore`) must use `claim`/`claimed`/`finalize`
+    # instead — which is exactly what Task 3/4 wire up.
 
     def segment_through(self, session_id: str, turn_id: str) -> list[BufferEntry]:
         """The ``complete`` ring PREFIX for *session_id* up to and including
@@ -185,16 +185,18 @@ class NoticingBuffer:
         own scan so "what was surveyed" and "what gets cleared" never drift
         apart. Empty if *turn_id* is not found (already cleared, or never
         present) — the caller treats that as nothing to do.
+
+        Raises :class:`NotImplementedError` when this buffer is not backed by
+        the default :class:`~lifemodel.core.buffer_store.InMemoryBufferStore`
+        (see the section note above).
         """
-        with self._lock:
-            ring = self._complete.get(session_id)
-            if ring is None:
-                return []
-            entries = list(ring)
-            for i, entry in enumerate(entries):
-                if entry.turn_id == turn_id:
-                    return entries[: i + 1]
-            return []
+        if isinstance(self._store, InMemoryBufferStore):
+            return self._store.segment_through(session_id, turn_id)
+        raise NotImplementedError(
+            "segment_through(session_id, turn_id) is the legacy in-memory-only "
+            "cursor read; a NoticingBuffer over a non-InMemoryBufferStore must "
+            "use claim/claimed instead (lm-705.13 Task 3/4)."
+        )
 
     def clear_through(self, session_id: str, turn_id: str) -> None:
         """Cursor: drop *session_id*'s ``complete`` entries up to and including *turn_id*.
@@ -202,14 +204,16 @@ class NoticingBuffer:
         Entries after it (a newer turn the surveyed pass did not consume)
         survive. A *turn_id* not found in the ring (already cleared, or never
         present) is a no-op — there is nothing to advance the cursor past.
+
+        Raises :class:`NotImplementedError` when this buffer is not backed by
+        the default :class:`~lifemodel.core.buffer_store.InMemoryBufferStore`
+        (see the section note above).
         """
-        with self._lock:
-            ring = self._complete.get(session_id)
-            if ring is None:
-                return
-            entries = list(ring)
-            for i, entry in enumerate(entries):
-                if entry.turn_id == turn_id:
-                    ring.clear()
-                    ring.extend(entries[i + 1 :])
-                    return
+        if isinstance(self._store, InMemoryBufferStore):
+            self._store.clear_through(session_id, turn_id)
+            return
+        raise NotImplementedError(
+            "clear_through(session_id, turn_id) is the legacy in-memory-only "
+            "cursor advance; a NoticingBuffer over a non-InMemoryBufferStore "
+            "must use claim/finalize instead (lm-705.13 Task 3/4)."
+        )
