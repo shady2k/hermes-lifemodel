@@ -30,6 +30,7 @@ from ..composition import LifeModel, build_lifemodel
 from ..core.component import ComponentLayer
 from ..core.desire_view import read_live_contact_desire
 from ..core.frame import FrameTrigger
+from ..core.noticing_buffer import NoticingBuffer
 from ..core.proactive import proactive_tick
 from ..core.quality import Actor, Label
 from ..core.registry import ComponentManifest, UnknownComponent
@@ -356,4 +357,53 @@ def build_processing_lifemodel(
                 accepts_signals=True,
             ),
         )
+    return lm
+
+
+def build_noticing_lifemodel(
+    *, buffer: NoticingBuffer, base_dir: Path | None = None, clock: ClockPort | None = None
+) -> LifeModel:
+    """A real-code ``LifeModel`` with the noticing pair —
+    :class:`~lifemodel.core.noticing.NoticingTrigger` +
+    :class:`~lifemodel.core.noticing.NoticingApply` — registered over *buffer*: the
+    slice-5 (lm-705.5) sim seam (spec §6: a buffered sitting becomes real thoughts,
+    source ids, closed-prefix, dedup, 0-LLM idle).
+
+    Mirrors :func:`build_processing_lifemodel` exactly (see its docstring / the
+    module docstring above for why this builds the ordinary real graph over a fresh
+    on-disk :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`), with one
+    difference: *buffer* is a REQUIRED, caller-supplied
+    :class:`~lifemodel.core.noticing_buffer.NoticingBuffer` rather than something
+    this function constructs. Unlike thought-processing's backlog (which lives
+    entirely in the store), noticing's input is the PROCESS-OWNED buffer — a fresh
+    one built here would never see the turns the caller seeds through its own public
+    API (``open_pending``/``stamp_source``/``complete``) before/after driving a frame
+    (see :mod:`lifemodel.core.noticing_buffer`'s own docstring on why it is
+    process-owned, not per-graph). ``build_lifemodel``'s own ``noticing_buffer=``
+    branch registers both components idempotently over *buffer*, so a caller that
+    already holds a registry with them registered (an unlikely but harmless case)
+    is left unchanged.
+
+    ``base_dir`` defaults to a fresh temp directory so a caller can write
+    ``build_noticing_lifemodel(buffer=NoticingBuffer())`` with only the mandatory
+    keyword. The being is committed BORN (:data:`BORN_AT`) before return, same
+    reasoning as :func:`build_processing_lifemodel`: a noticing sim scenario is an
+    ordinary tick inside an existing relationship, never the genesis wake.
+    """
+    resolved_base_dir = (
+        base_dir if base_dir is not None else Path(tempfile.mkdtemp(prefix="lifemodel-noticing-"))
+    )
+    resolved_clock: ClockPort = (
+        clock if clock is not None else FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    )
+    lm = build_lifemodel(base_dir=resolved_base_dir, clock=resolved_clock, noticing_buffer=buffer)
+    lm.state.commit(
+        State(
+            u=0.0,
+            energy=1.0,
+            fatigue=0.0,
+            last_tick_at=resolved_clock.now().isoformat(),
+            genesis_completed_at=BORN_AT,
+        )
+    )
     return lm
