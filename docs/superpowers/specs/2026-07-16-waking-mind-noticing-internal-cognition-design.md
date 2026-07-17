@@ -218,3 +218,19 @@ Part I host-integration test (§3.5).
 - **Retained (codex-affirmed sound):** no-`llm`-in-graph premise; non-delivered aux is
   possible; separate correlation is correct; segment+backlog+top-K is reasonable; aux call
   off the lock; ASYNC_COMPLETION+intent path consistent with single-store/snapshot.
+
+**lm-705.5 build (2026-07-17) — Part II shipped (§4/§5/§6).** Noticing on the lm-705.6 seam:
+`NoticingBuffer` (process-owned, per-session `pending→complete` ring, closed-prefix + TTL,
+wired into `pre_llm` open / `post_llm` complete inside the fail-loud guards, `turn_id` pointer)
++ `NoticingTrigger` (idle∨size closed-prefix → subjectless `LaunchInternalCognition`) +
+`NoticingApply` (validate source ids ⊆ segment, `NOTICING_TOP_K=3`, within-batch + consumed-ring
+dedup, no terminal-thought resurrection, transient/malformed → no-clear, seed via the slice-1
+capture door). Coexists with processing (lm-705.2) on the one seam + single-flight, disambiguated
+by `pending_internal_subject_id`. Judgment not heuristic; **no privacy classifier** (owner). This
+is the concrete **appraiser** the whole vector was dormant for — with it live, notice → process
+(705.2) → crystallize (705.3) runs end-to-end. Reviewed opus + codex `019f6f26` ×2 (2 fix waves;
+all correctness findings closed). **Deferred as beads:** buffer claim/finalize transactional
+lifecycle — segment-eviction / clear-before-commit / window↔cursor (**lm-705.13**); cheap-model
+routing, host-blocked, so noticing routes to the main model bounded by the FR20 call ceiling
+(**lm-705.10**). **Not built:** deep cross-segment reference; a model-facing thought READ tool
+(FR24 conversational); the arbiter (lm-705.4).
