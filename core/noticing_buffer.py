@@ -137,6 +137,41 @@ class NoticingBuffer:
                 return []
             return list(ring)
 
+    def session_ids(self) -> list[str]:
+        """Every session lane the buffer currently knows of (an open pending, a
+        non-empty ``complete`` ring, or both), lock-guarded and sorted for a
+        deterministic iteration order. There is no separate "live sessions"
+        registry elsewhere — a caller that needs to sweep every lane (e.g.
+        :class:`~lifemodel.core.noticing.NoticingTrigger`) reads this rather
+        than track session ids itself.
+        """
+        with self._lock:
+            return sorted(set(self._pending) | set(self._complete))
+
+    def segment_through(self, session_id: str, turn_id: str) -> list[BufferEntry]:
+        """The ``complete`` ring PREFIX for *session_id* up to and including
+        *turn_id* — unlike :meth:`closed_segment`, this does NOT apply the
+        closed-prefix (pending) gate.
+
+        For a caller re-deriving what an EARLIER :meth:`closed_segment` read
+        already gated once (a noticing pass's async completion, recovering the
+        exact segment its own trigger surveyed): a NEW pending opening on this
+        lane in the meantime must not retroactively hide entries that were
+        already safely closed at trigger time. Mirrors :meth:`clear_through`'s
+        own scan so "what was surveyed" and "what gets cleared" never drift
+        apart. Empty if *turn_id* is not found (already cleared, or never
+        present) — the caller treats that as nothing to do.
+        """
+        with self._lock:
+            ring = self._complete.get(session_id)
+            if ring is None:
+                return []
+            entries = list(ring)
+            for i, entry in enumerate(entries):
+                if entry.turn_id == turn_id:
+                    return entries[: i + 1]
+            return []
+
     def clear_through(self, session_id: str, turn_id: str) -> None:
         """Cursor: drop *session_id*'s ``complete`` entries up to and including *turn_id*.
 

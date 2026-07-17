@@ -173,6 +173,43 @@ def test_two_sessions_are_fully_independent() -> None:
     assert [e.turn_id for e in buf.closed_segment("s1", now=T0 + timedelta(seconds=4))] == ["t1"]
 
 
+def test_session_ids_reports_every_known_lane() -> None:
+    buf = NoticingBuffer()
+    buf.open_pending("s-pending-only", user_text="mid-turn", now=T0)
+    buf.open_pending("s-complete", user_text="hi", now=T0)
+    buf.complete("s-complete", "t1", assistant_text="hello", now=T0 + timedelta(seconds=1))
+
+    assert buf.session_ids() == ["s-complete", "s-pending-only"]
+
+
+def test_session_ids_is_empty_for_a_fresh_buffer() -> None:
+    assert NoticingBuffer().session_ids() == []
+
+
+def test_segment_through_returns_prefix_ignoring_an_open_pending() -> None:
+    # Unlike closed_segment, a NEW pending on the lane must not hide the
+    # already-complete prefix a caller already knows was surveyed.
+    buf = NoticingBuffer()
+    for i, turn_id in enumerate(["t1", "t2", "t3"]):
+        buf.open_pending("s1", user_text=f"u{i}", now=T0 + timedelta(seconds=i))
+        buf.complete(
+            "s1", turn_id, assistant_text=f"a{i}", now=T0 + timedelta(seconds=i, milliseconds=1)
+        )
+    buf.open_pending("s1", user_text="new turn mid-flight", now=T0 + timedelta(seconds=10))
+
+    assert buf.closed_segment("s1", now=T0 + timedelta(seconds=11)) == []  # gated
+    assert [e.turn_id for e in buf.segment_through("s1", "t2")] == ["t1", "t2"]
+
+
+def test_segment_through_unknown_turn_id_is_empty() -> None:
+    buf = NoticingBuffer()
+    buf.open_pending("s1", user_text="hi", now=T0)
+    buf.complete("s1", "t1", assistant_text="hello", now=T0 + timedelta(seconds=1))
+
+    assert buf.segment_through("s1", "does-not-exist") == []
+    assert buf.segment_through("unknown-session", "t1") == []
+
+
 def test_concurrent_open_stamp_complete_across_sessions_is_thread_safe() -> None:
     # Each thread owns its own session lane (the real usage shape — distinct
     # conversations proceed concurrently). This exercises the shared lock
