@@ -273,7 +273,13 @@ class FakeStateStore:
         self._state = State()
         return copy.deepcopy(self._state)
 
-    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[MemoryMutation],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         """Atomically apply *state* (if not ``None``) then each mutation in order.
 
         Snapshot-then-restore gives true all-or-nothing: any exception (a stale
@@ -281,6 +287,13 @@ class FakeStateStore:
         memory rows to their pre-batch values and re-raises — matching the real
         store's single transaction, including intra-batch ``put``-then-
         ``transition`` of the same record.
+
+        *finalize_survey_id* is accepted for :class:`~lifemodel.ports.tick_commit.TickCommitPort`
+        parity (the state-actor always threads it through). This state+memory fake
+        owns no conversation buffer, so finalize is a no-op here — the durable
+        claimed-row DELETE is exercised against the real
+        :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` + ``SqliteBufferStore``
+        (``tests/test_finalize_buffer_intent.py``).
         """
         if mutations and self._memory is None:
             raise TypeError(

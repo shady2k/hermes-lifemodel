@@ -124,3 +124,21 @@ class TransitionRecord(Intent):
     No live component emits one yet (lm-27n.2)."""
 
     op: TransitionOp
+
+
+@dataclass(frozen=True)
+class FinalizeBuffer(Intent):
+    """Drop the noticing conversation-buffer rows claimed under *survey_id* — the
+    durable cursor-advance half of a successful noticing pass (lm-705.13, codex I3).
+
+    Collected by the :class:`~lifemodel.core.state_actor.StateActor` and threaded
+    to :meth:`~lifemodel.ports.tick_commit.TickCommitPort.commit_tick` as
+    ``finalize_survey_id``, so the claimed-row ``DELETE`` runs INSIDE the tick's one
+    ``BEGIN IMMEDIATE`` transaction — ATOMIC with the pass's ``PutRecord(thought)``
+    and consumed-ring ``UpdateState``. A rollback therefore leaves neither the
+    thoughts nor the finalize: the claim stays put, to be re-surveyed by a retry or
+    released by boot recovery (``NoticingBuffer.recover_stale_claims``).
+    :class:`~lifemodel.core.noticing.NoticingApply` emits exactly one per genuinely
+    surveyed pass (fruitful or not), never on a transient/malformed/empty-claim path."""
+
+    survey_id: str

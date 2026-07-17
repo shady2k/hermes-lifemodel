@@ -4,7 +4,13 @@ from collections.abc import Sequence
 
 import pytest
 
-from lifemodel.core.intents import EmitSignal, PutRecord, TransitionRecord, UpdateState
+from lifemodel.core.intents import (
+    EmitSignal,
+    FinalizeBuffer,
+    PutRecord,
+    TransitionRecord,
+    UpdateState,
+)
 from lifemodel.core.state_actor import StateActor, UnknownStateField
 from lifemodel.domain.memory import MemoryDraft, MemoryMutation, PutOp, TransitionOp
 from lifemodel.domain.signal import Signal
@@ -18,6 +24,7 @@ class RecordingStore:
         self._state = initial if initial is not None else State()
         self.commits: list[State] = []
         self.tick_calls: list[tuple[State | None, list[MemoryMutation]]] = []
+        self.finalize_calls: list[str | None] = []
 
     def load(self) -> State:
         return self._state
@@ -31,8 +38,15 @@ class RecordingStore:
         self.commits.append(self._state)
         return self._state
 
-    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[MemoryMutation],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         self.tick_calls.append((state, list(mutations)))
+        self.finalize_calls.append(finalize_survey_id)
         if state is not None:
             self.commit(state)
 
@@ -152,6 +166,48 @@ def test_apply_state_only_passes_empty_mutations() -> None:
     committed_state, mutations = store.tick_calls[0]
     assert committed_state is not None and committed_state.u == 0.5
     assert mutations == []
+
+
+# --- lm-705.13: FinalizeBuffer threads the survey_id into the atomic commit ---
+
+
+def test_apply_threads_finalize_survey_id_alongside_thoughts() -> None:
+    # A genuine noticing pass: a thought put + a consumed-ring patch + the
+    # FinalizeBuffer, all collected into the ONE commit_tick so the claimed-row
+    # DELETE lands atomically with the thought (codex I3).
+    store = RecordingStore()
+    actor = StateActor(store)
+    actor.apply([_put("thought:x"), UpdateState({"u": 0.5}), FinalizeBuffer("t7@iso")])
+
+    assert len(store.tick_calls) == 1  # exactly one atomic commit
+    committed_state, mutations = store.tick_calls[0]
+    assert committed_state is not None and committed_state.u == 0.5
+    assert isinstance(mutations[0], PutOp)
+    assert store.finalize_calls == ["t7@iso"]
+
+
+def test_apply_finalize_only_still_commits() -> None:
+    # A genuinely-surveyed-but-fruitless pass emits ONLY a FinalizeBuffer (no
+    # state patch, no memory mutation) — it must STILL commit so the cursor
+    # advances and the segment is never re-shown forever. state=None: the row is
+    # untouched, but the finalize DELETE still runs.
+    store = RecordingStore()
+    actor = StateActor(store)
+    actor.apply([FinalizeBuffer("t1@iso")])
+
+    assert len(store.tick_calls) == 1
+    committed_state, mutations = store.tick_calls[0]
+    assert committed_state is None
+    assert mutations == []
+    assert store.finalize_calls == ["t1@iso"]
+    assert store.commits == []  # state row never rewritten
+
+
+def test_apply_without_finalize_passes_none() -> None:
+    store = RecordingStore()
+    actor = StateActor(store)
+    actor.apply([UpdateState({"u": 0.5})])
+    assert store.finalize_calls == [None]
 
 
 def test_state_actor_requires_a_committer_or_committing_store() -> None:

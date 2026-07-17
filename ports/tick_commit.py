@@ -29,8 +29,18 @@ from ..state.model import State
 class TickCommitPort(Protocol):
     """Persist a tick's ``State`` change + memory mutations in one transaction."""
 
-    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[MemoryMutation],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         """Apply *state* (if not ``None``) then each mutation in list order,
-        atomically. Raises on a stale transition or serialization error, rolling
-        back the whole batch (state included). Returns ``None``."""
+        atomically. When *finalize_survey_id* is not ``None``, the noticing
+        conversation-buffer rows claimed under it are dropped in the SAME
+        transaction (lm-705.13, codex I3) — so a noticing pass's thoughts and its
+        cursor-advance commit or roll back together. Raises on a stale transition
+        or serialization error, rolling back the whole batch (state, mutations, and
+        finalize alike). Returns ``None``."""
         ...

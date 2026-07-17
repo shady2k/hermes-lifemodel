@@ -660,7 +660,13 @@ class SQLiteRuntimeStore:
 
     # ---- TickCommitPort (lm-27n.2) ----------------------------------------
 
-    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[MemoryMutation],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         """Atomically persist a tick's *state* change + memory *mutations* (§4.1).
 
         ONE connection, ONE ``now``, ONE transaction spanning ``runtime_state``
@@ -669,6 +675,16 @@ class SQLiteRuntimeStore:
         The state UPSERT (if *state* is not ``None``) is applied first, then each
         mutation in list order. **All-or-nothing**: any stale transition, or a
         serialization error, rolls back *everything* and propagates.
+
+        When *finalize_survey_id* is not ``None``, the ``conversation_buffer`` rows
+        claimed under it are ``DELETE``d LAST, still inside this one
+        ``BEGIN IMMEDIATE`` transaction (lm-705.13, codex I3). The committer owns
+        ``conversation_buffer`` (D7 — one physical store), and this ``DELETE`` is
+        byte-identical to :meth:`SqliteBufferStore.finalize`'s. Landing it here,
+        alongside a noticing pass's ``PutRecord(thought)`` + consumed-ring
+        ``UpdateState``, is what makes the cursor-advance atomic with the thoughts:
+        a rollback leaves neither the thoughts nor the finalize, so the claim
+        survives to be re-surveyed or boot-recovered (never a half-applied pass).
 
         A state-only ``commit_tick(state, [])`` is byte-identical to
         :meth:`commit` (same UPSERT, same revision bump, same ``state_commit``
@@ -728,6 +744,13 @@ class SQLiteRuntimeStore:
                         )
                     case _:  # pragma: no cover - exhaustive over the closed union
                         assert_never(mutation)
+            if finalize_survey_id is not None:
+                # The cursor-advance half of a noticing pass, in the SAME txn as its
+                # thoughts (codex I3). BYTE-IDENTICAL to SqliteBufferStore.finalize.
+                conn.execute(
+                    "DELETE FROM conversation_buffer WHERE survey_id = ? AND state = 'claimed'",
+                    (finalize_survey_id,),
+                )
             conn.commit()
         except BaseException:
             conn.rollback()

@@ -42,7 +42,13 @@ class RecordingStore:
         self.commits.append(self._state)
         return self._state
 
-    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[MemoryMutation],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         # State-only in the live loop (no component emits a mutation yet); a
         # state change routes through the same commit-recording path.
         if state is not None:

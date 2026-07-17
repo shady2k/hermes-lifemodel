@@ -24,7 +24,7 @@ from ..domain.memory import MemoryMutation
 from ..ports.tick_commit import TickCommitPort
 from ..state.model import State
 from ..state.port import StatePort
-from .intents import Intent, PutRecord, TransitionRecord, UpdateState
+from .intents import FinalizeBuffer, Intent, PutRecord, TransitionRecord, UpdateState
 
 _STATE_FIELDS = frozenset(f.name for f in fields(State))
 
@@ -75,10 +75,20 @@ class StateActor:
 
     def apply(self, intents: Sequence[Intent]) -> State:
         """Apply a batch atomically. Commits once (one ``commit_tick``) iff the
-        merged patch is non-empty OR there is >=1 memory mutation; validates all
-        field names *before* committing (all-or-nothing)."""
+        merged patch is non-empty OR there is >=1 memory mutation OR a
+        ``FinalizeBuffer`` was emitted; validates all field names *before*
+        committing (all-or-nothing).
+
+        A ``FinalizeBuffer`` carries the noticing pass's ``survey_id`` for the
+        atomic claimed-row DELETE (lm-705.13, codex I3): it is threaded to
+        ``commit_tick`` so the cursor-advance lands in the SAME transaction as the
+        pass's thoughts. A genuinely-surveyed-but-fruitless pass emits ONLY a
+        ``FinalizeBuffer`` (no state patch, no mutation), so it MUST still trigger a
+        commit — the guard below accounts for it. At most one ``FinalizeBuffer`` is
+        expected per batch (the apply emits exactly one); a later one wins."""
         patch: dict[str, Any] = {}
         mutations: list[MemoryMutation] = []
+        finalize_survey_id: str | None = None
         for intent in intents:
             if isinstance(intent, UpdateState):
                 for name, value in intent.changes.items():
@@ -87,14 +97,18 @@ class StateActor:
                     patch[name] = value
             elif isinstance(intent, PutRecord | TransitionRecord):
                 mutations.append(intent.op)
-        if not patch and not mutations:
+            elif isinstance(intent, FinalizeBuffer):
+                finalize_survey_id = intent.survey_id
+        if not patch and not mutations and finalize_survey_id is None:
             return self.state
 
         # Rewrite the state row only when the patch changed something; a
-        # mutation-only tick passes ``None`` so the row (and its revision) is
-        # untouched. A state-only tick (``mutations == []``) is byte-identical to
-        # the old single ``commit`` path.
+        # mutation-only (or finalize-only) tick passes ``None`` so the row (and its
+        # revision) is untouched. A state-only tick (no mutation, no finalize) is
+        # byte-identical to the old single ``commit`` path.
         new_state = replace(self.state, **patch) if patch else self.state
-        self._committer.commit_tick(new_state if patch else None, mutations)
+        self._committer.commit_tick(
+            new_state if patch else None, mutations, finalize_survey_id=finalize_survey_id
+        )
         self._state = new_state
         return new_state

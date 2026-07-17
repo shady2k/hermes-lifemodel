@@ -64,7 +64,13 @@ class RecordingStore:
         self.commits.append(self._state)
         return self._state
 
-    def commit_tick(self, state: State | None, mutations: Sequence[MemoryMutation]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[MemoryMutation],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         if state is not None:
             self.commit(state)
 

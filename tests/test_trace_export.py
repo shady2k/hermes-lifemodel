@@ -135,7 +135,13 @@ class _RecordingStore:
         self._state = State()
         return self._state
 
-    def commit_tick(self, state: State | None, mutations: Sequence[object]) -> None:
+    def commit_tick(
+        self,
+        state: State | None,
+        mutations: Sequence[object],
+        *,
+        finalize_survey_id: str | None = None,
+    ) -> None:
         if state is not None:
             self.commit(state)
 
