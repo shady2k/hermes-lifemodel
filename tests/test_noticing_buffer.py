@@ -4,7 +4,7 @@ A process-owned, lock-protected per-session pending→complete ring: at most one
 open ``pending`` turn per session lane; completed turns land in a bounded ring;
 ``closed_segment`` honours the closed-prefix rule (never surveys mid-turn); a
 stale ``pending`` ages out via TTL so a dropped turn can't wedge the lane shut
-forever; ``clear_through`` is the surveyed-prefix cursor.
+forever.
 """
 
 from __future__ import annotations
@@ -131,34 +131,6 @@ def test_stamp_source_with_no_open_pending_is_a_noop() -> None:
     assert buf.closed_segment("s1", now=T0) == []
 
 
-def test_clear_through_drops_surveyed_prefix_and_keeps_later_entries() -> None:
-    buf = NoticingBuffer()
-    for i, turn_id in enumerate(["t1", "t2", "t3"]):
-        buf.open_pending("s1", user_text=f"u{i}", now=T0 + timedelta(seconds=i))
-        buf.complete(
-            "s1", turn_id, assistant_text=f"a{i}", now=T0 + timedelta(seconds=i, milliseconds=1)
-        )
-
-    segment = buf.closed_segment("s1", now=T0 + timedelta(seconds=10))
-    assert [e.turn_id for e in segment] == ["t1", "t2", "t3"]
-
-    buf.clear_through("s1", "t2")
-
-    segment_after = buf.closed_segment("s1", now=T0 + timedelta(seconds=11))
-    assert [e.turn_id for e in segment_after] == ["t3"]
-
-
-def test_clear_through_unknown_turn_id_is_a_noop() -> None:
-    buf = NoticingBuffer()
-    buf.open_pending("s1", user_text="u", now=T0)
-    buf.complete("s1", "t1", assistant_text="a", now=T0 + timedelta(seconds=1))
-
-    buf.clear_through("s1", "does-not-exist")
-
-    segment = buf.closed_segment("s1", now=T0 + timedelta(seconds=2))
-    assert [e.turn_id for e in segment] == ["t1"]
-
-
 def test_ring_bounds_length_and_evicts_oldest() -> None:
     buf = NoticingBuffer(max_entries=3)
     for i in range(5):
@@ -246,30 +218,6 @@ def test_session_ids_reports_every_known_lane() -> None:
 
 def test_session_ids_is_empty_for_a_fresh_buffer() -> None:
     assert NoticingBuffer().session_ids() == []
-
-
-def test_segment_through_returns_prefix_ignoring_an_open_pending() -> None:
-    # Unlike closed_segment, a NEW pending on the lane must not hide the
-    # already-complete prefix a caller already knows was surveyed.
-    buf = NoticingBuffer()
-    for i, turn_id in enumerate(["t1", "t2", "t3"]):
-        buf.open_pending("s1", user_text=f"u{i}", now=T0 + timedelta(seconds=i))
-        buf.complete(
-            "s1", turn_id, assistant_text=f"a{i}", now=T0 + timedelta(seconds=i, milliseconds=1)
-        )
-    buf.open_pending("s1", user_text="new turn mid-flight", now=T0 + timedelta(seconds=10))
-
-    assert buf.closed_segment("s1", now=T0 + timedelta(seconds=11)) == []  # gated
-    assert [e.turn_id for e in buf.segment_through("s1", "t2")] == ["t1", "t2"]
-
-
-def test_segment_through_unknown_turn_id_is_empty() -> None:
-    buf = NoticingBuffer()
-    buf.open_pending("s1", user_text="hi", now=T0)
-    buf.complete("s1", "t1", assistant_text="hello", now=T0 + timedelta(seconds=1))
-
-    assert buf.segment_through("s1", "does-not-exist") == []
-    assert buf.segment_through("unknown-session", "t1") == []
 
 
 def test_concurrent_open_stamp_complete_across_sessions_is_thread_safe() -> None:

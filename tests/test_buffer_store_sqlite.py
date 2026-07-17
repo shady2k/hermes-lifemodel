@@ -16,7 +16,7 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from lifemodel.core.buffer_store import BufferEntry, BufferStore
+from lifemodel.core.buffer_store import DEFAULT_BUFFER_MAX_ENTRIES, BufferEntry, BufferStore
 from lifemodel.state.sqlite_store import SqliteBufferStore, SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
 
@@ -360,3 +360,62 @@ def test_durability_of_a_still_open_pending(tmp_path: Path) -> None:
     # the closed-prefix rule survives the "restart" too -- still gated.
     assert reopened.completed("s1", now=T0 + timedelta(seconds=1), ttl=TTL) == []
     assert reopened.session_ids() == ["s1"]
+
+
+# ---- C3: capacity bound on the durable complete ring -------------------------
+
+
+def _complete_turn(
+    store: SqliteBufferStore, session_id: str, turn_id: str, *, at: datetime
+) -> None:
+    store.open_pending(session_id, user_text=f"u-{turn_id}", now=at)
+    store.complete(
+        session_id, turn_id, assistant_text=f"a-{turn_id}", now=at + timedelta(seconds=1)
+    )
+
+
+def test_complete_prunes_the_oldest_complete_rows_beyond_max_entries(tmp_path: Path) -> None:
+    """C3: the durable ``complete`` ring is bounded to ``max_entries`` per session
+    (parity with ``InMemoryBufferStore``'s deque(maxlen=...)) — completing more
+    than the cap prunes the OLDEST ``complete`` rows; the newest survive."""
+    store = SqliteBufferStore(tmp_path, clock=FakeClock(T0), max_entries=3)
+    for i in range(6):
+        _complete_turn(store, "s1", f"t{i}", at=T0 + timedelta(seconds=10 * i))
+
+    segment = store.completed("s1", now=T0 + timedelta(hours=1), ttl=TTL)
+    # only the newest max_entries (t3, t4, t5) remain; t0..t2 were pruned.
+    assert [e.turn_id for e in segment] == ["t3", "t4", "t5"]
+    with closing(sqlite3.connect(str(tmp_path / DB_FILENAME))) as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM conversation_buffer WHERE session_id='s1' AND state='complete'"
+        ).fetchone()[0]
+    assert total == 3  # the count stays <= cap, never growing unbounded
+
+
+def test_complete_never_prunes_a_claimed_row_even_over_the_cap(tmp_path: Path) -> None:
+    """C3 + claim immunity (I2): a ``claimed`` row (an in-flight noticing snapshot)
+    is NEVER counted against the cap nor pruned, even when the session's total rows
+    exceed ``max_entries`` — only ``state='complete'`` rows are bounded."""
+    store = SqliteBufferStore(tmp_path, clock=FakeClock(T0), max_entries=2)
+    _complete_turn(store, "s1", "t0", at=T0)
+    store.claim("s1", ("t0",), "survey-immune")
+    assert [e.turn_id for e in store.claimed("survey-immune")] == ["t0"]
+
+    # now flood the lane with complete rows well past the cap of 2.
+    for i in range(1, 5):
+        _complete_turn(store, "s1", f"t{i}", at=T0 + timedelta(seconds=10 * i))
+
+    # the claimed row is untouched by the prune...
+    assert [e.turn_id for e in store.claimed("survey-immune")] == ["t0"]
+    # ...and the complete ring is bounded to the newest max_entries (t3, t4).
+    segment = store.completed("s1", now=T0 + timedelta(hours=1), ttl=TTL)
+    assert [e.turn_id for e in segment] == ["t3", "t4"]
+
+
+def test_sqlite_buffer_store_default_max_entries_matches_the_shared_constant(
+    tmp_path: Path,
+) -> None:
+    """The durable store's default cap is the SAME shared constant the in-memory
+    store uses, so the two backings can never drift on retention."""
+    store = SqliteBufferStore(tmp_path, clock=FakeClock(T0))
+    assert store._max_entries == DEFAULT_BUFFER_MAX_ENTRIES

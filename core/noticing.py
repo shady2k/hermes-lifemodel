@@ -28,10 +28,12 @@ frame can register both and exactly one of them ever does real work.
 lm-705.13):** the ONLY channel that survives from launch to completion is the
 ``correlation_id`` string (mirrors ``ThoughtProcessingSelector``'s
 ``process-<thought_id>@<iso>``). The trigger mints a deterministic ``survey_id``
-(``<anchor_turn_id>@<iso>``, the anchor being the LAST entry of the oldest-
-``size_cap`` PREFIX it surveys — codex F2b) and encodes
-``notice-<session_id>#<survey_id>``. BEFORE emitting, it **claims** that exact
-window (:meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.claim`): the rows
+(``<session_id>@<anchor_turn_id>@<iso>``, the anchor being the LAST entry of the
+oldest-``size_cap`` PREFIX it surveys — codex F2b; the session is folded in so two
+lanes at the same clock instant with the same tail ``turn_id`` can never collide on
+one survey_id) and encodes ``notice-<session_id>#<survey_id>``. BEFORE emitting, it
+**claims** that exact window
+(:meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.claim`): the rows
 leave :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.closed_segment`, so a
 second tick never re-surveys them, and they become an IMMUTABLE snapshot under
 ``survey_id``. The apply recovers that snapshot via
@@ -42,8 +44,13 @@ result it emits :class:`~lifemodel.core.intents.FinalizeBuffer`; that finalize
 DELETE lands ATOMICALLY with the pass's thought commit (codex I3), never a bare
 side-effecting clear. A turn that arrives during the async gap was never claimed,
 so it is simply left ``complete`` for a LATER pass — never swept away un-surveyed.
-On a transient/malformed/empty-claim path the apply emits NOTHING that finalizes,
-leaving the claim in place for a retry or boot recovery.
+On a transient or malformed-shape completion the apply RELEASES the claim (a direct,
+fail-soft ``NoticingBuffer.release`` — never a finalize), so the SAME segment is
+re-surveyed by the next eligible tick rather than stranded ``claimed`` until a
+restart; boot recovery (``recover_stale_claims``) remains only the backstop for a
+pass that dies mid-flight with the process. An empty-claim completion (already
+finalized/released, or boot-recovered) emits nothing and releases nothing — there is
+nothing claimed to touch.
 """
 
 from __future__ import annotations
@@ -213,10 +220,10 @@ NOTICING_TRIGGER_ID = "noticing-trigger"
 
 #: The trigger's own correlation-id namespace/format —
 #: ``notice-<session_id>#<survey_id>`` — parsed back by
-#: :func:`_parse_noticing_correlation` at apply time. The FIRST ``#`` separates
+#: :func:`parse_noticing_correlation` at apply time. The FIRST ``#`` separates
 #: *session_id* from *survey_id*: session ids are plain alnum/dash/colon tokens
-#: (never a ``#``), while *survey_id* itself is ``<anchor_turn_id>@<iso>`` (it
-#: DOES contain ``@``), which is exactly why the split is on ``#``, not ``@``.
+#: (never a ``#``), while *survey_id* itself is ``<session_id>@<anchor_turn_id>@<iso>``
+#: (it DOES contain ``@``), which is exactly why the split is on ``#``, not ``@``.
 _CORRELATION_PREFIX = "notice-"
 
 
@@ -258,9 +265,15 @@ class NoticingTrigger:
         session_id, segment, launch_reason = due
         blocked = self._blocked_gate(ctx)
         if blocked is not None:
-            # The gate is checked BEFORE the claim, so a blocked/denied tick never
-            # leaves a dangling claim (recover_stale_claims is only the backstop for
-            # a pass that dies AFTER launching, not for the common gate-block path).
+            # This gate reads the FRAME-START snapshot (pending_internal_id) and returns
+            # BEFORE the claim, so a tick THIS gate blocks never claims — no dangling claim
+            # from the gate-block path. It is blind, though, to a processing launch
+            # co-emitted on the SAME frame (all cognition components read one frozen
+            # snapshot, so both this trigger and ThoughtProcessingSelector can emit): that
+            # path DOES claim, then the RUNNER's authoritative single-flight/FR20 denial
+            # drops the launch. That dangling claim is released by
+            # ``being_platform._tick`` (C1), not here; ``recover_stale_claims`` is only the
+            # backstop for a pass that dies AFTER launching.
             self._log(ctx, blocked)
             return []
         # The window is the oldest-``size_cap`` PREFIX of the due segment (codex
@@ -268,7 +281,13 @@ class NoticingTrigger:
         # the SAME set, so no un-surveyed older turn is ever cleared. When the
         # segment already fits, the whole of it is the window.
         window = segment[: self._size_cap] if self._size_cap > 0 else segment
-        survey_id = f"{window[-1].turn_id}@{to_iso(ctx.now)}"
+        # The session is folded into the survey_id (C4) so it is GLOBALLY unique:
+        # two lanes at the same clock instant with the same tail turn_id can never
+        # collide on one survey_id (which keys claimed/finalize/the commit_tick
+        # DELETE). The correlation stays notice-<session_id>#<survey_id>; the parser
+        # still splits on the FIRST '#', so the recovered survey_id is unchanged in
+        # shape for every downstream reader.
+        survey_id = f"{session_id}@{window[-1].turn_id}@{to_iso(ctx.now)}"
         # Claim the window BEFORE emitting: those ``complete`` rows become an
         # immutable ``claimed`` snapshot under ``survey_id`` and leave
         # ``closed_segment``, so a second tick can never re-survey them (and the
@@ -417,13 +436,17 @@ def _validate_one_seed(
     )
 
 
-def _parse_noticing_correlation(correlation_id: str) -> str | None:
+def parse_noticing_correlation(correlation_id: str) -> str | None:
     """Recover the ``survey_id`` from a ``notice-<session_id>#<survey_id>``
     correlation id (the format :class:`NoticingTrigger` mints). The FIRST ``#``
     separates *session_id* from *survey_id* — session ids never contain ``#``,
-    while *survey_id* is ``<anchor_turn_id>@<iso>`` (it DOES contain ``@``), so the
-    split is on ``#``, not ``@``. ``None`` for any other shape — a foreign/malformed
-    correlation id is never guessed at."""
+    while *survey_id* is ``<session_id>@<anchor_turn_id>@<iso>`` (it DOES contain
+    ``@``), so the split is on ``#``, not ``@``. ``None`` for any other shape — a
+    foreign/malformed correlation id is never guessed at.
+
+    Public (not ``_``-prefixed) so ``adapters/being_platform`` can recover the
+    survey_id of a DENIED/DROPPED noticing launch to release its stranded claim
+    (C1); this module's own :class:`NoticingApply` is the other caller."""
     if not correlation_id.startswith(_CORRELATION_PREFIX):
         return None
     rest = correlation_id[len(_CORRELATION_PREFIX) :]
@@ -534,35 +557,40 @@ class NoticingApply:
         if result is None:
             return []
         _log_aux_raw(ctx, result.raw)
-        if _is_transient_failure(result):
-            # The aux call itself failed/timed out — refund the attempt exactly
-            # like ThoughtProcessingApply's TRANSIENT_FAILURE (F1): leave the
-            # surveyed segment, the consumed ring, and the cursor all untouched
-            # so a LATER pass gets a genuine chance to notice it, instead of the
-            # segment being lost forever to a transient provider hiccup.
-            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0, parsed=result.parsed)
-            return []
-        survey_id = _parse_noticing_correlation(correlation_id)
+        # Parse the survey_id FIRST (codex): the transient/malformed refund paths
+        # below must RELEASE the claim (not merely leave it stranded), and that
+        # needs the survey_id in hand. A correlation that isn't ours degrades to
+        # nothing-lingered — there is no claim of ours behind it to release.
+        survey_id = parse_noticing_correlation(correlation_id)
         if survey_id is None:
             self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0, parsed=result.parsed)
+            return []
+        if _is_transient_failure(result):
+            # The aux call itself failed/timed out (empty raw) — refund the attempt
+            # like ThoughtProcessingApply's TRANSIENT_FAILURE (F1), but RELEASE the
+            # claim so the SAME segment is re-surveyed by the next eligible tick
+            # rather than stranded ``claimed`` until a restart (the plan's promised
+            # clean retry). A no-op if the claim was already finalized/released.
+            self._release_claim(ctx, survey_id)
+            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0, parsed=result.parsed)
             return []
         # The IMMUTABLE snapshot the launch claimed (codex I2) — never a fresh
         # closed_segment recompute against a ring the lane may have evicted/extended
         # during the async gap. Empty means the claim was already finalized/released
-        # (a duplicate completion, or a boot-recovered pass): nothing to do, and
-        # crucially DO NOT finalize (there is nothing claimed to finalize).
+        # (a duplicate completion, or a boot-recovered pass): nothing to do, nothing
+        # to release, and crucially DO NOT finalize (there is nothing claimed).
         segment = self._buffer.claimed(survey_id)
         if not segment:
             self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0, parsed=result.parsed)
             return []
         if not _has_valid_seeds_shape(result.parsed):
             # The aux call DID respond (raw non-empty, so _is_transient_failure
-            # above already said "not transient") but the response never took
-            # the {"seeds": [...]} shape — a malformed/adversarial reply, not a
-            # genuine "nothing lingered" judgment (review-2 G1). Treated
-            # exactly like the transient case: no clear, no consume, no seed,
-            # so a LATER pass gets a genuine chance to notice this segment
-            # instead of it being silently swept away by a parse failure.
+            # above already said "not transient") but the response never took the
+            # {"seeds": [...]} shape — a malformed/adversarial reply, not a genuine
+            # "nothing lingered" judgment (review-2 G1). Treated like the transient
+            # case: RELEASE the claim so a LATER pass gets a genuine chance to notice
+            # this segment instead of it being silently swept away by a parse failure.
+            self._release_claim(ctx, survey_id)
             self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0, parsed=result.parsed)
             return []
         segment_ids = frozenset(
@@ -605,6 +633,25 @@ class NoticingApply:
             parsed=result.parsed,
         )
         return intents
+
+    def _release_claim(self, ctx: TickContext, survey_id: str) -> None:
+        """Return the segment claimed under *survey_id* to ``complete`` so the NEXT
+        eligible tick re-surveys it — the transient/malformed refund path (C2).
+
+        **Design asymmetry (deliberate):** ``finalize`` MUST land atomically with
+        the thought commit, so it goes through a :class:`~lifemodel.core.intents.FinalizeBuffer`
+        intent; a ``release`` has NO companion state mutation, so it needs no
+        atomicity and no intent machinery — a direct, fail-soft ``self._buffer.release``
+        (a short UPDATE, consistent with the ``self._buffer.claimed`` read this same
+        ``step`` already makes off-lock). Fail-soft: the apply runs OFF-lock in the
+        completion frame, and a release hiccup must never crash that frame — it rides
+        the span (a tick component logs only through its SpanBoundLogger, spec §4.5),
+        never stdlib logging."""
+        try:
+            self._buffer.release(survey_id)
+        except Exception as exc:  # noqa: BLE001 - a release hiccup must never crash the frame
+            if ctx.logger is not None:
+                ctx.logger.span.set(noticing_release_error=str(exc)[:500])
 
     def _seed_intents(self, ctx: TickContext, seeds: Sequence[NoticedSeed]) -> list[Intent]:
         live_ids = {t.id for t in live_thoughts(ctx.objects)}

@@ -47,6 +47,13 @@ from typing import Protocol, runtime_checkable
 
 from .timeutil import to_iso
 
+#: Default per-session cap on the ``complete`` ring (design §4.1). Shared by
+#: :class:`InMemoryBufferStore`, :class:`~lifemodel.core.noticing_buffer.NoticingBuffer`,
+#: and the durable :class:`~lifemodel.state.sqlite_store.SqliteBufferStore` so the
+#: in-memory and durable backings can never drift on how much captured-but-not-yet-
+#: noticed conversation a lane retains before the oldest turns are dropped.
+DEFAULT_BUFFER_MAX_ENTRIES = 256
+
 
 @dataclass(frozen=True)
 class BufferEntry:
@@ -171,7 +178,7 @@ class InMemoryBufferStore:
     ``NoticingBuffer``'s own former lock one-for-one.
     """
 
-    def __init__(self, *, max_entries: int = 256) -> None:
+    def __init__(self, *, max_entries: int = DEFAULT_BUFFER_MAX_ENTRIES) -> None:
         self._max_entries = max_entries
         self._lock = threading.Lock()
         self._pending: dict[str, _PendingTurn] = {}
@@ -290,33 +297,3 @@ class InMemoryBufferStore:
     def session_ids(self) -> list[str]:
         with self._lock:
             return sorted(set(self._pending) | set(self._complete))
-
-    # ---- legacy surveyed-prefix cursor (lm-705.5) ---------------------------
-    # Superseded by claim/claimed/finalize above (lm-705.13 Task 3/4 rewires
-    # `NoticingApply` onto that lifecycle and retires these two); kept here,
-    # unchanged, so `NoticingBuffer.segment_through`/`clear_through` — which
-    # `core/noticing.py` still calls directly — have somewhere to delegate
-    # to for the only store that backs production today.
-
-    def segment_through(self, session_id: str, turn_id: str) -> list[BufferEntry]:
-        with self._lock:
-            ring = self._complete.get(session_id)
-            if ring is None:
-                return []
-            entries = list(ring)
-            for i, entry in enumerate(entries):
-                if entry.turn_id == turn_id:
-                    return entries[: i + 1]
-            return []
-
-    def clear_through(self, session_id: str, turn_id: str) -> None:
-        with self._lock:
-            ring = self._complete.get(session_id)
-            if ring is None:
-                return
-            entries = list(ring)
-            for i, entry in enumerate(entries):
-                if entry.turn_id == turn_id:
-                    ring.clear()
-                    ring.extend(entries[i + 1 :])
-                    return

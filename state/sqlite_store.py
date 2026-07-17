@@ -99,7 +99,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, assert_never
 
-from ..core.buffer_store import BufferEntry
+from ..core.buffer_store import DEFAULT_BUFFER_MAX_ENTRIES, BufferEntry
 from ..core.timeutil import from_iso, to_iso
 from ..domain.memory import (
     JsonObject,
@@ -1439,12 +1439,20 @@ class SqliteBufferStore:
     one transaction so it lands atomically with a noticing pass's thought commit).
     """
 
-    def __init__(self, base_dir: Path, *, clock: ClockPort) -> None:
+    def __init__(
+        self, base_dir: Path, *, clock: ClockPort, max_entries: int = DEFAULT_BUFFER_MAX_ENTRIES
+    ) -> None:
         self._path = base_dir / _DB_FILENAME
         # Not read by any method below (each takes an explicit `now`) — threaded
         # through for constructor-signature parity with SQLiteRuntimeStore and
         # because later tasks in this plan (claim/finalize wiring) may need it.
         self._clock = clock
+        # Per-session cap on the durable ``complete`` ring — parity with
+        # :class:`~lifemodel.core.buffer_store.InMemoryBufferStore` (default shared via
+        # ``DEFAULT_BUFFER_MAX_ENTRIES`` so the two backings can never drift). Enforced
+        # by :meth:`complete`'s prune, which drops the OLDEST ``complete`` rows beyond
+        # this bound (never a ``claimed``/``pending`` row).
+        self._max_entries = max_entries
         base_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_table()
 
@@ -1521,6 +1529,20 @@ class SqliteBufferStore:
                 "user_text=excluded.user_text, assistant_text=excluded.assistant_text, "
                 "opened_at=excluded.opened_at, ts=excluded.ts, survey_id=NULL",
                 (session_id, turn_id, source_ids_json, user_text, assistant_text, opened_at, ts),
+            )
+            # Bound the durable ``complete`` ring to ``max_entries`` per session
+            # (parity with InMemoryBufferStore's deque(maxlen=...)) — IN THE SAME
+            # transaction as the insert above. Keep the newest ``max_entries``
+            # ``complete`` rows by rowid; prune the oldest overflow. The
+            # ``state='complete'`` filter is load-bearing: a ``claimed`` row (an
+            # in-flight noticing snapshot) and a ``pending`` slot are NEVER counted
+            # against the cap nor deleted (claim immunity, I2).
+            conn.execute(
+                "DELETE FROM conversation_buffer "
+                "WHERE session_id = ? AND state = 'complete' AND rowid NOT IN ("
+                "SELECT rowid FROM conversation_buffer "
+                "WHERE session_id = ? AND state = 'complete' ORDER BY rowid DESC LIMIT ?)",
+                (session_id, session_id, self._max_entries),
             )
 
     def abandon_pending(self, session_id: str) -> None:

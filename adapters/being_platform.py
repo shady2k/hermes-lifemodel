@@ -50,6 +50,7 @@ from ..core.frame import FrameTrigger, run_frame, state_actor_lock
 from ..core.genesis import needs_adoption
 from ..core.llm_port import InternalCognitionRequest, LlmPort
 from ..core.metrics import get_metric_registry
+from ..core.noticing import parse_noticing_correlation
 from ..core.noticing_buffer import NoticingBuffer
 from ..core.proactive import dispatch_launches
 from ..core.supervised_loop import SupervisedLoop
@@ -234,9 +235,10 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
         report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
         dispatch_launches(lm, report, self._egress, self._target, voice=self._voice)
-        if self._internal_runner is not None:
-            for launch in report.internal_launches:
-                self._internal_runner.launch(
+        for launch in report.internal_launches:
+            accepted = False
+            if self._internal_runner is not None:
+                accepted = self._internal_runner.launch(
                     InternalCognitionRequest(
                         instructions=launch.instructions or _INTERNAL_COGNITION_INSTRUCTIONS,
                         input_text=launch.prompt,
@@ -245,6 +247,38 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
                     launch.correlation_id,
                     subject_id=launch.subject_id,
                 )
+            # A NOTICING launch (subject_id is None) already CLAIMED its surveyed prefix
+            # in the trigger (core/noticing.py). When the runner DENIES it (single-flight
+            # taken by a co-emitted processing launch this same frame, or FR20 budget) —
+            # or there is no runner at all, so the launch is dropped — nothing else
+            # releases that claim, and the prefix would be stranded ``claimed`` (invisible
+            # to ``completed()``) until the next restart-time ``recover_stale_claims`` (C1).
+            # Release it here, fail-soft. Processing launches (subject_id set) hold NO
+            # claim — never release for them.
+            if not accepted and launch.subject_id is None:
+                self._release_noticing_claim(launch.correlation_id)
+
+    def _release_noticing_claim(self, correlation_id: str) -> None:
+        """Return a DENIED/DROPPED noticing launch's claimed prefix to ``complete``
+        so a later tick re-surveys it (C1), fail-soft.
+
+        **Design asymmetry (deliberate):** unlike ``finalize`` — which MUST land
+        atomically with the thought commit and so rides a ``FinalizeBuffer`` intent
+        through ``commit_tick`` — a ``release`` has NO companion state mutation, so it
+        needs no atomicity and no intent: a direct, fail-soft ``NoticingBuffer.release``.
+        No-ops when no buffer is wired or the correlation isn't a noticing one; a
+        release hiccup must never break the tick."""
+        if self._noticing_buffer is None:
+            return
+        survey_id = parse_noticing_correlation(correlation_id)
+        if survey_id is None:
+            return
+        try:
+            self._noticing_buffer.release(survey_id)
+        except Exception:  # noqa: BLE001 - a release hiccup must never break the tick
+            _LOG.warning(
+                "noticing_claim_release_failed correlation_id=%s", correlation_id, exc_info=True
+            )
 
     def _prior_soul(self) -> str | None:
         """The soul someone wrote before this being woke, or ``None`` for a blank page.

@@ -36,7 +36,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from .buffer_store import BufferEntry, BufferStore, InMemoryBufferStore
+from .buffer_store import (
+    DEFAULT_BUFFER_MAX_ENTRIES,
+    BufferEntry,
+    BufferStore,
+    InMemoryBufferStore,
+)
 
 __all__ = ["BufferEntry", "NoticingBuffer"]
 
@@ -54,9 +59,13 @@ class NoticingBuffer:
         self,
         *,
         store: BufferStore | None = None,
-        max_entries: int = 256,
+        max_entries: int = DEFAULT_BUFFER_MAX_ENTRIES,
         pending_ttl: timedelta = timedelta(minutes=30),
     ) -> None:
+        # ``max_entries`` bounds ONLY the default in-memory store built here; an
+        # INJECTED store owns its own cap (the durable ``SqliteBufferStore`` prunes
+        # its ``complete`` rows to its own ``max_entries``), so this arg is ignored
+        # when ``store`` is not None.
         self._store: BufferStore = (
             store if store is not None else InMemoryBufferStore(max_entries=max_entries)
         )
@@ -154,66 +163,3 @@ class NoticingBuffer:
         that died mid-flight with the process. See
         :meth:`~lifemodel.core.buffer_store.BufferStore.recover_stale_claims`."""
         self._store.recover_stale_claims()
-
-    # ---- legacy surveyed-prefix cursor (lm-705.5) ---------------------------
-    # `segment_through`/`clear_through` are the OLD complete-ring cursor
-    # `core/noticing.py`'s `NoticingApply` still calls directly (keyed by
-    # session_id + a turn_id anchor). lm-705.13 Task 3/4 replace this cursor
-    # with the claim/claimed/finalize lifecycle above and rewire `NoticingApply`
-    # onto it; until then these two stay in place, unchanged in behaviour, so
-    # the live noticing path is never broken.
-    #
-    # They only work when this buffer is backed by the default
-    # `InMemoryBufferStore` — today's only production backing. No `BufferStore`
-    # method reads "the raw complete prefix, ignoring the pending gate"
-    # without risking silently abandoning a live pending turn (`completed`'s
-    # only path past the gate ages out — and drops — a non-stale pending would
-    # otherwise never touch). A `NoticingBuffer` over any OTHER store (e.g.
-    # the durable `SqliteBufferStore`) must use `claim`/`claimed`/`finalize`
-    # instead — which is exactly what Task 3/4 wire up.
-
-    def segment_through(self, session_id: str, turn_id: str) -> list[BufferEntry]:
-        """The ``complete`` ring PREFIX for *session_id* up to and including
-        *turn_id* — unlike :meth:`closed_segment`, this does NOT apply the
-        closed-prefix (pending) gate.
-
-        For a caller re-deriving what an EARLIER :meth:`closed_segment` read
-        already gated once (a noticing pass's async completion, recovering the
-        exact segment its own trigger surveyed): a NEW pending opening on this
-        lane in the meantime must not retroactively hide entries that were
-        already safely closed at trigger time. Mirrors :meth:`clear_through`'s
-        own scan so "what was surveyed" and "what gets cleared" never drift
-        apart. Empty if *turn_id* is not found (already cleared, or never
-        present) — the caller treats that as nothing to do.
-
-        Raises :class:`NotImplementedError` when this buffer is not backed by
-        the default :class:`~lifemodel.core.buffer_store.InMemoryBufferStore`
-        (see the section note above).
-        """
-        if isinstance(self._store, InMemoryBufferStore):
-            return self._store.segment_through(session_id, turn_id)
-        raise NotImplementedError(
-            "segment_through(session_id, turn_id) is the legacy in-memory-only "
-            "cursor read; a NoticingBuffer over a non-InMemoryBufferStore must "
-            "use claim/claimed instead (lm-705.13 Task 3/4)."
-        )
-
-    def clear_through(self, session_id: str, turn_id: str) -> None:
-        """Cursor: drop *session_id*'s ``complete`` entries up to and including *turn_id*.
-
-        Entries after it (a newer turn the surveyed pass did not consume)
-        survive. A *turn_id* not found in the ring (already cleared, or never
-        present) is a no-op — there is nothing to advance the cursor past.
-
-        Raises :class:`NotImplementedError` when this buffer is not backed by
-        the default :class:`~lifemodel.core.buffer_store.InMemoryBufferStore`
-        (see the section note above).
-        """
-        if isinstance(self._store, InMemoryBufferStore):
-            self._store.clear_through(session_id, turn_id)
-            return
-        raise NotImplementedError(
-            "clear_through(session_id, turn_id) is the legacy in-memory-only "
-            "cursor advance; a NoticingBuffer over a non-InMemoryBufferStore "
-            "must use claim/finalize instead (lm-705.13 Task 3/4)."
-        )

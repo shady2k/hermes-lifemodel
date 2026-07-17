@@ -62,8 +62,8 @@ def test_closed_segment_past_idle_emits_one_subjectless_launch():
     assert launch.instructions == NOTICING_INSTRUCTIONS
     assert "t1" in launch.prompt
     assert "tell me about it" in launch.prompt
-    # correlation is notice-<session>#<survey_id>, survey_id = <anchor>@<iso>
-    assert launch.correlation_id.startswith("notice-s1#t1@")
+    # correlation is notice-<session>#<survey_id>, survey_id = <session>@<anchor>@<iso>
+    assert launch.correlation_id.startswith("notice-s1#s1@t1@")
     assert launch.origin_traceparent  # mandatory async-correlation anchor
 
 
@@ -95,8 +95,8 @@ def test_size_cap_reached_launches_even_though_idle_has_not_elapsed():
     launches = [i for i in intents if isinstance(i, LaunchInternalCognition)]
     assert len(launches) == 1
     # the whole segment fits the window (exactly size_cap turns); its survey anchor
-    # is the LAST of the claimed prefix, t{size_cap - 1}.
-    assert launches[0].correlation_id.startswith(f"notice-s1#t{DEFAULT_NOTICING_SIZE_CAP - 1}@")
+    # is the LAST of the claimed prefix, t{size_cap - 1} (survey_id = <session>@<anchor>@<iso>).
+    assert launches[0].correlation_id.startswith(f"notice-s1#s1@t{DEFAULT_NOTICING_SIZE_CAP - 1}@")
 
 
 def test_single_flight_blocks_when_a_pass_is_in_flight():
@@ -211,8 +211,9 @@ def test_prompt_is_bounded_to_size_cap_turns_not_the_whole_ring():
     assert len(launches) == 1
     prompt = launches[0].prompt
     assert prompt.count("[turn_id=") == DEFAULT_NOTICING_SIZE_CAP
-    # the survey anchor is the LAST of the oldest-size_cap prefix (t7), not t49.
-    assert launches[0].correlation_id.startswith("notice-s1#t7@")
+    # the survey anchor is the LAST of the oldest-size_cap prefix (t7), not t49
+    # (survey_id = <session>@<anchor>@<iso>, so the correlation carries s1@t7@).
+    assert launches[0].correlation_id.startswith("notice-s1#s1@t7@")
     # only the OLDEST size_cap turns (t0..t7) are shown; the newest of those is t7.
     assert "msg 7" in prompt
     assert "msg 8" not in prompt

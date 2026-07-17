@@ -285,3 +285,165 @@ def test_tick_drives_report_internal_launches_into_the_runner(tmp_path: Path, mo
 
     assert store.load().pending_internal_id is None  # completion frame cleared it
     assert llm.requests[0].input_text == "notice this"
+
+
+def _register_launcher(lm, launcher) -> None:
+    from lifemodel.core.component import ComponentLayer  # noqa: PLC0415
+    from lifemodel.core.registry import ComponentManifest, UnknownComponent  # noqa: PLC0415
+
+    try:
+        lm.registry.manifest(launcher.id)
+    except UnknownComponent:
+        lm.registry.register(
+            launcher,
+            ComponentManifest(
+                id=launcher.id,
+                type="cognition",
+                layer=ComponentLayer.COGNITION,
+                metric_surface=(),
+                accepts_signals=False,
+            ),
+        )
+
+
+# A NON-idle, single-turn segment: the REAL NoticingTrigger (also registered when a
+# noticing_buffer is wired) never finds it due, so only our fake launcher claims/emits.
+_C1_SURVEY_ID = "s1@t1@2026-07-01T10:00:00+00:00"
+_C1_CORRELATION = f"notice-s1#{_C1_SURVEY_ID}"
+_TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+def test_tick_releases_a_denied_noticing_claim_when_single_flight_is_taken(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C1 (the merge-blocker): in ONE heartbeat frame both a PROCESSING and a
+    NOTICING launch can be emitted off one frozen snapshot. Processing takes the
+    single-flight slot; the runner then DENIES noticing (``launch()`` returns
+    False) — but the trigger already CLAIMED noticing's surveyed prefix. ``_tick``
+    must RELEASE that stranded claim, or the prefix is stuck ``claimed`` (invisible
+    to ``completed()``) until a restart."""
+    from lifemodel.adapters.clock import SystemClock  # noqa: PLC0415
+    from lifemodel.composition import build_lifemodel as real_build_lifemodel  # noqa: PLC0415
+    from lifemodel.core.component import TickContext  # noqa: PLC0415
+    from lifemodel.core.intents import LaunchInternalCognition  # noqa: PLC0415
+    from lifemodel.core.noticing_buffer import NoticingBuffer  # noqa: PLC0415
+    from lifemodel.state.sqlite_store import SqliteBufferStore  # noqa: PLC0415
+
+    clock = SystemClock()
+    now = clock.now()
+    buffer = NoticingBuffer(store=SqliteBufferStore(tmp_path, clock=clock))
+    buffer.open_pending("s1", user_text="hi", now=now)
+    buffer.complete("s1", "t1", assistant_text="yo", now=now)
+
+    class BothLauncher:
+        id = "both-launcher"
+
+        def step(self, ctx: TickContext):
+            # mirror the REAL NoticingTrigger: claim the surveyed prefix, THEN emit.
+            buffer.claim("s1", ("t1",), _C1_SURVEY_ID)
+            return [
+                LaunchInternalCognition(
+                    prompt="process this",
+                    correlation_id="process-thought-x",
+                    origin_traceparent=_TRACEPARENT,
+                    subject_id="thought-x",  # PROCESSING: holds NO claim
+                ),
+                LaunchInternalCognition(
+                    prompt="notice this",
+                    correlation_id=_C1_CORRELATION,
+                    origin_traceparent=_TRACEPARENT,
+                    subject_id=None,  # NOTICING: the claim just taken above
+                ),
+            ]
+
+    def _patched_build_lifemodel(*args, **kwargs):
+        lm = real_build_lifemodel(*args, **kwargs)
+        _register_launcher(lm, BothLauncher())
+        return lm
+
+    bp = _fresh_being_platform()
+    monkeypatch.setattr(bp, "build_lifemodel", _patched_build_lifemodel)
+
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit(State(genesis_completed_at=BORN_AT, last_tick_at=None))
+
+    llm = FakeLlmPort(InternalCognitionResult(raw="", parsed=None))
+    adapter = _make_adapter(bp, tmp_path, llm=llm, noticing_buffer=buffer, inert_tick=False)
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        adapter._tick()  # one manual tick
+
+        # SYNCHRONOUSLY, before any async completion task runs: processing took the
+        # single-flight slot, noticing was DENIED and its stranded claim RELEASED.
+        assert store.load().pending_internal_id == "process-thought-x"
+        assert buffer.claimed(_C1_SURVEY_ID) == []  # released...
+        recovered = buffer.closed_segment("s1", now=now)
+        assert [e.turn_id for e in recovered] == ["t1"]  # ...back to `complete`
+
+        runner = adapter._internal_runner
+        assert runner is not None
+        for task in list(runner._tasks):
+            await task
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+
+def test_tick_releases_a_dropped_noticing_claim_when_there_is_no_runner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C1 (the no-runner path): with no ``LlmPort`` injected there is no runner, so
+    a noticing launch is DROPPED entirely — its already-taken claim must STILL be
+    released, exactly like the denied-by-single-flight path above."""
+    from lifemodel.adapters.clock import SystemClock  # noqa: PLC0415
+    from lifemodel.composition import build_lifemodel as real_build_lifemodel  # noqa: PLC0415
+    from lifemodel.core.component import TickContext  # noqa: PLC0415
+    from lifemodel.core.intents import LaunchInternalCognition  # noqa: PLC0415
+    from lifemodel.core.noticing_buffer import NoticingBuffer  # noqa: PLC0415
+    from lifemodel.state.sqlite_store import SqliteBufferStore  # noqa: PLC0415
+
+    clock = SystemClock()
+    now = clock.now()
+    buffer = NoticingBuffer(store=SqliteBufferStore(tmp_path, clock=clock))
+    buffer.open_pending("s1", user_text="hi", now=now)
+    buffer.complete("s1", "t1", assistant_text="yo", now=now)
+
+    class NoticingLauncher:
+        id = "noticing-only-launcher"
+
+        def step(self, ctx: TickContext):
+            buffer.claim("s1", ("t1",), _C1_SURVEY_ID)
+            return [
+                LaunchInternalCognition(
+                    prompt="notice this",
+                    correlation_id=_C1_CORRELATION,
+                    origin_traceparent=_TRACEPARENT,
+                    subject_id=None,
+                )
+            ]
+
+    def _patched_build_lifemodel(*args, **kwargs):
+        lm = real_build_lifemodel(*args, **kwargs)
+        _register_launcher(lm, NoticingLauncher())
+        return lm
+
+    bp = _fresh_being_platform()
+    monkeypatch.setattr(bp, "build_lifemodel", _patched_build_lifemodel)
+
+    store = SQLiteRuntimeStore(tmp_path, clock=clock)
+    store.commit(State(genesis_completed_at=BORN_AT, last_tick_at=None))
+
+    # llm=None -> _internal_runner stays None -> the launch is dropped.
+    adapter = _make_adapter(bp, tmp_path, llm=None, noticing_buffer=buffer, inert_tick=False)
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        assert adapter._internal_runner is None
+        adapter._tick()
+        # the dropped noticing launch's claim was released, fully synchronously.
+        assert buffer.claimed(_C1_SURVEY_ID) == []
+        assert [e.turn_id for e in buffer.closed_segment("s1", now=now)] == ["t1"]
+        await adapter.disconnect()
+
+    asyncio.run(_run())

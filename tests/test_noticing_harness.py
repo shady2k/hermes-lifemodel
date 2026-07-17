@@ -651,3 +651,71 @@ def test_atomic_finalize_drops_the_claim_and_seeds_the_thought_from_one_commit()
     assert buffer.claimed(survey_id) == []
     # ...and the thought it produced exists.
     assert read_thought(lm.state, seed_thought_id(gist)) is not None
+
+
+def test_transient_completion_releases_the_claim_for_a_genuine_retry() -> None:
+    """C2: a TRANSIENT completion (empty ``raw``) RELEASES the claim so the SAME
+    segment is re-surveyed by the next eligible tick — not stranded ``claimed``
+    until a global recovery. A second heartbeat then genuinely re-claims +
+    re-launches it (the plan's promised clean retry)."""
+    lm, buffer = _noticing_lm()
+    old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
+    _complete_turn(buffer, "s1", "t1", user_text="a big life update", ts=old_ts)
+
+    report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+    launch = _only_noticing_launch(report)
+    survey_id = launch.correlation_id.split("#", 1)[1]
+    # the trigger claimed the prefix, so it left the closed segment...
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1"]
+    assert buffer.closed_segment("s1", now=lm.clock.now()) == []
+    _set_pending(lm, launch)
+
+    # the aux call never produced text (timeout/provider error) -> TRANSIENT.
+    run_internal_completion(
+        lm,
+        _fake_egress(),
+        TARGET,
+        correlation_id=launch.correlation_id,
+        result=InternalCognitionResult(raw="", parsed=None),
+        apply=NoticingApply(buffer),
+    )
+
+    # the claim is RELEASED (not stranded): the segment is `complete` again...
+    assert buffer.claimed(survey_id) == []
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=lm.clock.now())] == ["t1"]
+    # ...and the completion cleared the single-flight marker, so a SECOND heartbeat
+    # genuinely RE-surveys the same segment (a real re-claim + re-launch).
+    assert lm.state.load().pending_internal_id is None
+    report2 = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+    launch2 = _only_noticing_launch(report2)
+    survey_id2 = launch2.correlation_id.split("#", 1)[1]
+    assert [e.turn_id for e in buffer.claimed(survey_id2)] == ["t1"]
+
+
+def test_malformed_shape_completion_releases_the_claim() -> None:
+    """C2 (malformed variant): a NON-empty ``raw`` whose parsed body never took the
+    ``{"seeds": [...]}`` shape is not a genuine "nothing lingered" judgment — the
+    apply RELEASES the claim so a later pass re-surveys the segment, rather than it
+    being silently swept away by a parse failure."""
+    lm, buffer = _noticing_lm()
+    old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
+    _complete_turn(buffer, "s1", "t1", user_text="a big life update", ts=old_ts)
+
+    report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+    launch = _only_noticing_launch(report)
+    survey_id = launch.correlation_id.split("#", 1)[1]
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1"]
+    _set_pending(lm, launch)
+
+    run_internal_completion(
+        lm,
+        _fake_egress(),
+        TARGET,
+        correlation_id=launch.correlation_id,
+        result=InternalCognitionResult(raw="not json at all", parsed={"unexpected": "shape"}),
+        apply=NoticingApply(buffer),
+    )
+
+    # released back to complete, ready for a later pass -- never finalized/swept.
+    assert buffer.claimed(survey_id) == []
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=lm.clock.now())] == ["t1"]

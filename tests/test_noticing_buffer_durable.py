@@ -15,8 +15,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
-
 from lifemodel.core.buffer_store import BufferEntry, InMemoryBufferStore
 from lifemodel.core.noticing_buffer import NoticingBuffer
 from lifemodel.state.sqlite_store import SqliteBufferStore
@@ -62,30 +60,6 @@ def test_explicit_in_memory_buffer_store_behaves_identically_to_the_default() ->
     buf.complete("s1", "t1", assistant_text="hello", now=T0 + timedelta(seconds=2))
     segment = buf.closed_segment("s1", now=T0 + timedelta(seconds=3))
     assert [e.turn_id for e in segment] == ["t1"]
-
-
-def test_clear_through_still_works_over_the_default_in_memory_store() -> None:
-    buf = NoticingBuffer()
-    for i, turn_id in enumerate(["t1", "t2", "t3"]):
-        buf.open_pending("s1", user_text=f"u{i}", now=T0 + timedelta(seconds=i))
-        buf.complete(
-            "s1", turn_id, assistant_text=f"a{i}", now=T0 + timedelta(seconds=i, milliseconds=1)
-        )
-
-    buf.clear_through("s1", "t2")
-
-    segment = buf.closed_segment("s1", now=T0 + timedelta(seconds=10))
-    assert [e.turn_id for e in segment] == ["t3"]
-
-
-def test_segment_through_over_the_default_in_memory_store_ignores_a_new_pending() -> None:
-    buf = NoticingBuffer()
-    buf.open_pending("s1", user_text="hi", now=T0)
-    buf.complete("s1", "t1", assistant_text="hello", now=T0 + timedelta(seconds=1))
-    buf.open_pending("s1", user_text="new turn mid-flight", now=T0 + timedelta(seconds=2))
-
-    assert buf.closed_segment("s1", now=T0 + timedelta(seconds=3)) == []  # gated
-    assert [e.turn_id for e in buf.segment_through("s1", "t1")] == ["t1"]
 
 
 def test_claim_claimed_finalize_round_trip_over_in_memory_store() -> None:
@@ -190,19 +164,3 @@ def test_claim_claimed_finalize_round_trip_over_sqlite_store(tmp_path: Path) -> 
 
     buf.finalize("survey-1")
     assert buf.claimed("survey-1") == []
-
-
-def test_legacy_cursor_methods_are_unsupported_over_a_non_in_memory_store(tmp_path: Path) -> None:
-    # lm-705.13 Task 3/4 replace this cursor with claim/claimed/finalize; until
-    # then, a NoticingBuffer over any store OTHER than the default
-    # InMemoryBufferStore cannot honour it -- no BufferStore method reads "the
-    # raw complete prefix, ignoring the pending gate" without risking silently
-    # abandoning a live pending turn.
-    buf = _sqlite_buffer(tmp_path)
-    buf.open_pending("s1", user_text="hi", now=T0)
-    buf.complete("s1", "t1", assistant_text="hello", now=T0 + timedelta(seconds=1))
-
-    with pytest.raises(NotImplementedError):
-        buf.segment_through("s1", "t1")
-    with pytest.raises(NotImplementedError):
-        buf.clear_through("s1", "t1")

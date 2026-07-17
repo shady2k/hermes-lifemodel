@@ -363,12 +363,13 @@ def test_aux_raw_is_capped_at_2000_chars():
 # ---- F1: a transient (transport/provider) failure must NOT finalize the claim ----
 
 
-def test_transient_failure_leaves_the_claim_untouched():
-    """``raw=""``/``parsed=None`` is the runner's shape for a failed/timed-out
-    aux call (``adapters/internal_runner.py``) — it must be refunded exactly like
-    ``ThoughtProcessingApply``'s transient-failure guard: no PutRecord, no
-    consumed-ring update, and NO FinalizeBuffer, so the claimed snapshot stays put
-    for a later release/re-survey."""
+def test_transient_failure_releases_the_claim_for_a_retry():
+    """``raw=""``/``parsed=None`` is the runner's shape for a failed/timed-out aux
+    call (``adapters/internal_runner.py``) — refunded like ``ThoughtProcessingApply``'s
+    transient guard (no PutRecord, no consumed-ring update, and NO FinalizeBuffer),
+    but C2: the claim is now RELEASED (un-claimed back to ``complete``) so the next
+    eligible tick re-surveys the segment, rather than leaving it stranded
+    ``claimed`` until a global recovery."""
     buffer = _seeded_buffer()
     survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=None, raw="")
@@ -376,15 +377,20 @@ def test_transient_failure_leaves_the_claim_untouched():
     intents = list(NoticingApply(buffer).step(ctx))
 
     assert intents == []  # nothing — crucially, no FinalizeBuffer
-    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"]  # claim survives
+    assert buffer.claimed(survey_id) == []  # claim RELEASED (C2), not stranded
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == [
+        "t1",
+        "t2",
+    ]  # re-surveyable
     assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
 
 
-def test_malformed_non_empty_result_does_not_finalize_or_consume():
-    """review-2 G1: ``raw`` is non-empty (the model DID respond) but ``parsed``
-    never took the ``{"seeds": [...]}`` shape (e.g. plain prose, or truncated
-    JSON). A malformed response is treated exactly like the transient case: no
-    FinalizeBuffer, no consumed-ring update, no PutRecord — the claim survives."""
+def test_malformed_non_empty_result_releases_the_claim():
+    """review-2 G1 + C2: ``raw`` is non-empty (the model DID respond) but ``parsed``
+    never took the ``{"seeds": [...]}`` shape (e.g. plain prose, or truncated JSON).
+    A malformed response is treated like the transient case: no FinalizeBuffer, no
+    consumed-ring update, no PutRecord — and the claim is RELEASED so a later pass
+    re-surveys the segment rather than it being swept away by a parse failure."""
     buffer = _seeded_buffer()
     survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     ctx, logger = _ctx_with_logger(
@@ -397,17 +403,18 @@ def test_malformed_non_empty_result_does_not_finalize_or_consume():
     intents = list(NoticingApply(buffer).step(ctx))
 
     assert intents == []
-    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"]
+    assert buffer.claimed(survey_id) == []  # RELEASED (C2)
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
     assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
     assert logger.span.attrs["noticed_count"] == 0
 
 
-def test_malformed_parsed_shapes_do_not_finalize_the_claim():
+def test_malformed_parsed_shapes_release_the_claim():
     """Same G1 guard, exercised over every malformed (but still ``dict | None``
     -typed, per :class:`~lifemodel.core.taxonomy.InternalResultRead`'s own
     contract) ``parsed`` shape short of a valid ``{"seeds": [...]}`` dict: a
     dict with a non-list ``seeds``, and a dict missing the ``seeds`` key
-    entirely."""
+    entirely. Each RELEASES the claim (C2), never finalizes it."""
     for bad_parsed in ({"seeds": "not a list"}, {"no_seeds_key": []}):
         buffer = _seeded_buffer()
         survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
@@ -421,7 +428,8 @@ def test_malformed_parsed_shapes_do_not_finalize_the_claim():
         intents = list(NoticingApply(buffer).step(ctx))
 
         assert intents == [], bad_parsed
-        assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"], bad_parsed
+        assert buffer.claimed(survey_id) == [], bad_parsed  # RELEASED (C2)
+        assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"], bad_parsed
 
 
 def test_valid_empty_seeds_shape_still_finalizes_distinct_from_malformed():
