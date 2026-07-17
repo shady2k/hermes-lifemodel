@@ -68,19 +68,31 @@ from lifemodel.testing.harness import build_noticing_lifemodel
 TARGET: dict[str, str | None] = {"platform": "test", "chat_id": "1", "thread_id": None}
 
 
-def _noticing_lm() -> tuple[LifeModel, NoticingBuffer]:
+def _noticing_lm_at(base_dir: Path, clock: FakeClock) -> tuple[LifeModel, NoticingBuffer]:
     """A real-graph noticing ``LifeModel`` whose ``NoticingBuffer`` is backed by a
-    durable :class:`SqliteBufferStore` over the SAME ``base_dir`` (and clock) as the
-    runtime store — so the two share ONE ``lifemodel.sqlite``. This is load-bearing
+    durable :class:`SqliteBufferStore` over *base_dir* (and *clock*) — the SAME
+    file the runtime store uses (D7: one physical store). This is load-bearing
     for the claim/finalize round-trip (lm-705.13): the trigger's ``claim`` and the
     apply's ``FinalizeBuffer`` DELETE both land in that one file, so a completed pass
     actually clears the surveyed prefix (an in-memory buffer would be invisible to
-    the real committer's raw-SQL finalize, and the cursor would never advance)."""
-    base_dir = Path(tempfile.mkdtemp(prefix="lifemodel-noticing-harness-"))
-    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    the real committer's raw-SQL finalize, and the cursor would never advance).
+
+    Split out from :func:`_noticing_lm` (lm-705.14/lm-705.13 Task 6) so the
+    restart-survival sim can call this TWICE with the SAME *base_dir*/*clock* —
+    simulating a plugin/gateway restart: a brand-new ``LifeModel``/``NoticingBuffer``
+    pair reopening the identical ``lifemodel.sqlite`` a prior pair already wrote to.
+    """
     buffer = NoticingBuffer(store=SqliteBufferStore(base_dir, clock=clock))
     lm = build_noticing_lifemodel(buffer=buffer, base_dir=base_dir, clock=clock)
     return lm, buffer
+
+
+def _noticing_lm() -> tuple[LifeModel, NoticingBuffer]:
+    """:func:`_noticing_lm_at` over a fresh, private ``base_dir``/clock — what every
+    scenario that has no restart of its own uses."""
+    base_dir = Path(tempfile.mkdtemp(prefix="lifemodel-noticing-harness-"))
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    return _noticing_lm_at(base_dir, clock)
 
 
 class _FakeEgress:
@@ -497,3 +509,145 @@ def test_dedup_ring_prevents_a_duplicate_thought_on_a_resurvey_of_the_same_id() 
     assert read_thought(lm.state, seed_thought_id(duplicate_gist)) is None
     # the first pass's real thought is untouched -- one thought, no duplicate
     assert read_thought(lm.state, first_thought_id) is not None
+
+
+# --- lm-705.14/705.13 Task 6: durable-buffer end-to-end sims ------------------
+
+
+def test_restart_survives_the_buffer_and_the_rebuilt_graph_still_notices() -> None:
+    """THE headline durability sim -- nothing else covers this end-to-end.
+
+    Capture a closed segment through the buffer's public API over a KNOWN
+    ``base_dir`` (never running a frame -- exactly what a live pre_llm/post_llm
+    hook pair does mid-session, with no noticing pass in flight yet). Then
+    REBUILD a fresh ``NoticingBuffer`` + a fresh ``build_noticing_lifemodel`` over
+    the SAME ``base_dir``/clock -- simulating a plugin/gateway restart, a NEW
+    process reopening the SAME ``lifemodel.sqlite``. The segment must still be
+    there on the rebuilt buffer, and the rebuilt graph's own HEARTBEAT frame must
+    still fire the noticing launch and seed a real thought on completion -- proving
+    the DURABLE BUFFER survives a restart, not merely the store class underneath
+    it in isolation (already proven by ``test_noticing_buffer_durable.py``/
+    ``test_buffer_store_sqlite.py`` at the store/buffer layer alone)."""
+    base_dir = Path(tempfile.mkdtemp(prefix="lifemodel-noticing-restart-"))
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+
+    # "process 1": capture a completed turn through the buffer's own public API.
+    _, first_buffer = _noticing_lm_at(base_dir, clock)
+    old_ts = clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
+    _complete_turn(
+        first_buffer,
+        "s1",
+        "t1",
+        user_text="I have an interview Friday",
+        assistant_text="Good luck!",
+        ts=old_ts,
+    )
+
+    # "process 2" (a simulated restart): a BRAND-NEW LifeModel + NoticingBuffer,
+    # over the SAME base_dir/clock -- nothing carried over except the file.
+    lm, buffer = _noticing_lm_at(base_dir, clock)
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=clock.now())] == ["t1"]
+
+    report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+    launch = _only_noticing_launch(report)
+    assert launch.subject_id is None  # subjectless (noticing, not processing)
+    _set_pending(lm, launch)
+
+    gist = "they have an interview Friday, remembered across a restart"
+    run_internal_completion(
+        lm,
+        _fake_egress(),
+        TARGET,
+        correlation_id=launch.correlation_id,
+        result=InternalCognitionResult(
+            raw="...",
+            parsed={"seeds": [{"gist": gist, "source_message_ids": ["t1"], "turn_id": "t1"}]},
+        ),
+        apply=NoticingApply(buffer),
+    )
+
+    thought = read_thought(lm.state, seed_thought_id(gist))
+    assert thought is not None
+    assert thought.provenance is not None
+    assert thought.provenance.source_object_ids == ("t1",)
+
+
+def test_window_cursor_alignment_claims_only_the_oldest_prefix_and_leaves_the_rest() -> None:
+    """Window<->cursor alignment (codex F2b), end-to-end: with MORE than
+    ``DEFAULT_NOTICING_SIZE_CAP`` complete turns queued, the trigger's launch
+    claims ONLY the oldest ``size_cap`` prefix; completing that pass finalizes
+    EXACTLY that claimed prefix -- the newer, un-surveyed turns are untouched,
+    still ``complete``, ready for a later pass (no older-turn loss, no
+    newer-turn sweep)."""
+    lm, buffer = _noticing_lm()
+    total = DEFAULT_NOTICING_SIZE_CAP + 3
+    now = lm.clock.now()
+    for i in range(total):
+        _complete_turn(buffer, "s1", f"t{i}", ts=now - timedelta(seconds=total - i))
+
+    report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+    launch = _only_noticing_launch(report)
+    survey_id = launch.correlation_id.split("#", 1)[1]
+
+    older_ids = [f"t{i}" for i in range(DEFAULT_NOTICING_SIZE_CAP)]
+    newer_ids = [f"t{i}" for i in range(DEFAULT_NOTICING_SIZE_CAP, total)]
+    # the claimed window is EXACTLY the oldest size_cap prefix...
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == older_ids
+    # ...and the newer turns are untouched by the claim -- still `complete`.
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=lm.clock.now())] == newer_ids
+    _set_pending(lm, launch)
+
+    run_internal_completion(
+        lm,
+        _fake_egress(),
+        TARGET,
+        correlation_id=launch.correlation_id,
+        result=InternalCognitionResult(raw="{}", parsed={"seeds": []}),
+        apply=NoticingApply(buffer),
+    )
+
+    # finalize cleared EXACTLY the surveyed prefix -- the claim is gone...
+    assert buffer.claimed(survey_id) == []
+    # ...and the NEWER turns still remain `complete`, ready for a later pass --
+    # no older-turn loss (they're gone, not re-shown) and no newer-turn sweep
+    # (they're still here, not swept away with the finalize).
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=lm.clock.now())] == newer_ids
+
+
+def test_atomic_finalize_drops_the_claim_and_seeds_the_thought_from_one_commit() -> None:
+    """Atomic finalize (end-to-end, success path, codex I3): a genuine completed
+    pass finalizes the claimed ``conversation_buffer`` rows AND seeds the thought
+    row from the SAME ``commit_tick`` transaction.
+
+    ``test_finalize_buffer_intent.py`` already proves the transaction's atomicity
+    via a hand-built claim + a direct ``StateActor.apply`` call; this is the
+    full-stack companion -- the buffer's own ``claimed()`` reads empty after a
+    REAL launch -> claim -> completion pass, not a synthetic one, so the whole
+    real graph's wiring of claim/finalize is what is on trial here, not just the
+    committer in isolation."""
+    lm, buffer = _noticing_lm()
+    old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
+    _complete_turn(buffer, "s1", "t1", user_text="a big life update", ts=old_ts)
+
+    report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
+    launch = _only_noticing_launch(report)
+    survey_id = launch.correlation_id.split("#", 1)[1]
+    _set_pending(lm, launch)
+
+    gist = "noticed a big life update"
+    run_internal_completion(
+        lm,
+        _fake_egress(),
+        TARGET,
+        correlation_id=launch.correlation_id,
+        result=InternalCognitionResult(
+            raw="...",
+            parsed={"seeds": [{"gist": gist, "source_message_ids": ["t1"], "turn_id": "t1"}]},
+        ),
+        apply=NoticingApply(buffer),
+    )
+
+    # both halves of the ONE commit landed together: the claim is gone...
+    assert buffer.claimed(survey_id) == []
+    # ...and the thought it produced exists.
+    assert read_thought(lm.state, seed_thought_id(gist)) is not None
