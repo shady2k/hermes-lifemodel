@@ -119,6 +119,12 @@ launch the completion frame returns**; hard-budget reservation.
 
 A **single process-owned, lock-protected buffer service** injected into the hooks *and* the
 adapter — NOT a field on a freshly-built `LifeModel` (graphs are rebuilt per call).
+
+> **2026-07-17 update (lm-705.14/lm-705.13, §10):** "process-owned" above described identity, not
+> durability — the buffer's storage was in-memory and a restart silently dropped every
+> captured-but-not-yet-noticed segment. It is now backed by a durable `SqliteBufferStore` over the
+> SAME `lifemodel.sqlite` (one physical store), with a claim/finalize transactional lifecycle
+> replacing the plain cursor described below. See §10 for the shipped detail.
 - **Keyed by `session_id` + `turn_id`** (both available at `post_llm`) — the reliable shared
   key (the inbound message id is *not* handed to `post_llm`). The platform message id, if
   needed as a transcript pointer, rides from the inbound observer (`event.id`,
@@ -234,3 +240,26 @@ lifecycle — segment-eviction / clear-before-commit / window↔cursor (**lm-705
 routing, host-blocked, so noticing routes to the main model bounded by the FR20 call ceiling
 (**lm-705.10**). **Not built:** deep cross-segment reference; a model-facing thought READ tool
 (FR24 conversational); the arbiter (lm-705.4).
+
+**lm-705.14 + lm-705.13 (2026-07-17) — buffer made durable, claim/finalize atomic (§4.1).** The
+two beads deferred above are now shipped. `NoticingBuffer` no longer owns `pending`/`complete`
+state directly — every method delegates to an injected `BufferStore` (`core/buffer_store.py`);
+the production default is `SqliteBufferStore` (`state/sqlite_store.py`) over a new
+`conversation_buffer` table (migration v4) in the SAME `lifemodel.sqlite` (HLA §4.1/D7 — one
+physical store), so a captured-but-not-yet-noticed segment now survives a plugin/gateway restart
+instead of being silently dropped. The trigger's launch **claims** the surveyed window (the
+oldest `size_cap` prefix, codex F2b) under a deterministic `survey_id`
+(`<anchor_turn_id>@<iso>`, encoded into the correlation as `notice-<session_id>#<survey_id>`) — an
+immutable snapshot immune to further ring pressure — and the apply recovers exactly that snapshot
+via `claimed(survey_id)` rather than re-gating `closed_segment`. A genuine completion emits
+`FinalizeBuffer`, whose claimed-row `DELETE` lands in the SAME `commit_tick` transaction as the
+pass's thought `PutRecord` + consumed-ring `UpdateState` (codex I3) — a rollback leaves neither,
+so a half-applied pass never happens; connect-time `recover_stale_claims` releases any claim left
+by a pass that died mid-flight with the process. Proven end-to-end
+(`tests/test_noticing_harness.py`): a segment captured through the buffer's public API survives a
+simulated restart (a fresh `NoticingBuffer`/`LifeModel` pair reopening the same file) and the
+rebuilt graph's own heartbeat still notices it and completes into a real thought; more-than-
+`size_cap` turns claim and finalize exactly the oldest prefix, leaving newer turns intact for a
+later pass; and a genuine pass's `claimed()` reads empty from the SAME commit that seeds the
+thought. Also driven against real Hermes (`tests/hermes_internal_cognition_integration.py`,
+Part B-noticing) with the buffer switched to the durable store. Beads closed.
