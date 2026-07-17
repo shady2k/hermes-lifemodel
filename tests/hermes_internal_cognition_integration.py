@@ -82,6 +82,7 @@ def _fake_openai_response(text: str, *, model: str = "fake-model") -> Any:
 
 async def main_async() -> dict[str, Any]:
     import asyncio
+    from datetime import UTC, datetime
 
     from agent.plugin_llm import _TrustPolicy, make_plugin_llm_for_test
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -96,10 +97,17 @@ async def main_async() -> dict[str, Any]:
     from lifemodel.core.intents import Intent, LaunchProactive, PutRecord
     from lifemodel.core.internal_cognition import NullInternalApply
     from lifemodel.core.llm_port import InternalCognitionRequest
+    from lifemodel.core.noticing import NOTICING_JSON_SCHEMA, NoticingApply
+    from lifemodel.core.noticing_buffer import NoticingBuffer
     from lifemodel.core.registry import ComponentManifest
     from lifemodel.core.taxonomy import KIND_INTERNAL_RESULT, read_internal_result
     from lifemodel.core.thought_processing import ThoughtProcessingApply
-    from lifemodel.core.thought_view import build_thought, encode_thought, read_thought
+    from lifemodel.core.thought_view import (
+        build_thought,
+        encode_thought,
+        read_thought,
+        seed_thought_id,
+    )
     from lifemodel.domain.egress import ReachOutcome
     from lifemodel.domain.memory import MemoryDraft, PutOp
     from lifemodel.domain.objects import ThoughtState
@@ -508,6 +516,76 @@ async def main_async() -> dict[str, Any]:
     result["bc_pending_cleared"] = build_lm_bc().state.load().pending_internal_id is None
     _log(f"[BC] {result}")
 
+    # ---- Part B-noticing: a real noticing pass seeds thoughts, non-delivered ----
+    bn_dir = home / "seam-bn"
+    bn_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(bn_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_bn = _build_lm_factory(bn_dir)
+
+    # The noticing buffer is process-owned (never per-graph, see
+    # core/noticing_buffer.py) -- seed a closed segment through its OWN public API,
+    # exactly as the pre_llm/post_llm hooks would (Task 3/E3), rather than a fresh
+    # NoticingTrigger heartbeat: this proves the COMPLETION half of the seam
+    # (NoticingApply reading the segment back via ``segment_through`` + validating +
+    # creating real thoughts) against the REAL host's structured-completion path, the
+    # same way Part B-processing/B-crystallize drive ``ThoughtProcessingApply``
+    # directly rather than waiting on ``ThoughtProcessingSelector``.
+    bn_buffer = NoticingBuffer()
+    bn_now = datetime(2026, 1, 1, 10, 5, tzinfo=UTC)
+    bn_buffer.open_pending("bn-session", user_text="I have a big interview Friday", now=bn_now)
+    bn_buffer.complete("bn-session", "bn-turn-1", assistant_text="Good luck!", now=bn_now)
+    bn_correlation_id = f"notice-bn-session@bn-turn-1@{bn_now.isoformat()}"
+
+    async def _async_caller_bn(**kwargs: Any) -> Any:
+        return (
+            "fake-provider",
+            "fake-model",
+            _fake_openai_response(
+                '{"seeds": [{"gist": "they have a big interview Friday", '
+                '"source_message_ids": ["bn-turn-1"], "turn_id": "bn-turn-1", '
+                '"salience": 0.7}]}'
+            ),
+        )
+
+    plugin_llm_bn = make_plugin_llm_for_test(
+        plugin_id="lifemodel",
+        policy=_TrustPolicy(plugin_id="lifemodel"),
+        async_caller=_async_caller_bn,
+    )
+    egress_bn = FakeEgress()
+    runner_bn = InternalCognitionRunner(
+        build_lm_bn,
+        PluginLlmPort(plugin_llm_bn),
+        egress_bn,
+        _TARGET,
+        daily_ceiling=5,
+        gateway_loop=asyncio.get_running_loop(),
+        apply=NoticingApply(bn_buffer),
+        timeout=10.0,
+    )
+    runner_bn.launch(
+        InternalCognitionRequest(
+            instructions="notice", input_text="the segment", json_schema=NOTICING_JSON_SCHEMA
+        ),
+        bn_correlation_id,
+        # subject_id defaults to None -- subjectless, the noticing pass's own
+        # disambiguator against ThoughtProcessingApply (core/noticing.py).
+    )
+    for task in list(runner_bn._tasks):
+        await task
+    bn_thought = read_thought(
+        build_lm_bn().state, seed_thought_id("they have a big interview Friday")
+    )
+    result["bn_thought_created"] = bn_thought is not None
+    result["bn_thought_has_source"] = bn_thought is not None and (
+        bn_thought.provenance is not None
+        and bn_thought.provenance.source_object_ids == ("bn-turn-1",)
+        and bn_thought.provenance.turn_id == "bn-turn-1"
+    )
+    result["bn_egress_never_called"] = egress_bn.calls == []  # non-delivery is structural
+    result["bn_pending_cleared"] = build_lm_bn().state.load().pending_internal_id is None
+    _log(f"[BN] {result}")
+
     return result
 
 
@@ -543,6 +621,10 @@ _REQUIRED_TRUE_KEYS = (
     "bc_thought_resolved",
     "bc_egress_never_called",
     "bc_pending_cleared",
+    "bn_thought_created",
+    "bn_thought_has_source",
+    "bn_egress_never_called",
+    "bn_pending_cleared",
 )
 
 
