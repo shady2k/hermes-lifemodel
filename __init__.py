@@ -35,6 +35,7 @@ from .events import EventRing
 from .hooks import (
     make_belief_injector,
     make_check_in_tool,
+    make_commitment_injector,
     make_felt_state_injector,
     make_genesis_injector,
     make_inbound_observer,
@@ -667,6 +668,22 @@ def register(ctx: Any) -> None:
         ctx.register_hook(
             "pre_llm_call",
             make_belief_injector(
+                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
+            ),
+        )
+
+    # --- Commitment-track injector wiring (lm-705.21) — REQUIRED --------------
+    # The being's held DIRECTIVES carried into its live turn: a FOURTH pre_llm_call hook
+    # beside felt-state, genesis, and belief. Surfaces ALL active commitments (bounded by
+    # max_surfaced, self-authored framing, [when …] triggers, overflow notice) as an
+    # ephemeral {"context": …}; NO cooldown ring, no durable side effect. Hermes concatenates
+    # every pre_llm_call hook's non-None return, so all four coexist. REQUIRED like the other
+    # register_hook calls (the host never fails on an unknown hook, so a throw here is our
+    # bug); the hook body is fail-soft at RUNTIME on its own commitment_injector observer.
+    with wire("commitment_injector", required=True, health=health, logger=_LOG):
+        ctx.register_hook(
+            "pre_llm_call",
+            make_commitment_injector(
                 lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
             ),
         )

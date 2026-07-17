@@ -58,6 +58,15 @@ FELT_DISPLAY_TOTAL = "lifemodel_felt_display_total"
 #: ``cold_start`` (the soft "still settling" read) / ``error`` (a failed handler
 #: returned ``{"error": …}``). Emitted from the tool handler, fail-open.
 CHECK_IN_TOTAL = "lifemodel_check_in_total"
+#: The commitment-track injector's OVERFLOW signal (lm-705.21, §17-D1): a turn where more
+#: than ``max_surfaced`` commitments were active, so the surfaced set was capped and the
+#: self-heal notice appended. A distinct signal (not the shared observer) so a too-large
+#: active set is visible for tuning; emitted from the injector, fail-open.
+COMMITMENT_INJECTOR_OVERFLOW = "lifemodel_commitment_injector_overflow_total"
+#: The commitment lifecycle tool (lm-705.21, §20): create/discharge/defer calls by
+#: ``action`` × ``outcome`` (created / already_held / ok / not_found / already_deferred /
+#: already_terminal / invalid / error). Emitted from the tool handler, fail-open.
+COMMITMENT_TOOL_TOTAL = "lifemodel_commitment_tool_total"
 #: The brain HEARTBEAT (spec §4.4, codex MAJOR-8): a monotonic counter advanced once
 #: per completed tick, plus a gauge holding the last tick's wall-clock epoch. These
 #: are SUPPORTING evidence only — the PRIMARY liveness stays the durable
@@ -154,6 +163,18 @@ UNIVERSAL_SPECS: tuple[MetricSpec, ...] = (
         name=CHECK_IN_TOTAL,
         kind="counter",
         help="check_in self-read tool calls by outcome (read / cold_start / error).",
+        label_keys=("outcome",),
+    ),
+    MetricSpec(
+        name=COMMITMENT_INJECTOR_OVERFLOW,
+        kind="counter",
+        help="Turns where the commitment injector hit max_surfaced (active set too large).",
+    ),
+    MetricSpec(
+        name=COMMITMENT_TOOL_TOTAL,
+        kind="counter",
+        help="commitment tool calls by outcome (created/already_held/discharged/deferred/"
+        "not_found/already_deferred/already_terminal/invalid/error).",
         label_keys=("outcome",),
     ),
     MetricSpec(

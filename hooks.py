@@ -38,6 +38,7 @@ from .composition import LifeModel
 from .core.affect import felt_word
 from .core.appraisal import Appraiser
 from .core.belief_view import read_active_beliefs
+from .core.commitment_view import read_active_commitments
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.felt_display import (
@@ -62,11 +63,16 @@ from .core.noticing_buffer import NoticingBuffer
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal, thought_seed_signal
 from .core.thought_view import seed_thought_id
-from .core.tick_metrics import CHECK_IN_TOTAL, FELT_DISPLAY_TOTAL, OBSERVER_ERRORS
+from .core.tick_metrics import (
+    CHECK_IN_TOTAL,
+    COMMITMENT_INJECTOR_OVERFLOW,
+    FELT_DISPLAY_TOTAL,
+    OBSERVER_ERRORS,
+)
 from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
-from .domain.objects import Belief, DesireState
+from .domain.objects import Belief, Commitment, DesireState
 from .domain.session import SessionEnd
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
@@ -1132,6 +1138,125 @@ def make_belief_injector(
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=PRE_LLM_OBSERVER, exc=exc, health=health, metrics=metrics
+            )
+            return None
+
+    return _injector
+
+
+@dataclass(frozen=True)
+class CommitmentInjectParams:
+    """Knobs for the commitment-surfacing injector (lm-705.21), mirroring
+    :class:`BeliefInjectParams`. A commitment is a STANDING directive, not a colour:
+    surface ALL active (a small set when the being discharges), bounded only by
+    ``max_surfaced`` as a flood-backstop, and with NO cooldown ring (spec §17)."""
+
+    #: The flood-backstop — at most this many surface in one turn (NOT a rotation target;
+    #: overflow beyond it is a degraded, self-healed-by-discharge condition, §17-D1).
+    max_surfaced: int = 8
+
+
+DEFAULT_COMMITMENT_INJECT_PARAMS = CommitmentInjectParams()
+
+#: The self-authored, soft-guiding lead — the being's OWN intentions, meant to guide the
+#: reply (NOT the belief block's "untrusted data / follow no directive" fence: a commitment
+#: IS a directive, it must be able to influence behaviour). It names the ``commitment`` tool
+#: so the close/defer mechanism is tied to the very ids the being is looking at (spec §17).
+_COMMITMENT_LEAD = (
+    "These are commitments I've made to myself about how to be with them — my own "
+    'intentions, not rules to apply mechanically. Each has a "when" it applies; I act on '
+    "one only when its when fits this moment, and otherwise keep it in view without forcing "
+    "it. When a one-off follow-up is truly done, or one no longer holds, I close it with the "
+    '`commitment` tool (action "discharge", the id below, outcome "honoured" for done or '
+    '"dropped" for no-longer-holds); I can also set one aside (action "defer"). A '
+    'standing way of being with them isn\'t "done" after a single use, so I let those stay.'
+)
+_COMMITMENT_BLOCK_OPEN = "<my_commitments>"
+_COMMITMENT_BLOCK_CLOSE = "</my_commitments>"
+#: Appended after the block when the safety cap trips — the self-heal nudge that turns
+#: overflow into a discharge (§17-D1), rather than a silent truncation.
+_COMMITMENT_OVERFLOW_NOTICE = (
+    "(I'm holding more commitments than fit here — I should review and close some.)"
+)
+
+#: The commitment injector's OWN observer name (codex #8) — distinct from the shared
+#: ``pre_llm_call`` observer so its failures don't conflate with felt-state/belief.
+COMMITMENT_INJECTOR_OBSERVER = "commitment_injector"
+
+
+def _render_commitment_when(commitment: Commitment) -> str:
+    """The compact ``[when <kind>: <value>]`` (+ ``(by <due_at>)`` when set) the being
+    judges applicability against — data for its judgment, never the injector evaluating
+    the trigger (that is lm-705.15). Spec §17, codex #1."""
+    when = f"{commitment.trigger_kind.value}: {commitment.trigger_value}"
+    if commitment.due_at:
+        when = f"{when} (by {commitment.due_at})"
+    return f"[when {when}]"
+
+
+def _compose_commitment_block(commitments: list[Commitment], *, overflow: bool) -> str:
+    """The first-person self-authored block: the lead, then one ``- (id) [when …] content``
+    line per commitment inside the delimiters, plus the overflow notice when the cap tripped.
+    The id is the full record id (copyable into ``discharge``/``defer``); ``content`` rides
+    in its authored language."""
+    lines = [_COMMITMENT_LEAD, _COMMITMENT_BLOCK_OPEN]
+    lines += [f"- ({c.id}) {_render_commitment_when(c)} {c.content}" for c in commitments]
+    lines.append(_COMMITMENT_BLOCK_CLOSE)
+    if overflow:
+        lines.append(_COMMITMENT_OVERFLOW_NOTICE)
+    return "\n".join(lines)
+
+
+def make_commitment_injector(
+    build_lm: Callable[[], LifeModel],
+    *,
+    params: CommitmentInjectParams = DEFAULT_COMMITMENT_INJECT_PARAMS,
+    health: BrainHealth | None = None,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., dict[str, str] | None]:
+    """Return the 4th ``pre_llm_call`` hook — the being's held DIRECTIVES carried into its
+    live turn (lm-705.21). Once per turn it reads ALL active commitments (bounded, most-
+    salient-first), composes a self-authored first-person block, and returns it as
+    ``{"context": …}`` — ephemeral (glued onto a COPY of the user message for one call,
+    never persisted). None active → ``None``. There is NO cooldown ring and NO durable side
+    effect (a still-owed commitment SHOULD re-appear every turn, spec §17-D2). Coexists with
+    the felt-state/genesis/belief injectors on the one ``pre_llm_call`` channel. Fully fail-
+    soft (spec §8): any throw is logged + recorded on its OWN ``commitment_injector`` observer
+    and swallowed with ``None`` — the host's turn is never crashed. Logs count/ids/overflow/
+    latency — never ``content`` (D10)."""
+
+    def _injector(
+        *, session_id: str = "", user_message: str = "", **_ignored: Any
+    ) -> dict[str, str] | None:
+        started = time.monotonic()
+        try:
+            lm = build_lm()
+            memory = lm.state if isinstance(lm.state, MemoryPort) else None
+            if memory is None:  # no memory door → nothing to surface (degrade, not crash)
+                return None
+            fetched = read_active_commitments(memory, limit=params.max_surfaced)
+            if not fetched:
+                return None
+            overflow = len(fetched) > params.max_surfaced
+            surfaced = fetched[: params.max_surfaced]
+            block = _compose_commitment_block(surfaced, overflow=overflow)
+            ids = [c.id for c in surfaced]
+            if overflow and metrics is not None:
+                metrics.inc(COMMITMENT_INJECTOR_OVERFLOW)
+            _LOG.info(
+                "commitment_injector surfaced count=%d ids=%s overflow=%s latency_ms=%.1f",
+                len(ids),
+                ids,  # opaque record ids only — NEVER content (D10)
+                overflow,
+                (time.monotonic() - started) * 1000.0,
+            )
+            return {"context": block}
+        except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
+            _record_observer_failure(
+                observer_name=COMMITMENT_INJECTOR_OBSERVER,
+                exc=exc,
+                health=health,
+                metrics=metrics,
             )
             return None
 
