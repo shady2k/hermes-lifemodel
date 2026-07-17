@@ -26,8 +26,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -36,6 +37,7 @@ from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite, prior_soul
 from .composition import LifeModel
 from .core.affect import felt_word
 from .core.appraisal import Appraiser
+from .core.belief_view import read_active_beliefs
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.felt_display import (
@@ -64,7 +66,7 @@ from .core.tick_metrics import CHECK_IN_TOTAL, FELT_DISPLAY_TOTAL, OBSERVER_ERRO
 from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
-from .domain.objects import DesireState
+from .domain.objects import Belief, DesireState
 from .domain.session import SessionEnd
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
@@ -950,6 +952,151 @@ def make_genesis_injector(
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=GENESIS_OBSERVER, exc=exc, health=health, metrics=metrics
+            )
+            return None
+
+    return _injector
+
+
+@dataclass(frozen=True)
+class BeliefInjectParams:
+    """Calibratable knobs for the belief-surfacing gate (lm-705.19 Task 4), a small
+    frozen dataclass mirroring :class:`~lifemodel.core.felt_display.FeltDisplayParams`.
+
+    The seeds are deliberately conservative — surface only what the being genuinely
+    HOLDS (high confidence), and only a couple at a time (a live turn coloured by a
+    read, never a wall of assertions the model then defends)."""
+
+    #: The minimum confidence a held belief must carry before it is fit to surface into
+    #: a live turn — below this the being's read is too tentative to colour its reply.
+    min_confidence: float = 0.6
+    #: How many beliefs may surface in one turn — a small, non-flooding handful.
+    top_n: int = 2
+
+
+#: The default seeds — one shared frozen instance, calibratable on disk later (spec
+#: NFR5), mirroring :data:`~lifemodel.core.felt_display.DEFAULT_FELT_DISPLAY_PARAMS`.
+DEFAULT_BELIEF_INJECT_PARAMS = BeliefInjectParams()
+
+#: The lead line for a surfaced-beliefs block. It is FIRST-PERSON and FALLIBLE-framed on
+#: purpose (spec §9, D framing): the being's own read, held as possibly WRONG, NOT an
+#: instruction — the block re-feeds user-derived prose back into the prompt, and this
+#: framing is what blunts the prompt-injection-amplification risk of doing so. The list
+#: that follows is the being's understanding, never a directive to be obeyed.
+_BELIEF_LEAD = (
+    "Some things I think I've come to understand about them (my own read — I could be wrong):"
+)
+
+
+def _compose_belief_block(beliefs: list[Belief]) -> str:
+    """The compact first-person, fallible-framed block — the lead line then one line per
+    belief ``content``. The lead's "my own read — I could be wrong" is load-bearing (see
+    :data:`_BELIEF_LEAD`): it marks the whole block as the being's fallible understanding,
+    not instructions to follow."""
+    return "\n".join([_BELIEF_LEAD, *(f"- {belief.content}" for belief in beliefs)])
+
+
+def _stamp_surfaced_beliefs(lm: LifeModel, ids: list[str]) -> None:
+    """Atomically record which beliefs the injector just surfaced into the cooldown ring.
+
+    Reaches the concrete store's ``stamp_surfaced_beliefs`` (a ``BEGIN IMMEDIATE``
+    field-level merge of ONLY ``surfaced_belief_ids``) the same duck-typed way
+    :func:`_stamp_display` reaches ``stamp_affect_display`` — so ``StatePort`` stays narrow
+    and its fakes need no new method, and a stale full-State ``commit`` (which could roll
+    back the ~60s tick's drive/affect) is never used. A store WITHOUT it (a minimal fake)
+    simply skips the stamp: the being may then re-surface the same belief next turn, which
+    is the safe direction (a repeated read, never a swallowed one)."""
+    stamp = getattr(lm.state, "stamp_surfaced_beliefs", None)
+    if callable(stamp):
+        stamp(ids)
+
+
+def make_belief_injector(
+    build_lm: Callable[[], LifeModel],
+    *,
+    params: BeliefInjectParams = DEFAULT_BELIEF_INJECT_PARAMS,
+    health: BrainHealth | None = None,
+    metrics: MetricRegistry | None = None,
+) -> Callable[..., dict[str, str] | None]:
+    """Return the third ``pre_llm_call`` hook — the one that carries the being's held
+    UNDERSTANDING into its live turn (lm-705.19 Task 4, the belief-track payoff).
+
+    Once per user turn, BEFORE the model is called, it reads the being's live, high-
+    confidence, non-private beliefs (:func:`~lifemodel.core.belief_view.read_active_beliefs`
+    — a BOUNDED, gated store query, never a decode-all), drops any it has surfaced recently
+    (the ``surfaced_belief_ids`` cooldown ring, so the same read does not colour every reply
+    into a stutter), takes at most :attr:`~BeliefInjectParams.top_n`, and composes a compact
+    first-person FALLIBLE-framed block (:func:`_compose_belief_block`) returned as
+    ``{"context": …}`` — which Hermes glues onto a COPY of the user message for this ONE API
+    call (EPHEMERAL: never persisted, never in rolling history, gone next turn). None qualify
+    → ``None``.
+
+    The block is deliberately marked as the being's OWN read that could be WRONG and is NOT
+    instructions (:data:`_BELIEF_LEAD`): it re-feeds user-derived prose back into the prompt,
+    and that framing is what blunts the prompt-injection-amplification risk of doing so.
+
+    Coexists with the felt-state and genesis injectors on the host's same ``pre_llm_call``
+    event (Hermes calls every registered callback for a hook name and concatenates their
+    non-``None`` returns), so all three ride the one channel without interfering.
+
+    The one durable side effect is the ATOMIC cooldown stamp (:func:`_stamp_surfaced_beliefs`
+    → the store's field-level ``BEGIN IMMEDIATE`` merge of just ``surfaced_belief_ids``),
+    NEVER a ``commit`` of a stale full ``State`` — a concurrent ~60s tick that advanced
+    ``u``/affect/pending is never rolled back. Nothing else is written; the block itself is
+    never persisted (the pre_llm channel is inherently prefix-cache-safe — spliced onto a
+    copy only).
+
+    The whole body is plugin-owned fail-soft (spec §8), copying
+    :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in ``build_lm``)
+    is logged ERROR + traceback, recorded on *health* + *metrics*, and swallowed with a
+    ``None`` return — the host's hot dispatch path is never crashed, and the failure is
+    observable. The surfacing log carries the count/ids/latency ONLY — never the belief
+    ``content`` (D10 redaction: a belief is a proposition ABOUT a person, and the log is not
+    a place to leak it)."""
+
+    def _injector(
+        *,
+        session_id: str = "",
+        user_message: str = "",
+        **_ignored: Any,
+    ) -> dict[str, str] | None:
+        started = time.monotonic()
+        try:
+            lm = build_lm()
+            state = lm.state.load()
+            memory = lm.state if isinstance(lm.state, MemoryPort) else None
+            if memory is None:  # no memory door → nothing to surface (degrade, not crash)
+                return None
+            cooldown = set(state.surfaced_belief_ids)
+            # A BOUNDED, gated fetch — never scan-all. The cooldown's contribution to the
+            # limit is itself capped (the ring can hold up to SURFACED_BELIEF_IDS_CAP=64
+            # ids) so the internal superset (read_active_beliefs fetches ~limit*6) stays
+            # small; the freshest beliefs are read most-recent-first, so a small margin is
+            # enough to skip recently-surfaced ones and still fill top_n.
+            candidates = read_active_beliefs(
+                memory,
+                min_confidence=params.min_confidence,
+                exclude_private=True,
+                limit=params.top_n + min(len(cooldown), params.top_n),
+            )
+            beliefs = [b for b in candidates if b.id not in cooldown][: params.top_n]
+            if not beliefs:
+                return None
+            block = _compose_belief_block(beliefs)
+            # ATOMIC field-level stamp (never a stale full-State commit): record the
+            # surfaced ids in the cooldown ring so a later turn skips them.
+            _stamp_surfaced_beliefs(lm, [b.id for b in beliefs])
+            ids = [b.id for b in beliefs]
+            _LOG.info(
+                "belief_injector surfaced count=%d ids=%s latency_ms=%.1f",
+                len(ids),
+                ids,  # opaque content-fingerprint ids only — NEVER the belief content (D10)
+                (time.monotonic() - started) * 1000.0,
+            )
+            return {"context": block}
+        except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
+            _record_observer_failure(
+                observer_name=PRE_LLM_OBSERVER, exc=exc, health=health, metrics=metrics
             )
             return None
 

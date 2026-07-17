@@ -33,6 +33,7 @@ from .core.tick_metrics import register_universal_metrics
 from .debug import render_dump_for_dir
 from .events import EventRing
 from .hooks import (
+    make_belief_injector,
     make_check_in_tool,
     make_felt_state_injector,
     make_genesis_injector,
@@ -646,6 +647,27 @@ def register(ctx: Any) -> None:
                 identity_stale=GatewayStaleIdentity(soul_mtime=soul.mtime),
                 health=health,
                 metrics=metrics,
+            ),
+        )
+
+    # --- Belief-track injector wiring (lm-705.19 Task 4) — REQUIRED -----------
+    # The being's held UNDERSTANDING carried into its live turn: a THIRD pre_llm_call
+    # hook beside the felt-state and genesis injectors above. Once per turn it reads a
+    # few live, high-confidence, non-private beliefs (bounded/gated), drops any surfaced
+    # recently (the surfaced_belief_ids cooldown ring), and returns a compact first-person
+    # FALLIBLE-framed {"context": …} block — ephemeral (glued onto a COPY of the user
+    # message for one call), never persisted, so its understanding colours the reply
+    # without becoming instructions the model then defends. Hermes calls every registered
+    # pre_llm_call callback and concatenates their non-None returns, so all three coexist.
+    # REQUIRED like every other register_hook here (the host never fails on an unknown
+    # hook, so a throw during THIS wiring is our bug); the hook body itself stays fail-soft
+    # at RUNTIME (spec §8), same shape as felt_state_injector — the only durable side
+    # effect is the atomic cooldown stamp, never a stale full-State commit.
+    with wire("belief_injector", required=True, health=health, logger=_LOG):
+        ctx.register_hook(
+            "pre_llm_call",
+            make_belief_injector(
+                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
             ),
         )
 
