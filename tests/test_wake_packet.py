@@ -43,15 +43,21 @@ INITIATING_FRAME = (
     "carry, not a thread left open — I'm coming to them anew because I want to, not "
     "merely answering their last message."
 )
-# The consequence-transparency line (lm-md6.3): appended AFTER the </internal_impulse>
-# close tag, OUTSIDE the felt block. Consequence-ONLY — it discloses this turn's
-# delivery semantics (text written now reaches the user, and how to send nothing) and
-# says nothing about whether to reach out, so it can't re-trigger the [SILENT]
-# suppression regression. Spelled independently here so this test PINS the exact bytes
-# the model reads; the marker matches hooks._SUBSTRING_DECLINE_MARKERS (single source of truth).
+# The delivery-DECISION tail (lm-md6.3, rewritten 2026-07-17): appended AFTER the
+# </internal_impulse> close tag, OUTSIDE the felt block. A SYMMETRIC two-option framing
+# (communicate → the message they receive; send nothing → the marker) that states the
+# marker is "not a default, and not an instruction to choose it" — the fix for a small
+# model reading the old "Reply exactly [SILENT]" line as an imperative and complying every
+# wake. Its decision criterion ("match the outcome to your intent") is neutral, so it
+# can't re-trigger the [SILENT] regression. Spelled independently here so this test PINS
+# the exact bytes the model reads; the marker matches hooks._SUBSTRING_DECLINE_MARKERS.
 DELIVERY_CONSEQUENCE = (
-    "Delivery consequence: text you write now is delivered to the user.\n"
-    "Reply exactly [SILENT] for no message to be sent."
+    "Delivery decision:\n"
+    "* To communicate now, write the message you want them to receive. "
+    "It will be delivered as written.\n"
+    "* To send nothing now, reply exactly [SILENT] — they won't hear from you this time.\n"
+    "[SILENT] is only a way to send nothing — not a default, and not an instruction to choose it.\n"
+    "Choose the outcome that matches whether you intend to communicate now."
 )
 
 
@@ -396,18 +402,20 @@ def test_decline_instruction_sits_after_the_felt_block() -> None:
 
 
 def test_decline_instruction_is_consequence_only_no_suppression_bias() -> None:
-    # Consequence-only guard: the added line must never carry suppression-bias language.
-    # The old guidance bundled [SILENT] with a bias ("if it's filler → be silent",
-    # "don't invent a reason") that taught the being to distrust its own longing and go
-    # mute (the [SILENT] regression). This pins the new line to delivery semantics only.
+    # No-suppression-bias guard: the tail frames a symmetric decision but must never carry
+    # suppression-bias language. The old regression bundled [SILENT] with a bias ("if it's
+    # filler → be silent", "don't invent a reason") that taught the being to distrust its
+    # own longing and go mute. This pins the tail to a neutral decision — no bias words.
     p = _build(last_exchange_at=LAST).prompt
     _, _, consequence = p.partition(CLOSE_TAG)
     lowered = consequence.lower()
     for biased in ("filler", "invent", "should", "not worth", "waste"):
         assert biased not in lowered
     # it MUST name the recipient — the leak was private deliberation ABOUT the owner
-    # delivered TO the owner; "silence is an option" alone would not prevent that.
-    assert "the user" in consequence
+    # delivered TO the owner; "silence is an option" alone would not prevent that. The
+    # recipient is named "them" (consistent with the felt block's "I miss them"); the
+    # tail makes delivery-to-them explicit ("write the message you want them to receive").
+    assert "them" in consequence
 
 
 def test_decline_marker_is_single_source_of_truth_with_the_classifier() -> None:

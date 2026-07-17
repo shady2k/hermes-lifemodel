@@ -25,13 +25,16 @@ being a neutral way to decline an URGE; at a first waking there is no urge — `
 by construction — so there is nothing to decline except existing. The birth packet keeps
 the delivery FACT and drops the marker. Nowhere else.
 
-After the felt block — deliberately OUTSIDE it — the packet appends one
-consequence-transparency line (lm-md6.3): a consequence-ONLY disclosure that text
-written now is delivered to the user, plus the marker reply that sends nothing. It
-gives the being a NEUTRAL way to decline, so a turn it decides NOT to send no longer
-leaks its private "I won't write" deliberation to the owner. Because it discloses
-substrate affordance and never comments on whether the longing is valid/enough, it
-stays clear of the [SILENT] suppression regression the felt block itself guards against.
+After the felt block — deliberately OUTSIDE it — the packet appends a delivery-DECISION
+tail (lm-md6.3, rewritten 2026-07-17): it frames the turn as a SYMMETRIC choice between
+two outcomes — communicate (the message they receive) or send nothing (the marker) — and
+states plainly the marker is "not a default, and not an instruction to choose it". It
+still gives the being a NEUTRAL way to decline, so a turn it decides NOT to send no longer
+leaks its private "I won't write" deliberation to the owner; and it defuses the failure
+where a small model read the old tail's "Reply exactly [SILENT]" as an imperative and
+complied every wake. Its closing "match the outcome to your intent" is a neutral decision
+criterion, never "you should reach out" and never mechanism talk, so it stays clear of the
+[SILENT] suppression regression the felt block itself guards against.
 
 The temporal facts are two bare timestamps — ``now`` and ``last_exchange_at`` —
 rendered in the OWNER's local timezone (resolved from Hermes at the boundary and
@@ -104,25 +107,45 @@ _IMPULSE_CLOSE_TAG = "</internal_impulse>"
 #: here, so "[SILENT]" is never hardcoded in two places (lm-md6.3).
 DECLINE_MARKER = "[SILENT]"
 
-#: The DELIVERY FACT — the half of the consequence line that is true on EVERY egress:
-#: what the being writes now reaches the user. Both tails below are built from it, so
-#: the one substrate fact we disclose is written once (lm-md6.3's single-source rule,
-#: applied to the sentence as well as to the marker).
+#: The DELIVERY FACT — the substrate fact that is true on EVERY egress: what the being
+#: writes now reaches the user. The GENESIS tail (:data:`_GENESIS_DELIVERY`) is built from
+#: it. The ordinary tail (:data:`_DELIVERY_CONSEQUENCE`) states the same fact in its own
+#: words (a symmetric two-option decision — see below), so the two no longer share a
+#: sentence; only the MARKER stays single-sourced (lm-md6.3), from :data:`DECLINE_MARKER`.
 _DELIVERY_FACT = "Delivery consequence: text you write now is delivered to the user"
 
-#: The CONSEQUENCE-TRANSPARENCY line, appended AFTER the close tag — OUTSIDE the felt
-#: ``<internal_impulse>`` block, which stays purely phenomenological. It discloses ONLY
-#: this turn's delivery semantics: that text written now is delivered to the user, and
-#: how to decline (reply the marker). It says NOTHING about whether to reach out — no
-#: "if it's filler", no "don't invent a reason", no "you should" — so it is substrate
-#: affordance, not drive interpretation, and cannot re-trigger the [SILENT] suppression
-#: regression (lm-8p4/lm-32b) that behavioural bias caused. It MUST name the recipient
-#: ("the user"): the bug it fixes is the being's private third-person deliberation
-#: ABOUT the owner ("I feel the pull but won't write") being DELIVERED TO the owner —
-#: with no neutral way to decline it wrote prose instead of the marker, and the
-#: classifier delivered it. Built from :data:`DECLINE_MARKER` (single source of truth).
+#: The DELIVERY-DECISION tail, appended AFTER the close tag — OUTSIDE the felt
+#: ``<internal_impulse>`` block, which stays purely phenomenological. It frames the turn
+#: as a SYMMETRIC decision between two outcomes — communicate (write the message they
+#: receive) or send nothing (reply the marker) — and states plainly that the marker is
+#: "not a default, and not an instruction to choose it".
+#:
+#: **Why it was rewritten (lm — 2026-07-17).** The being (a small model) had answered
+#: ``[SILENT]`` on 22 consecutive proactive wakes. Its OWN captured reasoning (the
+#: ``proactive_reasoning`` trace event) read "Obeying explicit silent reply instruction"
+#: / "Enforcing exact silent token usage": it was reading the OLD tail's last line
+#: ("Reply exactly [SILENT] for no message to be sent") as THE imperative and complying,
+#: never weighing the feeling at all. The symmetric two-option framing removes the
+#: "last line == instruction" reading; the explicit "not an instruction to choose it"
+#: negates the exact trap; and the closing "Choose the outcome that matches whether you
+#: intend to communicate now" is a NEUTRAL decision criterion (align action with intent),
+#: NOT "you should reach out". It still carries no suppression-bias language
+#: ("filler"/"invent"/"should"/"waste") and no mechanism talk (timer/pressure/threshold),
+#: so it stays clear of the [SILENT] regression (lm-8p4/lm-32b) the felt block guards
+#: against — the mild anti-reflex lean of "not a default" is the owner-accepted trade.
+#: It names the recipient as "them" (consistent with the felt block's "I miss them") and
+#: makes delivery-TO-them explicit ("the message you want them to receive"), which fixes
+#: the original leak — private third-person deliberation ABOUT the owner DELIVERED TO
+#: them — at least as well as the earlier "the user". Marker built from
+#: :data:`DECLINE_MARKER` (single source of truth).
 _DELIVERY_CONSEQUENCE = (
-    f"{_DELIVERY_FACT}.\nReply exactly {DECLINE_MARKER} for no message to be sent."
+    "Delivery decision:\n"
+    "* To communicate now, write the message you want them to receive. "
+    "It will be delivered as written.\n"
+    f"* To send nothing now, reply exactly {DECLINE_MARKER} — they won't hear from you this time.\n"
+    f"{DECLINE_MARKER} is only a way to send nothing — not a default, "
+    "and not an instruction to choose it.\n"
+    "Choose the outcome that matches whether you intend to communicate now."
 )
 
 #: The GENESIS tail — the same disclosure with the decline affordance REMOVED, carried
@@ -344,13 +367,16 @@ def build_wake_packet(
     (:data:`IMPULSE_LABEL_PREFIX`), so the being's own hooks self-exclude it
     (``startswith(IMPULSE_LABEL_PREFIX)``).
 
-    AFTER the close tag — OUTSIDE the felt block — comes the consequence-transparency
-    line (:data:`_DELIVERY_CONSEQUENCE`, lm-md6.3): a consequence-ONLY disclosure that
-    text written now is delivered to the user, plus the :data:`DECLINE_MARKER` reply
-    that sends nothing. It gives the being a NEUTRAL way to decline, so a turn it
-    decides NOT to send no longer leaks its private "I won't write" prose to the owner.
-    It sits OUTSIDE the felt block on purpose: it discloses substrate affordance, never
-    whether the longing is valid/enough, so it cannot re-trigger the [SILENT] regression.
+    AFTER the close tag — OUTSIDE the felt block — comes the delivery-DECISION tail
+    (:data:`_DELIVERY_CONSEQUENCE`, lm-md6.3, rewritten 2026-07-17): a SYMMETRIC two-option
+    framing (communicate → the message they receive; send nothing → the
+    :data:`DECLINE_MARKER`) that states the marker is "not a default, and not an
+    instruction to choose it". It gives the being a NEUTRAL way to decline, so a turn it
+    decides NOT to send no longer leaks its private "I won't write" prose to the owner, and
+    it defuses the failure where a small model read the old "Reply exactly [SILENT]" line as
+    an imperative and complied every wake. It sits OUTSIDE the felt block on purpose: its
+    decision criterion ("match the outcome to your intent") is neutral and mechanism-free,
+    so it cannot re-trigger the [SILENT] regression.
 
     *value*/*theta* do NOT shape the text (the self-state is fixed): they feed
     :func:`project_contact` solely to stamp ``projection_id`` — an audit reference
