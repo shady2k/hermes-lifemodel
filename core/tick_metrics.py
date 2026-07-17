@@ -173,8 +173,9 @@ UNIVERSAL_SPECS: tuple[MetricSpec, ...] = (
     MetricSpec(
         name=COMMITMENT_TOOL_TOTAL,
         kind="counter",
-        help="commitment tool calls by outcome (created/already_held/discharged/deferred/"
-        "not_found/already_deferred/already_terminal/invalid/error).",
+        help="commitment tool calls by action-folded outcome (e.g. create_created / "
+        "create_already_held / create_exists / discharge_honoured / discharge_not_found / "
+        "defer_deferred / defer_already_deferred / <action>_invalid / unavailable / error).",
         label_keys=("outcome",),
     ),
     MetricSpec(

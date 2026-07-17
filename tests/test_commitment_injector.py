@@ -60,6 +60,15 @@ def test_default_params():
     assert DEFAULT_COMMITMENT_INJECT_PARAMS.max_surfaced == 8
 
 
+def test_max_surfaced_must_be_at_least_one():
+    from lifemodel.hooks import CommitmentInjectParams
+
+    with pytest.raises(ValueError):
+        CommitmentInjectParams(max_surfaced=0)
+    with pytest.raises(ValueError):
+        CommitmentInjectParams(max_surfaced=-3)
+
+
 def test_surfaces_active_commitment_with_self_authored_framing_and_when(tmp_path: Path):
     lm = _lm(tmp_path)
     lm.state.commit(State())

@@ -1162,6 +1162,12 @@ class CommitmentInjectParams:
     #: overflow beyond it is a degraded, self-healed-by-discharge condition, §17-D1).
     max_surfaced: int = 8
 
+    def __post_init__(self) -> None:
+        # A disk-calibratable knob (NFR5): reject a value that would make the injector
+        # nonsensical (an empty block, or a negative that mangles the limit+1 probe).
+        if self.max_surfaced < 1:
+            raise ValueError(f"max_surfaced must be >= 1, got {self.max_surfaced}")
+
 
 DEFAULT_COMMITMENT_INJECT_PARAMS = CommitmentInjectParams()
 
@@ -1278,9 +1284,20 @@ def _commitment_tool_error(message: str) -> str:
     return json.dumps({"error": f"commitment: {message}"}, ensure_ascii=False)
 
 
-def _commitment_invalid(metrics: MetricRegistry | None, message: str) -> str:
+def _record_commitment_tool(metrics: MetricRegistry | None, outcome: str) -> None:
+    """Emit the tool's outcome counter with a BOUNDED, action-folded ``outcome`` (codex #8:
+    the metric label set is closed, so ``action`` cannot be its own key — it is folded in,
+    e.g. ``create_created`` / ``discharge_honoured`` / ``defer_already_deferred`` /
+    ``create_invalid`` / ``error``)."""
     if metrics is not None:
-        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="invalid")
+        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome=outcome)
+
+
+def _commitment_invalid(metrics: MetricRegistry | None, action: str, message: str) -> str:
+    """A gentle validation error — LOGGED (so a bad call is debuggable, codex #4) and counted
+    under ``<action>_invalid``, never a silent count."""
+    _LOG.info("commitment_tool %s result=invalid detail=%s", action, message)
+    _record_commitment_tool(metrics, f"{action}_invalid")
     return _commitment_tool_error(message)
 
 
@@ -1300,10 +1317,14 @@ def make_commitment_tool(
         action = args.get("action") if isinstance(args, dict) else None
         try:
             if not isinstance(args, dict):
-                return _commitment_invalid(metrics, "expected an arguments object")
+                return _commitment_invalid(metrics, "args", "expected an arguments object")
             lm = build_lm()
             memory = lm.state if isinstance(lm.state, MemoryPort) else None
-            if memory is None:
+            if memory is None:  # log + count, never a silent failure (codex #4)
+                _LOG.warning(
+                    "commitment_tool action=%s result=unavailable (no memory port)", action
+                )
+                _record_commitment_tool(metrics, "unavailable")
                 return _commitment_tool_error("memory is unavailable")
             if action == "create":
                 return _commitment_create(memory, args, metrics)
@@ -1311,7 +1332,7 @@ def make_commitment_tool(
                 return _commitment_discharge(memory, args, metrics)
             if action == "defer":
                 return _commitment_defer(memory, args, metrics)
-            return _commitment_invalid(metrics, f"unknown action {action!r}")
+            return _commitment_invalid(metrics, "unknown", f"unknown action {action!r}")
         except Exception as exc:  # Hermes tool contract: return {"error": …}, never raise
             _LOG.error(
                 "commitment_tool_failed action=%s error=%s",
@@ -1319,8 +1340,7 @@ def make_commitment_tool(
                 f"{type(exc).__name__}: {exc}",
                 exc_info=True,
             )
-            if metrics is not None:
-                metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="error")
+            _record_commitment_tool(metrics, "error")  # action may be arbitrary → bounded label
             return json.dumps(
                 {"error": "the commitment tool is unavailable right now"}, ensure_ascii=False
             )
@@ -1334,22 +1354,23 @@ def _commitment_create(
     try:
         commitment = commitment_from_live_fields(fields=args)
     except InvalidPayload as exc:
-        return _commitment_invalid(metrics, str(exc))
+        return _commitment_invalid(metrics, "create", str(exc))
     # create-if-absent: a present row (ANY state) is never overwritten or resurrected (codex
     # #5 — put would clobber a differing row and reset a terminal/deferred one to active).
     existing = memory.get(COMMITMENT_KIND, commitment.id)
     if existing is not None:
-        if metrics is not None:
-            metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="already_held")
+        # An HONEST status (codex #4): "already_held" only when it is genuinely live; a row
+        # you dropped/honoured/deferred earlier is NOT "held" — say it exists in that state
+        # and was not re-created, so the being is never told it holds something it closed.
+        held = existing.state == CommitmentState.ACTIVE.value
+        status = "already_held" if held else "exists"
+        _record_commitment_tool(metrics, f"create_{status}")
         _LOG.info(
-            "commitment_tool create id=%s result=already_held state=%s",
-            commitment.id,
-            existing.state,
+            "commitment_tool create id=%s result=%s state=%s", commitment.id, status, existing.state
         )
-        return _commitment_tool_result("already_held", id=commitment.id, state=existing.state)
+        return _commitment_tool_result(status, id=commitment.id, state=existing.state)
     memory.put(encode_commitment(commitment))
-    if metrics is not None:
-        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="created")
+    _record_commitment_tool(metrics, "create_created")
     _LOG.info(
         "commitment_tool create id=%s basis=%s result=created",  # id/basis only — never content
         commitment.id,
@@ -1364,9 +1385,11 @@ def _commitment_discharge(
     cid = args.get("id")
     outcome = args.get("outcome")
     if not isinstance(cid, str) or not cid:
-        return _commitment_invalid(metrics, "discharge requires a string id")
+        return _commitment_invalid(metrics, "discharge", "discharge requires a string id")
     if outcome not in (CommitmentState.HONOURED.value, CommitmentState.DROPPED.value):
-        return _commitment_invalid(metrics, 'discharge outcome must be "honoured" or "dropped"')
+        return _commitment_invalid(
+            metrics, "discharge", 'discharge outcome must be "honoured" or "dropped"'
+        )
     return _commitment_transition(
         memory, cid, to_state=outcome, action="discharge", metrics=metrics
     )
@@ -1377,7 +1400,7 @@ def _commitment_defer(
 ) -> str:
     cid = args.get("id")
     if not isinstance(cid, str) or not cid:
-        return _commitment_invalid(metrics, "defer requires a string id")
+        return _commitment_invalid(metrics, "defer", "defer requires a string id")
     return _commitment_transition(
         memory, cid, to_state=CommitmentState.DEFERRED.value, action="defer", metrics=metrics
     )
@@ -1397,13 +1420,13 @@ def _commitment_transition(
         elif current.state == CommitmentState.DEFERRED.value:
             result = "already_deferred"
         else:
+            # Not active and not deferred → one of the terminal states (the registry's closed
+            # state set has no other option), so "already_terminal" is exact for every real row.
             result = "already_terminal"
-        if metrics is not None:
-            metrics.inc(COMMITMENT_TOOL_TOTAL, outcome=result)
+        _record_commitment_tool(metrics, f"{action}_{result}")
         _LOG.info("commitment_tool %s id=%s result=%s", action, cid, result)
         return _commitment_tool_result(result, id=cid)
-    if metrics is not None:
-        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome=to_state)
+    _record_commitment_tool(metrics, f"{action}_{to_state}")
     _LOG.info("commitment_tool %s id=%s prior=active result=%s", action, cid, to_state)
     return _commitment_tool_result("ok", id=cid, state=to_state)
 

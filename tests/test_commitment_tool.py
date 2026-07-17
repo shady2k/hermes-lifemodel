@@ -69,7 +69,9 @@ def test_create_never_resurrects_a_dropped_row(tmp_path: Path):
     json.loads(tool({"action": "discharge", "id": cid, "outcome": "dropped"}))
     assert _lm(tmp_path).state.get(COMMITMENT_KIND, cid).state == "dropped"
     out = json.loads(tool(_CREATE))  # re-create same content
-    assert out["status"] == "already_held"
+    # HONEST status: a dropped row is NOT "held" — it exists in a closed state and is not
+    # re-created or resurrected (codex #4). "already_held" is reserved for a live row.
+    assert out["status"] == "exists" and out["state"] == "dropped"
     assert _lm(tmp_path).state.get(COMMITMENT_KIND, cid).state == "dropped"  # NOT resurrected
 
 
@@ -129,6 +131,33 @@ def test_unknown_action_and_non_dict_args_are_gentle(tmp_path: Path):
     tool = _tool(tmp_path)
     assert "error" in json.loads(tool({"action": "nope"}))
     assert "error" in json.loads(tool("not a dict"))
+
+
+def test_tool_metric_folds_action_into_outcome(tmp_path: Path):
+    from lifemodel.core.tick_metrics import COMMITMENT_TOOL_TOTAL
+
+    reg = MetricRegistry()
+    register_universal_metrics(reg)
+    lm = _lm(tmp_path)
+    lm.state.commit(State())
+    tool = make_commitment_tool(lambda: _lm(tmp_path), metrics=reg)
+
+    cid = json.loads(tool(_CREATE))["id"]
+    tool({"action": "discharge", "id": cid, "outcome": "honoured"})
+    tool(
+        {
+            "action": "create",
+            "content": "",
+            "basis": "self_assumed",
+            "trigger_kind": "condition",
+            "trigger_value": "x",
+        }
+    )
+
+    metric = reg.get(COMMITMENT_TOOL_TOTAL)
+    assert metric.value(outcome="create_created") == 1.0  # action folded into outcome
+    assert metric.value(outcome="discharge_honoured") == 1.0
+    assert metric.value(outcome="create_invalid") == 1.0
 
 
 def test_crystallize_instruction_carries_the_creation_boundary():
