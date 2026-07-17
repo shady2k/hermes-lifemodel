@@ -17,8 +17,10 @@ the thought commit) rather than a direct buffer clear — so each scenario first
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from lifemodel.core.belief_view import belief_id, build_belief, encode_belief
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import FinalizeBuffer, PutRecord, UpdateState
 from lifemodel.core.noticing import NOTICING_TOP_K, NoticingApply, NoticingReason
@@ -26,7 +28,7 @@ from lifemodel.core.noticing_buffer import NoticingBuffer
 from lifemodel.core.taxonomy import internal_result_signal
 from lifemodel.core.thought_view import build_thought, encode_thought, seed_thought_id
 from lifemodel.core.timeutil import to_iso
-from lifemodel.domain.objects import Sensitivity, ThoughtState
+from lifemodel.domain.objects import BeliefState, Sensitivity, ThoughtState
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
 from lifemodel.testing import FakeActiveSpan, FakeClock, FakeMemoryStore, FakeSpanLogger
@@ -894,3 +896,88 @@ def test_belief_creation_logs_redacted_metadata_not_content():
     assert "id" in beliefs[0]
     # the raw content string must never ride ANY span field (redaction)
     assert all(secret not in str(v) for v in logger.span.attrs.values())
+
+
+# ---- F1: no belief-row resurrection / provenance overwrite (mirrors the thought path) ----
+
+_BELIEF_CONTENT = "They get anxious before a loss of status."
+
+
+def _belief_seed_parsed(content: str = _BELIEF_CONTENT) -> dict:
+    return {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "anxious",
+                "content": content,
+                "source_message_ids": ["t1"],
+                "confidence": 0.75,
+            }
+        ]
+    }
+
+
+def _seed_existing_belief(memory: FakeMemoryStore, *, content: str, state: BeliefState) -> str:
+    """Seed the store with a belief at the SAME content-scoped id the apply would derive
+    (``belief_id("noticing", content)``), in *state* — the row the F1 guard must find."""
+    bid = belief_id("noticing", content)
+    belief = replace(
+        build_belief(id=bid, content=content, confidence=0.5, source_thought_ids=("noticing",)),
+        state=state.value,
+    )
+    memory.put(encode_belief(belief))
+    return bid
+
+
+def test_belief_seed_matching_a_terminal_belief_is_not_resurrected():
+    """A re-noticed belief whose content-scoped id already names a TERMINAL row
+    (``dropped``) emits NO PutRecord — no blind upsert that would resurrect the
+    terminal belief back to ``active`` (mirrors the thought path's F4 guard)."""
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=_belief_seed_parsed())
+
+    memory = FakeMemoryStore(clock=FakeClock(NOW))
+    _seed_existing_belief(memory, content=_BELIEF_CONTENT, state=BeliefState.DROPPED)
+
+    intents = list(NoticingApply(buffer, memory=memory).step(ctx))
+
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+
+
+def test_belief_seed_matching_an_active_belief_is_not_overwritten():
+    """A re-notice of identical content whose id already names an ACTIVE row emits
+    NO PutRecord — the existing belief's creation provenance/evidence/confidence is
+    never silently wholesale-overwritten by a blind put (F1, reachable in v1)."""
+    buffer = _seeded_buffer()
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=_belief_seed_parsed())
+
+    memory = FakeMemoryStore(clock=FakeClock(NOW))
+    _seed_existing_belief(memory, content=_BELIEF_CONTENT, state=BeliefState.ACTIVE)
+
+    intents = list(NoticingApply(buffer, memory=memory).step(ctx))
+
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+    # skipped-existing belief still behaves like a skipped-existing thought: the
+    # surveyed window finalizes and the source id is still consumed for dedup.
+    assert FinalizeBuffer(survey_id) in intents
+    updates = [i for i in intents if isinstance(i, UpdateState)]
+    assert len(updates) == 1
+    assert set(updates[0].changes["noticed_source_ids"]) == {"t1"}
+
+
+def test_genuinely_new_belief_is_still_created_when_memory_is_wired():
+    """A belief whose content-scoped id names NO existing row is created as before —
+    the guard only skips ids that already exist, never a genuinely new belief."""
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=_belief_seed_parsed())
+    memory = FakeMemoryStore(clock=FakeClock(NOW))  # empty store — nothing to collide with
+
+    intents = list(NoticingApply(buffer, memory=memory).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.kind == "belief"
+    assert puts[0].op.draft.id == belief_id("noticing", _BELIEF_CONTENT)

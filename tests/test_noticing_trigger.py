@@ -343,3 +343,16 @@ def test_instructions_frame_a_belief_in_the_beings_voice():
     from a one-off — rides the instructions (no keyword rules)."""
     assert "belief" in NOTICING_INSTRUCTIONS
     assert "confidence" in NOTICING_INSTRUCTIONS
+
+
+def test_instructions_mandate_private_for_dont_remember_and_third_party_secrets():
+    """FR26 (F3): the belief clause must instruct the being to mark as ``private``
+    both an explicit "don't remember" from the owner and any third party's secret —
+    so such a belief carries the PRIVATE tier that keeps it out of the injector,
+    rather than coming back only SENSITIVE and surfacing. A light content guard (we
+    cannot unit-test model compliance); still judgment-first, in the being's voice."""
+    lowered = NOTICING_INSTRUCTIONS.lower()
+    assert "asked you not to remember" in lowered
+    assert "third party" in lowered
+    # the guidance names the load-bearing tier explicitly
+    assert "'private'" in NOTICING_INSTRUCTIONS

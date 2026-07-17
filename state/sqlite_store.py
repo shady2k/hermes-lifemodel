@@ -811,6 +811,13 @@ class SQLiteRuntimeStore:
         first). A missing row (a being with no committed state yet) is a no-op — same
         fail-posture as :meth:`stamp_affect_display`: the injector only stamps after a tick
         has already created the row, and the next tick would create it anyway.
+
+        Best-effort in ONE direction (F5, accepted residual): this merge cannot be clobbered
+        by a concurrent tick, but the REVERSE is unguarded — a tick's whole-row
+        :meth:`commit_tick` rewrite of ``state_json`` that snapshotted ``surfaced_belief_ids``
+        before this merge landed will roll the stamp back, letting a just-surfaced belief
+        surface once more next turn. Benign and self-healing (the ring re-fills on the
+        re-surface), the SAME accepted posture as :meth:`stamp_affect_display`.
         """
 
         def _stamp(data: dict[str, Any]) -> None:

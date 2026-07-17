@@ -65,7 +65,7 @@ from ..domain.objects import InvalidPayload, Thought
 from ..ports.memory import MemoryPort
 from ..ports.tracer import format_traceparent
 from ..state.model import NOTICED_SOURCE_IDS_CAP
-from .belief_view import belief_from_seed_fields, encode_belief
+from .belief_view import BELIEF_KIND, belief_from_seed_fields, encode_belief, live_beliefs
 from .budget import (
     DEFAULT_DAILY_INTERNAL_CALL_CEILING,
     DEFAULT_MIN_INTERPROCESSING_INTERVAL,
@@ -172,7 +172,10 @@ NOTICING_INSTRUCTIONS = (
     "leave it 'thought'), write the understanding plainly in 'content', and say how sure you "
     "are in 'confidence' (0 to 1). Most exchanges yield no belief at all; do not inflate a "
     "one-off remark or a passing mood into one, and cite the exact turn_id(s) it rests on as "
-    "your evidence. If the understanding is delicate, mark 'sensitivity' 'private'. Also include "
+    "your evidence. If the understanding is delicate, mark 'sensitivity' 'private'. And some "
+    "things you must always mark 'private': if they asked you not to remember something, or it "
+    "is a third party's secret or private matter, set 'sensitivity' to 'private' — you will "
+    "keep it, but never surface it in a reply or act on it. Also include "
     "a short first-person 'reflection': what you made of this stretch and why you did or did not "
     "carry anything — this is your own record of the thought, always written even when "
     "'seeds' is empty."
@@ -730,6 +733,7 @@ class NoticingApply:
 
     def _seed_intents(self, ctx: TickContext, seeds: Sequence[NoticedSeed]) -> list[Intent]:
         live_ids = {t.id for t in live_thoughts(ctx.objects)}
+        live_belief_ids = {b.id for b in live_beliefs(ctx.objects)}
         seen_thought_ids: set[str] = set()
         seen_belief_ids: set[str] = set()
         belief_log: list[JsonObject] = []
@@ -737,7 +741,9 @@ class NoticingApply:
         for seed in seeds:
             if seed.kind == "belief":
                 # A belief seed routes to a Belief (its own kind/row), NOT a Thought.
-                intent = self._belief_intent(ctx, seed, seen_belief_ids, belief_log)
+                intent = self._belief_intent(
+                    ctx, seed, seen_belief_ids, live_belief_ids, belief_log
+                )
                 if intent is not None:
                     intents.append(intent)
                 continue
@@ -787,6 +793,7 @@ class NoticingApply:
         ctx: TickContext,
         seed: NoticedSeed,
         seen_belief_ids: set[str],
+        live_belief_ids: set[str],
         belief_log: list[JsonObject],
     ) -> Intent | None:
         """Build the :class:`~lifemodel.domain.objects.belief.Belief` PutRecord for a
@@ -801,7 +808,18 @@ class NoticingApply:
         that is caught and DROPPED, never crashing the off-lock completion frame.
         A within-batch id already scheduled this call is skipped (G3, mirrors the
         thought path): two seeds with identical content would otherwise emit two
-        puts for one row."""
+        puts for one row.
+
+        A belief whose id already names a row in ANY state is skipped too (F1,
+        mirrors the thought path's ``_row_already_exists`` guard EXACTLY): a
+        blind ``MemoryPort.put`` upsert would otherwise resurrect a terminal
+        (superseded/dropped/expired) belief back to ``active`` once the
+        forget/reconcile path lands (lm-705.20), and — reachable already in v1 —
+        wholesale-overwrite an active belief's evidence/confidence/creation
+        provenance on a re-notice of identical content. A skipped belief still
+        consumes its source ids into the dedup ring (its seed rides ``seeds`` in
+        ``step``'s ``new_source_ids`` regardless), identical to how a
+        skipped-existing thought behaves — the two paths never diverge."""
         provenance = creation_provenance(
             ctx.trace,
             created_by=self.id,
@@ -827,6 +845,13 @@ class NoticingApply:
             return None  # bad model data (e.g. non-encodable content) — drop, never crash
         if belief.id in seen_belief_ids:
             return None  # this call already scheduled a put for this belief id (G3)
+        if self._belief_row_already_exists(belief.id, live_belief_ids):
+            # A row for this content-scoped belief id already exists — in ANY state,
+            # not just live (F1). Never re-seed it: a terminal (superseded/dropped/
+            # expired) belief must never be resurrected back to active, and an active
+            # belief's immutable creation provenance/evidence/confidence must never be
+            # silently overwritten. Mirrors the thought path's guard above exactly.
+            return None
         seen_belief_ids.add(belief.id)
         belief_log.append(
             {
@@ -850,6 +875,22 @@ class NoticingApply:
             return True
         if self._memory is not None:
             return self._memory.get(THOUGHT_KIND, thought_id) is not None
+        return False
+
+    def _belief_row_already_exists(self, belief_id: str, live_belief_ids: set[str]) -> bool:
+        """True iff *belief_id* already names a belief row in ANY state (F1).
+
+        The belief-track sibling of :meth:`_row_already_exists`, built identically:
+        ``ctx.objects`` is the tick's LIVE-only snapshot (active — see
+        ``core/coreloop.py``), so *live_belief_ids* only shortcuts the common
+        live-match case without a store round-trip; when a real store is wired,
+        ``memory.get`` is the authority — it sees every state, live or terminal
+        (superseded/dropped/expired). ``None`` memory (a bare unit-test construction)
+        degrades to the live snapshot only, exactly like the thought path."""
+        if belief_id in live_belief_ids:
+            return True
+        if self._memory is not None:
+            return self._memory.get(BELIEF_KIND, belief_id) is not None
         return False
 
     def _log(
