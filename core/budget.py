@@ -33,9 +33,11 @@ def _day(now: datetime) -> str:
 #: the spike once a live emitter (lm-705.2) exists. Tune against live traces.
 DEFAULT_DAILY_INTERNAL_CALL_CEILING = 50
 
-#: Min wall-clock gap between two internal-cognition launches (spec §4.5) — paces
-#: rumination so a live backlog is chewed a little at a time, not all at once.
-DEFAULT_MIN_INTERPROCESSING_INTERVAL = timedelta(minutes=30)
+#: Min wall-clock gap between two internal-cognition launches (spec §4.5) — the being's
+#: inner clock: paces rumination so a live backlog is chewed a little at a time, not all
+#: at once. Shared by noticing + processing. Tuned live 2026-07-17 (owner): 30→15 min —
+#: 30 felt too slow for a living inner life; cost stays bounded by the daily FR20 ceiling.
+DEFAULT_MIN_INTERPROCESSING_INTERVAL = timedelta(minutes=15)
 
 
 def internal_budget_available(state: State, *, now: datetime, daily_ceiling: int) -> bool:
