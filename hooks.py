@@ -56,6 +56,7 @@ from .core.genesis import (
     should_launch,
 )
 from .core.metrics import MetricRegistry
+from .core.noticing_buffer import NoticingBuffer
 from .core.suppression import SuppressionReason, emit_suppression_span
 from .core.taxonomy import contact_observed_signal, proactive_outcome_signal, thought_seed_signal
 from .core.thought_view import seed_thought_id
@@ -365,6 +366,7 @@ def make_post_llm_observer(
     build_lm: Callable[[], LifeModel],
     *,
     appraiser: Appraiser | None = None,
+    buffer: NoticingBuffer | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., None]:
@@ -376,6 +378,13 @@ def make_post_llm_observer(
     is optional and defaults to ``None`` (a no-op) so every existing caller keeps its
     prior behaviour unchanged; the live wiring (``__init__.py``) passes a real one.
 
+    Also the noticing-buffer close seam (lm-705.5 Task 3/E3): on that SAME genuine
+    reactive exchange, an injected *buffer* (:class:`~lifemodel.core.noticing_buffer.
+    NoticingBuffer`) closes out its per-session pending slot keyed by ``turn_id`` — the
+    source pointer this slice uses (spec §8's own lean; the platform message id is
+    deferred). ``buffer`` is optional and defaults to ``None`` (a no-op) for the exact
+    same back-compat reason as ``appraiser``.
+
     The whole body is plugin-owned fail-loud (spec §4.3/MAJOR-4): a throw anywhere
     in it (even in ``build_lm``) is logged ERROR + traceback, recorded on
     *health* + *metrics*, and swallowed — the host's dispatch is never crashed by an
@@ -384,6 +393,8 @@ def make_post_llm_observer(
 
     def _observer(
         *,
+        session_id: str = "",
+        turn_id: str = "",
         user_message: str = "",
         assistant_response: str = "",
         conversation_history: Any = None,
@@ -398,6 +409,14 @@ def make_post_llm_observer(
                 # core component in its own EVENT frame (spec §4.1). This hook never
                 # writes the store itself; it only seeds a signal.
                 _maybe_capture_thought(lm, appraiser, user_message, assistant_response)
+                _maybe_complete_buffer_entry(
+                    lm,
+                    buffer,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                )
                 return
             memory = lm.state if isinstance(lm.state, MemoryPort) else None
             desire = read_live_contact_desire(memory) if memory is not None else None
@@ -447,6 +466,28 @@ def make_post_llm_observer(
     return _observer
 
 
+def _is_genuine_reactive_exchange(user_message: str, assistant_response: str) -> bool:
+    """True when a completed post_llm turn is a genuine owner↔being exchange.
+
+    The ONE band-pass both waking-mind post_llm seams gate on (spec §4.1, lm-705.5
+    E3): mirrors the sensor band-pass the inbound observer already applies
+    (``_is_own_impulse``/``_is_control_command``) — our own composed impulse and a
+    slash command are not dialogue, an empty ``user_message`` is not an exchange at
+    all, and a declined (``[SILENT]``/``NO_REPLY``, per ``_is_no_reply``)
+    ``assistant_response`` is not a genuine exchange either. Note ``_is_no_reply``
+    matches those explicit markers only — a merely EMPTY ``assistant_response`` is
+    not itself treated as a decline and still passes.
+
+    Callers are ALSO already inside the ``if not _is_pending_proactive_turn(...)``
+    branch (this predicate does not re-check that) — a pending-proactive read-back
+    never reaches here at all.
+    """
+    text = user_message.strip()
+    if not text or _is_own_impulse(text) or _is_control_command(text):
+        return False
+    return not _is_no_reply(assistant_response)
+
+
 def _maybe_capture_thought(
     lm: LifeModel,
     appraiser: Appraiser | None,
@@ -459,20 +500,13 @@ def _maybe_capture_thought(
     Runs INSIDE the caller's fail-loud ``try`` (so a throw here is logged + swallowed
     like any other observer failure, never crashes the host turn). ``appraiser is
     None`` is the documented no-op (no live wiring passed yet, or the caller chose to
-    opt out) — every other guard mirrors the sensor band-pass the inbound observer
-    already applies (``hooks.py``'s ``_is_own_impulse``/``_is_control_command``): our
-    own composed impulse and a slash command are not dialogue, an empty ``user_message``
-    is not an exchange to appraise, and a declined (``[SILENT]``/``NO_REPLY``, per
-    ``_is_no_reply``) ``assistant_response`` is not a genuine exchange either. Note
-    ``_is_no_reply`` matches those explicit markers only — a merely EMPTY
-    ``assistant_response`` is not itself treated as a decline and is still appraised.
+    opt out); :func:`_is_genuine_reactive_exchange` is the shared band-pass every
+    other guard here mirrors (own impulse / control command / declined response are
+    not a genuine exchange).
     """
     if appraiser is None:
         return
-    text = user_message.strip()
-    if not text or _is_own_impulse(text) or _is_control_command(text):
-        return
-    if _is_no_reply(assistant_response):
+    if not _is_genuine_reactive_exchange(user_message, assistant_response):
         return
     seed = appraiser.appraise(user_message=user_message, assistant_response=assistant_response)
     if seed is None:
@@ -493,6 +527,36 @@ def _maybe_capture_thought(
         ],
         trigger=FrameTrigger.EVENT,
     )
+
+
+def _maybe_complete_buffer_entry(
+    lm: LifeModel,
+    buffer: NoticingBuffer | None,
+    *,
+    session_id: str,
+    turn_id: str,
+    user_message: str,
+    assistant_response: str,
+) -> None:
+    """Close the :class:`~lifemodel.core.noticing_buffer.NoticingBuffer`'s pending
+    slot for a completed genuine reactive turn (lm-705.5 Task 3/E3).
+
+    Runs INSIDE the caller's fail-loud ``try`` (a buffer hiccup is logged + swallowed
+    like any other observer failure, never crashes the host turn). ``buffer is None``
+    is the documented no-op (back-compat: no live wiring passed, or the caller opted
+    out); an empty ``session_id``/``turn_id`` is also a no-op — there is nothing to
+    key the entry on. Otherwise reuses :func:`_is_genuine_reactive_exchange` — the
+    SAME band-pass :func:`_maybe_capture_thought` gates on, so the buffer and the
+    appraisal seam agree on what counts as a genuine exchange worth keeping.
+
+    ``turn_id`` (not the platform message id) is this slice's source pointer (spec
+    §8's own lean) — :meth:`NoticingBuffer.stamp_source` stays unwired for now.
+    """
+    if buffer is None or not session_id or not turn_id:
+        return
+    if not _is_genuine_reactive_exchange(user_message, assistant_response):
+        return
+    buffer.complete(session_id, turn_id, assistant_text=assistant_response, now=lm.clock.now())
 
 
 def _is_own_impulse(text: str) -> bool:
@@ -570,6 +634,7 @@ def make_felt_state_injector(
     build_lm: Callable[[], LifeModel],
     *,
     params: FeltDisplayParams = DEFAULT_FELT_DISPLAY_PARAMS,
+    buffer: NoticingBuffer | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
 ) -> Callable[..., dict[str, str] | None]:
@@ -595,6 +660,17 @@ def make_felt_state_injector(
     glues onto a COPY of the user message for this ONE API call (ephemeral: never
     persisted, never in rolling history, gone next turn). Neither live → ``None``.
 
+    **A third, silent thing rides alongside them** (lm-705.5 Task 3/E3): this is the
+    ambient per-turn ``pre_llm_call`` hook (the felt-state cue fires on EVERY turn, unlike
+    the genesis injector below, which stands down once born), so it doubles as the
+    noticing seam's OPEN side — an injected *buffer* has its per-session pending slot
+    opened/refreshed (:meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.open_pending`)
+    for this turn, closed later by ``make_post_llm_observer``'s ``_maybe_complete_buffer_entry``
+    on the matching ``post_llm_call``. This is a pure side effect on *buffer* — it never
+    contributes to the returned ``{"context": …}`` and never changes the mood/notice
+    behaviour above. ``buffer`` is optional and defaults to ``None`` (a no-op) so every
+    existing caller keeps its prior behaviour unchanged.
+
     The whole body is plugin-owned fail-soft (spec §8): a throw anywhere (even in
     ``build_lm``) is logged ERROR + traceback, recorded on *health* + *metrics*, and
     swallowed with a ``None`` return — the host's hot dispatch path is never crashed, and
@@ -609,6 +685,7 @@ def make_felt_state_injector(
 
     def _injector(
         *,
+        session_id: str = "",
         user_message: str = "",
         conversation_history: Any = None,
         **_ignored: Any,
@@ -617,6 +694,9 @@ def make_felt_state_injector(
             lm = build_lm()
             state = lm.state.load()
             now = lm.clock.now()
+            _maybe_open_pending_turn(
+                buffer, session_id=session_id, user_message=user_message, now=now
+            )
             turn = TurnSignals.from_hook(
                 user_message, conversation_history, window=params.task_window
             )
@@ -652,6 +732,28 @@ def make_felt_state_injector(
             return None
 
     return _injector
+
+
+def _maybe_open_pending_turn(
+    buffer: NoticingBuffer | None, *, session_id: str, user_message: str, now: datetime
+) -> None:
+    """Open (or refresh) the noticing buffer's per-session pending slot for this turn
+    (lm-705.5 Task 3/E3) — the OPEN side of the seam whose CLOSE side is
+    ``make_post_llm_observer``'s ``_maybe_complete_buffer_entry``.
+
+    Runs INSIDE the felt-state injector's own fail-soft ``try`` (a buffer hiccup is
+    logged + swallowed like any other body failure, never crashes the host turn).
+    ``buffer is None`` is the documented no-op (back-compat: no live wiring passed,
+    or the caller opted out); an empty ``session_id``/``user_message`` is also a
+    no-op — there is no turn to key the entry on. Deliberately UNGATED on the
+    own-impulse/control-command band-pass ``_maybe_complete_buffer_entry`` applies —
+    opening is cheap and harmless (:meth:`NoticingBuffer.open_pending` simply
+    replaces whatever was there), and the one guard that matters is on the CLOSE
+    side, which decides what actually becomes a captured entry.
+    """
+    if buffer is None or not session_id or not user_message.strip():
+        return
+    buffer.open_pending(session_id, user_text=user_message, now=now)
 
 
 def _stamp_rewrite_told(lm: LifeModel, *, at: str) -> None:

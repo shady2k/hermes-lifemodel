@@ -28,6 +28,7 @@ from .adapters.soul_file import SoulFile, seed_newborn_stance
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
 from .core.metrics import get_metric_registry
+from .core.noticing_buffer import NoticingBuffer
 from .core.tick_metrics import register_universal_metrics
 from .debug import render_dump_for_dir
 from .events import EventRing
@@ -455,6 +456,19 @@ def register(ctx: Any) -> None:
         str(sdir),
     )
 
+    # --- The noticing buffer (lm-705.5 Task 3/E3) — ONE process-owned instance ---
+    # A single NoticingBuffer, shared between the pre_llm OPEN seam
+    # (make_felt_state_injector, below) and the post_llm CLOSE seam
+    # (make_post_llm_observer, right below this) — it is NOT a field on the
+    # per-call LifeModel (every graph is rebuilt fresh per hook call, so a
+    # per-graph buffer would lose every in-flight turn; see core/noticing_buffer.py's
+    # module docstring). Built here, once, so both wirings close over the SAME
+    # instance. This slice's source pointer is turn_id (spec §8's own lean, NOT the
+    # platform message id) — so only the pre_llm open + post_llm complete seams are
+    # wired; the inbound observer's stamp_source path stays deliberately unwired for
+    # now (deferred — add only if a later slice needs a platform-message deep-link).
+    noticing_buffer = NoticingBuffer()
+
     # --- Verdict feedback wiring (Task 5, spec §5/§7) — REQUIRED --------------
     # Resolves the pending proactive desire from the FINAL LLM output
     # (NO_REPLY -> reject + growing backoff, real text -> fulfill) via the
@@ -489,6 +503,12 @@ def register(ctx: Any) -> None:
                 # wired yet, so no ``appraiser=`` is passed and the capture pipeline
                 # stays dormant (``_maybe_capture_thought`` no-ops on ``None``) until it
                 # lands.
+                #
+                # The noticing-buffer CLOSE seam (lm-705.5 Task 3/E3): the SAME
+                # ``noticing_buffer`` instance the pre_llm injector below opens against —
+                # on a genuine reactive turn this closes its per-session pending slot,
+                # keyed by ``turn_id``.
+                buffer=noticing_buffer,
                 health=health,
                 metrics=metrics,
             ),
@@ -524,7 +544,14 @@ def register(ctx: Any) -> None:
         ctx.register_hook(
             "pre_llm_call",
             make_felt_state_injector(
-                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
+                lambda: build_lifemodel(base_dir=sdir),
+                # The noticing-buffer OPEN seam (lm-705.5 Task 3/E3): this hook fires on
+                # EVERY turn (unlike genesis, which stands down once born), so it doubles
+                # as the ambient per-turn place to open/refresh the pending slot the
+                # post_llm observer above closes.
+                buffer=noticing_buffer,
+                health=health,
+                metrics=metrics,
             ),
         )
     with wire("check_in_tool", required=True, health=health, logger=_LOG):
