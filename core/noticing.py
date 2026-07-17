@@ -55,6 +55,7 @@ from enum import StrEnum
 
 from ..domain.memory import JsonObject, PutOp
 from ..domain.objects import Thought
+from ..ports.memory import MemoryPort
 from ..ports.tracer import format_traceparent
 from ..state.model import NOTICED_SOURCE_IDS_CAP
 from .budget import (
@@ -66,8 +67,14 @@ from .budget import (
 from .component import TickContext
 from .intents import Intent, LaunchInternalCognition, PutRecord, UpdateState
 from .noticing_buffer import BufferEntry, NoticingBuffer
-from .taxonomy import KIND_INTERNAL_RESULT, read_internal_result
-from .thought_view import build_thought, encode_thought, live_thoughts, seed_thought_id
+from .taxonomy import KIND_INTERNAL_RESULT, InternalResultRead, read_internal_result
+from .thought_view import (
+    THOUGHT_KIND,
+    build_thought,
+    encode_thought,
+    live_thoughts,
+    seed_thought_id,
+)
 from .timeutil import from_iso, to_iso
 from .trace import creation_provenance
 
@@ -84,6 +91,16 @@ BACKLOG_TOP_M = 5
 DEFAULT_NOTICING_IDLE = timedelta(minutes=30)
 DEFAULT_NOTICING_SIZE_CAP = 8
 
+#: Bound on how many validated seeds ONE noticing pass may carry into thoughts
+#: (codex F2a) — a single pass judges a bounded conversational segment; more
+#: than a handful of "genuinely worth carrying" seeds from one pass is itself a
+#: signal the model is padding rather than being selective (the instructions
+#: already ask for that, this is the structural backstop). Enforced BOTH in the
+#: JSON schema (``maxItems``, so a well-behaved model never over-generates) and
+#: in :func:`validate_noticed_seeds` (so a malformed/adversarial response can't
+#: exceed it either).
+NOTICING_TOP_K = 3
+
 #: The noticing pass's typed result contract (mirrors ``PROCESSING_JSON_SCHEMA``
 #: shape/spirit): a bounded list of candidate seeds, each grounded in the
 #: source ids the model was actually shown.
@@ -92,6 +109,7 @@ NOTICING_JSON_SCHEMA: dict[str, object] = {
     "properties": {
         "seeds": {
             "type": "array",
+            "maxItems": NOTICING_TOP_K,
             "items": {
                 "type": "object",
                 "properties": {
@@ -143,14 +161,32 @@ class NoticingReason(StrEnum):
     NOTHING_LINGERED = "nothing_lingered"
     # apply
     NOTICED = "noticed"
+    #: The aux call itself failed/timed out (empty ``raw``, no parsed seeds) — a
+    #: refund-of-attempt, mirroring ``ThoughtProcessingApply``'s
+    #: ``TRANSIENT_FAILURE`` (F1): the surveyed segment, consumed ring, and cursor
+    #: are all left untouched so a LATER pass gets a genuine chance to notice it.
+    TRANSIENT_FAILURE = "transient_failure"
 
 
-def build_noticing_prompt(segment: Sequence[BufferEntry], backlog: Sequence[Thought]) -> str:
+def build_noticing_prompt(
+    segment: Sequence[BufferEntry],
+    backlog: Sequence[Thought],
+    *,
+    size_cap: int = DEFAULT_NOTICING_SIZE_CAP,
+) -> str:
     """The bounded input_text handed to the noticing pass: the surveyed
     segment's turns (each tagged with its citable ``turn_id``) plus a short
-    continuity backlog of what is already being turned over."""
+    continuity backlog of what is already being turned over.
+
+    Bounded to at most the most-recent *size_cap* entries of *segment* (codex
+    F2b) — NEVER the whole closed-prefix ring, which can hold up to
+    :data:`~lifemodel.core.noticing_buffer.NoticingBuffer`'s ``max_entries``
+    (256) turns on an idle-triggered long-lived lane. The window is a plain
+    tail slice: the anchor the caller clears/validates against is always the
+    segment's true LAST entry, unaffected by this display-only trim."""
+    window = segment[-size_cap:] if size_cap > 0 and len(segment) > size_cap else segment
     lines = ["The conversation since the last noticing pass, oldest first:"]
-    for entry in segment:
+    for entry in window:
         lines.append(f"\n[turn_id={entry.turn_id}]")
         lines.append(f"They said: {entry.user_text}")
         lines.append(f"You said: {entry.assistant_text}")
@@ -215,7 +251,7 @@ class NoticingTrigger:
         backlog = live_thoughts(ctx.objects)[:BACKLOG_TOP_M]
         anchor_turn_id = segment[-1].turn_id
         intent = LaunchInternalCognition(
-            prompt=build_noticing_prompt(segment, backlog),
+            prompt=build_noticing_prompt(segment, backlog, size_cap=self._size_cap),
             correlation_id=f"{_CORRELATION_PREFIX}{session_id}@{anchor_turn_id}@{to_iso(ctx.now)}",
             origin_traceparent=format_traceparent(ctx.trace),
             subject_id=None,
@@ -274,7 +310,11 @@ class NoticedSeed:
 
 
 def validate_noticed_seeds(
-    parsed: JsonObject | None, *, segment_ids: frozenset[str], consumed: frozenset[str]
+    parsed: JsonObject | None,
+    *,
+    segment_ids: frozenset[str],
+    segment_turn_ids: frozenset[str],
+    consumed: frozenset[str],
 ) -> list[NoticedSeed]:
     """Validate the model's raw seeds against the segment it was actually shown.
 
@@ -285,7 +325,18 @@ def validate_noticed_seeds(
     * it cites no ``source_message_ids`` at all (ungrounded), OR
     * any cited id is NOT in *segment_ids* (a hallucinated/foreign id — the
       model must ground every seed in what it was actually shown), OR
-    * any cited id is already in *consumed* (already noticed — dedup).
+    * its ``turn_id`` is set but NOT in *segment_turn_ids* (codex F3b — no
+      "ghost" turn_id anchored outside what was surveyed), OR
+    * any cited id is already consumed — dedup, but WITHIN this one batch too
+      (codex F3a): a working consumed set starts at *consumed* and grows with
+      every seed accepted so far in THIS result, so two seeds citing the same
+      source id never both survive (a source is consumed at most once per
+      result, first-listed wins).
+
+    Also bounds the result to at most :data:`NOTICING_TOP_K` seeds (codex F2a)
+    — a well-formed model response is already capped by the JSON schema's
+    ``maxItems``, but this is the structural backstop for a malformed/
+    adversarial one.
     """
     if not isinstance(parsed, dict):
         return []
@@ -293,15 +344,28 @@ def validate_noticed_seeds(
     if not isinstance(raw_seeds, list):
         return []
     validated: list[NoticedSeed] = []
+    working_consumed: set[str] = set(consumed)
     for raw in raw_seeds:
-        seed = _validate_one_seed(raw, segment_ids=segment_ids, consumed=consumed)
+        if len(validated) >= NOTICING_TOP_K:
+            break  # top-K reached — the rest are dropped regardless (F2a)
+        seed = _validate_one_seed(
+            raw,
+            segment_ids=segment_ids,
+            segment_turn_ids=segment_turn_ids,
+            consumed=working_consumed,
+        )
         if seed is not None:
             validated.append(seed)
+            working_consumed.update(seed.source_message_ids)
     return validated
 
 
 def _validate_one_seed(
-    raw: object, *, segment_ids: frozenset[str], consumed: frozenset[str]
+    raw: object,
+    *,
+    segment_ids: frozenset[str],
+    segment_turn_ids: frozenset[str],
+    consumed: set[str],
 ) -> NoticedSeed | None:
     if not isinstance(raw, dict):
         return None
@@ -315,11 +379,14 @@ def _validate_one_seed(
     if not all(i in segment_ids for i in source_ids):
         return None  # a hallucinated/foreign id — drop (anti-hallucination)
     if any(i in consumed for i in source_ids):
-        return None  # already noticed — dedup
+        return None  # already noticed (durable ring OR earlier in this batch) — dedup
     raw_turn_id = raw.get("turn_id")
     turn_id = raw_turn_id if isinstance(raw_turn_id, str) else None
+    if turn_id is not None and turn_id not in segment_turn_ids:
+        return None  # a ghost turn_id never actually in the surveyed segment — drop (F3b)
     raw_salience = raw.get("salience", 0.0)
     salience = float(raw_salience) if isinstance(raw_salience, int | float) else 0.0
+    salience = max(0.0, min(1.0, salience))  # clamp to [0, 1] — the schema documents it, enforce it
     return NoticedSeed(
         gist=gist.strip(), source_message_ids=source_ids, turn_id=turn_id, salience=salience
     )
@@ -340,6 +407,20 @@ def _parse_noticing_correlation(correlation_id: str) -> tuple[str, str] | None:
     if not sep2 or not session_id or not anchor_turn_id:
         return None
     return session_id, anchor_turn_id
+
+
+def _is_transient_failure(result: InternalResultRead) -> bool:
+    """True when *result* is a transport/provider failure, not a genuine
+    judgment (F1, both reviewers): empty ``raw`` — the aux call itself never
+    produced text (timeout/provider error, ``adapters/internal_runner.py``) —
+    AND *parsed* does not already carry a valid ``{"seeds": [...]}`` shape.
+    Mirrors ``ThoughtProcessingApply``'s ``not raw.strip()`` transient-failure
+    guard (``core/thought_processing.py``): a real result, even one whose
+    ``seeds`` list is genuinely empty ("nothing lingered"), is NOT transient —
+    only the "the call never happened" case is."""
+    if result.raw.strip():
+        return False
+    return not (isinstance(result.parsed, dict) and isinstance(result.parsed.get("seeds"), list))
 
 
 def _append_consumed_ring(
@@ -368,12 +449,21 @@ class NoticingApply:
     segment is recovered via :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.segment_through`
     (keyed by the correlation-id-encoded anchor turn id) rather than a fresh
     ``closed_segment`` read.
+
+    *memory* (F4) is the store's :class:`~lifemodel.ports.memory.MemoryPort` —
+    used ONLY to check whether a seed's content-digest id already exists as a
+    row in ANY state (not just live), so a terminal (resolved/dropped/expired/
+    merged) thought is never resurrected and its immutable creation provenance
+    never overwritten. ``None`` (a bare unit-test construction with no store)
+    degrades to checking only the live-thoughts snapshot — the composition
+    root always wires the real store, so this only matters off-host.
     """
 
     id: str = NOTICING_APPLY_ID
 
-    def __init__(self, buffer: NoticingBuffer) -> None:
+    def __init__(self, buffer: NoticingBuffer, *, memory: MemoryPort | None = None) -> None:
         self._buffer = buffer
+        self._memory = memory
 
     def step(self, ctx: TickContext) -> Sequence[Intent]:
         if ctx.state.pending_internal_subject_id is not None:
@@ -392,6 +482,14 @@ class NoticingApply:
         )
         if result is None:
             return []
+        if _is_transient_failure(result):
+            # The aux call itself failed/timed out — refund the attempt exactly
+            # like ThoughtProcessingApply's TRANSIENT_FAILURE (F1): leave the
+            # surveyed segment, the consumed ring, and the cursor all untouched
+            # so a LATER pass gets a genuine chance to notice it, instead of the
+            # segment being lost forever to a transient provider hiccup.
+            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0)
+            return []
         parsed_correlation = _parse_noticing_correlation(correlation_id)
         if parsed_correlation is None:
             self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0)
@@ -405,8 +503,14 @@ class NoticingApply:
             {entry.turn_id for entry in segment}
             | {sid for entry in segment for sid in entry.source_ids}
         )
+        segment_turn_ids = frozenset(entry.turn_id for entry in segment)
         consumed = frozenset(ctx.state.noticed_source_ids)
-        seeds = validate_noticed_seeds(result.parsed, segment_ids=segment_ids, consumed=consumed)
+        seeds = validate_noticed_seeds(
+            result.parsed,
+            segment_ids=segment_ids,
+            segment_turn_ids=segment_turn_ids,
+            consumed=consumed,
+        )
 
         intents: list[Intent] = self._seed_intents(ctx, seeds)
         thought_ids = [seed_thought_id(seed.gist) for seed in seeds]
@@ -427,22 +531,24 @@ class NoticingApply:
         return intents
 
     def _seed_intents(self, ctx: TickContext, seeds: Sequence[NoticedSeed]) -> list[Intent]:
-        existing_by_id = {t.id: t for t in live_thoughts(ctx.objects)}
+        live_ids = {t.id for t in live_thoughts(ctx.objects)}
         intents: list[Intent] = []
         for seed in seeds:
             thought_id = seed_thought_id(seed.gist)
-            existing = existing_by_id.get(thought_id)
-            provenance = (
-                existing.provenance
-                if existing is not None
-                else creation_provenance(
-                    ctx.trace,
-                    created_by=self.id,
-                    component="cognition",
-                    reason="noticed",
-                    source_object_ids=seed.source_message_ids,
-                    turn_id=seed.turn_id,
-                )
+            if self._row_already_exists(thought_id, live_ids):
+                # A row for this content-digest id already exists — in ANY
+                # state, not just live (F4). Never re-seed it: a terminal
+                # (resolved/dropped/expired/merged) row must never be
+                # resurrected back to active, and its immutable creation
+                # provenance must never be silently overwritten.
+                continue
+            provenance = creation_provenance(
+                ctx.trace,
+                created_by=self.id,
+                component="cognition",
+                reason="noticed",
+                source_object_ids=seed.source_message_ids,
+                turn_id=seed.turn_id,
             )
             thought = build_thought(
                 id=thought_id,
@@ -454,6 +560,20 @@ class NoticingApply:
             )
             intents.append(PutRecord(op=PutOp(draft=encode_thought(thought))))
         return intents
+
+    def _row_already_exists(self, thought_id: str, live_ids: set[str]) -> bool:
+        """True iff *thought_id* already names a row in ANY state (F4).
+
+        ``ctx.objects`` is the tick's LIVE-only snapshot (active/parked — see
+        ``core/coreloop.py``'s snapshot docstring), so it alone can't see a
+        terminal row; *live_ids* only shortcuts the common live-match case
+        without a store round-trip. When a real store is wired, ``memory.get``
+        is the authority — it sees every state, live or terminal."""
+        if thought_id in live_ids:
+            return True
+        if self._memory is not None:
+            return self._memory.get(THOUGHT_KIND, thought_id) is not None
+        return False
 
     def _log(
         self,

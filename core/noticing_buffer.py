@@ -98,18 +98,27 @@ class NoticingBuffer:
         Defensive: a ``complete`` with no matching ``open_pending`` (e.g. a
         duplicate/late callback) does nothing rather than fabricate an entry
         with no real user turn behind it.
+
+        *now* is validated (via :func:`~lifemodel.core.timeutil.to_iso`) BEFORE
+        the pending slot is popped (review minor M3): a tz-naive *now* would
+        otherwise be rejected only AFTER the pop already ran, silently
+        destroying the pending turn on the way to raising. Validating first
+        means a bad clock call fails loud with the pending still intact for a
+        later, valid retry.
         """
         with self._lock:
-            pending = self._pending.pop(session_id, None)
+            pending = self._pending.get(session_id)
             if pending is None:
                 return
+            ts = to_iso(now)  # validate BEFORE mutating anything (M3)
+            del self._pending[session_id]
             entry = BufferEntry(
                 session_id=session_id,
                 turn_id=turn_id,
                 source_ids=tuple(pending.source_ids),
                 user_text=pending.user_text,
                 assistant_text=assistant_text,
-                ts=to_iso(now),
+                ts=ts,
             )
             ring = self._complete.get(session_id)
             if ring is None:

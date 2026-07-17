@@ -549,12 +549,21 @@ def _maybe_complete_buffer_entry(
     SAME band-pass :func:`_maybe_capture_thought` gates on, so the buffer and the
     appraisal seam agree on what counts as a genuine exchange worth keeping.
 
+    Also requires a non-EMPTY ``assistant_response`` (review minor M2):
+    ``_is_genuine_reactive_exchange`` deliberately does NOT itself treat a bare
+    empty response as a decline (only the explicit ``[SILENT]``/``NO_REPLY``
+    markers count, per :func:`_is_no_reply`'s own docstring), so without this
+    extra guard a genuinely empty final response would still land as a
+    ``BufferEntry`` with nothing for a later noticing pass to read.
+
     ``turn_id`` (not the platform message id) is this slice's source pointer (spec
     §8's own lean) — :meth:`NoticingBuffer.stamp_source` stays unwired for now.
     """
     if buffer is None or not session_id or not turn_id:
         return
     if not _is_genuine_reactive_exchange(user_message, assistant_response):
+        return
+    if not assistant_response.strip():
         return
     buffer.complete(session_id, turn_id, assistant_text=assistant_response, now=lm.clock.now())
 
@@ -745,13 +754,25 @@ def _maybe_open_pending_turn(
     logged + swallowed like any other body failure, never crashes the host turn).
     ``buffer is None`` is the documented no-op (back-compat: no live wiring passed,
     or the caller opted out); an empty ``session_id``/``user_message`` is also a
-    no-op — there is no turn to key the entry on. Deliberately UNGATED on the
-    own-impulse/control-command band-pass ``_maybe_complete_buffer_entry`` applies —
-    opening is cheap and harmless (:meth:`NoticingBuffer.open_pending` simply
-    replaces whatever was there), and the one guard that matters is on the CLOSE
-    side, which decides what actually becomes a captured entry.
+    no-op — there is no turn to key the entry on.
+
+    Gated on the USER-message half of :func:`_is_genuine_reactive_exchange`'s
+    band-pass — our own composed impulse and a slash control command (review
+    minor M1): opening was previously UNGATED on the theory that it is "cheap
+    and harmless" because the CLOSE side (``_maybe_complete_buffer_entry``)
+    already filters those out — but that reasoning misses that
+    :meth:`NoticingBuffer.closed_segment` gates the WHOLE lane shut while ANY
+    pending is open (the closed-prefix rule), so an impulse/control-command
+    turn that opens here and is then never completed there would silently
+    block a previously-closed segment from being surveyed until the pending
+    ages out at ``pending_ttl`` (30 minutes). The DECLINED-response half of the
+    band-pass (``_is_no_reply`` on the assistant's reply) can't be checked here
+    — the assistant hasn't answered yet at ``pre_llm_call`` time — so that half
+    stays a post_llm-only concern, same as before.
     """
     if buffer is None or not session_id or not user_message.strip():
+        return
+    if _is_own_impulse(user_message) or _is_control_command(user_message):
         return
     buffer.open_pending(session_id, user_text=user_message, now=now)
 

@@ -438,7 +438,13 @@ class State:
             # JSON-shaped list on real disk (json.dumps/loads round-trips a tuple to
             # a list), but the in-memory to_dict()/from_dict() round trip (asdict()
             # preserves tuple as tuple) hands back a tuple, so both are accepted.
-            noticed_source_ids=_as_str_tuple(data, "noticed_source_ids", ()),
+            # Clamped to NOTICED_SOURCE_IDS_CAP on load (review minor M4, defense in
+            # depth): the cap is enforced where the ring is APPENDED
+            # (core/noticing.py's _append_consumed_ring), not here — but an oversized
+            # ring from an older/hand-edited file must not silently persist unbounded.
+            noticed_source_ids=_clamp_ring(
+                _as_str_tuple(data, "noticed_source_ids", ()), cap=NOTICED_SOURCE_IDS_CAP
+            ),
             # The noticing sibling of last_internal_call_at — opaque opt-str,
             # mirrored exactly (never parsed as an aware instant here).
             last_noticing_at=_as_opt_str(data.get("last_noticing_at"), "last_noticing_at"),
@@ -504,6 +510,17 @@ def _as_str_tuple(data: Mapping[str, Any], key: str, default: tuple[str, ...]) -
     if not isinstance(value, list | tuple) or not all(isinstance(x, str) for x in value):
         raise StateCorruptError(f"'{key}' must be a list[str]")
     return tuple(value)
+
+
+def _clamp_ring(ids: tuple[str, ...], *, cap: int) -> tuple[str, ...]:
+    """Keep only the most-recent *cap* entries of a bounded id ring (M4).
+
+    Mirrors ``core/noticing.py``'s ``_append_consumed_ring`` truncation
+    (``combined[-cap:]``) — the MOST RECENT entries survive, oldest first
+    dropped — so a load-time clamp of an oversized/hand-edited ring agrees with
+    the ring's own runtime bound instead of silently keeping the wrong end.
+    """
+    return ids[-cap:] if len(ids) > cap else ids
 
 
 def _as_str_str_dict(data: Mapping[str, Any], key: str, default: dict[str, str]) -> dict[str, str]:

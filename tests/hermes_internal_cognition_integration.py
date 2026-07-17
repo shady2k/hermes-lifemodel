@@ -111,6 +111,7 @@ async def main_async() -> dict[str, Any]:
     from lifemodel.domain.egress import ReachOutcome
     from lifemodel.domain.memory import MemoryDraft, PutOp
     from lifemodel.domain.objects import ThoughtState
+    from lifemodel.hooks import make_felt_state_injector, make_post_llm_observer
     from lifemodel.state.model import State
 
     result: dict[str, Any] = {}
@@ -586,6 +587,72 @@ async def main_async() -> dict[str, Any]:
     result["bn_pending_cleared"] = build_lm_bn().state.load().pending_internal_id is None
     _log(f"[BN] {result}")
 
+    # ---- Part BNS: opus-I2 -- the REAL pre_llm_call/post_llm_call host contract ----
+    # Part B-noticing above seeds the buffer directly through its own API and only
+    # drives the COMPLETION half of the seam against the real host; the live
+    # pre_llm/post_llm HOOK seam -- the code that rides every real turn -- was only
+    # ever unit-tested with hand-passed literal kwargs (tests/test_noticing_seam.py).
+    # This part drives that other half through the REAL PluginContext.register_hook +
+    # PluginManager.invoke_hook dispatch (never calling our hook closures directly),
+    # with the SAME kwarg names the real host actually passes: agent/turn_context.py's
+    # pre_llm_call call site passes session_id/task_id/turn_id/user_message/
+    # conversation_history/is_first_turn/model/platform/sender_id, and
+    # agent/turn_finalizer.py's post_llm_call call site passes session_id/task_id/
+    # turn_id/user_message/assistant_response/conversation_history/model/platform.
+    # `_maybe_complete_buffer_entry` degrades to a SILENT no-op on an empty
+    # turn_id/session_id (hooks.py) -- so a host-contract drift (a renamed or
+    # missing kwarg) would make noticing silently never capture a single live turn
+    # while every hand-literal-kwarg unit test kept passing. This proves the real
+    # dispatch mechanism hands both hooks a non-empty, CONSISTENT session_id/turn_id
+    # and that the buffer actually closes a segment from it.
+    bns_dir = home / "seam-bn-seam"
+    bns_dir.mkdir(parents=True, exist_ok=True)
+    _commit_born(bns_dir, internal_calls_today=0, internal_calls_day="")
+    build_lm_bns = _build_lm_factory(bns_dir)
+
+    bns_buffer = NoticingBuffer()
+    bns_manager = PluginManager()
+    bns_ctx = PluginContext(PluginManifest(name="lifemodel"), bns_manager)
+    bns_ctx.register_hook("pre_llm_call", make_felt_state_injector(build_lm_bns, buffer=bns_buffer))
+    bns_ctx.register_hook("post_llm_call", make_post_llm_observer(build_lm_bns, buffer=bns_buffer))
+
+    bns_session_id = "bns-session"
+    bns_turn_id = "bns-turn-1"
+    # Mirrors agent/turn_context.py's real pre_llm_call invoke_hook call site.
+    bns_manager.invoke_hook(
+        "pre_llm_call",
+        session_id=bns_session_id,
+        task_id="bns-task",
+        turn_id=bns_turn_id,
+        user_message="driving the real host contract",
+        conversation_history=[],
+        is_first_turn=True,
+        model="fake-model",
+        platform="test",
+        sender_id="owner",
+    )
+    # Mirrors agent/turn_finalizer.py's real post_llm_call invoke_hook call site.
+    bns_manager.invoke_hook(
+        "post_llm_call",
+        session_id=bns_session_id,
+        task_id="bns-task",
+        turn_id=bns_turn_id,
+        user_message="driving the real host contract",
+        assistant_response="a genuine reply, not a decline",
+        conversation_history=[],
+        model="fake-model",
+        platform="test",
+    )
+    bns_segment = bns_buffer.closed_segment(bns_session_id, now=datetime.now(UTC))
+    result["bns_closed_segment_has_one_entry"] = len(bns_segment) == 1
+    result["bns_captured_session_id_nonempty"] = (
+        bool(bns_segment) and bns_segment[0].session_id == bns_session_id
+    )
+    result["bns_captured_turn_id_nonempty"] = (
+        bool(bns_segment) and bns_segment[0].turn_id == bns_turn_id
+    )
+    _log(f"[BNS] {result['bns_closed_segment_has_one_entry']=} {bns_segment=}")
+
     return result
 
 
@@ -625,6 +692,9 @@ _REQUIRED_TRUE_KEYS = (
     "bn_thought_has_source",
     "bn_egress_never_called",
     "bn_pending_cleared",
+    "bns_closed_segment_has_one_entry",
+    "bns_captured_session_id_nonempty",
+    "bns_captured_turn_id_nonempty",
 )
 
 

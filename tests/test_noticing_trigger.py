@@ -190,6 +190,32 @@ def test_span_logs_skipped_in_flight():
     assert logger.span.attrs["noticing_reason"] == NoticingReason.SKIPPED_IN_FLIGHT.value
 
 
+def test_prompt_is_bounded_to_size_cap_turns_not_the_whole_ring():
+    """F2b: an idle-triggered lane can carry up to the buffer's ``max_entries``
+    (256) closed turns, but the prompt handed to the aux call must only ever
+    show the most recent ``size_cap`` of them — never dump the whole ring."""
+    buffer = NoticingBuffer()
+    old_ts = NOW - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
+    for i in range(50):
+        _complete_turn(
+            buffer, "s1", f"t{i}", ts=old_ts - timedelta(seconds=50 - i), user_text=f"msg {i}"
+        )
+
+    ctx = make_tick_context(state=State(), now=NOW, trace=_TRACE)
+    intents = list(NoticingTrigger(buffer).step(ctx))
+
+    launches = [i for i in intents if isinstance(i, LaunchInternalCognition)]
+    assert len(launches) == 1
+    prompt = launches[0].prompt
+    assert prompt.count("[turn_id=") == DEFAULT_NOTICING_SIZE_CAP
+    # the anchor is unaffected by the display-only window trim — still the
+    # segment's TRUE last (most recent) entry.
+    assert launches[0].correlation_id.startswith("notice-s1@t49@")
+    # only the most-recent size_cap turns are shown, oldest of those is t42.
+    assert "msg 42" in prompt
+    assert "msg 41" not in prompt
+
+
 def test_backlog_thought_gists_are_folded_into_the_prompt():
     from lifemodel.core.thought_view import build_thought, encode_thought
     from lifemodel.testing.harness import draft_to_record

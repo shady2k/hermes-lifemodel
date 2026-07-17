@@ -419,7 +419,7 @@ def build_lifemodel(
             resolved_registry.manifest(NOTICING_APPLY_ID)
         except UnknownComponent:
             resolved_registry.register(
-                NoticingApply(noticing_buffer),
+                NoticingApply(noticing_buffer, memory=resolved_memory),
                 ComponentManifest(
                     id=NOTICING_APPLY_ID,
                     type="noticing-apply",

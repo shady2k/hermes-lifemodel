@@ -462,6 +462,20 @@ def test_noticed_source_ids_rejects_non_list_and_non_str_items() -> None:
         State.from_dict({"noticed_source_ids": [1, 2]})
 
 
+def test_noticed_source_ids_clamped_to_cap_on_load() -> None:
+    # M4 (defense in depth): the cap is enforced where the ring is APPENDED
+    # (core/noticing.py), not here -- but an oversized ring from an older/
+    # hand-edited file must not silently persist unbounded. The MOST RECENT
+    # entries survive (mirrors the append-time truncation), oldest dropped.
+    from lifemodel.state.model import NOTICED_SOURCE_IDS_CAP
+
+    oversized = [f"m{i}" for i in range(NOTICED_SOURCE_IDS_CAP + 10)]
+    loaded = State.from_dict({"noticed_source_ids": oversized})
+    assert len(loaded.noticed_source_ids) == NOTICED_SOURCE_IDS_CAP
+    assert loaded.noticed_source_ids[0] == "m10"
+    assert loaded.noticed_source_ids[-1] == f"m{NOTICED_SOURCE_IDS_CAP + 9}"
+
+
 def test_last_noticing_at_defaults_none_and_roundtrips() -> None:
     # Mirrors last_internal_call_at exactly (lm-705.2's additive pattern).
     assert State().last_noticing_at is None

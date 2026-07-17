@@ -13,13 +13,15 @@ from datetime import UTC, datetime, timedelta
 
 from lifemodel.core.component import TickContext
 from lifemodel.core.intents import PutRecord, UpdateState
-from lifemodel.core.noticing import NoticingApply, NoticingReason
+from lifemodel.core.noticing import NOTICING_TOP_K, NoticingApply, NoticingReason
 from lifemodel.core.noticing_buffer import NoticingBuffer
 from lifemodel.core.taxonomy import internal_result_signal
+from lifemodel.core.thought_view import build_thought, encode_thought, seed_thought_id
 from lifemodel.core.timeutil import to_iso
+from lifemodel.domain.objects import ThoughtState
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
-from lifemodel.testing import FakeActiveSpan, FakeSpanLogger
+from lifemodel.testing import FakeActiveSpan, FakeClock, FakeMemoryStore, FakeSpanLogger
 from lifemodel.testing.tick import make_tick_context
 
 NOW = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
@@ -38,6 +40,19 @@ def _seeded_buffer() -> NoticingBuffer:
     buffer.complete("s1", "t1", assistant_text="reply1", now=old + timedelta(seconds=1))
     buffer.open_pending("s1", user_text="second", now=old + timedelta(seconds=2))
     buffer.complete("s1", "t2", assistant_text="reply2", now=old + timedelta(seconds=3))
+    return buffer
+
+
+def _buffer_with_n_turns(n: int) -> NoticingBuffer:
+    """A buffer with *n* closed turns on lane ``s1``, ``t0``..``t{n-1}``, each
+    its own citable turn_id — for tests that need more source ids than
+    :func:`_seeded_buffer`'s two."""
+    buffer = NoticingBuffer()
+    old = NOW - timedelta(hours=1)
+    for i in range(n):
+        ts = old + timedelta(seconds=2 * i)
+        buffer.open_pending("s1", user_text=f"msg{i}", now=ts)
+        buffer.complete("s1", f"t{i}", assistant_text=f"reply{i}", now=ts + timedelta(seconds=1))
     return buffer
 
 
@@ -233,3 +248,160 @@ def test_noticed_span_fields():
     assert logger.span.attrs["noticing_reason"] == NoticingReason.NOTICED.value
     assert logger.span.attrs["noticed_count"] == 1
     assert logger.span.attrs["source_ids"] == ["t1"]
+
+
+# ---- F1: a transient (transport/provider) failure must NOT clear the segment ----
+
+
+def test_transient_failure_leaves_segment_ring_and_cursor_untouched():
+    """``raw=""``/``parsed=None`` is the runner's shape for a failed/timed-out
+    aux call (``adapters/internal_runner.py``) — it must be refunded exactly
+    like ``ThoughtProcessingApply``'s transient-failure guard: no PutRecord, no
+    consumed-ring update, and the surveyed segment stays in the buffer for a
+    later pass to re-survey."""
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=None, raw="")
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert intents == []
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
+    assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
+
+
+def test_genuine_empty_seeds_result_still_clears_the_cursor():
+    """A REAL result (non-empty ``raw``, a parsed ``{"seeds": [...]}`` shape)
+    whose ``seeds`` list is genuinely empty is "the model looked and found
+    nothing" — NOT transient — so the cursor still advances."""
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    ctx = _ctx(
+        correlation_id=correlation,
+        subject_id=None,
+        parsed={"seeds": []},
+        raw='{"seeds": []}',
+    )
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert intents == []
+    assert buffer.closed_segment("s1", now=NOW) == []
+
+
+# ---- F2a: at most NOTICING_TOP_K validated seeds survive one pass ----
+
+
+def test_more_than_top_k_valid_seeds_are_capped():
+    buffer = _buffer_with_n_turns(10)
+    correlation = f"notice-s1@t9@{to_iso(NOW)}"
+    parsed = {"seeds": [{"gist": f"seed {i}", "source_message_ids": [f"t{i}"]} for i in range(10)]}
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == NOTICING_TOP_K == 3
+
+
+# ---- F3: within-batch dedup + turn_id must be in the surveyed segment ----
+
+
+def test_two_seeds_citing_the_same_source_id_only_the_first_is_accepted():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {
+        "seeds": [
+            {"gist": "first claim", "source_message_ids": ["t1"]},
+            {"gist": "second claim, same source", "source_message_ids": ["t1"]},
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.payload["content"] == "first claim"
+
+
+def test_seed_with_turn_id_outside_the_segment_is_dropped():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {
+        "seeds": [
+            {
+                "gist": "ghost anchor",
+                "source_message_ids": ["t1"],
+                "turn_id": "t-never-in-segment",
+            }
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+
+
+def test_seed_with_turn_id_inside_the_segment_is_kept():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {"seeds": [{"gist": "grounded anchor", "source_message_ids": ["t1"], "turn_id": "t1"}]}
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+
+
+# ---- F4: no terminal-thought resurrection / provenance overwrite ----
+
+
+def test_seed_matching_an_existing_terminal_thought_is_not_resurrected():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    content = "already handled, long since resolved"
+    parsed = {"seeds": [{"gist": content, "source_message_ids": ["t1"]}]}
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    memory = FakeMemoryStore(clock=FakeClock(NOW))
+    terminal = build_thought(
+        id=seed_thought_id(content), content=content, state=ThoughtState.RESOLVED
+    )
+    memory.put(encode_thought(terminal))
+
+    intents = list(NoticingApply(buffer, memory=memory).step(ctx))
+
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+
+
+def test_seed_with_genuinely_new_content_is_still_seeded_when_memory_is_wired():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {"seeds": [{"gist": "brand new content", "source_message_ids": ["t1"]}]}
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+    memory = FakeMemoryStore(clock=FakeClock(NOW))
+
+    intents = list(NoticingApply(buffer, memory=memory).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.payload["content"] == "brand new content"
+
+
+# ---- salience clamp ----
+
+
+def test_salience_is_clamped_to_the_unit_range():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {"seeds": [{"gist": "over the top", "source_message_ids": ["t1"], "salience": 5.0}]}
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.salience == 1.0

@@ -130,6 +130,59 @@ def test_control_command_and_own_impulse_are_not_captured(tmp_path: Path) -> Non
     assert buffer.closed_segment("s1", now=_NOW) == []
 
 
+def test_control_command_turn_does_not_block_an_already_closed_segment(tmp_path: Path) -> None:
+    # M1: a genuine turn closes the lane normally...
+    lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    buffer = NoticingBuffer()
+    injector = make_felt_state_injector(lambda: lm, buffer=buffer)
+    observer = make_post_llm_observer(lambda: lm, buffer=buffer)
+
+    injector(session_id="s1", user_message="hello there", conversation_history=[])
+    observer(session_id="s1", turn_id="t1", user_message="hello there", assistant_response="hi!")
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+    # ...then a control command arrives on the SAME lane. Its post_llm never
+    # completes it (control commands are filtered at the CLOSE side already),
+    # so if the OPEN side is left ungated, this control-command turn re-opens
+    # (and re-blocks) the lane until pending_ttl — the already-closed t1
+    # segment would wrongly read as [] until then.
+    injector(session_id="s1", user_message="/lifemodel force-wake", conversation_history=[])
+
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+
+def test_own_impulse_turn_does_not_block_an_already_closed_segment(tmp_path: Path) -> None:
+    lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    buffer = NoticingBuffer()
+    injector = make_felt_state_injector(lambda: lm, buffer=buffer)
+    observer = make_post_llm_observer(lambda: lm, buffer=buffer)
+
+    injector(session_id="s1", user_message="hello there", conversation_history=[])
+    observer(session_id="s1", turn_id="t1", user_message="hello there", assistant_response="hi!")
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+    injector(
+        session_id="s1", user_message=f"{IMPULSE_LABEL_PREFIX} musing", conversation_history=[]
+    )
+
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+
+def test_empty_final_response_does_not_complete_the_buffer_entry(tmp_path: Path) -> None:
+    # M2: an empty assistant_response has nothing for a later noticing pass to
+    # read; _is_genuine_reactive_exchange alone does not reject it (only the
+    # explicit [SILENT]/NO_REPLY markers count), so this needs its own guard.
+    lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    buffer = NoticingBuffer()
+    injector = make_felt_state_injector(lambda: lm, buffer=buffer)
+    observer = make_post_llm_observer(lambda: lm, buffer=buffer)
+
+    injector(session_id="s1", user_message="hello there", conversation_history=[])
+    observer(session_id="s1", turn_id="t1", user_message="hello there", assistant_response="")
+
+    assert buffer.closed_segment("s1", now=_NOW) == []
+
+
 def test_buffer_none_is_a_noop_back_compat(tmp_path: Path) -> None:  # existing wiring unaffected
     lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
     injector = make_felt_state_injector(lambda: lm)  # buffer omitted

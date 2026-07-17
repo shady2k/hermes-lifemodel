@@ -12,6 +12,8 @@ from __future__ import annotations
 import threading
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from lifemodel.core.noticing_buffer import BufferEntry, NoticingBuffer
 
 T0 = datetime(2026, 7, 17, 12, 0, 0, tzinfo=UTC)
@@ -93,6 +95,27 @@ def test_stale_pending_ages_to_abandoned_and_lane_reopens() -> None:
     buf.complete("s1", "t3", assistant_text="ok", now=past_ttl + timedelta(seconds=2))
     segment2 = buf.closed_segment("s1", now=past_ttl + timedelta(seconds=3))
     assert [e.turn_id for e in segment2] == ["t1", "t3"]
+
+
+def test_complete_with_a_naive_now_raises_without_dropping_the_pending() -> None:
+    # M3: ts must be validated (to_iso rejects a naive datetime) BEFORE the
+    # pending slot is popped, so a bad clock call fails loud with the pending
+    # still intact — never silently destroyed on the way to raising.
+    buf = NoticingBuffer()
+    buf.open_pending("s1", user_text="hi", now=T0)
+    naive_now = datetime(2026, 7, 17, 12, 0, 1)  # no tzinfo
+
+    with pytest.raises(ValueError):
+        buf.complete("s1", "t1", assistant_text="hello", now=naive_now)
+
+    # still pending (closed-prefix rule keeps the lane shut) -- never dropped.
+    assert buf.closed_segment("s1", now=T0 + timedelta(seconds=2)) == []
+
+    # a later, valid complete lands normally on the SAME (never-destroyed) pending.
+    buf.complete("s1", "t1", assistant_text="hello", now=T0 + timedelta(seconds=3))
+    segment = buf.closed_segment("s1", now=T0 + timedelta(seconds=4))
+    assert [e.turn_id for e in segment] == ["t1"]
+    assert segment[0].user_text == "hi"
 
 
 def test_complete_with_no_open_pending_is_a_defensive_noop() -> None:
