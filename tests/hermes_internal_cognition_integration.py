@@ -82,7 +82,7 @@ def _fake_openai_response(text: str, *, model: str = "fake-model") -> Any:
 
 async def main_async() -> dict[str, Any]:
     import asyncio
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
 
     from agent.plugin_llm import _TrustPolicy, make_plugin_llm_for_test
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -113,6 +113,7 @@ async def main_async() -> dict[str, Any]:
     from lifemodel.domain.objects import ThoughtState
     from lifemodel.hooks import make_felt_state_injector, make_post_llm_observer
     from lifemodel.state.model import State
+    from lifemodel.state.sqlite_store import SqliteBufferStore
 
     result: dict[str, Any] = {}
 
@@ -534,7 +535,17 @@ async def main_async() -> dict[str, Any]:
     # the trigger heartbeat is bypassed here, we CLAIM the surveyed prefix ourselves
     # (lm-705.13) -- exactly what the trigger does at launch -- so the apply's
     # ``claimed(survey_id)`` recovers it; the correlation encodes that survey_id.
-    bn_buffer = NoticingBuffer()
+    #
+    # DURABLE, not the in-memory default (lm-705.14/lm-705.13 Task 6): backed by a
+    # SqliteBufferStore over the SAME ``bn_dir`` ``build_lm_bn`` commits its
+    # runtime state to (D7 -- one physical ``lifemodel.sqlite``), so the apply's
+    # FinalizeBuffer DELETE -- issued through the REAL completion frame's
+    # ``commit_tick`` against that file -- actually lands on the rows this buffer
+    # claimed, rather than a no-op against a private in-process dict. That is the
+    # whole point of driving this against real Hermes: an in-memory buffer would
+    # make the finalize assertions below vacuously true no matter what the real
+    # committer did.
+    bn_buffer = NoticingBuffer(store=SqliteBufferStore(bn_dir, clock=SystemClock()))
     bn_now = datetime(2026, 1, 1, 10, 5, tzinfo=UTC)
     bn_buffer.open_pending("bn-session", user_text="I have a big interview Friday", now=bn_now)
     bn_buffer.complete("bn-session", "bn-turn-1", assistant_text="Good luck!", now=bn_now)
@@ -590,7 +601,38 @@ async def main_async() -> dict[str, Any]:
     )
     result["bn_egress_never_called"] = egress_bn.calls == []  # non-delivery is structural
     result["bn_pending_cleared"] = build_lm_bn().state.load().pending_internal_id is None
+    # The durable finalize proof (lm-705.13 codex I3): the claimed rows landed
+    # DELETE atomically with the thought PutRecord above, against the REAL host's
+    # completion frame + commit_tick -- not a synthetic StateActor.apply like
+    # tests/test_finalize_buffer_intent.py's unit proof.
+    result["bn_claim_finalized_atomically"] = bn_buffer.claimed(bn_survey_id) == []
+    bn_remaining = bn_buffer.closed_segment("bn-session", now=datetime.now(UTC))
+    result["bn_surveyed_turn_no_longer_in_completed"] = not any(
+        e.turn_id == "bn-turn-1" for e in bn_remaining
+    )
     _log(f"[BN] {result}")
+
+    # A light "restart preserves the segment" check: a FRESH SqliteBufferStore
+    # over the SAME bn_dir (a brand-new instance, never bn_buffer itself) still
+    # sees a turn captured afterwards -- a plugin/gateway restart of just the
+    # store layer, over the ONE physical file (D7) the finalize proof above just
+    # exercised.
+    bn_restart_now = datetime.now(UTC)
+    bn_restart_store = SqliteBufferStore(bn_dir, clock=SystemClock())
+    bn_restart_store.open_pending(
+        "bn-session-2", user_text="a later, unrelated turn", now=bn_restart_now
+    )
+    bn_restart_store.complete(
+        "bn-session-2", "bn-turn-2", assistant_text="noted", now=bn_restart_now
+    )
+    bn_reopened_store = SqliteBufferStore(bn_dir, clock=SystemClock())
+    bn_restart_segment = bn_reopened_store.completed(
+        "bn-session-2", now=datetime.now(UTC), ttl=timedelta(minutes=30)
+    )
+    result["bn_restart_preserves_the_segment"] = [e.turn_id for e in bn_restart_segment] == [
+        "bn-turn-2"
+    ]
+    _log(f"[BN-restart] {result['bn_restart_preserves_the_segment']=}")
 
     # ---- Part BNS: opus-I2 -- the REAL pre_llm_call/post_llm_call host contract ----
     # Part B-noticing above seeds the buffer directly through its own API and only
@@ -697,6 +739,9 @@ _REQUIRED_TRUE_KEYS = (
     "bn_thought_has_source",
     "bn_egress_never_called",
     "bn_pending_cleared",
+    "bn_claim_finalized_atomically",
+    "bn_surveyed_turn_no_longer_in_completed",
+    "bn_restart_preserves_the_segment",
     "bns_closed_segment_has_one_entry",
     "bns_captured_session_id_nonempty",
     "bns_captured_turn_id_nonempty",
