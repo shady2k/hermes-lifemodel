@@ -314,11 +314,11 @@ def test_old_shape_db_migrates_preserving_the_self(tmp_path: Path) -> None:
     assert list(tmp_path.glob(f"{DB_FILENAME}.superseded.*")) == []
     assert len(list(tmp_path.glob(f"{DB_FILENAME}.bak.*"))) == 1
 
-    # quick_check passes and schema_migrations records the new version.
+    # quick_check passes and schema_migrations records the new versions.
     with closing(sqlite3.connect(str(db_path))) as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY 1")]
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
 
 
 def test_ordering_and_expiry_correct_after_migration(tmp_path: Path) -> None:
@@ -494,7 +494,7 @@ _OLD_RUNTIME_DDL = (
 
 def test_migration_handles_empty_old_shape_tables(tmp_path: Path) -> None:
     # Codex test-gap: an old-shape file with NO rows still migrates to the ISO-only
-    # shape (empty rebuild) and records v3 — no crash on empty SELECT/executemany.
+    # shape (empty rebuild) and records v3 (+ v4) — no crash on empty SELECT/executemany.
     db_path = tmp_path / DB_FILENAME
     with closing(sqlite3.connect(str(db_path))) as conn, conn:
         _build_epoch_scaffold(conn)
@@ -509,7 +509,7 @@ def test_migration_handles_empty_old_shape_tables(tmp_path: Path) -> None:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY 1")]
         (mem_count,) = conn.execute("SELECT COUNT(*) FROM memory_records").fetchone()
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
     assert mem_count == 0  # empty rebuild preserved zero rows
 
 

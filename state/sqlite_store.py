@@ -54,8 +54,10 @@ must still pass, or the backup is restored and the migration raises
 still-bad file). Migration v1 creates ``store_meta``, ``memory_records``, and
 its two indexes; v2 (lm-fib.6.2) creates the ``runtime_state`` singleton row
 table backing ``StatePort``; v3 (lm-fib.10.5) rebuilds an old dual-column file
-into the ISO-only shape IN PLACE, preserving every row. No destructive migration
-ever runs silently.
+into the ISO-only shape IN PLACE, preserving every row; v4 (lm-705.14) creates
+``conversation_buffer`` — the durable backing for the noticing conversation
+buffer (:class:`SqliteBufferStore` below), purely additive. No destructive
+migration ever runs silently.
 
 **STRICT tables** are used when the host's SQLite build supports them
 (feature-detected once, at construction, via a throwaway ``:memory:`` table);
@@ -93,10 +95,11 @@ import shutil
 import sqlite3
 from collections.abc import Callable, Sequence
 from contextlib import closing, suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, assert_never
 
+from ..core.buffer_store import BufferEntry
 from ..core.timeutil import from_iso, to_iso
 from ..domain.memory import (
     JsonObject,
@@ -139,6 +142,22 @@ _ORDER_SQL: Final[dict[OrderBy, str]] = {
     "created_desc": "created_at DESC, id ASC",
     "salience_desc": "salience DESC, id ASC",
 }
+
+
+def _connect_db(path: Path) -> sqlite3.Connection:
+    """Open a short-lived connection to *path* with this store's standard PRAGMAs.
+
+    Shared by :meth:`SQLiteRuntimeStore._connect` and :class:`SqliteBufferStore`
+    so both writers over the same ``lifemodel.sqlite`` file (D7: one physical
+    store) open connections with the identical posture (module docstring's
+    "Connection-per-operation") — one PRAGMA set, never duplicated out of sync.
+    """
+    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000)
+    conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA wal_autocheckpoint = {_WAL_AUTOCHECKPOINT_PAGES}")
+    return conn
 
 
 class MigrationFailed(Exception):
@@ -302,12 +321,7 @@ class SQLiteRuntimeStore:
         shutil.copyfile(backup_path, self._path)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._path), timeout=_BUSY_TIMEOUT_MS / 1000)
-        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute(f"PRAGMA wal_autocheckpoint = {_WAL_AUTOCHECKPOINT_PAGES}")
-        return conn
+        return _connect_db(self._path)
 
     # ---- MemoryPort ---------------------------------------------------------
 
@@ -1281,8 +1295,289 @@ def _migrate_v3(conn: sqlite3.Connection, strict: bool) -> None:
         conn.execute("DELETE FROM store_meta WHERE key = 'schema_version'")
 
 
+def _create_conversation_buffer_table(conn: sqlite3.Connection, strict_kw: str) -> None:
+    """The durable backing for the noticing conversation buffer (lm-705.14).
+
+    One row per conversation turn, keyed ``(session_id, turn_id)``: a ``pending``
+    row (turn in flight, keyed under :data:`_PENDING_TURN_ID` — see
+    :class:`SqliteBufferStore`) has ``assistant_text=''``, ``ts=NULL``,
+    ``survey_id=NULL``; ``complete``/``claimed`` rows carry the full turn.
+    ``source_ids`` is a JSON-encoded list of str. Shared by :func:`_migrate_v4`
+    AND :class:`SqliteBufferStore`'s own idempotent ensure-create, so a migrated
+    file and a freshly-bootstrapped one are byte-for-byte the same shape.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS conversation_buffer ("
+        "session_id TEXT NOT NULL, "
+        "turn_id TEXT NOT NULL, "
+        "state TEXT NOT NULL, "
+        "source_ids TEXT NOT NULL, "
+        "user_text TEXT NOT NULL, "
+        "assistant_text TEXT NOT NULL, "
+        "opened_at TEXT NOT NULL, "
+        "ts TEXT, "
+        "survey_id TEXT, "
+        "PRIMARY KEY (session_id, turn_id))" + strict_kw
+    )
+
+
+def _create_conversation_buffer_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_buffer_session_state "
+        "ON conversation_buffer (session_id, state)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_buffer_survey_id "
+        "ON conversation_buffer (survey_id)"
+    )
+
+
+def _migrate_v4(conn: sqlite3.Connection, strict: bool) -> None:
+    """Create ``conversation_buffer`` — the durable NoticingBuffer backing (lm-705.14).
+
+    Purely additive (a brand-new table): every existing table/row is untouched,
+    and this is idempotent via the ``schema_migrations`` framework like every
+    other migration here. :class:`SqliteBufferStore` does NOT re-run this
+    framework (:class:`SQLiteRuntimeStore` owns it) — it idempotently
+    ``CREATE TABLE IF NOT EXISTS``-creates the identical shape itself
+    (:func:`_create_conversation_buffer_table` is the one DDL source of truth
+    for both routes), so it also works standalone, with no prior
+    :class:`SQLiteRuntimeStore` construction.
+    """
+    strict_kw = " STRICT" if strict else ""
+    _create_conversation_buffer_table(conn, strict_kw)
+    _create_conversation_buffer_indexes(conn)
+
+
 _MIGRATIONS: Final[list[tuple[int, Callable[[sqlite3.Connection, bool], None]]]] = [
     (1, _migrate_v1),
     (2, _migrate_v2),
     (3, _migrate_v3),
+    (4, _migrate_v4),
 ]
+
+
+# ---- SqliteBufferStore (lm-705.14 Task 1) ----------------------------------
+
+# Reserved sentinel ``turn_id`` for a session's single ``pending`` slot: the
+# real ``turn_id`` isn't known until :meth:`SqliteBufferStore.complete` (the
+# port's ``open_pending`` takes no ``turn_id`` — mirrors
+# :class:`~lifemodel.core.noticing_buffer.NoticingBuffer`'s ``_PendingTurn``,
+# which is likewise keyed by session only). An empty string can never collide
+# with a real caller-supplied turn id (a Hermes message/turn id is always
+# non-empty), and the ``(session_id, turn_id)`` PRIMARY KEY then naturally
+# enforces "at most one open pending per session" — a second ``open_pending``
+# UPSERTs the same sentinel row rather than inserting a second one.
+_PENDING_TURN_ID: Final[str] = ""
+
+_BUFFER_SELECT_COLUMNS = (
+    "SELECT session_id, turn_id, source_ids, user_text, assistant_text, ts FROM conversation_buffer"
+)
+
+
+def _row_to_buffer_entry(row: tuple[object, ...]) -> BufferEntry:
+    session_id, turn_id, source_ids_json, user_text, assistant_text, ts = row
+    assert isinstance(session_id, str)
+    assert isinstance(turn_id, str)
+    assert isinstance(source_ids_json, str)
+    assert isinstance(user_text, str)
+    assert isinstance(assistant_text, str)
+    assert isinstance(ts, str)  # only 'complete'/'claimed' rows are ever mapped (ts is stamped)
+    source_ids = json.loads(source_ids_json)
+    assert isinstance(source_ids, list)
+    return BufferEntry(
+        session_id=session_id,
+        turn_id=turn_id,
+        source_ids=tuple(source_ids),
+        user_text=user_text,
+        assistant_text=assistant_text,
+        ts=ts,
+    )
+
+
+class SqliteBufferStore:
+    """Durable :class:`~lifemodel.core.buffer_store.BufferStore` (lm-705.14) over the
+    ``conversation_buffer`` table — the SAME physical file as :class:`SQLiteRuntimeStore`
+    (D7: one store), opening its own short-lived connections via :func:`_connect_db`
+    (identical PRAGMA posture, "connection-per-operation").
+
+    **Does NOT run the ``schema_migrations`` framework** — :class:`SQLiteRuntimeStore`
+    owns that (:func:`_migrate_v4` above creates this table for a construction that
+    goes through the runtime store first). Construction here idempotently
+    ``CREATE TABLE IF NOT EXISTS``-creates the identical shape
+    (:func:`_create_conversation_buffer_table` is the one DDL source of truth for
+    both routes), so this class also works completely standalone — e.g. in a test
+    that constructs only a :class:`SqliteBufferStore`, with no prior
+    :class:`SQLiteRuntimeStore` — and is a harmless no-op once the real migration has
+    already created the table.
+
+    Every method is its own short transaction; there is no cross-method atomicity
+    here (a later task threads :meth:`finalize` into :meth:`SQLiteRuntimeStore.commit_tick`'s
+    one transaction so it lands atomically with a noticing pass's thought commit).
+    """
+
+    def __init__(self, base_dir: Path, *, clock: ClockPort) -> None:
+        self._path = base_dir / _DB_FILENAME
+        # Not read by any method below (each takes an explicit `now`) — threaded
+        # through for constructor-signature parity with SQLiteRuntimeStore and
+        # because later tasks in this plan (claim/finalize wiring) may need it.
+        self._clock = clock
+        base_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_table()
+
+    def _ensure_table(self) -> None:
+        with suppress(sqlite3.Error), closing(sqlite3.connect(str(self._path))) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")  # database-level; harmless if already set
+        strict = SQLiteRuntimeStore._detect_strict_support()
+        with closing(self._connect()) as conn, conn:
+            _create_conversation_buffer_table(conn, " STRICT" if strict else "")
+            _create_conversation_buffer_indexes(conn)
+
+    def _connect(self) -> sqlite3.Connection:
+        return _connect_db(self._path)
+
+    # ---- pending lifecycle -------------------------------------------------
+
+    def open_pending(self, session_id: str, *, user_text: str, now: datetime) -> None:
+        opened_at = to_iso(now)
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO conversation_buffer "
+                "(session_id, turn_id, state, source_ids, user_text, assistant_text, "
+                "opened_at, ts, survey_id) "
+                "VALUES (?, ?, 'pending', '[]', ?, '', ?, NULL, NULL) "
+                "ON CONFLICT(session_id, turn_id) DO UPDATE SET "
+                "state='pending', source_ids='[]', user_text=excluded.user_text, "
+                "assistant_text='', opened_at=excluded.opened_at, ts=NULL, survey_id=NULL",
+                (session_id, _PENDING_TURN_ID, user_text, opened_at),
+            )
+
+    def stamp_source(self, session_id: str, message_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT source_ids FROM conversation_buffer "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'pending'",
+                (session_id, _PENDING_TURN_ID),
+            ).fetchone()
+            if row is None:
+                return  # no open pending -- defensive no-op (mirrors NoticingBuffer)
+            source_ids = json.loads(row[0])
+            source_ids.append(message_id)
+            conn.execute(
+                "UPDATE conversation_buffer SET source_ids = ? "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'pending'",
+                (json.dumps(source_ids), session_id, _PENDING_TURN_ID),
+            )
+
+    def complete(
+        self, session_id: str, turn_id: str, *, assistant_text: str, now: datetime
+    ) -> None:
+        # Validate BEFORE mutating anything (mirrors NoticingBuffer.complete's M3
+        # fix): a bad clock call must fail loud with the pending slot intact.
+        ts = to_iso(now)
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT source_ids, user_text, opened_at FROM conversation_buffer "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'pending'",
+                (session_id, _PENDING_TURN_ID),
+            ).fetchone()
+            if row is None:
+                return  # no matching open_pending -- defensive no-op
+            source_ids_json, user_text, opened_at = row
+            conn.execute(
+                "DELETE FROM conversation_buffer WHERE session_id = ? AND turn_id = ?",
+                (session_id, _PENDING_TURN_ID),
+            )
+            conn.execute(
+                "INSERT INTO conversation_buffer "
+                "(session_id, turn_id, state, source_ids, user_text, assistant_text, "
+                "opened_at, ts, survey_id) "
+                "VALUES (?, ?, 'complete', ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(session_id, turn_id) DO UPDATE SET "
+                "state='complete', source_ids=excluded.source_ids, "
+                "user_text=excluded.user_text, assistant_text=excluded.assistant_text, "
+                "opened_at=excluded.opened_at, ts=excluded.ts, survey_id=NULL",
+                (session_id, turn_id, source_ids_json, user_text, assistant_text, opened_at, ts),
+            )
+
+    def abandon_pending(self, session_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM conversation_buffer "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'pending'",
+                (session_id, _PENDING_TURN_ID),
+            )
+
+    def completed(self, session_id: str, *, now: datetime, ttl: timedelta) -> list[BufferEntry]:
+        with closing(self._connect()) as conn, conn:
+            pending = conn.execute(
+                "SELECT opened_at FROM conversation_buffer "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'pending'",
+                (session_id, _PENDING_TURN_ID),
+            ).fetchone()
+            if pending is not None and now - from_iso(pending[0]) > ttl:
+                conn.execute(
+                    "DELETE FROM conversation_buffer "
+                    "WHERE session_id = ? AND turn_id = ? AND state = 'pending'",
+                    (session_id, _PENDING_TURN_ID),
+                )
+                pending = None
+            if pending is not None:
+                return []  # closed-prefix rule: a live pending gates the whole lane
+            rows = conn.execute(
+                f"{_BUFFER_SELECT_COLUMNS} WHERE session_id = ? AND state = 'complete' "
+                "ORDER BY rowid",
+                (session_id,),
+            ).fetchall()
+        return [_row_to_buffer_entry(row) for row in rows]
+
+    # ---- claim / finalize / release lifecycle (lm-705.13) ------------------
+
+    def claim(self, session_id: str, turn_ids: tuple[str, ...], survey_id: str) -> None:
+        if not turn_ids:
+            return
+        placeholders = ",".join("?" for _ in turn_ids)
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE conversation_buffer SET state = 'claimed', survey_id = ? "
+                f"WHERE session_id = ? AND turn_id IN ({placeholders}) AND state = 'complete'",
+                (survey_id, session_id, *turn_ids),
+            )
+
+    def claimed(self, survey_id: str) -> list[BufferEntry]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"{_BUFFER_SELECT_COLUMNS} WHERE survey_id = ? AND state = 'claimed' "
+                "ORDER BY rowid",
+                (survey_id,),
+            ).fetchall()
+        return [_row_to_buffer_entry(row) for row in rows]
+
+    def finalize(self, survey_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM conversation_buffer WHERE survey_id = ? AND state = 'claimed'",
+                (survey_id,),
+            )
+
+    def release(self, survey_id: str) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE conversation_buffer SET state = 'complete', survey_id = NULL "
+                "WHERE survey_id = ? AND state = 'claimed'",
+                (survey_id,),
+            )
+
+    def recover_stale_claims(self) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE conversation_buffer SET state = 'complete', survey_id = NULL "
+                "WHERE state = 'claimed'"
+            )
+
+    def session_ids(self) -> list[str]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT session_id FROM conversation_buffer ORDER BY session_id"
+            ).fetchall()
+        return [row[0] for row in rows]
