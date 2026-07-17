@@ -38,7 +38,12 @@ from .composition import LifeModel
 from .core.affect import felt_word
 from .core.appraisal import Appraiser
 from .core.belief_view import read_active_beliefs
-from .core.commitment_view import read_active_commitments
+from .core.commitment_view import (
+    COMMITMENT_KIND,
+    commitment_from_live_fields,
+    encode_commitment,
+    read_active_commitments,
+)
 from .core.correlate import open_correlated_span
 from .core.desire_view import read_live_contact_desire
 from .core.felt_display import (
@@ -66,13 +71,15 @@ from .core.thought_view import seed_thought_id
 from .core.tick_metrics import (
     CHECK_IN_TOTAL,
     COMMITMENT_INJECTOR_OVERFLOW,
+    COMMITMENT_TOOL_TOTAL,
     FELT_DISPLAY_TOTAL,
     OBSERVER_ERRORS,
 )
 from .core.timeutil import to_iso
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
-from .domain.objects import Belief, Commitment, DesireState
+from .domain.memory import StaleTransition
+from .domain.objects import Belief, Commitment, CommitmentState, DesireState, InvalidPayload
 from .domain.session import SessionEnd
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
@@ -1261,6 +1268,144 @@ def make_commitment_injector(
             return None
 
     return _injector
+
+
+def _commitment_tool_result(status: str, **fields: object) -> str:
+    return json.dumps({"status": status, **fields}, ensure_ascii=False)
+
+
+def _commitment_tool_error(message: str) -> str:
+    return json.dumps({"error": f"commitment: {message}"}, ensure_ascii=False)
+
+
+def _commitment_invalid(metrics: MetricRegistry | None, message: str) -> str:
+    if metrics is not None:
+        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="invalid")
+    return _commitment_tool_error(message)
+
+
+def make_commitment_tool(
+    build_lm: Callable[[], LifeModel], *, metrics: MetricRegistry | None = None
+) -> Callable[..., str]:
+    """Return the ``commitment`` lifecycle tool handler (lm-705.21) — the being's full live
+    agency over its commitments, called in its OWN reply turn by its own judgment. ``action``
+    ∈ create / discharge / defer. Honours the Hermes tool contract exactly like ``check_in``:
+    a ``json.dumps`` STRING, ``{"error": …}`` on failure, and it NEVER raises (a throw is
+    logged + counted, and a generic error string returned). ``create`` is create-if-absent
+    (never overwrites a differing row or resurrects a terminal/deferred one — codex #5);
+    ``discharge``/``defer`` are guarded transitions whose ``StaleTransition`` is refined via a
+    typed ``get`` (codex #6). Logs action/id/state — never ``content`` (D10)."""
+
+    def _handler(args: Any = None, **_ignored: Any) -> str:
+        action = args.get("action") if isinstance(args, dict) else None
+        try:
+            if not isinstance(args, dict):
+                return _commitment_invalid(metrics, "expected an arguments object")
+            lm = build_lm()
+            memory = lm.state if isinstance(lm.state, MemoryPort) else None
+            if memory is None:
+                return _commitment_tool_error("memory is unavailable")
+            if action == "create":
+                return _commitment_create(memory, args, metrics)
+            if action == "discharge":
+                return _commitment_discharge(memory, args, metrics)
+            if action == "defer":
+                return _commitment_defer(memory, args, metrics)
+            return _commitment_invalid(metrics, f"unknown action {action!r}")
+        except Exception as exc:  # Hermes tool contract: return {"error": …}, never raise
+            _LOG.error(
+                "commitment_tool_failed action=%s error=%s",
+                action,
+                f"{type(exc).__name__}: {exc}",
+                exc_info=True,
+            )
+            if metrics is not None:
+                metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="error")
+            return json.dumps(
+                {"error": "the commitment tool is unavailable right now"}, ensure_ascii=False
+            )
+
+    return _handler
+
+
+def _commitment_create(
+    memory: MemoryPort, args: dict[str, Any], metrics: MetricRegistry | None
+) -> str:
+    try:
+        commitment = commitment_from_live_fields(fields=args)
+    except InvalidPayload as exc:
+        return _commitment_invalid(metrics, str(exc))
+    # create-if-absent: a present row (ANY state) is never overwritten or resurrected (codex
+    # #5 — put would clobber a differing row and reset a terminal/deferred one to active).
+    existing = memory.get(COMMITMENT_KIND, commitment.id)
+    if existing is not None:
+        if metrics is not None:
+            metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="already_held")
+        _LOG.info(
+            "commitment_tool create id=%s result=already_held state=%s",
+            commitment.id,
+            existing.state,
+        )
+        return _commitment_tool_result("already_held", id=commitment.id, state=existing.state)
+    memory.put(encode_commitment(commitment))
+    if metrics is not None:
+        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome="created")
+    _LOG.info(
+        "commitment_tool create id=%s basis=%s result=created",  # id/basis only — never content
+        commitment.id,
+        commitment.basis.value,
+    )
+    return _commitment_tool_result("created", id=commitment.id)
+
+
+def _commitment_discharge(
+    memory: MemoryPort, args: dict[str, Any], metrics: MetricRegistry | None
+) -> str:
+    cid = args.get("id")
+    outcome = args.get("outcome")
+    if not isinstance(cid, str) or not cid:
+        return _commitment_invalid(metrics, "discharge requires a string id")
+    if outcome not in (CommitmentState.HONOURED.value, CommitmentState.DROPPED.value):
+        return _commitment_invalid(metrics, 'discharge outcome must be "honoured" or "dropped"')
+    return _commitment_transition(
+        memory, cid, to_state=outcome, action="discharge", metrics=metrics
+    )
+
+
+def _commitment_defer(
+    memory: MemoryPort, args: dict[str, Any], metrics: MetricRegistry | None
+) -> str:
+    cid = args.get("id")
+    if not isinstance(cid, str) or not cid:
+        return _commitment_invalid(metrics, "defer requires a string id")
+    return _commitment_transition(
+        memory, cid, to_state=CommitmentState.DEFERRED.value, action="defer", metrics=metrics
+    )
+
+
+def _commitment_transition(
+    memory: MemoryPort, cid: str, *, to_state: str, action: str, metrics: MetricRegistry | None
+) -> str:
+    try:
+        memory.transition(COMMITMENT_KIND, cid, CommitmentState.ACTIVE.value, to_state)
+    except StaleTransition:
+        # The guard failed because the row is not `active`. Refine to an accurate, gentle
+        # message via a typed get — never a blanket "already closed" (codex #6).
+        current = memory.get(COMMITMENT_KIND, cid)
+        if current is None:
+            result = "not_found"
+        elif current.state == CommitmentState.DEFERRED.value:
+            result = "already_deferred"
+        else:
+            result = "already_terminal"
+        if metrics is not None:
+            metrics.inc(COMMITMENT_TOOL_TOTAL, outcome=result)
+        _LOG.info("commitment_tool %s id=%s result=%s", action, cid, result)
+        return _commitment_tool_result(result, id=cid)
+    if metrics is not None:
+        metrics.inc(COMMITMENT_TOOL_TOTAL, outcome=to_state)
+    _LOG.info("commitment_tool %s id=%s prior=active result=%s", action, cid, to_state)
+    return _commitment_tool_result("ok", id=cid, state=to_state)
 
 
 def make_check_in_tool(
