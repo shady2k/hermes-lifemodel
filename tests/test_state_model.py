@@ -433,3 +433,43 @@ def test_internal_calls_today_rejects_non_int() -> None:
 def test_internal_calls_day_rejects_non_str() -> None:
     with pytest.raises(StateCorruptError):
         State.from_dict({"internal_calls_day": 20260716})
+
+
+def test_noticed_source_ids_defaults_empty_and_roundtrips() -> None:
+    # lm-705.5 Task 1: the durable consumed-source-id ring the noticing pass will
+    # use for dedup (the CAP is enforced where the ring is appended, Task 5 — here
+    # it only persists). Additive: an older runtime_state file without the key
+    # loads as "nothing noticed yet".
+    assert State().noticed_source_ids == ()
+    assert State.from_dict({}).noticed_source_ids == ()  # additive
+    s = State(noticed_source_ids=("m1", "m2"))
+    assert State.from_dict(s.to_dict()).noticed_source_ids == ("m1", "m2")
+
+
+def test_noticed_source_ids_accepts_json_shaped_list() -> None:
+    # Real persistence round-trips through json.dumps/loads (sqlite_store), which
+    # turns the in-memory tuple into a plain JSON array — from_dict must accept a
+    # plain list (not just the tuple ``asdict()`` produces for the direct
+    # to_dict()/from_dict() round trip exercised above).
+    loaded = State.from_dict({"noticed_source_ids": ["m1", "m2"]})
+    assert loaded.noticed_source_ids == ("m1", "m2")
+
+
+def test_noticed_source_ids_rejects_non_list_and_non_str_items() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"noticed_source_ids": "nope"})
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"noticed_source_ids": [1, 2]})
+
+
+def test_last_noticing_at_defaults_none_and_roundtrips() -> None:
+    # Mirrors last_internal_call_at exactly (lm-705.2's additive pattern).
+    assert State().last_noticing_at is None
+    assert State.from_dict({}).last_noticing_at is None  # additive
+    s = State(last_noticing_at="2026-07-16T12:00:00+00:00")
+    assert State.from_dict(s.to_dict()).last_noticing_at == "2026-07-16T12:00:00+00:00"
+
+
+def test_last_noticing_at_rejects_non_str() -> None:
+    with pytest.raises(StateCorruptError):
+        State.from_dict({"last_noticing_at": 123})

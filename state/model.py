@@ -33,6 +33,12 @@ from .errors import StateCorruptError
 #: any mismatch (see :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.load`).
 SCHEMA_VERSION = 4
 
+#: Bound on :attr:`State.noticed_source_ids` (lm-705.5 Task 1) — the consumed-
+#: source-id ring the noticing pass dedups against. Enforced where the ring is
+#: APPENDED (Task 5's noticing pass), not here: this module only persists
+#: whatever tuple it is handed, however long.
+NOTICED_SOURCE_IDS_CAP = 512
+
 
 @dataclass
 class State:
@@ -282,6 +288,19 @@ class State:
     #: pass really started). ``None`` before the first pass ever. Additive: ``from_dict``
     #: defaults it to ``None``.
     last_internal_call_at: str | None = None
+    #: The consumed-source-id ring (lm-705.5 Task 1): source message/turn ids the
+    #: noticing pass has already turned into a ``thought_seed`` (or decided not
+    #: to), so a later pass can dedup against it rather than re-noticing the same
+    #: conversation material. Bounded by :data:`NOTICED_SOURCE_IDS_CAP`, but that
+    #: cap is enforced where the ring is APPENDED (the noticing pass, Task 5) —
+    #: this field and its (de)serialization only persist whatever tuple they are
+    #: handed. Additive: ``from_dict`` defaults it to ``()`` when absent.
+    noticed_source_ids: tuple[str, ...] = ()
+    #: ISO-8601 UTC timestamp of the last noticing pass (lm-705.5 Task 1) — the
+    #: noticing sibling of :attr:`last_internal_call_at`, mirrored exactly (same
+    #: server-local ISO-8601 shape, same "``None`` before the first pass ever"
+    #: contract). Additive: ``from_dict`` defaults it to ``None`` when absent.
+    last_noticing_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -415,6 +434,14 @@ class State:
             last_internal_call_at=_as_opt_str(
                 data.get("last_internal_call_at"), "last_internal_call_at"
             ),
+            # The noticing pass's consumed-source-id ring (lm-705.5 Task 1) — a
+            # JSON-shaped list on real disk (json.dumps/loads round-trips a tuple to
+            # a list), but the in-memory to_dict()/from_dict() round trip (asdict()
+            # preserves tuple as tuple) hands back a tuple, so both are accepted.
+            noticed_source_ids=_as_str_tuple(data, "noticed_source_ids", ()),
+            # The noticing sibling of last_internal_call_at — opaque opt-str,
+            # mirrored exactly (never parsed as an aware instant here).
+            last_noticing_at=_as_opt_str(data.get("last_noticing_at"), "last_noticing_at"),
         )
 
 
@@ -463,6 +490,20 @@ def _as_str_list(data: Mapping[str, Any], key: str, default: list[str]) -> list[
     if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
         raise StateCorruptError(f"'{key}' must be a list[str]")
     return list(value)
+
+
+def _as_str_tuple(data: Mapping[str, Any], key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    # Mirrors _as_str_list, but for a tuple-shaped field. Accepts BOTH a plain
+    # list (the JSON-native shape a real json.dumps/loads round trip produces)
+    # and a tuple (what dataclasses.asdict() preserves for a direct
+    # to_dict()/from_dict() round trip with no JSON in between) — strict on
+    # anything else, and on any non-str item.
+    if key not in data:
+        return tuple(default)
+    value = data[key]
+    if not isinstance(value, list | tuple) or not all(isinstance(x, str) for x in value):
+        raise StateCorruptError(f"'{key}' must be a list[str]")
+    return tuple(value)
 
 
 def _as_str_str_dict(data: Mapping[str, Any], key: str, default: dict[str, str]) -> dict[str, str]:

@@ -171,6 +171,12 @@ _SET_PROTECTED: dict[str, str] = {
         "internal_calls_day would desync the quota rollover; never hand-edit either half"
     ),
     "internal_calls_day": "FR20 quota bookkeeping (see internal_calls_today)",
+    "noticed_source_ids": (
+        "lm-705.5: the noticing pass's consumed-source-id dedup ring — hand-editing could "
+        "drop or duplicate dedup coverage, mirroring the other ledgers "
+        "(processed_external_event_ids/proactive_send_log); no safe scalar coercion either "
+        "(it's a tuple, not a settable scalar)"
+    ),
 }
 
 #: Field TYPE -> coercion kind. A field whose type is absent here (``list``/``dict``) has no

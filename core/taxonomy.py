@@ -173,12 +173,20 @@ def read_proactive_outcome_correlation(signal: Signal) -> str:
 @dataclass(frozen=True)
 class ThoughtSeedRead:
     """The validated payload of a ``thought_seed`` signal — the appraisal result a
-    completed exchange produced, on its way to a captured ``Thought`` (slice 1)."""
+    completed exchange produced, on its way to a captured ``Thought`` (slice 1).
+
+    ``source_message_ids``/``turn_id`` are the SOURCE LINEAGE (lm-705.5 Task 1):
+    which conversation messages/turn the noticed thought came from, feeding the
+    later noticing pass's dedup against ``State.noticed_source_ids``. Additive —
+    both default when a seed predates this field (built by a pre-lm-705.5 caller,
+    or hand-crafted without them)."""
 
     content: str
     salience: float
     actionability: float
     other_regarding_value: float
+    source_message_ids: tuple[str, ...]
+    turn_id: str | None
 
 
 def thought_seed_signal(
@@ -188,10 +196,16 @@ def thought_seed_signal(
     salience: float,
     actionability: float = 0.0,
     other_regarding_value: float = 0.0,
+    source_message_ids: tuple[str, ...] = (),
+    turn_id: str | None = None,
     timestamp: str | None,
 ) -> Signal:
     """Build a ``thought_seed`` signal — a bounded appraisal result seeded by the
-    ``post_llm`` appraisal seam, consumed by ``ThoughtCapture`` (spec §4.1)."""
+    ``post_llm`` appraisal seam, consumed by ``ThoughtCapture`` (spec §4.1).
+
+    ``source_message_ids``/``turn_id`` carry the source lineage (lm-705.5 Task 1);
+    both default to "unknown" (``()``/``None``) for a caller that predates them.
+    """
     return Signal(
         origin_id=origin_id,
         kind=KIND_THOUGHT_SEED,
@@ -200,23 +214,40 @@ def thought_seed_signal(
             "salience": float(salience),
             "actionability": float(actionability),
             "other_regarding_value": float(other_regarding_value),
+            "source_message_ids": list(source_message_ids),
+            "turn_id": turn_id,
         },
         timestamp=timestamp,
     )
 
 
 def read_thought_seed(signal: Signal) -> ThoughtSeedRead:
-    """Validate and extract a :class:`ThoughtSeedRead` from a ``thought_seed`` signal."""
+    """Validate and extract a :class:`ThoughtSeedRead` from a ``thought_seed`` signal.
+
+    The lineage fields are read defensively (isinstance-guarded, never raising):
+    an absent, foreign, or malformed ``source_message_ids``/``turn_id`` degrades to
+    the back-compat default (``()``/``None``) rather than rejecting an otherwise
+    valid seed — mirrors the module's other non-required-field readers (e.g.
+    :func:`read_contact_presence`).
+    """
     if signal.kind != KIND_THOUGHT_SEED:
         raise ValueError(f"not a thought_seed signal: kind={signal.kind!r}")
     content = signal.payload.get("content")
     if not isinstance(content, str) or not content.strip():
         raise ValueError(f"invalid thought_seed payload: {signal.payload!r}")
+    raw_source_ids = signal.payload.get("source_message_ids", [])
+    source_message_ids: tuple[str, ...] = ()
+    if isinstance(raw_source_ids, list) and all(isinstance(x, str) for x in raw_source_ids):
+        source_message_ids = tuple(raw_source_ids)
+    raw_turn_id = signal.payload.get("turn_id")
+    turn_id = raw_turn_id if isinstance(raw_turn_id, str) else None
     return ThoughtSeedRead(
         content=content,
         salience=float(signal.payload.get("salience", 0.0)),
         actionability=float(signal.payload.get("actionability", 0.0)),
         other_regarding_value=float(signal.payload.get("other_regarding_value", 0.0)),
+        source_message_ids=source_message_ids,
+        turn_id=turn_id,
     )
 
 
