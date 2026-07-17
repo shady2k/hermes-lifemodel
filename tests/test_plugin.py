@@ -192,6 +192,26 @@ def test_register_wires_felt_state_injector_and_check_in_tool(
     assert "check_in" in ctx.tools
 
 
+def test_register_wires_commitment_injector_and_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # lm-705.21: the 4th pre_llm_call hook (the commitment injector, beside felt-state,
+    # genesis, belief) and the 5th lifemodel tool (`commitment`) coexist.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+
+    assert sum(1 for name, _ in ctx.hooks if name == "pre_llm_call") == 4
+    assert "commitment" in ctx.tools
+    schema = ctx.tools["commitment"]["kwargs"]["schema"]
+    assert schema["name"] == "commitment"
+    assert schema["parameters"]["required"] == ["action"]
+    assert schema["parameters"]["additionalProperties"] is False
+    # the model-facing description carries the creation-boundary safety prose (codex #4)
+    assert "self-authored intention" in schema["description"].lower()
+
+
 def test_register_check_in_tool_schema_and_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
