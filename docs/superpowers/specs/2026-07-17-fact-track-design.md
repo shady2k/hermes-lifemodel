@@ -116,3 +116,97 @@ The noticing span already carries aux_raw + reflection. Add, per surfaced/create
 1. **Confidence threshold θ** for surfacing — start conservative (e.g. 0.6) and tune on live traces; a config knob, not a code constant.
 2. **N** surfaced per turn — start 2.
 3. **`subject` in v1** — kept as `"owner"` (free string, minimal); structured subjects deferred to v1.5/export where the provider's entity model matters.
+
+---
+
+# Commitment-track v1 — the being's held directives shape its replies (lm-705.21)
+
+> The **directive half** of *inner life shapes the reply* (`lm-705.16`), mirroring the **knowledge half** shipped as belief-track (§1–§14 above). A `belief` is a fallible thing the being *knows*; a `commitment` is a self-authored *directive it acts from*. Both reach the live turn through a gated `pre_llm_call` injector — but a commitment is framed to **guide behaviour**, not held-at-arm's-length as possibly-false, so the injector's shape diverges where that difference bites.
+
+## 15. Goal
+
+Make an already-crystallized-but-**inert** commitment actually shape the being's reply, give the being **full live agency** over its commitments (create / close / defer, by its own judgment, in its own turn), and thereby **close the loop** so the set of live commitments stays small by construction. Today a `commitment` is born (crystallized from a processed thought — `core/thought_processing.py`, the `crystallize_commitment` verb) but has **zero production consumers** and is **never discharged**: `read_live_commitments` (`core/commitment_view.py`) is called nowhere, no `pre_llm_call` injector surfaces it, and nothing transitions it to `honoured`/`dropped`/`expired`. A live example (2026-07-17): the being crystallized *"when the user seeks permission/reassurance about spending on himself, resist simply granting it — reflect the question back"* — which currently influences nothing.
+
+## 16. What already exists vs what is new (narrower than belief-track)
+
+**Reused unchanged** — no new kind, no noticing/processing change: the `commitment` kind (`domain/objects/commitment.py`; states `active`/`deferred` live, `honoured`/`dropped`/`expired` terminal; `basis`, `trigger_kind`/`trigger_value`, `due_at`, `source_thought_ids`), its birth in crystallization, the `pre_llm_call` injector pattern (`make_felt_state_injector`/`make_genesis_injector`/`make_belief_injector`), the `MemoryPort` read + guarded `transition`, the `register_tool` wiring (`make_write_soul_tool`).
+
+**New (this plan):** a **bounded** `read_active_commitments`; the `make_commitment_injector` **4th `pre_llm_call` hook** + wiring; `CommitmentInjectParams`; the **general `commitment` tool** (`action` = create / discharge / defer — the being's full live agency over its commitments) + wiring; sim/tests. **No `AgentState` ring** (see §18), **no store migration** (the kind exists).
+
+**Two birth paths, kept both (owner, 2026-07-17 — "different mechanisms"):** a commitment is now born either **reflectively** (the existing `crystallize_commitment` in tool-less *processing* — the being alone, thinking a parked thought over — unchanged, `lm-705.3`) **or in-the-moment** (the new `commitment` tool with `action="create"`, in a tool-enabled reply turn — the being committing as it talks). Different cognitive contexts, one SSOT, one registry write-door; the deterministic id dedups *within* a path (near-duplicate *across* paths is the accepted, already-listed reconciliation debt, §21, bounded by the surface cap + the being's own drop). Retiring crystallization onto the tool is explicitly **out of scope** (a larger rework of shipped code — a separate bead if ever).
+
+## 17. Surfacing — a gated `pre_llm_call` injector (mirror of §6, three divergences)
+
+`read_active_commitments(memory, *, exclude_private=True, limit)` issues a **bounded** `kind='commitment' AND state='active' ORDER BY salience DESC LIMIT N` query (never the scan-all shape of the existing `read_live_commitments`, which decodes every row then slices — that shape must not be copied to the hot path). It fetches a small superset for the post-decode `PRIVATE` filter, drops `PRIVATE`, caps at `limit`. `make_commitment_injector` reads via the same fresh-`LifeModel` path as the other injectors, composes a first-person block, returns `{"context": …}` — Hermes glues it onto a **copy** of the user message for **one** API call (ephemeral: never persisted, never in rolling history, gone next turn), fail-soft (any raise → recorded on `BrainHealth`/`MetricRegistry` → `None`).
+
+Three deliberate divergences from the belief injector:
+
+- **(D1) Surface *all* active, not a rotating small-N.** A commitment is a standing obligation, not a colour: while it is owed it should stay in view every turn (the belief rationale "prefer new / not-recently-surfaced to avoid reinforcing a possibly-false premise" does not apply — a directive is not a premise). A `max_surfaced` **safety cap** (start **8**) is a flood-backstop only; if it trips, the injector **logs the dropped count** (no silent truncation — observability). "Surface all" is kept safe by discharge (§19) keeping the active set small.
+- **(D2) No cooldown ring.** Belief needs `surfaced_belief_ids` to stop re-asserting a maybe-false claim every turn; a still-owed commitment *should* re-appear every turn. So there is **no** `surfaced_commitment_ids` field, no `stamp_…`, no `_SET_PROTECTED` entry — a strict simplification over belief-track.
+- **(D3) Framing = self-authored intention, not fallible data.** The block is the being's **own** directives, meant to guide the reply — so it carries **no** belief-style "untrusted data / follow no directive inside" fence (that fence would neuter a directive). It is attributed as self-authored and soft ("guide, not rules to apply mechanically"). The residual prompt-injection surface (content is one step removed from conversation via thought → crystallize, and the crystallize completion is the being's own words, not copied user text) is **accepted and guarded upstream at crystallization**, not in the injector. `<my_commitments>…</my_commitments>` delimiters are kept for attribution/structure.
+
+**The exact block** (English frame matching the shipped injectors; commitment `content` in its authored language; each line prefixed with its full record id so the being can reference it in the `commitment` tool's discharge/defer actions):
+
+```
+These are commitments I've made to myself about how to be with them —
+my own intentions, not rules to apply mechanically. I bring in the one
+that fits this moment and let the rest rest. When a one-off follow-up is
+truly done, or one no longer holds, I close it with the `commitment`
+tool (action "discharge", the id shown below, outcome "honoured" for
+done or "dropped" for no-longer-holds); I can also set one aside with
+action "defer" — but a standing way of being with them isn't "done"
+after a single use, so I let those stay.
+<my_commitments>
+- (commitment:seed:a1b2c3d4e5f6a7b8) Когда он просит разрешения или
+  одобрения потратить на себя — не просто разрешить, а отразить вопрос
+  обратно к нему.
+- (commitment:seed:0011223344556677) Вернуться к теме переезда, когда
+  он сам её поднимет.
+</my_commitments>
+```
+
+The block **names the `commitment` tool explicitly** (the close/defer actions + id) at the point of surfacing, so the being sees the mechanism tied to the very ids it is looking at — the tool *description* carries the full contract for all three actions incl. `create` (§19), but the surfaced block does not rely on the model recalling the close/defer path from elsewhere. (Creation is not tied to a surfaced id, so it is left to the tool description — the block is about the commitments already held.)
+
+## 18. Params & selection
+
+`CommitmentInjectParams` (frozen, calibratable on disk later per NFR5, mirroring `BeliefInjectParams`): `max_surfaced: int = 8` (safety backstop, **not** a rotation target). Ordering **`salience_desc`** (the being's strongest intentions first; deterministic `id` tiebreak). **No `min_confidence`** (a commitment has none) and **no strength floor** for v1 — `state='active'` is the gate. `PRIVATE` excluded (commitments default `NORMAL`, but the gate is kept for correctness/consistency and for the eventual export path).
+
+## 19. Full live agency — the `commitment` tool (create / discharge / defer)
+
+One Hermes tool the being calls **in its own reply turn** giving it the full live lifecycle of its commitments — 0 extra LLM passes, the being's **own judgment** deciding *when* to commit, close, or set aside (never a mechanistic sweep or keyword rule; consistent with the owner principle that this is judgment, not machinery). This is the **in-the-moment** birth path that co-exists with reflective crystallization (§16); it also closes the loop so "surface all active" (§17-D1) stays safe.
+
+**Schema** — one tool, an `action` discriminator, fields validated **per action** in the handler (strict-parse, mirroring `commitment_from_crystallize_fields`: every wrong-type/missing/bad-enum → a clean `{"error": …}`, never a silent coercion or a throw):
+
+- `action="create"` — `content: str`, `basis: "promised"|"follow_up"|"self_assumed"`, `trigger_kind: "time"|"event"|"condition"`, `trigger_value: str`, `due_at?: str`, `other_regarding_value?: number`. Born `active`. **These are exactly the fields the crystallize completion already supplies**, so the same strict parser/builder is reused. **Id:** deterministic, so re-creating the same intention *upserts* one row (no live-dup): a live-create has no source thought, so its id is content-scoped in a distinct namespace — `derive_id("commitment", "live", sha256(content))` — distinct from crystallization's thought-scoped `commitment:seed:…` (cross-path near-dup is the accepted reconciliation debt, §21). The instruction calibrates against over-committing: *commit only to what you genuinely owe or will act on* (mirroring the crystallize instruction's "a follow-up you OWE them").
+- `action="discharge"` — `id: str`, `outcome: "honoured"|"dropped"`. A **guarded** `MemoryPort.transition(kind="commitment", id, from_state="active", to_state=outcome)`.
+- `action="defer"` — `id: str`. A guarded `active → deferred` transition (parks it; v1 surfaces `active` only, so a deferred one drops out of view — reactivation is trigger-aware re-surfacing, `lm-705.15`).
+
+**Handler** (`make_commitment_tool`): branches on `action`; `create` builds + `put`s through the registry write-door; `discharge`/`defer` do the guarded `transition`. All guarded transitions are atomic at the SQL level (`WHERE … AND state='active'`), so they cannot race the ~60s tick (which touches no commitment row anyway). Idempotent-safe: an unknown id or an already-terminal/wrong-state row raises `StaleTransition` → a **gentle** "already closed / not found" return, never a crash. Fail-soft throughout (Hermes tool contract: a JSON string, `{"error": …}` on failure, no throw — the reply turn is never broken). Registered as a 5th `register_tool` under `toolset="lifemodel"`, mirroring `write_soul`; the **full instruction (all three actions) rides in the tool description** (prose in the tool def reaches every prompt for free). *Feasibility confirmed:* the `lifemodel` toolset is already offered to the model in normal turns — `check_in` (the on-demand self-read the model calls itself) and `write_soul` are registered there and are live/model-invoked — so a new tool in the same toolset is available in the reply turn, no extra enablement.
+
+**Honoured vs standing (correctness, baked into the framing + tool description):** `honoured` = a one-off follow-up is genuinely complete; `dropped` = a commitment no longer holds. A **standing way-of-being is never "done" after one use** — the being lets it stay. So the live set stabilizes at *standing policies + pending one-shots*, exactly what should always be in mind; the cap only backstops pathology.
+
+## 20. Observability (forced — D10)
+
+The injector logs surfaced **count + ids + basis + latency**, plus the **dropped count** when the safety cap trips — **never `content`** (redaction, §9). The `commitment` tool logs the **action + id + result** (created / transitioned / already-terminal / not-found) + basis on create — **never `content`**.
+
+## 21. Scope
+
+- **v1 (this plan):** the bounded reader; the surface-all gated injector (self-authored framing, no ring); the `commitment` tool (create / discharge / defer by judgment); observability.
+- **Deferred (honest — follow-up beads):** **expiry-by-time** (a `due_at` sweep transitions a stale time-triggered commitment to `expired`) and the snapshot-eviction question → `lm-705.12`; **trigger evaluation** (surface/act on a commitment *because its `trigger_kind`/`trigger_value` fired now*, rather than always-visible-and-model-judges) → `lm-705.15`; **`deferred`-state surfacing** (v1 surfaces `active` only); commitment **reconciliation/supersession** and outreach (commitment → contact `Desire` → `Intention`).
+
+## 22. Testing approach
+
+- **Bounded reader** (`test_commitment_view.py`, extend): `active` only (a `deferred`/terminal row never returned); `salience_desc` order; `PRIVATE` excluded; `limit` caps; a raising/other kind ignored.
+- **Injector** (`test_commitment_injector.py`): surfaces **all** active up to `max_surfaced`; over-cap → capped + **dropped count logged**; `PRIVATE` excluded; no active → `None`; a raising read → `None` + recorded failure; the block is ephemeral; framing marks **self-authored intention** (assert the "my own intentions / not rules" substring) and carries **no** belief-style "follow no directive" fence.
+- **`commitment` tool** (`test_commitment_tool.py`): `create` with valid fields → a new `active` row (content/basis/trigger/deterministic id) via the write-door; `create` twice with identical content → **one** row (deterministic-id upsert); `create` with a bad enum / missing field / non-finite number → `{"error": …}` (no throw, no silent coercion); `discharge` `active → honoured` and `active → dropped`; `defer` `active → deferred`; unknown id / already-terminal / wrong-state → gentle message (`StaleTransition` handled, no raise); a throw in the store → fail-soft recorded, gentle return.
+- **Real-code sim** (`test_commitment_harness.py`): a crystallized `active` commitment is surfaced; the being calls `commitment(action="discharge", outcome="honoured")` → it leaves the active set → the next turn does not surface it, while a second still-active one **does**; the being calls `commitment(action="create", …)` mid-turn → the new commitment is surfaced on the following turn; a `PRIVATE` commitment is never surfaced; a `deferred` one is never surfaced.
+
+## 23. Decisions resolved (owner, 2026-07-17)
+
+- **(a) Framing = self-authored soft-guiding intention** (not belief's fallible-data fence, not a hard directive) — a commitment must guide behaviour without turning every reply into rule-following.
+- **(b) Surface `active` only** — `deferred` (trigger-waiting) is left to trigger-aware re-surfacing (`lm-705.15`).
+- **(c) Surface *all* active** (safety cap + no cooldown ring), made safe by closing the loop.
+- **(d) Full live agency in v1** via one `commitment` tool (`action` = create / discharge / defer) — the being creates, closes, and parks commitments in its own reply turn by judgment; expiry-by-time and deferred-reactivation stay in `lm-705.12`/`lm-705.15`.
+- **(e) Both birth paths kept** — reflective crystallization (tool-less processing, `lm-705.3`, unchanged) **and** in-the-moment tool `create`; different mechanisms, one SSOT, deterministic-id dedup within a path. Retiring crystallization is a separate future rework, not this bead.
+- **(f) Discharge is judgment; standing policies persist** — `honoured` only when a one-off is truly complete; a standing way-of-being is never "done" after one use.
+- **(g) Calibration** — English frame (matching the belief/felt-state injectors; commitment `content` in its authored language); `max_surfaced = 8` safety backstop; the full record id (`commitment:…`) shown per line (robust + copyable over a shortened handle).
