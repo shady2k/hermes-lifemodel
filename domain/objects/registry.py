@@ -4,7 +4,7 @@ No feature code constructs a raw ``MemoryDraft``/``MemoryRecord`` for a typed
 kind, and no feature code decides a lifecycle edge by hand: every
 create/decode/transition goes through this registry. The catalog is **closed at
 construction** — there is no public ``register()`` to call — so the set of
-kinds is exactly ``{desire, intention, user_model, thought, commitment}``.
+kinds is exactly ``{desire, intention, user_model, thought, commitment, belief}``.
 
 Registration validates each kind at construction: semantic field names must not
 use the reserved ``_`` prefix, the transition table must be non-empty, and every
@@ -20,6 +20,7 @@ from dataclasses import dataclass, fields
 
 from ..memory import MemoryDraft, MemoryRecord
 from .base import RESERVED_KEYS, BaseFields, BaseObject, pack_envelope, unpack_envelope
+from .belief import BELIEF_TRANSITIONS, Belief
 from .commitment import COMMITMENT_TRANSITIONS, Commitment
 from .desire import DESIRE_TRANSITIONS, Desire
 from .errors import InvalidPayload, InvalidTransition, UnknownKind
@@ -227,13 +228,15 @@ class KindRegistry:
 
 
 #: The catalog, wired to each kind's module-level transition table. ``Commitment``
-#: (lm-705.3) is the first catalog EXTENSION type, added atop the original four.
+#: (lm-705.3) was the first catalog EXTENSION type, added atop the original four;
+#: ``Belief`` (lm-705.19) is the second — a defeasible inferred proposition.
 _CATALOG: tuple[KindSpec, ...] = (
     KindSpec(cls=Desire, transitions=DESIRE_TRANSITIONS),
     KindSpec(cls=Intention, transitions=INTENTION_TRANSITIONS),
     KindSpec(cls=UserModel, transitions=USER_MODEL_TRANSITIONS),
     KindSpec(cls=Thought, transitions=THOUGHT_TRANSITIONS),
     KindSpec(cls=Commitment, transitions=COMMITMENT_TRANSITIONS),
+    KindSpec(cls=Belief, transitions=BELIEF_TRANSITIONS),
 )
 
 

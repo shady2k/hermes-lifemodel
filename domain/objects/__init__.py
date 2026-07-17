@@ -3,8 +3,9 @@
 A typed Belief-Desire-Intention layer sitting *on top of* the generic
 ``memory_records`` envelope (:mod:`lifemodel.domain.memory`). Four foundation
 kinds (:class:`Desire`, :class:`Intention`, :class:`UserModel`, :class:`Thought`)
-plus the first catalog extension type, :class:`Commitment` (lm-705.3), subclass
-a shared :class:`BaseObject`; the :class:`KindRegistry` is the single door for
+plus two catalog extension types, :class:`Commitment` (lm-705.3) and
+:class:`Belief` (lm-705.19), subclass a shared :class:`BaseObject`; the
+:class:`KindRegistry` is the single door for
 every encode/decode/transition. :func:`default_registry` is the blessed factory
 for the closed catalog — feature code takes one and cannot add kinds. (The
 ``KindRegistry(specs)`` constructor stays as the extension/test seam,
@@ -25,6 +26,7 @@ from .base import (
     derive_id,
     qualified_id,
 )
+from .belief import BELIEF_TRANSITIONS, Belief, BeliefState
 from .commitment import Commitment, CommitmentBasis, CommitmentState, CommitmentTriggerKind
 from .desire import Desire, DesireSpring, DesireState
 from .errors import (
@@ -50,7 +52,10 @@ __all__ = [
     "CONTACT_INTENTION_ID",
     "OWNER_USER_MODEL_ID",
     "UNKNOWN",
+    "BELIEF_TRANSITIONS",
     "BaseObject",
+    "Belief",
+    "BeliefState",
     "Commitment",
     "CommitmentBasis",
     "CommitmentState",
