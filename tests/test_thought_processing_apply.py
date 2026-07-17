@@ -120,3 +120,52 @@ def test_missing_reflection_key_stamps_nothing():  # no field when the model omi
     ctx, logger = _ctx_with_logger("thought:seed:a", parsed={"outcome": "resolve"}, raw="{...}")
     list(ThoughtProcessingApply().step(ctx))
     assert "reflection" not in logger.span.attrs
+
+
+# ---- D10: the raw aux result must ride every completion span ----
+
+
+def test_aux_raw_is_stamped_on_the_apply_span():
+    ctx, logger = _ctx_with_logger(
+        "thought:seed:a",
+        parsed={"outcome": "resolve", "reflection": "a quiet resolve"},
+        raw='{"outcome": "resolve", "reflection": "a quiet resolve"}',
+    )
+    list(ThoughtProcessingApply().step(ctx))
+    assert logger.span.attrs["aux_raw"] == '{"outcome": "resolve", "reflection": "a quiet resolve"}'
+
+
+def test_aux_raw_is_capped_at_2000_chars():
+    long_raw = "x" * 2500
+    ctx, logger = _ctx_with_logger("thought:seed:a", parsed=None, raw=long_raw)
+    list(ThoughtProcessingApply().step(ctx))
+    assert logger.span.attrs["aux_raw"] == "x" * 2000
+
+
+def test_aux_raw_is_stamped_even_when_subject_no_longer_live():
+    """``aux_raw`` fires as soon as a matching ``internal_result`` is present —
+    even on the NO_SUBJECT no-op path, so a stale/malformed completion's raw
+    output is still not invisible."""
+    ctx, logger = _ctx_with_logger(
+        "thought:seed:gone", parsed={"outcome": "resolve"}, raw="{...gone...}"
+    )
+    list(ThoughtProcessingApply().step(ctx))
+    assert logger.span.attrs["aux_raw"] == "{...gone...}"
+
+
+def test_aux_raw_is_stamped_on_crystallize_completion():
+    ctx, logger = _ctx_with_logger(
+        "thought:seed:a",
+        parsed={
+            "outcome": "crystallize_commitment",
+            "commitment": {
+                "content": "follow up",
+                "basis": "promised",
+                "trigger_kind": "time",
+                "trigger_value": "2026-08-01T00:00:00+00:00",
+            },
+        },
+        raw='{"outcome": "crystallize_commitment", ...}',
+    )
+    list(ThoughtProcessingApply().step(ctx))
+    assert logger.span.attrs["aux_raw"] == '{"outcome": "crystallize_commitment", ...}'

@@ -250,6 +250,72 @@ def test_noticed_span_fields():
     assert logger.span.attrs["source_ids"] == ["t1"]
 
 
+# ---- D10: the raw aux result and the model's reflection must ride the span ----
+
+
+def test_seeds_completion_logs_aux_raw_and_reflection():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {
+        "seeds": [{"gist": "carried", "source_message_ids": ["t1"]}],
+        "reflection": "a quiet realization about t1",
+    }
+    ctx, logger = _ctx_with_logger(
+        correlation_id=correlation, subject_id=None, parsed=parsed, raw='{"seeds": [...]}'
+    )
+
+    list(NoticingApply(buffer).step(ctx))
+
+    assert logger.span.attrs["aux_raw"] == '{"seeds": [...]}'
+    assert logger.span.attrs["reflection"] == "a quiet realization about t1"
+    assert logger.span.attrs["noticing_reason"] == NoticingReason.NOTICED.value
+
+
+def test_nothing_lingered_still_logs_aux_raw_and_reflection():
+    """The whole point of capturing ``reflection`` (spec D10) is the empty-seeds
+    case — WHY nothing lingered, not just THAT nothing did. Both ``aux_raw`` and
+    ``reflection`` must land on the span even when ``seeds`` is empty."""
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    raw = '{"seeds": [], "reflection": "nothing worth carrying from this stretch"}'
+    parsed = {"seeds": [], "reflection": "nothing worth carrying from this stretch"}
+    ctx, logger = _ctx_with_logger(
+        correlation_id=correlation, subject_id=None, parsed=parsed, raw=raw
+    )
+
+    list(NoticingApply(buffer).step(ctx))
+
+    assert logger.span.attrs["noticing_reason"] == NoticingReason.NOTHING_LINGERED.value
+    assert logger.span.attrs["noticed_count"] == 0
+    assert logger.span.attrs["aux_raw"] == raw
+    assert logger.span.attrs["reflection"] == "nothing worth carrying from this stretch"
+
+
+def test_missing_reflection_key_stamps_nothing():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {"seeds": [{"gist": "carried", "source_message_ids": ["t1"]}]}
+    ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    list(NoticingApply(buffer).step(ctx))
+
+    assert "reflection" not in logger.span.attrs
+
+
+def test_aux_raw_is_capped_at_2000_chars():
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    long_raw = "x" * 2500
+    parsed = {"seeds": [{"gist": "carried", "source_message_ids": ["t1"]}]}
+    ctx, logger = _ctx_with_logger(
+        correlation_id=correlation, subject_id=None, parsed=parsed, raw=long_raw
+    )
+
+    list(NoticingApply(buffer).step(ctx))
+
+    assert logger.span.attrs["aux_raw"] == "x" * 2000
+
+
 # ---- F1: a transient (transport/provider) failure must NOT clear the segment ----
 
 

@@ -122,6 +122,13 @@ NOTICING_JSON_SCHEMA: dict[str, object] = {
                 "additionalProperties": False,
             },
         },
+        # A whole-pass, first-person note distinct from any per-seed ``gist`` —
+        # observability-only (D10): rides the apply span (see ``NoticingApply``'s
+        # ``_log``), never persisted, never read for control flow. NOT required,
+        # but the instructions ask the model to always write one, even (especially)
+        # when ``seeds`` is empty — that is the whole point: capture WHY nothing
+        # lingered, not just THAT nothing did.
+        "reflection": {"type": "string"},
     },
     "required": ["seeds"],
     "additionalProperties": False,
@@ -142,7 +149,10 @@ NOTICING_INSTRUCTIONS = (
     "you were not given. Answer as JSON: a 'seeds' array (may be empty), each with 'gist' "
     "(a short first-person note of what to carry), 'source_message_ids' (the turn_id(s) it "
     "is grounded in), 'turn_id' (the single turn_id it is most anchored to, if one stands "
-    "out), and 'salience' (0 to 1, how much this deserves attention)."
+    "out), and 'salience' (0 to 1, how much this deserves attention). Also include a short "
+    "first-person 'reflection': what you made of this stretch and why you did or did not "
+    "carry anything — this is your own record of the thought, always written even when "
+    "'seeds' is empty."
 )
 
 
@@ -451,6 +461,15 @@ def _append_consumed_ring(
     return tuple(combined)
 
 
+def _log_aux_raw(ctx: TickContext, raw: str) -> None:
+    """Log the aux call's raw output on the apply span (D10 — every internal-
+    cognition pass's completion must make what the model actually said visible
+    in the traces, not just a derived reason code). Observability-only: never
+    persisted, never read for control flow."""
+    if ctx.logger is not None:
+        ctx.logger.span.set(aux_raw=str(raw)[:2000])
+
+
 NOTICING_APPLY_ID = "noticing-apply"
 
 
@@ -498,22 +517,23 @@ class NoticingApply:
         )
         if result is None:
             return []
+        _log_aux_raw(ctx, result.raw)
         if _is_transient_failure(result):
             # The aux call itself failed/timed out — refund the attempt exactly
             # like ThoughtProcessingApply's TRANSIENT_FAILURE (F1): leave the
             # surveyed segment, the consumed ring, and the cursor all untouched
             # so a LATER pass gets a genuine chance to notice it, instead of the
             # segment being lost forever to a transient provider hiccup.
-            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0)
+            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0, parsed=result.parsed)
             return []
         parsed_correlation = _parse_noticing_correlation(correlation_id)
         if parsed_correlation is None:
-            self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0)
+            self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0, parsed=result.parsed)
             return []
         session_id, anchor_turn_id = parsed_correlation
         segment = self._buffer.segment_through(session_id, anchor_turn_id)
         if not segment:
-            self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0)
+            self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0, parsed=result.parsed)
             return []
         if not _has_valid_seeds_shape(result.parsed):
             # The aux call DID respond (raw non-empty, so _is_transient_failure
@@ -523,7 +543,7 @@ class NoticingApply:
             # exactly like the transient case: no clear, no consume, no seed,
             # so a LATER pass gets a genuine chance to notice this segment
             # instead of it being silently swept away by a parse failure.
-            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0)
+            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0, parsed=result.parsed)
             return []
         segment_ids = frozenset(
             {entry.turn_id for entry in segment}
@@ -553,7 +573,14 @@ class NoticingApply:
         # the same old turns forever.
         self._buffer.clear_through(session_id, anchor_turn_id)
         reason = NoticingReason.NOTICED if seeds else NoticingReason.NOTHING_LINGERED
-        self._log(ctx, reason, count=len(seeds), thought_ids=thought_ids, source_ids=new_source_ids)
+        self._log(
+            ctx,
+            reason,
+            count=len(seeds),
+            thought_ids=thought_ids,
+            source_ids=new_source_ids,
+            parsed=result.parsed,
+        )
         return intents
 
     def _seed_intents(self, ctx: TickContext, seeds: Sequence[NoticedSeed]) -> list[Intent]:
@@ -619,6 +646,7 @@ class NoticingApply:
         count: int,
         thought_ids: Sequence[str] = (),
         source_ids: Sequence[str] = (),
+        parsed: JsonObject | None = None,
     ) -> None:
         if ctx.logger is None:
             return
@@ -627,3 +655,9 @@ class NoticingApply:
             ctx.logger.span.set(thought_ids=list(thought_ids))
         if source_ids:
             ctx.logger.span.set(source_ids=list(source_ids))
+        # The model's whole-pass reflection rides the span (D10/FR24 debug),
+        # never the thought — ALWAYS logged when present, including the
+        # nothing_lingered path (that is the whole point: capture WHY nothing
+        # lingered, not just THAT nothing did).
+        if isinstance(parsed, dict) and isinstance(parsed.get("reflection"), str):
+            ctx.logger.span.set(reflection=str(parsed["reflection"])[:1000])

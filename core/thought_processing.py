@@ -136,6 +136,15 @@ class ProcessingDecision:
     crystallize: JsonObject | None = None  # the validated commitment sub-object (apply builds it)
 
 
+def _log_aux_raw(ctx: TickContext, raw: str) -> None:
+    """Log the aux call's raw output on the apply span (D10 — every internal-
+    cognition pass's completion must make what the model actually said visible
+    in the traces, not just a derived reason code). Observability-only: never
+    persisted, never read for control flow."""
+    if ctx.logger is not None:
+        ctx.logger.span.set(aux_raw=str(raw)[:2000])
+
+
 def build_processing_prompt(thought: Thought) -> str:
     """The bounded input_text handed to the aux call — the thought and its history."""
     revisited = (
@@ -354,6 +363,7 @@ class ThoughtProcessingApply:
         )
         if result is None:
             return []
+        _log_aux_raw(ctx, result.raw)
         thought = self._live_subject(ctx, subject_id)
         if thought is None:
             self._log(ctx, ProcessingReason.NO_SUBJECT, subject_id)
