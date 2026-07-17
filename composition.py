@@ -57,6 +57,8 @@ from .core.component import ComponentLayer, layer_for_type
 from .core.contact_sensor import ContactSensor
 from .core.coreloop import CoreLoop
 from .core.metrics import MetricRegistry, MetricSpec, get_metric_registry
+from .core.noticing import NOTICING_APPLY_ID, NOTICING_TRIGGER_ID, NoticingApply, NoticingTrigger
+from .core.noticing_buffer import NoticingBuffer
 from .core.personality import Personality
 from .core.registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .core.solitude_drive import CONTACT_DRIVE_U_SPEC, SolitudeDrive
@@ -172,6 +174,7 @@ def build_lifemodel(
     metrics: MetricRegistry | None = None,
     display_tz: tzinfo | None = None,
     prior_soul: PriorSoulReader | None = None,
+    noticing_buffer: NoticingBuffer | None = None,
 ) -> LifeModel:
     """Assemble the :class:`LifeModel` graph from injected parts (HLA §13).
 
@@ -192,6 +195,18 @@ def build_lifemodel(
     It is wired by the being adapter, the ONE graph whose launches are actually delivered;
     the hook/CLI graphs leave it unwired (their frames never deliver a launch) and would
     fall back to the blank-page ritual.
+
+    ``noticing_buffer`` (lm-705.5, waking mind slice 5) is the ONE process-owned
+    :class:`~lifemodel.core.noticing_buffer.NoticingBuffer` instance ``register()`` built
+    to feed the pre_llm/post_llm hooks (Task 3/E3) — passed through unchanged, never
+    constructed here (a fresh-per-graph buffer would lose every in-flight turn, see that
+    module's docstring). When not ``None`` it registers BOTH
+    :class:`~lifemodel.core.noticing.NoticingTrigger` (the heartbeat emitter) and
+    :class:`~lifemodel.core.noticing.NoticingApply` (the STANDING completion-frame
+    consumer — unlike ``ThoughtProcessingApply``, which stays the runner's per-call
+    INJECTED apply) over the SAME buffer, so a trigger's launch and its later completion
+    read/write one shared instance. ``None`` (the default, and every existing caller/test)
+    registers neither — back-compat, unchanged behaviour.
     """
     resolved_clock: ClockPort = clock or SystemClock()
     resolved_state: StatePort = state or SQLiteRuntimeStore(base_dir, clock=resolved_clock)
@@ -377,6 +392,42 @@ def build_lifemodel(
                 accepts_signals=True,
             ),
         )
+    if noticing_buffer is not None:
+        # Waking mind slice 5 (lm-705.5, spec §4): the SUBJECTLESS pair riding the SAME
+        # non-delivered internal-cognition seam as processing above. Unlike
+        # ThoughtProcessingApply, NoticingApply IS registered here as a STANDING
+        # COGNITION component — the completion frame runs it alongside the runner's
+        # injected apply (``ThoughtProcessingApply``), and each guards on the opposite
+        # of ``pending_internal_subject_id`` (see ``core/noticing.py``'s module
+        # docstring), so exactly one of them ever does real work per completion.
+        # ``None`` (the default — every existing ``build_lifemodel`` caller/test)
+        # registers neither, unchanged from before this bead.
+        try:
+            resolved_registry.manifest(NOTICING_TRIGGER_ID)
+        except UnknownComponent:
+            resolved_registry.register(
+                NoticingTrigger(noticing_buffer),
+                ComponentManifest(
+                    id=NOTICING_TRIGGER_ID,
+                    type="noticing-trigger",
+                    layer=ComponentLayer.COGNITION,
+                    metric_surface=(),
+                    accepts_signals=True,
+                ),
+            )
+        try:
+            resolved_registry.manifest(NOTICING_APPLY_ID)
+        except UnknownComponent:
+            resolved_registry.register(
+                NoticingApply(noticing_buffer),
+                ComponentManifest(
+                    id=NOTICING_APPLY_ID,
+                    type="noticing-apply",
+                    layer=ComponentLayer.COGNITION,
+                    metric_surface=(),
+                    accepts_signals=True,
+                ),
+            )
     resolved_state_actor = StateActor(resolved_state, committer=resolved_committer)
     resolved_coreloop = CoreLoop(
         registry=resolved_registry,

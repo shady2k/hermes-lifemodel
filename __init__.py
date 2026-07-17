@@ -727,6 +727,11 @@ def register(ctx: Any) -> None:
             soul=soul,
             default_soul_text=_default_soul_text(),
             llm=internal_llm,
+            # The SAME NoticingBuffer instance the pre_llm/post_llm hooks above already
+            # share (lm-705.5 Task 3/E3) — threaded through so the tick's own graph
+            # registers NoticingTrigger/NoticingApply over that ONE instance, never a
+            # second one (see build_lifemodel's ``noticing_buffer`` docstring).
+            noticing_buffer=noticing_buffer,
         )
 
     # All REQUIRED wiring for this process succeeded → wipe any stale durable

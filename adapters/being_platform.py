@@ -50,6 +50,7 @@ from ..core.frame import FrameTrigger, run_frame, state_actor_lock
 from ..core.genesis import needs_adoption
 from ..core.llm_port import InternalCognitionRequest, LlmPort
 from ..core.metrics import get_metric_registry
+from ..core.noticing_buffer import NoticingBuffer
 from ..core.proactive import dispatch_launches
 from ..core.supervised_loop import SupervisedLoop
 from ..core.thought_processing import ThoughtProcessingApply
@@ -111,6 +112,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         soul: SoulFile | None = None,
         default_soul_text: str = "",
         llm: LlmPort | None = None,
+        noticing_buffer: NoticingBuffer | None = None,
     ) -> None:
         super().__init__(config, Platform(PLATFORM_NAME))
         self._base_dir = base_dir
@@ -123,6 +125,13 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         # bare-constructed adapter (every existing test) or a host build without
         # `ctx.llm` still boots and ticks exactly as before this bead.
         self._llm = llm
+        # The ONE process-owned NoticingBuffer instance (lm-705.5, waking mind slice 5)
+        # `register()` built to feed the pre_llm/post_llm hooks (Task 3/E3) — threaded
+        # through unchanged so `_build_lm`'s graph registers `NoticingTrigger`/
+        # `NoticingApply` over the SAME instance, never a second one (a per-graph buffer
+        # would lose every in-flight turn). `None` (a bare-constructed adapter, e.g. every
+        # existing test) leaves the seam's noticing half unregistered — back-compat.
+        self._noticing_buffer = noticing_buffer
         # The SAME SoulFile instance `register()` built for the genesis pre_llm_call
         # injector (spec §6.4) — reused here (never a second instance) so the veteran
         # read behind the WAKE PACKET's ritual and the injector's own read go through
@@ -189,6 +198,11 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
         packet must be able to open from the soul someone wrote before it woke. Passed as
         a bound method, not a resolved string — it is called only when a GENESIS-sprung
         desire actually launches, so an ordinary tick never reads the file.
+
+        Threads :attr:`_noticing_buffer` through so this graph registers
+        ``NoticingTrigger``/``NoticingApply`` (lm-705.5) over the SAME buffer instance
+        the pre_llm/post_llm hooks read/write — ``None`` (no buffer wired) registers
+        neither, matching every ``build_lifemodel`` caller before this bead.
         """
         return build_lifemodel(
             base_dir=self._base_dir,
@@ -196,6 +210,7 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
             trace_writer=self._trace_writer,
             event_ring=self._event_ring,
             prior_soul=self._prior_soul,
+            noticing_buffer=self._noticing_buffer,
         )
 
     def _tick(self) -> None:
@@ -544,6 +559,7 @@ def register_being_platform(
     soul: SoulFile | None = None,
     default_soul_text: str = "",
     llm: LlmPort | None = None,
+    noticing_buffer: NoticingBuffer | None = None,
 ) -> None:
     """Register the being as a gateway platform (call from ``register(ctx)``).
 
@@ -558,6 +574,13 @@ def register_being_platform(
     — ``register()`` resolves the real :class:`~lifemodel.adapters.plugin_llm_adapter.PluginLlmPort`
     over ``ctx.llm`` and passes it through; ``None`` (the default, and every caller
     that doesn't wire one) leaves the seam degraded off in :meth:`BeingAdapter.connect`.
+
+    *noticing_buffer* (lm-705.5) is the SAME :class:`~lifemodel.core.noticing_buffer.NoticingBuffer`
+    instance ``register()`` built to feed the pre_llm/post_llm hooks — threaded through so
+    every tick's graph (:meth:`BeingAdapter._build_lm`) registers ``NoticingTrigger``/
+    ``NoticingApply`` over that ONE instance, never a second one. ``None`` (the default,
+    and every caller that doesn't wire one) leaves the noticing pair unregistered — the
+    being ticks exactly as it did before this bead.
     """
     ctx.register_platform(
         PLATFORM_NAME,
@@ -569,6 +592,7 @@ def register_being_platform(
             soul=soul,
             default_soul_text=default_soul_text,
             llm=llm,
+            noticing_buffer=noticing_buffer,
         ),
         check_fn=make_check_fn(),
         emoji="🫀",
