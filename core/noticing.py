@@ -61,10 +61,11 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 
 from ..domain.memory import JsonObject, PutOp
-from ..domain.objects import Thought
+from ..domain.objects import InvalidPayload, Thought
 from ..ports.memory import MemoryPort
 from ..ports.tracer import format_traceparent
 from ..state.model import NOTICED_SOURCE_IDS_CAP
+from .belief_view import belief_from_seed_fields, encode_belief
 from .budget import (
     DEFAULT_DAILY_INTERNAL_CALL_CEILING,
     DEFAULT_MIN_INTERPROCESSING_INTERVAL,
@@ -124,6 +125,14 @@ NOTICING_JSON_SCHEMA: dict[str, object] = {
                     "source_message_ids": {"type": "array", "items": {"type": "string"}},
                     "turn_id": {"type": "string"},
                     "salience": {"type": "number"},
+                    # Belief-track v1 (lm-705.19): a seed may be a grounded ``belief``
+                    # rather than a ``thought`` (default). JSON-schema cannot express
+                    # "content+confidence required ONLY when kind=='belief'", so that
+                    # conditional-required is enforced in ``validate_noticed_seeds``.
+                    "kind": {"enum": ["thought", "belief"]},
+                    "content": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "sensitivity": {"enum": ["normal", "sensitive", "private"]},
                 },
                 "required": ["gist", "source_message_ids"],
                 "additionalProperties": False,
@@ -156,8 +165,15 @@ NOTICING_INSTRUCTIONS = (
     "you were not given. Answer as JSON: a 'seeds' array (may be empty), each with 'gist' "
     "(a short first-person note of what to carry), 'source_message_ids' (the turn_id(s) it "
     "is grounded in), 'turn_id' (the single turn_id it is most anchored to, if one stands "
-    "out), and 'salience' (0 to 1, how much this deserves attention). Also include a short "
-    "first-person 'reflection': what you made of this stretch and why you did or did not "
+    "out), and 'salience' (0 to 1, how much this deserves attention). Now and then a seed is "
+    "not just a passing thought but something you have come to actually understand about this "
+    "person or their world — a fallible reading you would act on across future conversations, "
+    "not only in this one. When that is genuinely the case, set 'kind' to 'belief' (otherwise "
+    "leave it 'thought'), write the understanding plainly in 'content', and say how sure you "
+    "are in 'confidence' (0 to 1). Most exchanges yield no belief at all; do not inflate a "
+    "one-off remark or a passing mood into one, and cite the exact turn_id(s) it rests on as "
+    "your evidence. If the understanding is delicate, mark 'sensitivity' 'private'. Also include "
+    "a short first-person 'reflection': what you made of this stretch and why you did or did not "
     "carry anything — this is your own record of the thought, always written even when "
     "'seeds' is empty."
 )
@@ -345,12 +361,23 @@ class NoticingTrigger:
 @dataclass(frozen=True)
 class NoticedSeed:
     """One validated noticing-pass result — grounded in the surveyed segment's
-    real source ids (anti-hallucination) and not already consumed (dedup)."""
+    real source ids (anti-hallucination) and not already consumed (dedup).
+
+    A seed is a ``thought`` by default; belief-track v1 (lm-705.19) lets it be a
+    grounded ``belief`` instead, in which case :attr:`content` (the proposition)
+    and :attr:`confidence` (validated to a number in ``[0, 1]``) are present and
+    :attr:`sensitivity` carries the model's proposed privacy tier (floored to at
+    least SENSITIVE at build time). For a ``thought`` seed those three are the
+    inert defaults (``None``/``None``/``"normal"``)."""
 
     gist: str
     source_message_ids: tuple[str, ...]
     turn_id: str | None
     salience: float
+    kind: str = "thought"
+    content: str | None = None
+    confidence: float | None = None
+    sensitivity: str = "normal"
 
 
 def validate_noticed_seeds(
@@ -404,6 +431,23 @@ def validate_noticed_seeds(
     return validated
 
 
+def _seed_confidence(value: object) -> float | None:
+    """A belief seed's ``confidence``: a real number in ``[0, 1]``, else ``None``.
+
+    JSON-schema conditional-required can't express "a belief needs a numeric
+    confidence", so this is the enforcement point — a missing, non-numeric
+    (``bool`` is NOT a number here), or out-of-range value returns ``None``, and
+    the caller DROPS the whole belief seed (never a crash, never a silent
+    coercion to a made-up default). Mirrors ``belief_view._validated_confidence``'s
+    contract, but returns ``None`` to drop rather than raising."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    if not (0.0 <= number <= 1.0):
+        return None
+    return number
+
+
 def _validate_one_seed(
     raw: object,
     *,
@@ -431,8 +475,35 @@ def _validate_one_seed(
     raw_salience = raw.get("salience", 0.0)
     salience = float(raw_salience) if isinstance(raw_salience, int | float) else 0.0
     salience = max(0.0, min(1.0, salience))  # clamp to [0, 1] — the schema documents it, enforce it
+    # A seed is a ``thought`` unless the model explicitly (and validly) marks it a
+    # ``belief`` (an unknown/absent kind is a thought, fail-soft). A belief carries
+    # the same anti-hallucination + dedup guarantees above (grounded, in-segment,
+    # unconsumed source ids) PLUS its own conditional-required fields, enforced here
+    # since JSON-schema cannot: a non-empty ``content`` proposition and a numeric
+    # ``confidence`` in [0, 1]. A belief seed missing either is DROPPED (lm-705.19).
+    kind = "belief" if raw.get("kind") == "belief" else "thought"
+    content: str | None = None
+    confidence: float | None = None
+    sensitivity = "normal"
+    if kind == "belief":
+        raw_content = raw.get("content")
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            return None  # a belief needs a proposition to hold — drop
+        content = raw_content.strip()
+        confidence = _seed_confidence(raw.get("confidence"))
+        if confidence is None:
+            return None  # a belief needs a numeric confidence in [0, 1] — drop
+        raw_sensitivity = raw.get("sensitivity")
+        sensitivity = raw_sensitivity if isinstance(raw_sensitivity, str) else "normal"
     return NoticedSeed(
-        gist=gist.strip(), source_message_ids=source_ids, turn_id=turn_id, salience=salience
+        gist=gist.strip(),
+        source_message_ids=source_ids,
+        turn_id=turn_id,
+        salience=salience,
+        kind=kind,
+        content=content,
+        confidence=confidence,
+        sensitivity=sensitivity,
     )
 
 
@@ -607,7 +678,11 @@ class NoticingApply:
         )
 
         intents: list[Intent] = self._seed_intents(ctx, seeds)
-        thought_ids = [seed_thought_id(seed.gist) for seed in seeds]
+        # A belief seed is not a thought — keep the thought_ids span field honest.
+        # Its source ids still ride the consumed ring below (dedup applies to belief
+        # evidence too); the belief's own id/subject/confidence/sensitivity are logged
+        # separately (redacted, no content) by ``_seed_intents``.
+        thought_ids = [seed_thought_id(seed.gist) for seed in seeds if seed.kind != "belief"]
         new_source_ids = [sid for seed in seeds for sid in seed.source_message_ids]
         if new_source_ids:
             updated_ring = _append_consumed_ring(
@@ -656,8 +731,16 @@ class NoticingApply:
     def _seed_intents(self, ctx: TickContext, seeds: Sequence[NoticedSeed]) -> list[Intent]:
         live_ids = {t.id for t in live_thoughts(ctx.objects)}
         seen_thought_ids: set[str] = set()
+        seen_belief_ids: set[str] = set()
+        belief_log: list[JsonObject] = []
         intents: list[Intent] = []
         for seed in seeds:
+            if seed.kind == "belief":
+                # A belief seed routes to a Belief (its own kind/row), NOT a Thought.
+                intent = self._belief_intent(ctx, seed, seen_belief_ids, belief_log)
+                if intent is not None:
+                    intents.append(intent)
+                continue
             thought_id = seed_thought_id(seed.gist)
             if thought_id in seen_thought_ids:
                 # Two validated seeds can share a gist (→ the same content-
@@ -692,7 +775,68 @@ class NoticingApply:
                 provenance=provenance,
             )
             intents.append(PutRecord(op=PutOp(draft=encode_thought(thought))))
+        # D10 (tightened): a created belief's id/subject/confidence/sensitivity ride
+        # the span — NEVER its content (the model's words already live once in
+        # ``aux_raw``; a reason/span field must not re-log the proposition).
+        if belief_log and ctx.logger is not None:
+            ctx.logger.span.set(beliefs=belief_log)
         return intents
+
+    def _belief_intent(
+        self,
+        ctx: TickContext,
+        seed: NoticedSeed,
+        seen_belief_ids: set[str],
+        belief_log: list[JsonObject],
+    ) -> Intent | None:
+        """Build the :class:`~lifemodel.domain.objects.belief.Belief` PutRecord for a
+        validated ``belief`` seed, or ``None`` to drop it.
+
+        The belief id is CONTENT-scoped (a constant ``"noticing"`` anchor + content
+        fingerprint, NOT the survey_id): an exact-duplicate belief upserts ONE row
+        rather than minting a fresh duplicate on every re-notice (the partial dedup
+        v1 affords; broader semantic dedup is deferred). ``belief_from_seed_fields``
+        strictly re-parses the untrusted seed and can still raise :class:`InvalidPayload`
+        on a case validation above did not (e.g. content that isn't UTF-8 encodable) —
+        that is caught and DROPPED, never crashing the off-lock completion frame.
+        A within-batch id already scheduled this call is skipped (G3, mirrors the
+        thought path): two seeds with identical content would otherwise emit two
+        puts for one row."""
+        provenance = creation_provenance(
+            ctx.trace,
+            created_by=self.id,
+            component="cognition",
+            reason="believed",
+            source_object_ids=seed.source_message_ids,
+            turn_id=seed.turn_id,
+        )
+        try:
+            belief = belief_from_seed_fields(
+                source_thought_id="noticing",
+                fields={
+                    "content": seed.content,
+                    "confidence": seed.confidence,
+                    "subject": "owner",
+                    "sensitivity": seed.sensitivity,
+                },
+                source_message_ids=seed.source_message_ids,
+                salience=seed.salience,
+                provenance=provenance,
+            )
+        except InvalidPayload:
+            return None  # bad model data (e.g. non-encodable content) — drop, never crash
+        if belief.id in seen_belief_ids:
+            return None  # this call already scheduled a put for this belief id (G3)
+        seen_belief_ids.add(belief.id)
+        belief_log.append(
+            {
+                "id": belief.id,
+                "subject": belief.subject,
+                "confidence": belief.confidence,
+                "sensitivity": belief.sensitivity.value,
+            }
+        )
+        return PutRecord(op=PutOp(draft=encode_belief(belief)))
 
     def _row_already_exists(self, thought_id: str, live_ids: set[str]) -> bool:
         """True iff *thought_id* already names a row in ANY state (F4).

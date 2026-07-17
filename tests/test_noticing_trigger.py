@@ -314,3 +314,32 @@ def test_claimed_snapshot_is_immune_to_ring_eviction_of_newer_turns():
     for tid in ("t3", "t4", "t5"):
         _complete_turn(buffer, "s1", tid, ts=NOW)
     assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t0", "t1"]
+
+
+# ---- belief-track v1 (lm-705.19 Task 3): the seed schema carries belief fields ----
+
+
+def test_seed_schema_carries_belief_fields():
+    """The per-seed schema now allows a grounded ``belief`` (kind/content/
+    confidence/sensitivity) alongside the ``thought`` default, so a real
+    structured aux call may emit one. ``content``/``confidence`` stay OPTIONAL at
+    the schema level — their "required only when kind=='belief'" is enforced in
+    ``validate_noticed_seeds`` (JSON-schema can't express conditional-required)."""
+    seed_props = NOTICING_JSON_SCHEMA["properties"]["seeds"]["items"]["properties"]
+    assert seed_props["kind"] == {"enum": ["thought", "belief"]}
+    assert seed_props["content"] == {"type": "string"}
+    assert seed_props["confidence"] == {"type": "number"}
+    assert seed_props["sensitivity"] == {"enum": ["normal", "sensitive", "private"]}
+    # unchanged: only gist + source_message_ids are unconditionally required
+    assert NOTICING_JSON_SCHEMA["properties"]["seeds"]["items"]["required"] == [
+        "gist",
+        "source_message_ids",
+    ]
+
+
+def test_instructions_frame_a_belief_in_the_beings_voice():
+    """The being's own judgment-first framing for a belief — a fallible reading
+    it would act on across conversations, stated with a confidence, not inflated
+    from a one-off — rides the instructions (no keyword rules)."""
+    assert "belief" in NOTICING_INSTRUCTIONS
+    assert "confidence" in NOTICING_INSTRUCTIONS

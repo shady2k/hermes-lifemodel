@@ -26,7 +26,7 @@ from lifemodel.core.noticing_buffer import NoticingBuffer
 from lifemodel.core.taxonomy import internal_result_signal
 from lifemodel.core.thought_view import build_thought, encode_thought, seed_thought_id
 from lifemodel.core.timeutil import to_iso
-from lifemodel.domain.objects import ThoughtState
+from lifemodel.domain.objects import Sensitivity, ThoughtState
 from lifemodel.ports.tracer import TraceContext
 from lifemodel.state.model import State
 from lifemodel.testing import FakeActiveSpan, FakeClock, FakeMemoryStore, FakeSpanLogger
@@ -620,3 +620,277 @@ def test_salience_is_clamped_to_the_unit_range():
     puts = [i for i in intents if isinstance(i, PutRecord)]
     assert len(puts) == 1
     assert puts[0].op.draft.salience == 1.0
+
+
+# ---- belief-track v1 (lm-705.19 Task 3): a seed may be a grounded belief ----
+
+
+def test_belief_seed_becomes_a_belief_with_evidence_and_confidence():
+    """A ``kind:"belief"`` seed grounded in the surveyed segment becomes a
+    ``Belief`` PutRecord carrying its evidence (``source_message_ids``),
+    ``confidence``, and — a proposition about the person — a SENSITIVE floor;
+    the surveyed window still finalizes and the source id is consumed."""
+    buffer = _seeded_buffer()
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    parsed = {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "they get anxious before status loss",
+                "content": "They get anxious before a loss of status.",
+                "source_message_ids": ["t1"],
+                "confidence": 0.75,
+            }
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    draft = puts[0].op.draft
+    assert draft.kind == "belief"
+    assert draft.payload["content"] == "They get anxious before a loss of status."
+    assert draft.payload["source_message_ids"] == ["t1"]
+    assert draft.confidence == 0.75
+    assert draft.payload["_sensitivity"] == Sensitivity.SENSITIVE.value
+    # provenance records the belief lineage + the "believed" reason (not "noticed")
+    assert draft.payload["_provenance"]["reason"] == "believed"
+    assert draft.payload["_provenance"]["source_object_ids"] == ["t1"]
+    # the surveyed window still finalizes and the source is consumed for dedup
+    assert FinalizeBuffer(survey_id) in intents
+    updates = [i for i in intents if isinstance(i, UpdateState)]
+    assert len(updates) == 1
+    assert set(updates[0].changes["noticed_source_ids"]) == {"t1"}
+
+
+def test_belief_seed_id_is_content_scoped_not_survey_scoped():
+    """The belief id is derived from a CONSTANT source anchor + content (the
+    partial dedup we can afford), so it is stable across surveys — an exact-
+    duplicate belief upserts ONE row rather than a fresh duplicate per re-notice."""
+    from lifemodel.core.belief_view import belief_id
+
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    content = "They get anxious before a loss of status."
+    parsed = {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "anxious",
+                "content": content,
+                "source_message_ids": ["t1"],
+                "confidence": 0.5,
+            }
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert puts[0].op.draft.id == belief_id("noticing", content)
+
+
+def test_belief_seed_with_ungrounded_source_id_is_dropped():
+    """Anti-hallucination applies to belief seeds too: a belief citing a source
+    id never shown to the model is dropped, no Belief created."""
+    buffer = _seeded_buffer()
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    parsed = {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "ungrounded",
+                "content": "A claim grounded in a turn never shown.",
+                "source_message_ids": ["ghost-never-shown"],
+                "confidence": 0.6,
+            }
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+    # surveyed-but-fruitless still advances the cursor
+    assert FinalizeBuffer(survey_id) in intents
+    # nothing consumed (the seed never validated)
+    assert [i for i in intents if isinstance(i, UpdateState)] == []
+
+
+def test_belief_seed_with_bad_confidence_is_dropped_not_crashed():
+    """A belief needs a numeric confidence in [0, 1]; a missing, non-numeric, or
+    out-of-range confidence DROPS the seed (never a crash) — no Belief, no put."""
+    bad_confidences: list[dict] = [
+        {
+            "kind": "belief",
+            "gist": "g",
+            "content": "missing confidence.",
+            "source_message_ids": ["t1"],
+        },
+        {
+            "kind": "belief",
+            "gist": "g",
+            "content": "out of range high.",
+            "source_message_ids": ["t1"],
+            "confidence": 1.5,
+        },
+        {
+            "kind": "belief",
+            "gist": "g",
+            "content": "out of range low.",
+            "source_message_ids": ["t1"],
+            "confidence": -0.1,
+        },
+        {
+            "kind": "belief",
+            "gist": "g",
+            "content": "not a number.",
+            "source_message_ids": ["t1"],
+            "confidence": "high",
+        },
+        {
+            "kind": "belief",
+            "gist": "g",
+            "content": "a bool is not a number.",
+            "source_message_ids": ["t1"],
+            "confidence": True,
+        },
+    ]
+    for bad in bad_confidences:
+        buffer = _seeded_buffer()
+        _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+        ctx = _ctx(correlation_id=correlation, subject_id=None, parsed={"seeds": [bad]})
+
+        intents = list(NoticingApply(buffer).step(ctx))
+
+        assert [i for i in intents if isinstance(i, PutRecord)] == [], bad
+
+
+def test_belief_seed_missing_content_is_dropped():
+    """A belief needs a proposition to hold: a ``kind:"belief"`` seed with no
+    ``content`` is dropped (JSON-schema can't express conditional-required, so
+    it is enforced here)."""
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    parsed = {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "no content",
+                "source_message_ids": ["t1"],
+                "confidence": 0.7,
+            }
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+
+
+def test_thought_seed_kind_still_produces_a_thought():
+    """An explicit ``kind:"thought"`` seed (and, by every other test, a seed
+    with NO kind) builds a Thought exactly as before — the thought path is
+    untouched."""
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    parsed = {"seeds": [{"kind": "thought", "gist": "carry this", "source_message_ids": ["t1"]}]}
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.kind == "thought"
+    assert puts[0].op.draft.payload["content"] == "carry this"
+
+
+def test_belief_seed_with_private_sensitivity_is_private():
+    """The model may escalate a belief to PRIVATE; anything else floors to
+    SENSITIVE (never below)."""
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    parsed = {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "private matter",
+                "content": "A private worry they confided.",
+                "source_message_ids": ["t1"],
+                "confidence": 0.9,
+                "sensitivity": "private",
+            }
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.payload["_sensitivity"] == Sensitivity.PRIVATE.value
+
+
+def test_belief_and_thought_seeds_coexist_in_one_pass():
+    """A single pass may carry both a thought and a belief — each routed to its
+    own kind, both grounded, both consumed."""
+    buffer = _seeded_buffer()
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    parsed = {
+        "seeds": [
+            {"kind": "thought", "gist": "keep chewing on this", "source_message_ids": ["t1"]},
+            {
+                "kind": "belief",
+                "gist": "steady preference",
+                "content": "They prefer async updates.",
+                "source_message_ids": ["t2"],
+                "confidence": 0.8,
+            },
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    kinds = {p.op.draft.kind for p in puts}
+    assert kinds == {"thought", "belief"}
+    assert FinalizeBuffer(survey_id) in intents
+    updates = [i for i in intents if isinstance(i, UpdateState)]
+    assert set(updates[0].changes["noticed_source_ids"]) == {"t1", "t2"}
+
+
+def test_belief_creation_logs_redacted_metadata_not_content():
+    """D10 (tightened): a created belief logs id/subject/confidence/sensitivity
+    on the span — NEVER the full content string in any span field."""
+    buffer = _seeded_buffer()
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    secret = "A secret worry about their job security."
+    parsed = {
+        "seeds": [
+            {
+                "kind": "belief",
+                "gist": "worry",
+                "content": secret,
+                "source_message_ids": ["t1"],
+                "confidence": 0.8,
+                "sensitivity": "private",
+            }
+        ]
+    }
+    ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    list(NoticingApply(buffer).step(ctx))
+
+    beliefs = logger.span.attrs["beliefs"]
+    assert len(beliefs) == 1
+    assert beliefs[0]["subject"] == "owner"
+    assert beliefs[0]["confidence"] == 0.8
+    assert beliefs[0]["sensitivity"] == Sensitivity.PRIVATE.value
+    assert "id" in beliefs[0]
+    # the raw content string must never ride ANY span field (redaction)
+    assert all(secret not in str(v) for v in logger.span.attrs.values())
