@@ -122,7 +122,7 @@ from ..domain.memory import (
 from ..ports.clock import ClockPort
 from ..ports.memory import OrderBy
 from .errors import StateCorruptError, StateSchemaError, StateSerializationError
-from .model import SCHEMA_VERSION, State
+from .model import SCHEMA_VERSION, SURFACED_BELIEF_IDS_CAP, State
 from .soul_revisions import SOUL_KINDS
 
 _DB_FILENAME = "lifemodel.sqlite"
@@ -789,6 +789,38 @@ class SQLiteRuntimeStore:
             ),
             create_missing=False,
         )
+
+    def stamp_surfaced_beliefs(self, ids: Sequence[str]) -> None:
+        """Atomically append newly-surfaced belief ids to the injector's cooldown ring
+        (lm-705.19 Task 2), deduped and bounded to the most-recent
+        ``SURFACED_BELIEF_IDS_CAP`` entries.
+
+        The belief-track sibling of :meth:`stamp_affect_display`: the ``pre_llm_call``
+        injector stamps which beliefs it just surfaced so a later turn's injector can skip
+        them (Task 4's cooldown gate), and it must do so WITHOUT rolling back the drive —
+        a plain ``load()`` -> ``commit(state)`` would write back a whole ``State`` snapshot
+        that could be stale by the time it commits (the ~60s tick may have advanced
+        ``u``/affect/pending in between), overwriting the tick's work. So this is a
+        field-level read-modify-write of ONLY ``surfaced_belief_ids`` inside ONE
+        ``BEGIN IMMEDIATE`` write transaction (same discipline as :meth:`stamp_affect_display`
+        / :meth:`commit_tick`): the latest committed ``state_json`` is read under the write
+        lock, the new ids are merged into the ring, and only that one key is replaced — every
+        other field keeps its latest committed value. Dedup preserves order (first-seen wins,
+        mirrors ``core/noticing.py``'s ``_append_consumed_ring``), and the combined ring is
+        truncated to the most-recent ``SURFACED_BELIEF_IDS_CAP`` entries (oldest dropped
+        first). A missing row (a being with no committed state yet) is a no-op — same
+        fail-posture as :meth:`stamp_affect_display`: the injector only stamps after a tick
+        has already created the row, and the next tick would create it anyway.
+        """
+
+        def _stamp(data: dict[str, Any]) -> None:
+            existing = data.get("surfaced_belief_ids", [])
+            combined = list(dict.fromkeys((*existing, *ids)))
+            if len(combined) > SURFACED_BELIEF_IDS_CAP:
+                combined = combined[-SURFACED_BELIEF_IDS_CAP:]
+            data["surfaced_belief_ids"] = combined
+
+        self._merge_state_fields(_stamp, create_missing=False)
 
     def _merge_state_fields(
         self, mutate: Callable[[dict[str, Any]], None], *, create_missing: bool

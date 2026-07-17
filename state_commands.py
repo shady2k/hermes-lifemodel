@@ -177,6 +177,10 @@ _SET_PROTECTED: dict[str, str] = {
         "(processed_external_event_ids/proactive_send_log); no safe scalar coercion either "
         "(it's a tuple, not a settable scalar)"
     ),
+    "surfaced_belief_ids": (
+        "lm-705.19: the belief injector's cooldown ring — internal injector cooldown ring; "
+        "not hand-written, mirroring noticed_source_ids (it's a tuple, not a settable scalar)"
+    ),
 }
 
 #: Field TYPE -> coercion kind. A field whose type is absent here (``list``/``dict``) has no

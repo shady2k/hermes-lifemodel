@@ -39,6 +39,14 @@ SCHEMA_VERSION = 4
 #: whatever tuple it is handed, however long.
 NOTICED_SOURCE_IDS_CAP = 512
 
+#: Bound on :attr:`State.surfaced_belief_ids` (lm-705.19 Task 2) — the belief
+#: injector's cooldown ring, mirroring :data:`NOTICED_SOURCE_IDS_CAP`. Enforced
+#: where the ring is APPENDED (``SQLiteRuntimeStore.stamp_surfaced_beliefs``,
+#: Task 4's injector), not here: this module only persists whatever tuple it is
+#: handed, however long (and clamps a hand-edited/legacy oversized one on load,
+#: same defense-in-depth as ``noticed_source_ids``).
+SURFACED_BELIEF_IDS_CAP = 64
+
 
 @dataclass
 class State:
@@ -303,6 +311,16 @@ class State:
     #: server-local ISO-8601 shape, same "``None`` before the first pass ever"
     #: contract). Additive: ``from_dict`` defaults it to ``None`` when absent.
     last_noticing_at: str | None = None
+    #: The belief injector's cooldown ring (lm-705.19 Task 2): ids of ``belief``
+    #: records the injector has already surfaced into context recently, so a
+    #: later pass can dedup against it rather than re-surfacing the same belief
+    #: every turn — the belief-track sibling of :attr:`noticed_source_ids`,
+    #: mirrored exactly (bounded by :data:`SURFACED_BELIEF_IDS_CAP`, the
+    #: PRIMARY enforcement is where the ring is APPENDED — Task 4's injector via
+    #: :meth:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore.stamp_surfaced_beliefs`
+    #: — and ``from_dict`` ALSO clamps it on load, defense in depth). Additive:
+    #: ``from_dict`` defaults it to ``()`` when absent.
+    surfaced_belief_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-native dict, header (``schema_version``) first."""
@@ -450,6 +468,15 @@ class State:
             # The noticing sibling of last_internal_call_at — opaque opt-str,
             # mirrored exactly (never parsed as an aware instant here).
             last_noticing_at=_as_opt_str(data.get("last_noticing_at"), "last_noticing_at"),
+            # The belief injector's cooldown ring (lm-705.19 Task 2) — mirrors
+            # noticed_source_ids exactly: accepts both a plain JSON list (a real
+            # json.dumps/loads round trip) and a tuple (the in-memory
+            # to_dict()/from_dict() round trip, since asdict() preserves tuple as
+            # tuple), and is clamped to SURFACED_BELIEF_IDS_CAP on load (defense in
+            # depth; the PRIMARY enforcement is where the ring is APPENDED).
+            surfaced_belief_ids=_clamp_ring(
+                _as_str_tuple(data, "surfaced_belief_ids", ()), cap=SURFACED_BELIEF_IDS_CAP
+            ),
         )
 
 
