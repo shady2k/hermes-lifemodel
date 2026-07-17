@@ -129,3 +129,14 @@ def test_unknown_action_and_non_dict_args_are_gentle(tmp_path: Path):
     tool = _tool(tmp_path)
     assert "error" in json.loads(tool({"action": "nope"}))
     assert "error" in json.loads(tool("not a dict"))
+
+
+def test_crystallize_instruction_carries_the_creation_boundary():
+    # The SAME judgment-based creation boundary the tool description carries (codex #4) must
+    # also guard the OTHER birth path — crystallization — so a poisoned thought cannot mint a
+    # standing directive from either door.
+    from lifemodel.core.thought_processing import PROCESSING_INSTRUCTIONS
+
+    lowered = PROCESSING_INSTRUCTIONS.lower()
+    assert "your own self-authored intention" in lowered
+    assert "never" in lowered and "instructions" in lowered
