@@ -527,15 +527,20 @@ async def main_async() -> dict[str, Any]:
     # core/noticing_buffer.py) -- seed a closed segment through its OWN public API,
     # exactly as the pre_llm/post_llm hooks would (Task 3/E3), rather than a fresh
     # NoticingTrigger heartbeat: this proves the COMPLETION half of the seam
-    # (NoticingApply reading the segment back via ``segment_through`` + validating +
-    # creating real thoughts) against the REAL host's structured-completion path, the
-    # same way Part B-processing/B-crystallize drive ``ThoughtProcessingApply``
-    # directly rather than waiting on ``ThoughtProcessingSelector``.
+    # (NoticingApply reading the surveyed snapshot back via ``claimed`` + validating +
+    # creating real thoughts, then emitting FinalizeBuffer) against the REAL host's
+    # structured-completion path, the same way Part B-processing/B-crystallize drive
+    # ``ThoughtProcessingApply`` directly rather than waiting on the selector. Because
+    # the trigger heartbeat is bypassed here, we CLAIM the surveyed prefix ourselves
+    # (lm-705.13) -- exactly what the trigger does at launch -- so the apply's
+    # ``claimed(survey_id)`` recovers it; the correlation encodes that survey_id.
     bn_buffer = NoticingBuffer()
     bn_now = datetime(2026, 1, 1, 10, 5, tzinfo=UTC)
     bn_buffer.open_pending("bn-session", user_text="I have a big interview Friday", now=bn_now)
     bn_buffer.complete("bn-session", "bn-turn-1", assistant_text="Good luck!", now=bn_now)
-    bn_correlation_id = f"notice-bn-session@bn-turn-1@{bn_now.isoformat()}"
+    bn_survey_id = f"bn-turn-1@{bn_now.isoformat()}"
+    bn_buffer.claim("bn-session", ("bn-turn-1",), bn_survey_id)
+    bn_correlation_id = f"notice-bn-session#{bn_survey_id}"
 
     async def _async_caller_bn(**kwargs: Any) -> Any:
         return (

@@ -24,26 +24,26 @@ guards on the opposite of that field — ``ThoughtProcessingApply`` on
 "subject set", ``NoticingApply`` on "subject absent" — so the SAME completion
 frame can register both and exactly one of them ever does real work.
 
-**Threading the session id (and the exact surveyed prefix) across the async
-gap:** the ONLY channel that survives from launch to completion is the
+**Threading the surveyed snapshot across the async gap (claim/finalize,
+lm-705.13):** the ONLY channel that survives from launch to completion is the
 ``correlation_id`` string (mirrors ``ThoughtProcessingSelector``'s
-``process-<thought_id>@<iso>``). The trigger encodes
-``notice-<session_id>@<anchor_turn_id>@<iso>``, where ``anchor_turn_id`` is the
-LAST entry's ``turn_id`` in the segment it just surveyed. The apply recovers
-both and reads the buffer via
-:meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.segment_through` —
-**not** a fresh :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.closed_segment`
-call. That distinction is load-bearing: ``closed_segment`` reapplies the
-closed-prefix gate, which returns ``[]`` for the WHOLE lane the instant a NEW
-turn opens on it — entirely plausible during the async call's own window (up
-to ``DEFAULT_TIMEOUT_SECONDS``, ``adapters/internal_runner.py``) — and would
-then reject every otherwise-good seed from a pass that was itself triggered by
-a lively (size-cap) burst on that very lane. ``segment_through`` instead reads
-the exact prefix the trigger already gated once at launch time, un-gated by
-whatever the lane is doing now, and the apply clears through that SAME anchor
-— never a larger, freshly-recomputed segment — so a turn that arrives during
-the async gap is left in the ring for a LATER pass, never silently swept away
-un-surveyed.
+``process-<thought_id>@<iso>``). The trigger mints a deterministic ``survey_id``
+(``<anchor_turn_id>@<iso>``, the anchor being the LAST entry of the oldest-
+``size_cap`` PREFIX it surveys — codex F2b) and encodes
+``notice-<session_id>#<survey_id>``. BEFORE emitting, it **claims** that exact
+window (:meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.claim`): the rows
+leave :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.closed_segment`, so a
+second tick never re-surveys them, and they become an IMMUTABLE snapshot under
+``survey_id``. The apply recovers that snapshot via
+:meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.claimed` — **not** a fresh
+``closed_segment`` call, which reapplies the closed-prefix gate and can recompute
+against a ring the lane has evicted or extended since (codex I2). On a genuine
+result it emits :class:`~lifemodel.core.intents.FinalizeBuffer`; that finalize
+DELETE lands ATOMICALLY with the pass's thought commit (codex I3), never a bare
+side-effecting clear. A turn that arrives during the async gap was never claimed,
+so it is simply left ``complete`` for a LATER pass — never swept away un-surveyed.
+On a transient/malformed/empty-claim path the apply emits NOTHING that finalizes,
+leaving the claim in place for a retry or boot recovery.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ from .budget import (
     internal_interval_elapsed,
 )
 from .component import TickContext
-from .intents import Intent, LaunchInternalCognition, PutRecord, UpdateState
+from .intents import FinalizeBuffer, Intent, LaunchInternalCognition, PutRecord, UpdateState
 from .noticing_buffer import BufferEntry, NoticingBuffer
 from .taxonomy import KIND_INTERNAL_RESULT, InternalResultRead, read_internal_result
 from .thought_view import (
@@ -185,16 +185,18 @@ def build_noticing_prompt(
     size_cap: int = DEFAULT_NOTICING_SIZE_CAP,
 ) -> str:
     """The bounded input_text handed to the noticing pass: the surveyed
-    segment's turns (each tagged with its citable ``turn_id``) plus a short
+    window's turns (each tagged with its citable ``turn_id``) plus a short
     continuity backlog of what is already being turned over.
 
-    Bounded to at most the most-recent *size_cap* entries of *segment* (codex
-    F2b) — NEVER the whole closed-prefix ring, which can hold up to
-    :data:`~lifemodel.core.noticing_buffer.NoticingBuffer`'s ``max_entries``
-    (256) turns on an idle-triggered long-lived lane. The window is a plain
-    tail slice: the anchor the caller clears/validates against is always the
-    segment's true LAST entry, unaffected by this display-only trim."""
-    window = segment[-size_cap:] if size_cap > 0 and len(segment) > size_cap else segment
+    The caller (:class:`NoticingTrigger`) already trims *segment* to the oldest-
+    *size_cap* PREFIX it claims + surveys (codex F2b) — the window is aligned to
+    the ``survey_id`` the pass is keyed by, NOT an anchor-tail slice — so the
+    ``size_cap`` bound below is a defensive no-op in that path (``len(window) <=
+    size_cap``). It stays here as the structural guard against ever dumping the
+    whole closed-prefix ring (up to
+    :data:`~lifemodel.core.noticing_buffer.NoticingBuffer`'s ``max_entries``, 256)
+    should a future caller pass an untrimmed segment."""
+    window = segment[:size_cap] if size_cap > 0 and len(segment) > size_cap else segment
     lines = ["The conversation since the last noticing pass, oldest first:"]
     for entry in window:
         lines.append(f"\n[turn_id={entry.turn_id}]")
@@ -210,11 +212,11 @@ def build_noticing_prompt(
 NOTICING_TRIGGER_ID = "noticing-trigger"
 
 #: The trigger's own correlation-id namespace/format —
-#: ``notice-<session_id>@<anchor_turn_id>@<iso>`` — parsed back by
-#: :func:`_parse_noticing_correlation` at apply time. Assumes neither
-#: *session_id* nor a *turn_id* contains ``@`` (true of every id this codebase
-#: mints: platform session keys and buffer ``turn_id``s are plain
-#: alnum/dash/colon tokens).
+#: ``notice-<session_id>#<survey_id>`` — parsed back by
+#: :func:`_parse_noticing_correlation` at apply time. The FIRST ``#`` separates
+#: *session_id* from *survey_id*: session ids are plain alnum/dash/colon tokens
+#: (never a ``#``), while *survey_id* itself is ``<anchor_turn_id>@<iso>`` (it
+#: DOES contain ``@``), which is exactly why the split is on ``#``, not ``@``.
 _CORRELATION_PREFIX = "notice-"
 
 
@@ -256,13 +258,26 @@ class NoticingTrigger:
         session_id, segment, launch_reason = due
         blocked = self._blocked_gate(ctx)
         if blocked is not None:
+            # The gate is checked BEFORE the claim, so a blocked/denied tick never
+            # leaves a dangling claim (recover_stale_claims is only the backstop for
+            # a pass that dies AFTER launching, not for the common gate-block path).
             self._log(ctx, blocked)
             return []
+        # The window is the oldest-``size_cap`` PREFIX of the due segment (codex
+        # F2b) — NOT the tail. Claim + finalize + what the model is shown are then
+        # the SAME set, so no un-surveyed older turn is ever cleared. When the
+        # segment already fits, the whole of it is the window.
+        window = segment[: self._size_cap] if self._size_cap > 0 else segment
+        survey_id = f"{window[-1].turn_id}@{to_iso(ctx.now)}"
+        # Claim the window BEFORE emitting: those ``complete`` rows become an
+        # immutable ``claimed`` snapshot under ``survey_id`` and leave
+        # ``closed_segment``, so a second tick can never re-survey them (and the
+        # apply reads the snapshot, not a re-gated recompute — codex I2).
+        self._buffer.claim(session_id, tuple(entry.turn_id for entry in window), survey_id)
         backlog = live_thoughts(ctx.objects)[:BACKLOG_TOP_M]
-        anchor_turn_id = segment[-1].turn_id
         intent = LaunchInternalCognition(
-            prompt=build_noticing_prompt(segment, backlog, size_cap=self._size_cap),
-            correlation_id=f"{_CORRELATION_PREFIX}{session_id}@{anchor_turn_id}@{to_iso(ctx.now)}",
+            prompt=build_noticing_prompt(window, backlog, size_cap=self._size_cap),
+            correlation_id=f"{_CORRELATION_PREFIX}{session_id}#{survey_id}",
             origin_traceparent=format_traceparent(ctx.trace),
             subject_id=None,
             instructions=NOTICING_INSTRUCTIONS,
@@ -402,21 +417,20 @@ def _validate_one_seed(
     )
 
 
-def _parse_noticing_correlation(correlation_id: str) -> tuple[str, str] | None:
-    """Recover ``(session_id, anchor_turn_id)`` from a
-    ``notice-<session_id>@<anchor_turn_id>@<iso>`` correlation id (the format
-    :class:`NoticingTrigger` mints). ``None`` for any other shape — a foreign/
-    malformed correlation id is never guessed at."""
+def _parse_noticing_correlation(correlation_id: str) -> str | None:
+    """Recover the ``survey_id`` from a ``notice-<session_id>#<survey_id>``
+    correlation id (the format :class:`NoticingTrigger` mints). The FIRST ``#``
+    separates *session_id* from *survey_id* — session ids never contain ``#``,
+    while *survey_id* is ``<anchor_turn_id>@<iso>`` (it DOES contain ``@``), so the
+    split is on ``#``, not ``@``. ``None`` for any other shape — a foreign/malformed
+    correlation id is never guessed at."""
     if not correlation_id.startswith(_CORRELATION_PREFIX):
         return None
     rest = correlation_id[len(_CORRELATION_PREFIX) :]
-    head, sep, _timestamp = rest.rpartition("@")
-    if not sep:
+    session_id, sep, survey_id = rest.partition("#")
+    if not sep or not session_id or not survey_id:
         return None
-    session_id, sep2, anchor_turn_id = head.rpartition("@")
-    if not sep2 or not session_id or not anchor_turn_id:
-        return None
-    return session_id, anchor_turn_id
+    return survey_id
 
 
 def _has_valid_seeds_shape(parsed: JsonObject | None) -> bool:
@@ -481,9 +495,11 @@ class NoticingApply:
     ``None`` (a subject-SET completion is a processing pass, not ours; mirrors
     ``ThoughtProcessingApply``'s guard, inverted) plus a matching
     ``internal_result`` signal. See the module docstring for why the surveyed
-    segment is recovered via :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.segment_through`
-    (keyed by the correlation-id-encoded anchor turn id) rather than a fresh
-    ``closed_segment`` read.
+    segment is recovered via :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.claimed`
+    (the immutable snapshot keyed by the correlation-id-encoded ``survey_id``)
+    rather than a fresh ``closed_segment`` read, and why the cursor advance is an
+    emitted :class:`~lifemodel.core.intents.FinalizeBuffer` (atomic with the thought
+    commit, codex I3) rather than a direct buffer clear.
 
     *memory* (F4) is the store's :class:`~lifemodel.ports.memory.MemoryPort` —
     used ONLY to check whether a seed's content-digest id already exists as a
@@ -526,12 +542,16 @@ class NoticingApply:
             # segment being lost forever to a transient provider hiccup.
             self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0, parsed=result.parsed)
             return []
-        parsed_correlation = _parse_noticing_correlation(correlation_id)
-        if parsed_correlation is None:
+        survey_id = _parse_noticing_correlation(correlation_id)
+        if survey_id is None:
             self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0, parsed=result.parsed)
             return []
-        session_id, anchor_turn_id = parsed_correlation
-        segment = self._buffer.segment_through(session_id, anchor_turn_id)
+        # The IMMUTABLE snapshot the launch claimed (codex I2) — never a fresh
+        # closed_segment recompute against a ring the lane may have evicted/extended
+        # during the async gap. Empty means the claim was already finalized/released
+        # (a duplicate completion, or a boot-recovered pass): nothing to do, and
+        # crucially DO NOT finalize (there is nothing claimed to finalize).
+        segment = self._buffer.claimed(survey_id)
         if not segment:
             self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0, parsed=result.parsed)
             return []
@@ -568,10 +588,13 @@ class NoticingApply:
             intents.append(UpdateState({"noticed_source_ids": updated_ring}))
 
         # The segment was genuinely surveyed (a real result matched a real,
-        # still-present prefix) whether or not any seed survived validation —
-        # advance the cursor either way, so a fruitless pass is never re-shown
-        # the same old turns forever.
-        self._buffer.clear_through(session_id, anchor_turn_id)
+        # still-claimed snapshot) whether or not any seed survived validation —
+        # advance the cursor either way, so a fruitless pass is never re-shown the
+        # same old turns forever. FinalizeBuffer (not a direct clear) so the
+        # claimed-row DELETE lands ATOMICALLY with the thought PutRecord + consumed
+        # ring in the tick's one commit_tick transaction (codex I3): a rollback
+        # leaves neither the thoughts nor the finalize.
+        intents.append(FinalizeBuffer(survey_id))
         reason = NoticingReason.NOTICED if seeds else NoticingReason.NOTHING_LINGERED
         self._log(
             ctx,

@@ -120,7 +120,11 @@ def test_full_graph_tick_emits_a_subjectless_launch_for_a_due_segment(tmp_path) 
 def test_subjectless_completion_seeds_a_thought_never_delivers(tmp_path) -> None:
     buffer = _seeded_buffer()
     lm = build_lifemodel(base_dir=tmp_path, clock=FixedClock(NOW), noticing_buffer=buffer)
-    correlation_id = f"notice-s1@t1@{NOW.isoformat()}"
+    # The launched pass claimed its surveyed prefix (t1) under a survey_id; the
+    # correlation carries it as notice-<session>#<survey_id>.
+    survey_id = f"t1@{NOW.isoformat()}"
+    correlation_id = f"notice-s1#{survey_id}"
+    buffer.claim("s1", ("t1",), survey_id)
     lm.state.commit(
         State(
             genesis_completed_at=BORN_AT,
@@ -152,7 +156,7 @@ def test_subjectless_completion_seeds_a_thought_never_delivers(tmp_path) -> None
     live = read_live_thoughts(lm.state)
     assert len(live) == 1
     assert live[0].content == "carry this"
-    # the surveyed segment cleared through the anchor
+    # the surveyed prefix was claimed away — nothing left in the closed segment
     assert buffer.closed_segment("s1", now=NOW) == []
 
 

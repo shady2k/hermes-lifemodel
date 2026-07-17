@@ -62,7 +62,8 @@ def test_closed_segment_past_idle_emits_one_subjectless_launch():
     assert launch.instructions == NOTICING_INSTRUCTIONS
     assert "t1" in launch.prompt
     assert "tell me about it" in launch.prompt
-    assert launch.correlation_id.startswith("notice-s1@t1@")
+    # correlation is notice-<session>#<survey_id>, survey_id = <anchor>@<iso>
+    assert launch.correlation_id.startswith("notice-s1#t1@")
     assert launch.origin_traceparent  # mandatory async-correlation anchor
 
 
@@ -93,8 +94,9 @@ def test_size_cap_reached_launches_even_though_idle_has_not_elapsed():
     intents = list(NoticingTrigger(buffer).step(ctx))
     launches = [i for i in intents if isinstance(i, LaunchInternalCognition)]
     assert len(launches) == 1
-    # the anchor is the LAST (most recent) entry's turn_id
-    assert launches[0].correlation_id.startswith(f"notice-s1@t{DEFAULT_NOTICING_SIZE_CAP - 1}@")
+    # the whole segment fits the window (exactly size_cap turns); its survey anchor
+    # is the LAST of the claimed prefix, t{size_cap - 1}.
+    assert launches[0].correlation_id.startswith(f"notice-s1#t{DEFAULT_NOTICING_SIZE_CAP - 1}@")
 
 
 def test_single_flight_blocks_when_a_pass_is_in_flight():
@@ -192,8 +194,9 @@ def test_span_logs_skipped_in_flight():
 
 def test_prompt_is_bounded_to_size_cap_turns_not_the_whole_ring():
     """F2b: an idle-triggered lane can carry up to the buffer's ``max_entries``
-    (256) closed turns, but the prompt handed to the aux call must only ever
-    show the most recent ``size_cap`` of them — never dump the whole ring."""
+    (256) closed turns, but the claimed window (and the prompt handed to the aux
+    call) is only ever the OLDEST ``size_cap`` PREFIX of them — never dump the
+    whole ring, and claim + finalize + shown-to-model are the SAME set."""
     buffer = NoticingBuffer()
     old_ts = NOW - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
     for i in range(50):
@@ -208,12 +211,11 @@ def test_prompt_is_bounded_to_size_cap_turns_not_the_whole_ring():
     assert len(launches) == 1
     prompt = launches[0].prompt
     assert prompt.count("[turn_id=") == DEFAULT_NOTICING_SIZE_CAP
-    # the anchor is unaffected by the display-only window trim — still the
-    # segment's TRUE last (most recent) entry.
-    assert launches[0].correlation_id.startswith("notice-s1@t49@")
-    # only the most-recent size_cap turns are shown, oldest of those is t42.
-    assert "msg 42" in prompt
-    assert "msg 41" not in prompt
+    # the survey anchor is the LAST of the oldest-size_cap prefix (t7), not t49.
+    assert launches[0].correlation_id.startswith("notice-s1#t7@")
+    # only the OLDEST size_cap turns (t0..t7) are shown; the newest of those is t7.
+    assert "msg 7" in prompt
+    assert "msg 8" not in prompt
 
 
 def test_backlog_thought_gists_are_folded_into_the_prompt():
@@ -232,3 +234,82 @@ def test_backlog_thought_gists_are_folded_into_the_prompt():
     launches = [i for i in intents if isinstance(i, LaunchInternalCognition)]
     assert len(launches) == 1
     assert "a lingering worry" in launches[0].prompt
+
+
+# --- lm-705.13: the trigger claims the surveyed prefix (claim/finalize) --------
+
+
+def _launch(intents) -> LaunchInternalCognition:
+    launches = [i for i in intents if isinstance(i, LaunchInternalCognition)]
+    assert len(launches) == 1
+    return launches[0]
+
+
+def _survey_id(launch: LaunchInternalCognition) -> str:
+    # correlation is notice-<session>#<survey_id>; the FIRST '#' splits them.
+    return launch.correlation_id.split("#", 1)[1]
+
+
+def test_the_surveyed_prefix_is_claimed_and_leaves_the_closed_segment():
+    """The due window is CLAIMED before the launch: it appears under the
+    correlation's survey_id via ``claimed`` and leaves ``closed_segment`` (so a
+    second tick can never re-survey it)."""
+    buffer = NoticingBuffer()
+    old_ts = NOW - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
+    _complete_turn(buffer, "s1", "t1", ts=old_ts)
+
+    ctx = make_tick_context(state=State(), now=NOW, trace=_TRACE)
+    launch = _launch(NoticingTrigger(buffer).step(ctx))
+
+    assert [e.turn_id for e in buffer.claimed(_survey_id(launch))] == ["t1"]
+    assert buffer.closed_segment("s1", now=NOW) == []
+
+
+def test_a_second_tick_does_not_re_survey_the_claimed_window():
+    """Single-flight aside, the claim itself is what stops a re-survey: the
+    claimed rows left ``completed()``, so the very next tick finds nothing due."""
+    buffer = NoticingBuffer()
+    old_ts = NOW - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
+    _complete_turn(buffer, "s1", "t1", ts=old_ts)
+    trigger = NoticingTrigger(buffer)
+
+    _launch(trigger.step(make_tick_context(state=State(), now=NOW, trace=_TRACE)))
+
+    second = trigger.step(make_tick_context(state=State(), now=NOW, trace=_TRACE))
+    assert [i for i in second if isinstance(i, LaunchInternalCognition)] == []
+
+
+def test_a_blocked_tick_never_claims():
+    """A gate-blocked tick returns before the claim — no dangling claim to
+    recover (the gate check runs BEFORE the claim in the trigger)."""
+    buffer = NoticingBuffer()
+    old_ts = NOW - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
+    _complete_turn(buffer, "s1", "t1", ts=old_ts)
+
+    ctx = make_tick_context(state=State(pending_internal_id="process-x"), now=NOW, trace=_TRACE)
+    assert [
+        i for i in NoticingTrigger(buffer).step(ctx) if isinstance(i, LaunchInternalCognition)
+    ] == []
+    # the turn is still ``complete``, unclaimed — a later, unblocked tick surveys it.
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1"]
+
+
+def test_claimed_snapshot_is_immune_to_ring_eviction_of_newer_turns():
+    """codex I2: the claimed snapshot is an immutable prefix held OUTSIDE the
+    bounded ``complete`` ring, so later turns evicting the ring past ``max_entries``
+    never change what a launched pass surveys."""
+    buffer = NoticingBuffer(max_entries=3)
+    old_ts = NOW - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
+    for i in range(3):
+        _complete_turn(buffer, "s1", f"t{i}", ts=old_ts + timedelta(seconds=i))
+
+    ctx = make_tick_context(state=State(), now=NOW, trace=_TRACE)
+    launch = _launch(NoticingTrigger(buffer, size_cap=2).step(ctx))
+    survey_id = _survey_id(launch)
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t0", "t1"]
+
+    # flood the ring past its cap of 3 with newer turns — the oldest complete
+    # rows are evicted, but the CLAIMED snapshot is untouched.
+    for tid in ("t3", "t4", "t5"):
+        _complete_turn(buffer, "s1", tid, ts=NOW)
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t0", "t1"]

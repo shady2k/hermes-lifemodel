@@ -35,7 +35,9 @@ module docstring).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import tempfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from lifemodel.composition import LifeModel
 from lifemodel.core.coreloop import TickReport
@@ -59,9 +61,26 @@ from lifemodel.core.thought_view import (
 )
 from lifemodel.domain.egress import ReachOutcome
 from lifemodel.domain.objects import DesireState
+from lifemodel.state.sqlite_store import SqliteBufferStore
+from lifemodel.testing import FakeClock
 from lifemodel.testing.harness import build_noticing_lifemodel
 
 TARGET: dict[str, str | None] = {"platform": "test", "chat_id": "1", "thread_id": None}
+
+
+def _noticing_lm() -> tuple[LifeModel, NoticingBuffer]:
+    """A real-graph noticing ``LifeModel`` whose ``NoticingBuffer`` is backed by a
+    durable :class:`SqliteBufferStore` over the SAME ``base_dir`` (and clock) as the
+    runtime store — so the two share ONE ``lifemodel.sqlite``. This is load-bearing
+    for the claim/finalize round-trip (lm-705.13): the trigger's ``claim`` and the
+    apply's ``FinalizeBuffer`` DELETE both land in that one file, so a completed pass
+    actually clears the surveyed prefix (an in-memory buffer would be invisible to
+    the real committer's raw-SQL finalize, and the cursor would never advance)."""
+    base_dir = Path(tempfile.mkdtemp(prefix="lifemodel-noticing-harness-"))
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    buffer = NoticingBuffer(store=SqliteBufferStore(base_dir, clock=clock))
+    lm = build_noticing_lifemodel(buffer=buffer, base_dir=base_dir, clock=clock)
+    return lm, buffer
 
 
 class _FakeEgress:
@@ -134,8 +153,7 @@ def _only_noticing_launch(report: TickReport) -> LaunchInternalCognition:
 def test_buffered_sitting_becomes_a_real_thought_with_source_ids() -> None:
     """A buffered sitting -> a real ``kind=thought`` row whose provenance carries
     the exact source ids/turn_id the model was shown (anti-hallucination + lineage)."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
     _complete_turn(
         buffer,
@@ -188,8 +206,7 @@ def test_continuity_uses_the_backlog_not_raw_old_text() -> None:
     already turning over"); a new pass's real thought THEMATICALLY builds on it, but
     is formally GROUNDED only in the new segment's own turn id -- continuity never
     resurrects raw old text as a source."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     prior = build_thought(
         id="thought:seed:prior", content="worried about the Friday interview", salience=0.9
     )
@@ -237,8 +254,7 @@ def test_continuity_uses_the_backlog_not_raw_old_text() -> None:
 def test_idle_elapsed_alone_fires_the_launch() -> None:
     """Idle ∨ size-cap (idle branch): a single old closed turn is due once it has
     sat past ``idle``, even nowhere near the size cap."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=1)
     _complete_turn(buffer, "s1", "t1", ts=old_ts)
 
@@ -250,8 +266,7 @@ def test_idle_elapsed_alone_fires_the_launch() -> None:
 def test_size_cap_alone_fires_the_launch_even_though_idle_has_not_elapsed() -> None:
     """Idle ∨ size-cap (size-cap branch): a fresh, size-cap-deep segment is due
     even though none of it is anywhere near ``idle``."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     now = lm.clock.now()
     for i in range(DEFAULT_NOTICING_SIZE_CAP):
         _complete_turn(
@@ -266,8 +281,7 @@ def test_size_cap_alone_fires_the_launch_even_though_idle_has_not_elapsed() -> N
 def test_pending_turn_blocks_the_launch() -> None:
     """The closed-prefix rule: a lane with a live (fresh, within-TTL) pending turn
     yields NO segment, even though its ALREADY-closed entries are well past idle."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
     _complete_turn(buffer, "s1", "t1", ts=old_ts)
     # a NEW turn opens (mid-flight) on the SAME lane, never completed
@@ -282,8 +296,7 @@ def test_pending_turn_blocks_the_launch() -> None:
 def test_cursor_clears_after_a_pass() -> None:
     """The cursor: a genuinely-surveyed segment is cleared through its anchor once
     the pass completes, fruitless or not -- never re-shown forever."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
     _complete_turn(buffer, "s1", "t1", ts=old_ts)
 
@@ -306,8 +319,7 @@ def test_cursor_clears_after_a_pass() -> None:
 def test_top_k_backlog_holds() -> None:
     """The bounded backlog (``BACKLOG_TOP_M``): with more live thoughts than the
     cap, only the top-K by salience are folded into the prompt."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     total = BACKLOG_TOP_M + 2
     for i in range(total):
         salience = (i + 1) / 10.0  # strictly ascending, so rank == i
@@ -333,8 +345,7 @@ def test_top_k_backlog_holds() -> None:
 def test_idle_with_empty_buffer_stays_zero_llm() -> None:
     """0-LLM idle: a heartbeat over a buffer that has never seen a single turn
     emits no launch at all."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
 
     report = run_frame(lm.coreloop, trigger=FrameTrigger.HEARTBEAT)
 
@@ -345,8 +356,7 @@ def test_internal_correlation_never_collides_with_pending_proactive_id() -> None
     """Separate correlation spaces: an in-flight PROACTIVE turn does not block a
     noticing launch, and the noticing pass's own completion never touches
     ``pending_proactive_id``."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     assert lm.state_actor is not None
     with state_actor_lock():
         lm.state_actor.apply([UpdateState({"pending_proactive_id": "proactive-xyz"})])
@@ -380,8 +390,7 @@ def test_completion_frame_with_incidental_proactive_launch_dispatches_it() -> No
     ASYNC_COMPLETION frame this noticing pass's own apply also runs on must still
     have its ``LaunchProactive`` dispatched -- and the noticing pass's own
     (non-delivered) work still lands in the same frame."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=5)
     _complete_turn(buffer, "s1", "t1", user_text="a big life update", ts=old_ts)
 
@@ -428,8 +437,7 @@ def test_dedup_ring_prevents_a_duplicate_thought_on_a_resurvey_of_the_same_id() 
     """The consumed-id ring dedups across a re-survey: a SECOND real pass whose
     (scripted) response cites a source id already consumed by an earlier pass is
     dropped -- no duplicate thought for that citation, one real thought total."""
-    buffer = NoticingBuffer()
-    lm = build_noticing_lifemodel(buffer=buffer)
+    lm, buffer = _noticing_lm()
     old_ts = lm.clock.now() - DEFAULT_NOTICING_IDLE - timedelta(minutes=10)
     _complete_turn(buffer, "s1", "t1", user_text="first mention", ts=old_ts)
 

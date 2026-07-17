@@ -1,10 +1,18 @@
-"""Unit tests for :class:`NoticingApply` (lm-705.5 combined task E4, Task 5).
+"""Unit tests for :class:`NoticingApply` (lm-705.5 combined task E4, Task 5;
+claim/finalize rewire lm-705.13).
 
 Mirrors ``tests/test_thought_processing_apply.py``'s style: a real
 :class:`NoticingBuffer` (Task 2) stands in for the live conversation buffer,
 seeded through its OWN public API (``open_pending``/``stamp_source``/
 ``complete``) rather than hand-built ``BufferEntry`` values, and an
 ``internal_result`` signal carries the (fake) aux call's typed result.
+
+Since lm-705.13 the apply reads the surveyed segment via
+:meth:`NoticingBuffer.claimed` (keyed by the correlation's ``survey_id``) and
+advances the cursor by EMITTING :class:`FinalizeBuffer` (applied atomically with
+the thought commit) rather than a direct buffer clear — so each scenario first
+``claim``s the prefix a launched pass would have claimed, and asserts the emitted
+``FinalizeBuffer`` (not an in-place clear).
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from lifemodel.core.component import TickContext
-from lifemodel.core.intents import PutRecord, UpdateState
+from lifemodel.core.intents import FinalizeBuffer, PutRecord, UpdateState
 from lifemodel.core.noticing import NOTICING_TOP_K, NoticingApply, NoticingReason
 from lifemodel.core.noticing_buffer import NoticingBuffer
 from lifemodel.core.taxonomy import internal_result_signal
@@ -54,6 +62,15 @@ def _buffer_with_n_turns(n: int) -> NoticingBuffer:
         buffer.open_pending("s1", user_text=f"msg{i}", now=ts)
         buffer.complete("s1", f"t{i}", assistant_text=f"reply{i}", now=ts + timedelta(seconds=1))
     return buffer
+
+
+def _claim(buffer: NoticingBuffer, *, anchor: str, turn_ids: tuple[str, ...]) -> tuple[str, str]:
+    """Claim *turn_ids* under a deterministic survey_id anchored at *anchor* — the
+    immutable snapshot the trigger leaves behind at launch time. Returns
+    ``(survey_id, correlation_id)``."""
+    survey_id = f"{anchor}@{to_iso(NOW)}"
+    buffer.claim("s1", turn_ids, survey_id)
+    return survey_id, f"notice-s1#{survey_id}"
 
 
 def _ctx(
@@ -103,7 +120,7 @@ def _ctx_with_logger(**kwargs):
 
 def test_two_valid_seeds_produce_two_thoughts_and_append_ring():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [
             {
@@ -132,13 +149,14 @@ def test_two_valid_seeds_produce_two_thoughts_and_append_ring():
     assert len(updates) == 1
     assert set(updates[0].changes["noticed_source_ids"]) == {"m1", "t2"}
 
-    # the cursor advanced through the anchor — nothing left to survey
-    assert buffer.closed_segment("s1", now=NOW) == []
+    # the cursor advance is an EMITTED FinalizeBuffer (atomic with the thoughts),
+    # keyed by the launch's survey_id — never an in-place clear.
+    assert FinalizeBuffer(survey_id) in intents
 
 
 def test_hallucinated_source_id_is_dropped():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [
             {"gist": "grounded", "source_message_ids": ["t1"]},
@@ -156,7 +174,7 @@ def test_hallucinated_source_id_is_dropped():
 
 def test_already_consumed_source_id_is_dropped():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [
             {"gist": "already seen", "source_message_ids": ["t1"]},
@@ -176,7 +194,7 @@ def test_already_consumed_source_id_is_dropped():
 
 def test_subject_set_completion_is_a_noop():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    correlation = f"notice-s1#t2@{to_iso(NOW)}"
     parsed = {"seeds": [{"gist": "x", "source_message_ids": ["t1"]}]}
     ctx = _ctx(correlation_id=correlation, subject_id="thought:seed:a", parsed=parsed)
 
@@ -188,7 +206,7 @@ def test_subject_set_completion_is_a_noop():
 def test_no_matching_internal_result_signal_is_a_noop():
     buffer = _seeded_buffer()
     ctx = make_tick_context(
-        state=State(pending_internal_id="notice-s1@t2@x", pending_internal_subject_id=None),
+        state=State(pending_internal_id="notice-s1#t2@x", pending_internal_subject_id=None),
         now=NOW,
         signals=[],
         trace=_TRACE,
@@ -196,19 +214,38 @@ def test_no_matching_internal_result_signal_is_a_noop():
     assert list(NoticingApply(buffer).step(ctx)) == []
 
 
-def test_malformed_correlation_id_is_a_noop_and_does_not_clear():
+def test_malformed_correlation_id_is_a_noop_and_does_not_finalize():
     buffer = _seeded_buffer()
     correlation = "not-a-noticing-correlation"
     parsed = {"seeds": [{"gist": "x", "source_message_ids": ["t1"]}]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
 
-    assert list(NoticingApply(buffer).step(ctx)) == []
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert intents == []  # no FinalizeBuffer for an unparseable correlation
     assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
 
 
-def test_no_seeds_survive_still_clears_the_surveyed_cursor():
+def test_empty_claimed_snapshot_is_a_noop_and_does_not_finalize():
+    """A parseable correlation whose survey_id names NOTHING claimed (an already
+    finalized/released claim, or a duplicate completion) does no work and — crucially
+    — emits no FinalizeBuffer (there is nothing claimed to finalize)."""
+    buffer = _seeded_buffer()  # t1, t2 completed but NOT claimed under this survey_id
+    correlation = f"notice-s1#t2@{to_iso(NOW)}"
+    parsed = {"seeds": [{"gist": "x", "source_message_ids": ["t1"]}]}
+    ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert intents == []
+    assert logger.span.attrs["noticing_reason"] == NoticingReason.NOTHING_LINGERED.value
+    # the completed turns are untouched — nothing was claimed under this survey_id.
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
+
+
+def test_no_seeds_survive_still_finalizes_the_surveyed_window():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {"seeds": [{"gist": "hallucinated", "source_message_ids": ["ghost"]}]}
     ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=parsed)
 
@@ -216,30 +253,37 @@ def test_no_seeds_survive_still_clears_the_surveyed_cursor():
 
     assert [i for i in intents if isinstance(i, PutRecord)] == []
     assert [i for i in intents if isinstance(i, UpdateState)] == []
-    assert buffer.closed_segment("s1", now=NOW) == []  # surveyed prefix cleared regardless
+    # surveyed-but-fruitless still advances the cursor: a FinalizeBuffer is emitted.
+    assert FinalizeBuffer(survey_id) in intents
     assert logger.span.attrs["noticing_reason"] == NoticingReason.NOTHING_LINGERED.value
     assert logger.span.attrs["noticed_count"] == 0
 
 
 def test_a_turn_arriving_during_the_async_gap_is_not_swept_away():
-    """The anchor-scoped clear: a NEW turn (t3) completing on the SAME lane
-    between the trigger's launch and this apply must survive — only the
-    anchor's prefix (t1, t2) is surveyed/cleared, never a fresher recompute."""
+    """The claim-scoped finalize: a NEW turn (t3) completing on the SAME lane
+    between the trigger's launch (which claimed t1, t2) and this apply is NEVER in
+    the claimed snapshot — only the claimed prefix is surveyed/finalized, and t3
+    stays ``complete`` for a later pass."""
     buffer = _seeded_buffer()
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
+    # t3 arrives on the same lane during the async gap — AFTER the claim.
     buffer.open_pending("s1", user_text="third", now=NOW - timedelta(seconds=1))
     buffer.complete("s1", "t3", assistant_text="reply3", now=NOW)
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
     parsed = {"seeds": [{"gist": "x", "source_message_ids": ["t1"]}]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
 
-    list(NoticingApply(buffer).step(ctx))
+    intents = list(NoticingApply(buffer).step(ctx))
 
+    # the emitted FinalizeBuffer covers ONLY the claimed prefix (t1, t2)...
+    assert FinalizeBuffer(survey_id) in intents
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"]
+    # ...and t3 (never claimed) is still available for a later pass.
     assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t3"]
 
 
 def test_noticed_span_fields():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {"seeds": [{"gist": "carried", "source_message_ids": ["t1"]}]}
     ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=parsed)
 
@@ -255,7 +299,7 @@ def test_noticed_span_fields():
 
 def test_seeds_completion_logs_aux_raw_and_reflection():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [{"gist": "carried", "source_message_ids": ["t1"]}],
         "reflection": "a quiet realization about t1",
@@ -276,7 +320,7 @@ def test_nothing_lingered_still_logs_aux_raw_and_reflection():
     case — WHY nothing lingered, not just THAT nothing did. Both ``aux_raw`` and
     ``reflection`` must land on the span even when ``seeds`` is empty."""
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     raw = '{"seeds": [], "reflection": "nothing worth carrying from this stretch"}'
     parsed = {"seeds": [], "reflection": "nothing worth carrying from this stretch"}
     ctx, logger = _ctx_with_logger(
@@ -293,7 +337,7 @@ def test_nothing_lingered_still_logs_aux_raw_and_reflection():
 
 def test_missing_reflection_key_stamps_nothing():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {"seeds": [{"gist": "carried", "source_message_ids": ["t1"]}]}
     ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=parsed)
 
@@ -304,7 +348,7 @@ def test_missing_reflection_key_stamps_nothing():
 
 def test_aux_raw_is_capped_at_2000_chars():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     long_raw = "x" * 2500
     parsed = {"seeds": [{"gist": "carried", "source_message_ids": ["t1"]}]}
     ctx, logger = _ctx_with_logger(
@@ -316,36 +360,33 @@ def test_aux_raw_is_capped_at_2000_chars():
     assert logger.span.attrs["aux_raw"] == "x" * 2000
 
 
-# ---- F1: a transient (transport/provider) failure must NOT clear the segment ----
+# ---- F1: a transient (transport/provider) failure must NOT finalize the claim ----
 
 
-def test_transient_failure_leaves_segment_ring_and_cursor_untouched():
+def test_transient_failure_leaves_the_claim_untouched():
     """``raw=""``/``parsed=None`` is the runner's shape for a failed/timed-out
-    aux call (``adapters/internal_runner.py``) — it must be refunded exactly
-    like ``ThoughtProcessingApply``'s transient-failure guard: no PutRecord, no
-    consumed-ring update, and the surveyed segment stays in the buffer for a
-    later pass to re-survey."""
+    aux call (``adapters/internal_runner.py``) — it must be refunded exactly like
+    ``ThoughtProcessingApply``'s transient-failure guard: no PutRecord, no
+    consumed-ring update, and NO FinalizeBuffer, so the claimed snapshot stays put
+    for a later release/re-survey."""
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     ctx, logger = _ctx_with_logger(correlation_id=correlation, subject_id=None, parsed=None, raw="")
 
     intents = list(NoticingApply(buffer).step(ctx))
 
-    assert intents == []
-    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
+    assert intents == []  # nothing — crucially, no FinalizeBuffer
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"]  # claim survives
     assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
 
 
-def test_malformed_non_empty_result_does_not_clear_or_consume():
+def test_malformed_non_empty_result_does_not_finalize_or_consume():
     """review-2 G1: ``raw`` is non-empty (the model DID respond) but ``parsed``
     never took the ``{"seeds": [...]}`` shape (e.g. plain prose, or truncated
-    JSON). Before the fix, ``_is_transient_failure`` said "not transient" (a
-    non-empty ``raw`` short-circuits it) and the apply fell through to
-    clearing the segment anyway -- silently losing it. A malformed response
-    must be treated exactly like the transient case: no clear, no consumed-
-    ring update, no PutRecord."""
+    JSON). A malformed response is treated exactly like the transient case: no
+    FinalizeBuffer, no consumed-ring update, no PutRecord — the claim survives."""
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     ctx, logger = _ctx_with_logger(
         correlation_id=correlation,
         subject_id=None,
@@ -356,12 +397,12 @@ def test_malformed_non_empty_result_does_not_clear_or_consume():
     intents = list(NoticingApply(buffer).step(ctx))
 
     assert intents == []
-    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
+    assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"]
     assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
     assert logger.span.attrs["noticed_count"] == 0
 
 
-def test_malformed_parsed_shapes_do_not_clear_the_cursor():
+def test_malformed_parsed_shapes_do_not_finalize_the_claim():
     """Same G1 guard, exercised over every malformed (but still ``dict | None``
     -typed, per :class:`~lifemodel.core.taxonomy.InternalResultRead`'s own
     contract) ``parsed`` shape short of a valid ``{"seeds": [...]}`` dict: a
@@ -369,7 +410,7 @@ def test_malformed_parsed_shapes_do_not_clear_the_cursor():
     entirely."""
     for bad_parsed in ({"seeds": "not a list"}, {"no_seeds_key": []}):
         buffer = _seeded_buffer()
-        correlation = f"notice-s1@t2@{to_iso(NOW)}"
+        survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
         ctx = _ctx(
             correlation_id=correlation,
             subject_id=None,
@@ -380,19 +421,16 @@ def test_malformed_parsed_shapes_do_not_clear_the_cursor():
         intents = list(NoticingApply(buffer).step(ctx))
 
         assert intents == [], bad_parsed
-        assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == [
-            "t1",
-            "t2",
-        ], bad_parsed
+        assert [e.turn_id for e in buffer.claimed(survey_id)] == ["t1", "t2"], bad_parsed
 
 
-def test_valid_empty_seeds_shape_still_clears_distinct_from_malformed():
+def test_valid_empty_seeds_shape_still_finalizes_distinct_from_malformed():
     """The counterpoint to the malformed case above (G1): ``{"seeds": []}`` IS
     a well-formed shape (a dict with a ``seeds`` list, even if empty) -- "the
-    model looked and found nothing" -- so it still clears, unlike a truly
+    model looked and found nothing" -- so it still finalizes, unlike a truly
     malformed response."""
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     ctx = _ctx(
         correlation_id=correlation,
         subject_id=None,
@@ -402,16 +440,16 @@ def test_valid_empty_seeds_shape_still_clears_distinct_from_malformed():
 
     intents = list(NoticingApply(buffer).step(ctx))
 
-    assert intents == []
-    assert buffer.closed_segment("s1", now=NOW) == []
+    assert [i for i in intents if isinstance(i, PutRecord)] == []
+    assert FinalizeBuffer(survey_id) in intents
 
 
-def test_genuine_empty_seeds_result_still_clears_the_cursor():
+def test_genuine_empty_seeds_result_still_finalizes():
     """A REAL result (non-empty ``raw``, a parsed ``{"seeds": [...]}`` shape)
     whose ``seeds`` list is genuinely empty is "the model looked and found
-    nothing" — NOT transient — so the cursor still advances."""
+    nothing" — NOT transient — so the cursor still advances (FinalizeBuffer)."""
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     ctx = _ctx(
         correlation_id=correlation,
         subject_id=None,
@@ -421,8 +459,7 @@ def test_genuine_empty_seeds_result_still_clears_the_cursor():
 
     intents = list(NoticingApply(buffer).step(ctx))
 
-    assert intents == []
-    assert buffer.closed_segment("s1", now=NOW) == []
+    assert FinalizeBuffer(survey_id) in intents
 
 
 # ---- F2a: at most NOTICING_TOP_K validated seeds survive one pass ----
@@ -430,7 +467,9 @@ def test_genuine_empty_seeds_result_still_clears_the_cursor():
 
 def test_more_than_top_k_valid_seeds_are_capped():
     buffer = _buffer_with_n_turns(10)
-    correlation = f"notice-s1@t9@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(
+        buffer, anchor="t9", turn_ids=tuple(f"t{i}" for i in range(10))
+    )
     parsed = {"seeds": [{"gist": f"seed {i}", "source_message_ids": [f"t{i}"]} for i in range(10)]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
 
@@ -445,7 +484,7 @@ def test_more_than_top_k_valid_seeds_are_capped():
 
 def test_two_seeds_citing_the_same_source_id_only_the_first_is_accepted():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [
             {"gist": "first claim", "source_message_ids": ["t1"]},
@@ -463,7 +502,7 @@ def test_two_seeds_citing_the_same_source_id_only_the_first_is_accepted():
 
 def test_seed_with_turn_id_outside_the_segment_is_dropped():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [
             {
@@ -482,7 +521,7 @@ def test_seed_with_turn_id_outside_the_segment_is_dropped():
 
 def test_seed_with_turn_id_inside_the_segment_is_kept():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {"seeds": [{"gist": "grounded anchor", "source_message_ids": ["t1"], "turn_id": "t1"}]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
 
@@ -503,7 +542,7 @@ def test_same_gist_disjoint_source_seeds_produce_exactly_one_put():
     ``seen_thought_ids`` guard, both would become a PutRecord for the SAME id,
     the later silently winning with different provenance."""
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {
         "seeds": [
             {"gist": "same gist both times", "source_message_ids": ["t1"]},
@@ -529,7 +568,7 @@ def test_same_gist_disjoint_source_seeds_produce_exactly_one_put():
 
 def test_seed_matching_an_existing_terminal_thought_is_not_resurrected():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     content = "already handled, long since resolved"
     parsed = {"seeds": [{"gist": content, "source_message_ids": ["t1"]}]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
@@ -547,7 +586,7 @@ def test_seed_matching_an_existing_terminal_thought_is_not_resurrected():
 
 def test_seed_with_genuinely_new_content_is_still_seeded_when_memory_is_wired():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {"seeds": [{"gist": "brand new content", "source_message_ids": ["t1"]}]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
     memory = FakeMemoryStore(clock=FakeClock(NOW))
@@ -564,7 +603,7 @@ def test_seed_with_genuinely_new_content_is_still_seeded_when_memory_is_wired():
 
 def test_salience_is_clamped_to_the_unit_range():
     buffer = _seeded_buffer()
-    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    _survey_id, correlation = _claim(buffer, anchor="t2", turn_ids=("t1", "t2"))
     parsed = {"seeds": [{"gist": "over the top", "source_message_ids": ["t1"], "salience": 5.0}]}
     ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
 
