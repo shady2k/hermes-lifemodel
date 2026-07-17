@@ -446,6 +446,20 @@ class BeingAdapter(BasePlatformAdapter):  # type: ignore[misc]  # base is Any (g
                 )
                 self._internal_runner.recover_stale(self._build_lm())
 
+        # The noticing buffer's claim recovery (lm-705.14 Task 5) is OPTIONAL/DEGRADED,
+        # like the two steps above — but unlike the internal-cognition runner just
+        # above, it needs NO ``LlmPort`` (releasing a stale claim is a single UPDATE,
+        # not a call out), so it must run on EVERY real connect, not gated on
+        # ``self._llm``. Releases any row a noticing pass left ``claimed`` when its
+        # process died mid-flight, so that segment is re-surveyed cleanly on the next
+        # pass rather than stuck forever. Harmless near-no-op for the default
+        # in-memory buffer (nothing survives a restart to recover); the real release
+        # for the durable `SqliteBufferStore`-backed buffer `register()` wires in
+        # production.
+        with wire("noticing_buffer_recovery", required=False, health=health, logger=_LOG):
+            if self._noticing_buffer is not None:
+                self._noticing_buffer.recover_stale_claims()
+
         # The brain loop itself is REQUIRED — a failure to start it is the outage.
         with wire("brain_loop_start", required=True, health=health, logger=_LOG):
             self._loop = SupervisedLoop(

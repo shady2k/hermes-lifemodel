@@ -45,6 +45,7 @@ from .paths import state_dir
 from .ports.memory import MemoryPort
 from .state.brain_health import get_brain_health
 from .state.brain_liveness import brain_liveness_lines
+from .state.sqlite_store import SqliteBufferStore
 from .state.trace_store import acquire_trace_writer, observability_db_path
 from .state.wiring import wire
 from .state_commands import (
@@ -467,7 +468,16 @@ def register(ctx: Any) -> None:
     # platform message id) — so only the pre_llm open + post_llm complete seams are
     # wired; the inbound observer's stamp_source path stays deliberately unwired for
     # now (deferred — add only if a later slice needs a platform-message deep-link).
-    noticing_buffer = NoticingBuffer()
+    #
+    # Durable backing (lm-705.14 Task 5): the SAME ``sdir`` the runtime store uses,
+    # so the buffer's ``conversation_buffer`` table and ``SQLiteRuntimeStore``'s
+    # ``commit_tick`` finalize DELETE share the ONE ``lifemodel.sqlite`` file (D7) —
+    # never a second store/file. ``SqliteBufferStore``'s constructor idempotently
+    # ``CREATE TABLE IF NOT EXISTS``-creates ``conversation_buffer`` (also created
+    # by migration v4), so this is safe whether or not the runtime store has
+    # migrated yet. This makes a plugin/gateway restart no longer wipe captured-
+    # but-not-yet-noticed conversation.
+    noticing_buffer = NoticingBuffer(store=SqliteBufferStore(sdir, clock=SystemClock()))
 
     # --- Verdict feedback wiring (Task 5, spec §5/§7) — REQUIRED --------------
     # Resolves the pending proactive desire from the FINAL LLM output

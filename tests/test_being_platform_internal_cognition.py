@@ -84,9 +84,21 @@ def _fresh_being_platform() -> types.ModuleType:
 BORN_AT = "2026-07-01T10:00:00+00:00"
 
 
-def _make_adapter(bp: types.ModuleType, base_dir: Path, *, llm=None, inert_tick: bool = True):
+def _make_adapter(
+    bp: types.ModuleType,
+    base_dir: Path,
+    *,
+    llm=None,
+    noticing_buffer=None,
+    inert_tick: bool = True,
+):
     adapter = bp.BeingAdapter(
-        config=None, base_dir=base_dir, target=None, interval_sec=60.0, llm=llm
+        config=None,
+        base_dir=base_dir,
+        target=None,
+        interval_sec=60.0,
+        llm=llm,
+        noticing_buffer=noticing_buffer,
     )
     if inert_tick:
         adapter._tick = lambda: None  # the loop ticks immediately on run — keep it inert
@@ -135,6 +147,44 @@ def test_connect_recovers_a_stale_pending_internal_id(tmp_path: Path) -> None:
     asyncio.run(_run())
 
     assert store.load().pending_internal_id is None
+
+
+def test_connect_recovers_a_stale_claimed_survey(tmp_path: Path) -> None:
+    """A ``claimed`` survey left behind by a noticing pass that died mid-flight
+    with the process (lm-705.14 Task 5) must be released back to ``complete``
+    by the NEXT real ``connect()`` — regardless of whether an ``LlmPort`` was
+    injected (buffer recovery needs no LLM, unlike the internal-runner
+    recovery above)."""
+    from datetime import timedelta
+
+    from lifemodel.adapters.clock import SystemClock
+    from lifemodel.core.noticing_buffer import NoticingBuffer
+    from lifemodel.state.sqlite_store import SqliteBufferStore
+
+    clock = SystemClock()
+    now = clock.now()
+    store = SqliteBufferStore(tmp_path, clock=clock)
+    store.open_pending("session-1", user_text="hi", now=now)
+    store.complete("session-1", "turn-1", assistant_text="yo", now=now)
+    store.claim("session-1", ("turn-1",), "survey-dead")
+    assert store.claimed("survey-dead"), "sanity: the seeded row is actually claimed"
+
+    bp = _fresh_being_platform()
+    # A SEPARATE NoticingBuffer/SqliteBufferStore instance over the SAME base_dir —
+    # exactly what `register()` builds in production: one physical file, reached
+    # through independent connections (D7).
+    buffer = NoticingBuffer(store=SqliteBufferStore(tmp_path, clock=clock))
+    adapter = _make_adapter(bp, tmp_path, noticing_buffer=buffer)
+
+    async def _run() -> None:
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    asyncio.run(_run())
+
+    assert store.claimed("survey-dead") == []
+    recovered = store.completed("session-1", now=now, ttl=timedelta(minutes=30))
+    assert [entry.turn_id for entry in recovered] == ["turn-1"]
 
 
 def test_disconnect_cancels_an_in_flight_internal_launch(tmp_path: Path) -> None:
