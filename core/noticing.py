@@ -409,6 +409,16 @@ def _parse_noticing_correlation(correlation_id: str) -> tuple[str, str] | None:
     return session_id, anchor_turn_id
 
 
+def _has_valid_seeds_shape(parsed: JsonObject | None) -> bool:
+    """True iff *parsed* is a dict with a ``seeds`` key whose value is a list —
+    the minimal well-formed noticing-result shape (review-2 G1). An EMPTY
+    ``seeds`` list still counts: "the model looked and found nothing" is a
+    genuine judgment, not a malformed one. Anything short of this shape
+    (``None``, not a dict, a missing/foreign ``seeds`` key) is NOT well-formed,
+    whether or not ``raw`` is empty."""
+    return isinstance(parsed, dict) and isinstance(parsed.get("seeds"), list)
+
+
 def _is_transient_failure(result: InternalResultRead) -> bool:
     """True when *result* is a transport/provider failure, not a genuine
     judgment (F1, both reviewers): empty ``raw`` — the aux call itself never
@@ -417,10 +427,16 @@ def _is_transient_failure(result: InternalResultRead) -> bool:
     Mirrors ``ThoughtProcessingApply``'s ``not raw.strip()`` transient-failure
     guard (``core/thought_processing.py``): a real result, even one whose
     ``seeds`` list is genuinely empty ("nothing lingered"), is NOT transient —
-    only the "the call never happened" case is."""
+    only the "the call never happened" case is.
+
+    NOTE this alone is NOT the full malformed-response guard: a NON-empty
+    ``raw`` whose ``parsed`` still isn't :func:`_has_valid_seeds_shape` (the
+    model responded, but not into a shape we can validate) returns ``False``
+    here — ``step`` below checks :func:`_has_valid_seeds_shape` again,
+    separately, to catch that case too (review-2 G1)."""
     if result.raw.strip():
         return False
-    return not (isinstance(result.parsed, dict) and isinstance(result.parsed.get("seeds"), list))
+    return not _has_valid_seeds_shape(result.parsed)
 
 
 def _append_consumed_ring(
@@ -499,6 +515,16 @@ class NoticingApply:
         if not segment:
             self._log(ctx, NoticingReason.NOTHING_LINGERED, count=0)
             return []
+        if not _has_valid_seeds_shape(result.parsed):
+            # The aux call DID respond (raw non-empty, so _is_transient_failure
+            # above already said "not transient") but the response never took
+            # the {"seeds": [...]} shape — a malformed/adversarial reply, not a
+            # genuine "nothing lingered" judgment (review-2 G1). Treated
+            # exactly like the transient case: no clear, no consume, no seed,
+            # so a LATER pass gets a genuine chance to notice this segment
+            # instead of it being silently swept away by a parse failure.
+            self._log(ctx, NoticingReason.TRANSIENT_FAILURE, count=0)
+            return []
         segment_ids = frozenset(
             {entry.turn_id for entry in segment}
             | {sid for entry in segment for sid in entry.source_ids}
@@ -532,9 +558,18 @@ class NoticingApply:
 
     def _seed_intents(self, ctx: TickContext, seeds: Sequence[NoticedSeed]) -> list[Intent]:
         live_ids = {t.id for t in live_thoughts(ctx.objects)}
+        seen_thought_ids: set[str] = set()
         intents: list[Intent] = []
         for seed in seeds:
             thought_id = seed_thought_id(seed.gist)
+            if thought_id in seen_thought_ids:
+                # Two validated seeds can share a gist (→ the same content-
+                # digest id) while citing DISJOINT source ids — both pass
+                # source-validation independently, but must not both become a
+                # PutRecord for the SAME id in one call (review-2 G3): the
+                # later would silently win with different provenance. Skip
+                # any seed whose id THIS call already scheduled a put for.
+                continue
             if self._row_already_exists(thought_id, live_ids):
                 # A row for this content-digest id already exists — in ANY
                 # state, not just live (F4). Never re-seed it: a terminal
@@ -542,6 +577,7 @@ class NoticingApply:
                 # resurrected back to active, and its immutable creation
                 # provenance must never be silently overwritten.
                 continue
+            seen_thought_ids.add(thought_id)
             provenance = creation_provenance(
                 ctx.trace,
                 created_by=self.id,

@@ -183,6 +183,50 @@ def test_empty_final_response_does_not_complete_the_buffer_entry(tmp_path: Path)
     assert buffer.closed_segment("s1", now=_NOW) == []
 
 
+def test_declined_empty_response_abandons_pending_and_unblocks_the_lane(tmp_path: Path) -> None:
+    # review-2 G2: pre_llm opens a pending for a genuine-looking user message
+    # (the ASSISTANT half of the band-pass can't be checked until post_llm),
+    # then post_llm declines it (a genuinely empty final response, M2's
+    # guard). Before the fix the pending would linger, silently gating the
+    # WHOLE lane shut (closed-prefix rule) -- even t1, already safely closed
+    # beforehand -- until pending_ttl elapsed. Proven with NO elapsed time.
+    lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    buffer = NoticingBuffer()
+    injector = make_felt_state_injector(lambda: lm, buffer=buffer)
+    observer = make_post_llm_observer(lambda: lm, buffer=buffer)
+
+    injector(session_id="s1", user_message="hello there", conversation_history=[])
+    observer(session_id="s1", turn_id="t1", user_message="hello there", assistant_response="hi!")
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+    injector(session_id="s1", user_message="are you there?", conversation_history=[])
+    observer(session_id="s1", turn_id="t2", user_message="are you there?", assistant_response="")
+
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+
+def test_declined_no_reply_marker_abandons_pending_and_unblocks_the_lane(tmp_path: Path) -> None:
+    # The OTHER decline branch (review-2 G2): a genuine-looking user message
+    # whose assistant reply is the explicit NO_REPLY/SILENT marker fails
+    # _is_genuine_reactive_exchange -- must also abandon, not just leave the
+    # pending to linger until pending_ttl.
+    lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+    buffer = NoticingBuffer()
+    injector = make_felt_state_injector(lambda: lm, buffer=buffer)
+    observer = make_post_llm_observer(lambda: lm, buffer=buffer)
+
+    injector(session_id="s1", user_message="hello there", conversation_history=[])
+    observer(session_id="s1", turn_id="t1", user_message="hello there", assistant_response="hi!")
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+    injector(session_id="s1", user_message="are you there?", conversation_history=[])
+    observer(
+        session_id="s1", turn_id="t2", user_message="are you there?", assistant_response="NO_REPLY"
+    )
+
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=_NOW)] == ["t1"]
+
+
 def test_buffer_none_is_a_noop_back_compat(tmp_path: Path) -> None:  # existing wiring unaffected
     lm = build_capture_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
     injector = make_felt_state_injector(lambda: lm)  # buffer omitted

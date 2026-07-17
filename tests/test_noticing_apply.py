@@ -270,6 +270,76 @@ def test_transient_failure_leaves_segment_ring_and_cursor_untouched():
     assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
 
 
+def test_malformed_non_empty_result_does_not_clear_or_consume():
+    """review-2 G1: ``raw`` is non-empty (the model DID respond) but ``parsed``
+    never took the ``{"seeds": [...]}`` shape (e.g. plain prose, or truncated
+    JSON). Before the fix, ``_is_transient_failure`` said "not transient" (a
+    non-empty ``raw`` short-circuits it) and the apply fell through to
+    clearing the segment anyway -- silently losing it. A malformed response
+    must be treated exactly like the transient case: no clear, no consumed-
+    ring update, no PutRecord."""
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    ctx, logger = _ctx_with_logger(
+        correlation_id=correlation,
+        subject_id=None,
+        parsed=None,
+        raw="garbage that didn't parse",
+    )
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert intents == []
+    assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == ["t1", "t2"]
+    assert logger.span.attrs["noticing_reason"] == NoticingReason.TRANSIENT_FAILURE.value
+    assert logger.span.attrs["noticed_count"] == 0
+
+
+def test_malformed_parsed_shapes_do_not_clear_the_cursor():
+    """Same G1 guard, exercised over every malformed (but still ``dict | None``
+    -typed, per :class:`~lifemodel.core.taxonomy.InternalResultRead`'s own
+    contract) ``parsed`` shape short of a valid ``{"seeds": [...]}`` dict: a
+    dict with a non-list ``seeds``, and a dict missing the ``seeds`` key
+    entirely."""
+    for bad_parsed in ({"seeds": "not a list"}, {"no_seeds_key": []}):
+        buffer = _seeded_buffer()
+        correlation = f"notice-s1@t2@{to_iso(NOW)}"
+        ctx = _ctx(
+            correlation_id=correlation,
+            subject_id=None,
+            parsed=bad_parsed,
+            raw="some non-empty raw text",
+        )
+
+        intents = list(NoticingApply(buffer).step(ctx))
+
+        assert intents == [], bad_parsed
+        assert [e.turn_id for e in buffer.closed_segment("s1", now=NOW)] == [
+            "t1",
+            "t2",
+        ], bad_parsed
+
+
+def test_valid_empty_seeds_shape_still_clears_distinct_from_malformed():
+    """The counterpoint to the malformed case above (G1): ``{"seeds": []}`` IS
+    a well-formed shape (a dict with a ``seeds`` list, even if empty) -- "the
+    model looked and found nothing" -- so it still clears, unlike a truly
+    malformed response."""
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    ctx = _ctx(
+        correlation_id=correlation,
+        subject_id=None,
+        parsed={"seeds": []},
+        raw="{...}",
+    )
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    assert intents == []
+    assert buffer.closed_segment("s1", now=NOW) == []
+
+
 def test_genuine_empty_seeds_result_still_clears_the_cursor():
     """A REAL result (non-empty ``raw``, a parsed ``{"seeds": [...]}`` shape)
     whose ``seeds`` list is genuinely empty is "the model looked and found
@@ -354,6 +424,38 @@ def test_seed_with_turn_id_inside_the_segment_is_kept():
 
     puts = [i for i in intents if isinstance(i, PutRecord)]
     assert len(puts) == 1
+
+
+# ---- G3 (review-2): per-call dedup on the scheduled thought id ----
+
+
+def test_same_gist_disjoint_source_seeds_produce_exactly_one_put():
+    """Two seeds with the IDENTICAL gist (-> the same content-digest thought
+    id) but DISJOINT source ids both pass source-validation independently --
+    neither cites an id the other already claimed, so the existing within-
+    batch consumed-id dedup (F3a) does not catch this. Without G3's per-call
+    ``seen_thought_ids`` guard, both would become a PutRecord for the SAME id,
+    the later silently winning with different provenance."""
+    buffer = _seeded_buffer()
+    correlation = f"notice-s1@t2@{to_iso(NOW)}"
+    parsed = {
+        "seeds": [
+            {"gist": "same gist both times", "source_message_ids": ["t1"]},
+            {"gist": "same gist both times", "source_message_ids": ["t2"]},
+        ]
+    }
+    ctx = _ctx(correlation_id=correlation, subject_id=None, parsed=parsed)
+
+    intents = list(NoticingApply(buffer).step(ctx))
+
+    puts = [i for i in intents if isinstance(i, PutRecord)]
+    assert len(puts) == 1
+    assert puts[0].op.draft.payload["content"] == "same gist both times"
+    # both source ids are still marked consumed, even though only one thought
+    # was created -- neither is left re-eligible for a later pass to re-notice.
+    updates = [i for i in intents if isinstance(i, UpdateState)]
+    assert len(updates) == 1
+    assert set(updates[0].changes["noticed_source_ids"]) == {"t1", "t2"}
 
 
 # ---- F4: no terminal-thought resurrection / provenance overwrite ----

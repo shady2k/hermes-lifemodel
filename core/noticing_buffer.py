@@ -146,6 +146,21 @@ class NoticingBuffer:
                 return []
             return list(ring)
 
+    def abandon_pending(self, session_id: str) -> None:
+        """Drop *session_id*'s pending slot, if any; a no-op otherwise (review-2 G2).
+
+        For a caller that opened a pending turn (``open_pending``) and then, at
+        ``post_llm``, DECLINES it — an empty assistant response, or the turn
+        turning out not to be a genuine reactive exchange after all — rather
+        than completing it. Without this, the declined pending would otherwise
+        only clear via :meth:`closed_segment`'s stale-pending aging, silently
+        blocking the WHOLE lane (the closed-prefix rule) for up to
+        ``pending_ttl`` even though nothing is actually in flight on it
+        anymore. Lock-guarded like every other mutation here.
+        """
+        with self._lock:
+            self._pending.pop(session_id, None)
+
     def session_ids(self) -> list[str]:
         """Every session lane the buffer currently knows of (an open pending, a
         non-empty ``complete`` ring, or both), lock-guarded and sorted for a

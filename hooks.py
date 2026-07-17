@@ -556,14 +556,28 @@ def _maybe_complete_buffer_entry(
     extra guard a genuinely empty final response would still land as a
     ``BufferEntry`` with nothing for a later noticing pass to read.
 
+    On EITHER decline branch (not a genuine reactive exchange, or a genuinely
+    empty response) this ABANDONS the session's pending slot (review-2 G2,
+    :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.abandon_pending`)
+    rather than leaving it open: ``pre_llm``'s OPEN side
+    (``_maybe_open_pending_turn``) can only gate on the USER half of the
+    band-pass (the assistant hasn't answered yet at that point), so a pending
+    can still open here for a turn that then declines at the ASSISTANT half —
+    and an un-abandoned pending blocks the WHOLE lane's
+    :meth:`~lifemodel.core.noticing_buffer.NoticingBuffer.closed_segment`
+    (closed-prefix rule) until ``pending_ttl``, even though nothing is
+    actually in flight anymore.
+
     ``turn_id`` (not the platform message id) is this slice's source pointer (spec
     §8's own lean) — :meth:`NoticingBuffer.stamp_source` stays unwired for now.
     """
     if buffer is None or not session_id or not turn_id:
         return
     if not _is_genuine_reactive_exchange(user_message, assistant_response):
+        buffer.abandon_pending(session_id)
         return
     if not assistant_response.strip():
+        buffer.abandon_pending(session_id)
         return
     buffer.complete(session_id, turn_id, assistant_text=assistant_response, now=lm.clock.now())
 

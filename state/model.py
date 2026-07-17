@@ -291,10 +291,12 @@ class State:
     #: The consumed-source-id ring (lm-705.5 Task 1): source message/turn ids the
     #: noticing pass has already turned into a ``thought_seed`` (or decided not
     #: to), so a later pass can dedup against it rather than re-noticing the same
-    #: conversation material. Bounded by :data:`NOTICED_SOURCE_IDS_CAP`, but that
-    #: cap is enforced where the ring is APPENDED (the noticing pass, Task 5) —
-    #: this field and its (de)serialization only persist whatever tuple they are
-    #: handed. Additive: ``from_dict`` defaults it to ``()`` when absent.
+    #: conversation material. Bounded by :data:`NOTICED_SOURCE_IDS_CAP` — the
+    #: PRIMARY enforcement is where the ring is APPENDED (the noticing pass,
+    #: Task 5), and ``from_dict`` ALSO clamps it on load (review minor M4,
+    #: defense in depth) so an oversized ring from an older/hand-edited file
+    #: can't silently persist unbounded. Additive: ``from_dict`` defaults it to
+    #: ``()`` when absent.
     noticed_source_ids: tuple[str, ...] = ()
     #: ISO-8601 UTC timestamp of the last noticing pass (lm-705.5 Task 1) — the
     #: noticing sibling of :attr:`last_internal_call_at`, mirrored exactly (same

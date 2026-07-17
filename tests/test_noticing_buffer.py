@@ -172,6 +172,45 @@ def test_ring_bounds_length_and_evicts_oldest() -> None:
     assert [e.turn_id for e in segment] == ["t2", "t3", "t4"]
 
 
+def test_abandon_pending_drops_the_open_slot() -> None:
+    # review-2 G2: a post_llm decline must be able to release a pending slot
+    # without ever completing it, so a later closed_segment isn't blocked by
+    # a turn that never really landed.
+    buf = NoticingBuffer()
+    buf.open_pending("s1", user_text="hi", now=T0)
+
+    buf.abandon_pending("s1")
+
+    # The lane reopens immediately -- no stale pending left to gate it shut.
+    assert buf.closed_segment("s1", now=T0) == []  # empty ring, but NOT gated
+    buf.open_pending("s1", user_text="second try", now=T0 + timedelta(seconds=1))
+    buf.complete("s1", "t1", assistant_text="ok", now=T0 + timedelta(seconds=2))
+    assert [e.turn_id for e in buf.closed_segment("s1", now=T0 + timedelta(seconds=3))] == ["t1"]
+
+
+def test_abandon_pending_with_no_open_pending_is_a_noop() -> None:
+    buf = NoticingBuffer()
+    buf.complete("s1", "t1", assistant_text="a", now=T0)  # defensive no-op, no pending exists
+
+    buf.abandon_pending("s1")  # must not raise, must not disturb anything
+
+    assert buf.closed_segment("s1", now=T0) == []
+
+
+def test_abandon_pending_does_not_touch_the_completed_ring() -> None:
+    buf = NoticingBuffer()
+    buf.open_pending("s1", user_text="first", now=T0)
+    buf.complete("s1", "t1", assistant_text="reply1", now=T0 + timedelta(seconds=1))
+    # A second turn opens on the same lane, then is abandoned (declined).
+    buf.open_pending("s1", user_text="second", now=T0 + timedelta(seconds=2))
+
+    buf.abandon_pending("s1")
+
+    # t1 -- already safely closed before the abandoned pending ever opened --
+    # is immediately visible again, not gated behind pending_ttl.
+    assert [e.turn_id for e in buf.closed_segment("s1", now=T0 + timedelta(seconds=3))] == ["t1"]
+
+
 def test_two_sessions_are_fully_independent() -> None:
     buf = NoticingBuffer()
     buf.open_pending("s1", user_text="hi from s1", now=T0)
