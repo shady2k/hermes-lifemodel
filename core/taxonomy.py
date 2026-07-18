@@ -179,7 +179,12 @@ class ThoughtSeedRead:
     which conversation messages/turn the noticed thought came from, feeding the
     later noticing pass's dedup against ``State.noticed_source_ids``. Additive —
     both default when a seed predates this field (built by a pre-lm-705.5 caller,
-    or hand-crafted without them)."""
+    or hand-crafted without them).
+
+    ``producer`` tags which path emitted this seed (e.g. ``\"create-thought-tool\"``,
+    ``\"noticing\"``, ``\"unknown\"``) — the capture path records it as the thought's
+    ``source`` for per-producer effectiveness comparison (lm-705.11 spec §8).
+    """
 
     content: str
     salience: float
@@ -187,6 +192,7 @@ class ThoughtSeedRead:
     other_regarding_value: float
     source_message_ids: tuple[str, ...]
     turn_id: str | None
+    producer: str
 
 
 def thought_seed_signal(
@@ -198,6 +204,7 @@ def thought_seed_signal(
     other_regarding_value: float = 0.0,
     source_message_ids: tuple[str, ...] = (),
     turn_id: str | None = None,
+    producer: str = "unknown",
     timestamp: str | None,
 ) -> Signal:
     """Build a ``thought_seed`` signal — a bounded appraisal result seeded by the
@@ -216,6 +223,7 @@ def thought_seed_signal(
             "other_regarding_value": float(other_regarding_value),
             "source_message_ids": list(source_message_ids),
             "turn_id": turn_id,
+            "producer": producer,
         },
         timestamp=timestamp,
     )
@@ -241,6 +249,8 @@ def read_thought_seed(signal: Signal) -> ThoughtSeedRead:
         source_message_ids = tuple(raw_source_ids)
     raw_turn_id = signal.payload.get("turn_id")
     turn_id = raw_turn_id if isinstance(raw_turn_id, str) else None
+    raw_producer = signal.payload.get("producer", "unknown")
+    producer = raw_producer if isinstance(raw_producer, str) and raw_producer else "unknown"
     return ThoughtSeedRead(
         content=content,
         salience=float(signal.payload.get("salience", 0.0)),
@@ -248,6 +258,7 @@ def read_thought_seed(signal: Signal) -> ThoughtSeedRead:
         other_regarding_value=float(signal.payload.get("other_regarding_value", 0.0)),
         source_message_ids=source_message_ids,
         turn_id=turn_id,
+        producer=producer,
     )
 
 

@@ -88,3 +88,22 @@ def test_reseed_of_same_content_preserves_original_provenance():
     assert first_provenance is not None
     assert second_provenance == first_provenance  # birth lineage untouched
     assert second_provenance.trace_id == birth_trace.trace_id  # NOT retry_trace's
+
+
+def test_capture_emits_create_only_and_records_producer() -> None:
+    from lifemodel.core.taxonomy import thought_seed_signal
+    from lifemodel.core.thought_capture import ThoughtCapture
+
+    sig = thought_seed_signal(
+        origin_id="o",
+        content="hello",
+        salience=0.5,
+        producer="create-thought-tool",
+        timestamp="2026-07-18T00:00:00+00:00",
+    )
+    ctx = make_tick_context(signals=[sig])
+    intents = list(ThoughtCapture().step(ctx))
+    assert len(intents) == 1
+    op = intents[0].op
+    assert op.create_only is True
+    assert op.draft.source == "create-thought-tool"

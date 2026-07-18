@@ -33,3 +33,19 @@ def test_read_thought_seed_rejects_wrong_kind():
 
     with pytest.raises(ValueError):
         read_thought_seed(Signal(origin_id="x", kind="not_a_seed", payload={}, timestamp=None))
+
+
+def test_thought_seed_carries_producer() -> None:
+    sig = thought_seed_signal(
+        origin_id="o",
+        content="c",
+        salience=0.5,
+        producer="create-thought-tool",
+        timestamp=None,
+    )
+    assert read_thought_seed(sig).producer == "create-thought-tool"
+
+
+def test_thought_seed_producer_defaults_unknown() -> None:
+    sig = thought_seed_signal(origin_id="o", content="c", salience=0.5, timestamp=None)
+    assert read_thought_seed(sig).producer == "unknown"

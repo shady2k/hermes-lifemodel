@@ -67,10 +67,10 @@ class ThoughtCapture:
                 salience=seed.salience,
                 actionability=seed.actionability,
                 other_regarding_value=seed.other_regarding_value,
-                source="thought-capture",
+                source=seed.producer if seed.producer != "unknown" else "thought-capture",
                 provenance=provenance,
             )
-            intents.append(PutRecord(op=PutOp(draft=encode_thought(thought))))
+            intents.append(PutRecord(op=PutOp(draft=encode_thought(thought), create_only=True)))
         if intents and ctx.logger is not None:
             ctx.logger.span.set(captured=len(intents))
         return intents
