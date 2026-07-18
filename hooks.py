@@ -75,7 +75,7 @@ from .core.tick_metrics import (
     OBSERVER_ERRORS,
 )
 from .core.timeutil import to_iso
-from .core.turn_metrics import INJECTOR_FELT, INJECTOR_GENESIS
+from .core.turn_metrics import INJECTOR_BELIEF, INJECTOR_FELT, INJECTOR_GENESIS
 from .core.turn_recorder import TurnRecorder
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
@@ -1131,6 +1131,7 @@ def make_belief_injector(
     params: BeliefInjectParams = DEFAULT_BELIEF_INJECT_PARAMS,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
+    recorder: TurnRecorder | None = None,
 ) -> Callable[..., dict[str, str] | None]:
     """Return the third ``pre_llm_call`` hook — the one that carries the being's held
     UNDERSTANDING into its live turn (lm-705.19 Task 4, the belief-track payoff).
@@ -1166,53 +1167,66 @@ def make_belief_injector(
     ``None`` return — the host's hot dispatch path is never crashed, and the failure is
     observable. The surfacing log carries the count/ids/latency ONLY — never the belief
     ``content`` (D10 redaction: a belief is a proposition ABOUT a person, and the log is not
-    a place to leak it)."""
+    a place to leak it).
+
+    Every verdict — ``"unavailable"`` (no memory door), ``"empty"`` (nothing qualified) or
+    ``"surfaced"`` (+ ``count``/``ids``, the same opaque ids the log line carries — NEVER
+    content, D10) — is recorded as this turn's ``turn.injector.belief`` child span + a
+    ``lifemodel_turn_injector_total{component=belief,outcome}`` bump (lm-hg7 Task 9), through
+    the same shared :func:`_injector_span` wrapper Tasks 7/8 gave the felt-state/genesis
+    injectors. ``recorder`` is optional (``None`` degrades to a no-op span, e.g. off-host
+    unit tests that don't care about turn observability)."""
 
     def _injector(
         *,
         session_id: str = "",
+        turn_id: str = "",
         user_message: str = "",
         **_ignored: Any,
     ) -> dict[str, str] | None:
         started = time.monotonic()
         try:
-            lm = build_lm()
-            state = lm.state.load()
-            memory = lm.state if isinstance(lm.state, MemoryPort) else None
-            if memory is None:  # no memory door → nothing to surface (degrade, not crash)
-                return None
-            cooldown = set(state.surfaced_belief_ids)
-            # A BOUNDED, gated fetch — never scan-all. The fetch limit reserves ONE slot
-            # per cooldown id PLUS top_n fresh ones: `top_n + len(cooldown)`. This is the
-            # correctness bound (F2) — a plain `top_n + min(len(cooldown), top_n)` pins the
-            # limit at 2*top_n once the ring fills, so `read_active_beliefs` (most-recent-
-            # first) only ever returns the 2*top_n newest rows; if those are all in the
-            # cooldown, the injector goes permanently silent while older un-surfaced beliefs
-            # never surface even once. Reserving a slot per cooldown id guarantees up to
-            # top_n FRESH (non-cooldown) candidates survive the exclusion below. Still
-            # bounded: len(cooldown) <= SURFACED_BELIEF_IDS_CAP=64, so limit <= 66 and the
-            # internal superset (read_active_beliefs fetches ~limit*6) stays ~396 rows max.
-            candidates = read_active_beliefs(
-                memory,
-                min_confidence=params.min_confidence,
-                exclude_private=True,
-                limit=params.top_n + len(cooldown),
-            )
-            beliefs = [b for b in candidates if b.id not in cooldown][: params.top_n]
-            if not beliefs:
-                return None
-            block = _compose_belief_block(beliefs)
-            # ATOMIC field-level stamp (never a stale full-State commit): record the
-            # surfaced ids in the cooldown ring so a later turn skips them.
-            _stamp_surfaced_beliefs(lm, [b.id for b in beliefs])
-            ids = [b.id for b in beliefs]
-            _LOG.info(
-                "belief_injector surfaced count=%d ids=%s latency_ms=%.1f",
-                len(ids),
-                ids,  # opaque content-fingerprint ids only — NEVER the belief content (D10)
-                (time.monotonic() - started) * 1000.0,
-            )
-            return {"context": block}
+            with _injector_span(recorder, session_id, turn_id, INJECTOR_BELIEF) as span:
+                lm = build_lm()
+                state = lm.state.load()
+                memory = lm.state if isinstance(lm.state, MemoryPort) else None
+                if memory is None:  # no memory door → nothing to surface (degrade, not crash)
+                    span.set(outcome="unavailable")
+                    return None
+                cooldown = set(state.surfaced_belief_ids)
+                # A BOUNDED, gated fetch — never scan-all. The fetch limit reserves ONE slot
+                # per cooldown id PLUS top_n fresh ones: `top_n + len(cooldown)`. This is the
+                # correctness bound (F2) — a plain `top_n + min(len(cooldown), top_n)` pins the
+                # limit at 2*top_n once the ring fills, so `read_active_beliefs` (most-recent-
+                # first) only ever returns the 2*top_n newest rows; if those are all in the
+                # cooldown, the injector goes permanently silent while older un-surfaced beliefs
+                # never surface even once. Reserving a slot per cooldown id guarantees up to
+                # top_n FRESH (non-cooldown) candidates survive the exclusion below. Still
+                # bounded: len(cooldown) <= SURFACED_BELIEF_IDS_CAP=64, so limit <= 66 and the
+                # internal superset (read_active_beliefs fetches ~limit*6) stays ~396 rows max.
+                candidates = read_active_beliefs(
+                    memory,
+                    min_confidence=params.min_confidence,
+                    exclude_private=True,
+                    limit=params.top_n + len(cooldown),
+                )
+                beliefs = [b for b in candidates if b.id not in cooldown][: params.top_n]
+                if not beliefs:
+                    span.set(outcome="empty")
+                    return None
+                block = _compose_belief_block(beliefs)
+                # ATOMIC field-level stamp (never a stale full-State commit): record the
+                # surfaced ids in the cooldown ring so a later turn skips them.
+                _stamp_surfaced_beliefs(lm, [b.id for b in beliefs])
+                ids = [b.id for b in beliefs]
+                span.set(outcome="surfaced", count=len(ids), ids=ids)
+                _LOG.info(
+                    "belief_injector surfaced count=%d ids=%s latency_ms=%.1f",
+                    len(ids),
+                    ids,  # opaque content-fingerprint ids only — NEVER the belief content (D10)
+                    (time.monotonic() - started) * 1000.0,
+                )
+                return {"context": block}
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=PRE_LLM_OBSERVER, exc=exc, health=health, metrics=metrics

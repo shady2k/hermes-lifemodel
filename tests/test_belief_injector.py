@@ -23,6 +23,8 @@ from lifemodel.composition import build_lifemodel
 from lifemodel.core.belief_view import belief_id, build_belief, encode_belief
 from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.tick_metrics import OBSERVER_ERRORS, register_universal_metrics
+from lifemodel.core.turn_metrics import TURN_INJECTOR_TOTAL
+from lifemodel.core.turn_recorder import TurnRecorder
 from lifemodel.domain.objects.provenance import Sensitivity
 from lifemodel.hooks import (
     _BELIEF_BLOCK_CLOSE,
@@ -33,7 +35,7 @@ from lifemodel.hooks import (
 )
 from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
-from lifemodel.testing import FakeClock
+from lifemodel.testing import FakeClock, FakeTracer
 
 _NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
 
@@ -46,6 +48,35 @@ def _registry() -> MetricRegistry:
 
 def _lm(tmp_path: Path):
     return build_lifemodel(base_dir=tmp_path, clock=FakeClock(_NOW))
+
+
+class _CapturingSink:
+    """Minimal :class:`~lifemodel.state.trace_store.TraceSink` fake — mirrors
+    ``tests/test_genesis_injector.py``'s local one, just enough for a
+    :class:`TurnRecorder` to persist spans into and for a test to inspect them."""
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, object]] = []
+
+    def submit_span(self, **kw: object) -> bool:
+        self.spans.append(kw)
+        return True
+
+    def submit_event(self, **kw: object) -> bool:
+        return True
+
+    def submit_correlation(self, **kw: object) -> bool:
+        return True
+
+
+def _recorder(reg: MetricRegistry) -> tuple[TurnRecorder, _CapturingSink]:
+    """A real :class:`TurnRecorder` over a capturing sink + the SAME shared *reg* —
+    the belief injector's ``turn_injector_total`` bump lands in the registry the test
+    already reads, and the sink lets a test assert the ``turn.injector.belief`` child
+    span was actually opened (lm-hg7 Task 9, mirroring Task 7/8's recorder helper)."""
+    sink = _CapturingSink()
+    rec = TurnRecorder(tracer=FakeTracer(), writer=sink, metrics=reg, clock=FakeClock(_NOW))
+    return rec, sink
 
 
 def _put_belief(
@@ -238,6 +269,49 @@ def test_composed_block_frames_beliefs_as_untrusted_data_not_instructions() -> N
     assert block.count(_ADVERSARIAL) == 1
     assert open_idx < block.index(_ADVERSARIAL) < close_idx
     assert f"- {_ADVERSARIAL}" in block
+
+
+# ---- lm-hg7 Task 9: turn.injector.belief child span + turn_injector_total ----
+
+
+def test_surfaced_belief_emits_child_span_and_metric_with_ids_but_no_content(
+    tmp_path: Path,
+) -> None:
+    lm = _lm(tmp_path)
+    lm.state.commit(State())
+    bid = _put_belief(lm.state, "t1", _CONFIDENT, confidence=0.8)
+    reg = _registry()
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_belief_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
+
+    result = injector(session_id="s1", turn_id="t1", user_message="hi")
+
+    assert result is not None and _CONFIDENT in result["context"]
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="belief", outcome="surfaced") == 1.0
+    span = next(s for s in sink.spans if s["component"] == "turn.injector.belief")
+    attrs = span["attrs"]
+    assert attrs["outcome"] == "surfaced"
+    assert attrs["count"] == 1
+    assert attrs["ids"] == [bid]
+    # D10 redaction: only the opaque id rides the span, NEVER the belief content
+    assert _CONFIDENT not in json.dumps(span)
+
+
+def test_no_active_beliefs_emits_empty_outcome_and_child_span(tmp_path: Path) -> None:
+    lm = _lm(tmp_path)
+    lm.state.commit(State())
+    reg = _registry()
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_belief_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
+
+    result = injector(session_id="s1", turn_id="t1", user_message="hi")
+
+    assert result is None
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="belief", outcome="empty") == 1.0
+    span = next(s for s in sink.spans if s["component"] == "turn.injector.belief")
+    assert span["attrs"]["outcome"] == "empty"
 
 
 def test_injector_surfaces_adversarial_belief_only_inside_the_data_block(tmp_path: Path) -> None:
