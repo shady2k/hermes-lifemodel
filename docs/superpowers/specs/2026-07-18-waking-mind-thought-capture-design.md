@@ -1,14 +1,14 @@
 # Waking-mind thought capture — the being drops a thought in its own turn (lm-705.11)
 
-**Status:** design **v1** (owner brainstorm 2026-07-18). Ready for review → plan. Task **lm-705.11** (epic **lm-705** — Живой ум). Lights up the currently-inert waking-mind vector by giving live conversation a real, judgment-based thought producer — **without** a heuristic classifier (owner principle, memory `appraisal-is-judgment-not-heuristic`).
+**Status:** design **v2** (owner brainstorm 2026-07-18 + codex design review `019f767c`, findings adjudicated). Ready for review → plan. Task **lm-705.11** (epic **lm-705** — Живой ум). Lights up the currently-inert waking-mind vector by giving live conversation a real, judgment-based thought producer — **without** a heuristic classifier (owner principle, memory `appraisal-is-judgment-not-heuristic`).
 
-> **One-line intent:** add ONE tool — `create_thought` — that lets the being, mid-reply, drop a thought as an **impulse onto the signal bus**, which the **aggregation layer** dedups and persists as a durable thought; downstream rumination/crystallization (already built) then turn it into commitments/beliefs. The being's reply is its thinking; this only drops a mental bookmark.
+> **One-line intent:** add ONE tool — `create_thought` — that lets the being, mid-reply, drop a thought (with its own rough sense of how much it matters) as an **impulse** the aggregation layer dedups and persists as a durable thought, via a **restricted capture path** that touches ONLY the thought store; downstream rumination/crystallization (already built) then turns it into commitments/beliefs. The being's reply is its thinking; this only drops a mental bookmark.
 
 ## 1. Goal
 
-Make **live conversation create thoughts** on the live being. Today the whole waking-mind machine (capture → rumination → crystallization → injection) is built and wired but **inert**: nothing produces a thought from a reactive exchange, so the processing selector finds an empty backlog every tick and the being has ~0 thought rows (lm-705.11 description, verified against `__init__.py:599`).
+Make **live conversation create thoughts** on the live being. Today the whole waking-mind machine (capture → rumination → crystallization → injection) is built and wired but **inert**: nothing produces a thought from a reactive exchange, so the processing selector finds an empty backlog every tick and the being has ~0 thought rows (verified against `__init__.py:599`).
 
-There are two intended thought producers (spec §8 of the epic left the form open — "classifier vs ride-the-tail"):
+Two intended producers (the epic's §8 open question — "classifier vs ride-the-tail"):
 - **Curator / `noticing`** (batch, idle) — already built + registered.
 - **Ride-the-tail** (in-the-moment) — the being flags a thought during its own reply turn. **Not built.** This spec builds it.
 
@@ -16,134 +16,122 @@ There are two intended thought producers (spec §8 of the epic left the form ope
 
 ## 2. Background — the seam that already exists
 
-- **The impulse type + the aggregation consumer are built and tested.** `thought_seed_signal(...)` (`core/taxonomy.py:192`) is the impulse; `ThoughtCapture` (`core/thought_capture.py:25`) is the AGGREGATION component that consumes it from the bus, dedups, and emits a `PutRecord` — never a direct store write. The only production emitter of `thought_seed_signal` today is the post-hoc appraiser seam (`hooks.py:780`, inside `_maybe_capture_thought`).
-- **The post-hoc appraiser is a no-op.** `make_post_llm_observer(appraiser=...)` (`hooks.py:581`) defaults `appraiser=None`; `__init__.py:599` passes no appraiser ("that appraiser is not wired yet"). `core/appraisal.py` holds only the `Appraiser` protocol + `ThoughtSeed` — no concrete implementation. So `_maybe_capture_thought` (`hooks.py:752`) returns early, always.
-- **The bus is a general transport, not tick-bound.** `FrameTrigger` (`core/frame.py:36`) is a closed set of FOUR occasions — `HEARTBEAT`, `EVENT`, `ASYNC_COMPLETION`, `ADMIN`; the heartbeat is one of four. `SignalFrame` (`core/frame.py:53`) is *"the in-memory ephemeral signal bus for ONE ExecutionFrame"*. `run_frame` (`core/frame.py:115`) conducts any signals under the one process-wide re-entrant `_STATE_ACTOR_LOCK` (`core/frame.py:85`), so *every* frame — heartbeat, event, async-completion, admin — is strictly serialized; two frames can never interleave their snapshot→commit. `_maybe_capture_thought` already conducts an `EVENT` frame from a hook. There is **no** race with the live tick and **no** tick-coupling.
-- **Downstream is wired and functional** (verified 2026-07-18). The internal-cognition LLM lane goes through the sanctioned `ctx.llm.acomplete_structured` facade → the user's **main** model (`adapters/plugin_llm_adapter.py`; the cheap-aux-model routing is a known gap, lm-705.10, not a blocker). `InternalCognitionRunner` is driven by `being_platform._tick` (`adapters/being_platform.py:238`, `report.internal_launches → runner.launch`) whenever a `LlmPort` is injected. Live emitters now exist (processing selector + noticing trigger, `composition.py:395`+). The adapter's "no live emitter yet" note is **stale** (pre-dates noticing/processing landing). Whether the curator is *currently producing* on the live being is a runtime question (read-only `python -m lifemodel.activity` baseline), not a design blocker.
+- **The impulse type + the aggregation consumer are built and tested.** `thought_seed_signal(...)` (`core/taxonomy.py:192`) is the impulse; `ThoughtCapture` (`core/thought_capture.py:25`) is the AGGREGATION component that consumes it, dedups, and emits a `PutRecord` — never a direct store write. Its only production emitter today is the post-hoc appraiser seam (`hooks.py:780`, inside `_maybe_capture_thought`).
+- **The post-hoc appraiser is a no-op.** `make_post_llm_observer(appraiser=...)` (`hooks.py:581`) defaults `appraiser=None`; `__init__.py:599` passes none. `core/appraisal.py` holds only the `Appraiser` protocol + `ThoughtSeed`. So `_maybe_capture_thought` (`hooks.py:752`) returns early, always. **Retiring it is safe** (codex-confirmed: unwired in production).
+- **The bus is a general transport, not tick-bound.** `FrameTrigger` (`core/frame.py:36`) is a closed set of FOUR occasions — `HEARTBEAT`, `EVENT`, `ASYNC_COMPLETION`, `ADMIN`. `SignalFrame` (`core/frame.py:53`) is the in-memory ephemeral signal bus; `run_frame` (`core/frame.py:115`) commits under the one re-entrant `_STATE_ACTOR_LOCK` (`core/frame.py:85`), so every frame is strictly serialized (codex-confirmed).
+- **But `run_frame` runs the WHOLE registry** (`core/coreloop.py:315`, `for component in self._registry.enabled()`), regardless of trigger — this is the crux the mechanism must respect (§3).
+- **Downstream is wired and functional** (verified 2026-07-18, codex-confirmed). The internal-cognition LLM lane goes through the sanctioned `ctx.llm.acomplete_structured` → the user's **main** model (cheap-aux routing is a known gap, lm-705.10, not a blocker). `InternalCognitionRunner` is driven by `being_platform._tick` (`adapters/being_platform.py:234`). Live emitters now exist (processing selector + noticing trigger). Whether the curator is *currently producing* on the live being is a runtime question (read-only baseline), not a design blocker.
 
-## 3. The mechanism — impulse → bus → aggregation → durable memory
+## 3. The mechanism — a RESTRICTED capture path (NOT a full frame)
 
-`create_thought` is a normal `lifemodel`-toolset tool (mirrors `commitment`/`check_in` registration, `__init__.py:687`/`:867`). Its handler does **not** write the store. It builds one `thought_seed_signal` per captured text and conducts them through the bus exactly as `_maybe_capture_thought` does today:
+`create_thought` is a normal `lifemodel`-toolset tool (mirrors `commitment`/`check_in`, `__init__.py:687`/`:867`). Its handler must persist thoughts through the aggregation layer (so aggregation owns dedup), but it must **NOT** run a full `run_frame`.
+
+**Why not `run_frame(EVENT)` (codex Critical #1, self-verified).** `CoreLoop.tick` runs *every* enabled component regardless of trigger (`core/coreloop.py:315`); `TickContext` does not even carry the trigger. So a full frame conducted from a tool handler would ALSO run physiology (`core/personality.py`), affect (persists felt state), contact/solitude drives, **desire aggregation and proactive cognition**, and advance tick bookkeeping (a spurious double-tick, `core/coreloop.py:392`). Worst case: with an already-active desire, `CognitionLauncher` writes an intention, reserves energy, sets `pending_proactive_id`, and returns a `LaunchProactive` in one batch (`core/cognition.py`) — but the heartbeat path DISPATCHES launches (`being_platform._tick`: `run_frame` **then** `dispatch_launches`, `:236-237`), and a tool handler does not. The launch is **stranded** while its pending marker + energy reservation commit → future outreach can **deadlock**. A test cannot make this safe; the architecture must.
+
+**The restricted capture path.** Conduct the thought-seed impulse(s) through a path that runs **only** the aggregation capture component and commits **only** its intents, under `_STATE_ACTOR_LOCK`, with **no** physiology/desire/cognition components and **no** tick bookkeeping:
 
 ```
-create_thought(["…", "…"])            # the being, mid-reply
-  → run_frame(coreloop, [thought_seed_signal(content=…), …], trigger=EVENT)
-      → SignalFrame carries the impulses; components run AUTONOMIC → AGGREGATION → COGNITION
-      → ThoughtCapture (aggregation) reads the impulses, DEDUPS, emits PutRecord(s)
-      → frame commits intents atomically under _STATE_ACTOR_LOCK → durable Thought row(s), state=ACTIVE
+create_thought([{content, salience}, …])       # the being, mid-reply
+  → capture_thoughts(coreloop, seeds)           # NEW restricted entrypoint (not run_frame)
+      → under _STATE_ACTOR_LOCK:
+          run ONLY ThoughtCapture.step over a minimal context (the seeds + current object snapshot)
+          collect its PutRecord intents
+          commit ONLY those intents (the same committer)
+      → durable Thought row(s), state=ACTIVE; NO launches produced, NO tick advance, NO other State mutated
 ```
 
-The impulse is **transient** (the `SignalFrame` is discarded on commit — "lost consciousness → don't replay stale impulses", `core/frame.py:59`); the **thought is durable** (a persisted row that survives restart, has a status model, is ruminated on later ticks, and can crystallize). Durability is NOT a discriminator between "bus" and "direct write" — the frame commits durably either way; routing through aggregation is correct because that is where dedup + provenance + (future) semantic dedup belong.
+This preserves the owner's principle — **impulse → aggregation dedups → durable memory** — with zero side effects. The impulse is transient; the thought is durable. The plan settles the exact entrypoint shape (a scoped committer call over a filtered intent set, or a dedicated `CoreLoop.capture(...)` method); §12/§14 name the required guarantee + test.
 
-**Why the bus, not a direct `memory.put` (like the commitment tool did).** The commitment tool's direct write (`hooks.py:1677`) is a CRUD-style lifecycle op. Thought *creation* is an **impulse** and must flow the nervous-system path so the aggregation layer owns integration/dedup. This also aligns the codebase toward the owner's invariant (§10): impulses and events go through the bus; nothing bypasses it. (`create_thought` moves us toward that invariant; removing the commitment tool, §9, removes one bypass.)
+**Alignment note (§9 invariant).** This is the bus discipline done *correctly*: capture still flows through the aggregation layer under the one lock, but scoped to the one component that subscribes to the impulse — not a bypass, and not a full-brain side-effect.
 
-### 3.1 Dedup — done by aggregation, from the bus
+### 3.1 Dedup — done by aggregation, hardened against resurrection
 
-`ThoughtCapture` already dedups: the thought id is a content digest (`seed_thought_id`, `core/thought_view.py:66` — `sha256(strip(content))[:16]`); an in-frame `seen` set collapses same-frame duplicates (`core/thought_capture.py:48`); against the store, an existing row's provenance is preserved (`existing_by_id`, `:51`) so a re-notice / host retry upserts ONE row, never a growing pile.
+`ThoughtCapture` dedups by content digest: the thought id is `seed_thought_id` (`core/thought_view.py:66` — `sha256(strip(content))[:16]`); an in-frame `seen` set collapses same-call duplicates; a re-notice / host retry upserts ONE row.
 
-**Honest limitation (accepted for v1):** this is **exact-content** dedup only. Near-duplicates in different words become separate thoughts, and downstream does not merge them (the processing pass sees one thought in isolation). This is acceptable at the low capture volume of v1. The *right home* for better-than-hash (semantic) dedup is the aggregation layer itself — it already sees both the incoming impulse and the full live thought set — so upgrading is a localized change there, filed as a follow-up (§13).
+**Must-fix (codex Major #5, a real pre-existing bug the tool would expose).** `ThoughtCapture` currently checks only the **live** snapshot (`live_thoughts`, `core/thought_capture.py:40`). Re-capturing content whose prior row is **terminal** (`resolved`/`dropped`/`expired`) finds nothing live → it upserts a fresh `active` row with the same id, **resurrecting** the dead thought and overwriting its provenance. Noticing already avoids this by checking the authoritative store across ALL states (`core/noticing.py:759`). Fix: the capture path checks the authoritative store for **any-state** existence of the id and treats a duplicate as a **no-op** (never an active upsert, never a provenance overwrite).
 
-### 3.2 The one safety check (verify in plan, not assert)
-
-`_maybe_capture_thought` conducts its `EVENT` frame from `post_llm` — *after* the turn. A tool handler runs *mid*-reply (inside the host's tool-dispatch loop). Conducting `run_frame(EVENT)` from there is a **re-entrant nested frame** relative to whatever frame the host turn sits in. The `_STATE_ACTOR_LOCK` is an `RLock` (safe against self-nesting, `core/frame.py:85`) and the processing selector's `LaunchInternalCognition` is *dropped* on non-heartbeat frames (only `being_platform._tick` reads `internal_launches`, `core/thought_processing.py:249`), so no spurious rumination fires mid-dialogue. The plan MUST confirm — with a test, not prose — that a nested `EVENT` frame from a tool handler commits cleanly and has no unintended component side effects on the live turn's state.
+**Accepted limitation (v1):** dedup is exact-content only; near-duplicates in different words become separate thoughts, and downstream does not merge them. Acceptable at v1 volume; semantic (better-than-hash) dedup — the aggregation layer's job, since it sees the whole live set — is a follow-up (§12).
 
 ## 4. The tool contract
 
-- **Name:** `create_thought`. Toolset `lifemodel`. Registered like the others (`ctx.register_tool`, `__init__.py`).
-- **Schema:** ONE parameter — a list of thought texts. Accept `1..N` strings so the being can drop several notions in one call (cheaper than N calls, and natural — a mind surfaces a couple of things at once). A single notion is a one-element list. **No** salience / actionability / importance fields — the being does not self-score at capture (owner: capture is a cheap reflex, not a micro-rating; §5).
-- **Description (English prose — the ride-the-tail instruction lives here, 0 extra LLM, language-agnostic content).** Draft:
-  > *Capture a thought you want to return to later. When something in this exchange leaves a thread worth revisiting — a question you want to sit with, something you noticed about them or about yourself, an idea not yet finished — write it here in a sentence (in whatever language is natural). Your reply is your thinking; this only drops a bookmark your quieter, later mind will pick up and think through. Not every turn — only when something genuinely tugs. You may capture more than one at once.*
-- **Hermes contract (exactly like `check_in`/`commitment`, `hooks.py:1621`):** the handler returns a `json.dumps` STRING, returns `{"error": …}` on failure, and **never raises**. A throw is logged + counted + swallowed. The being gets an honest result (e.g. `{"captured": N, "deduped": M}`).
-- **Metric:** a per-call outcome counter, mirroring the other tools' folded metrics (e.g. `lifemodel_thought_tool_total{outcome=captured|deduped|empty|error}`), so "did the being drop a thought, how often" is answerable from `metrics.sqlite`, not a grep (observability-first).
+- **Name:** `create_thought`. Toolset `lifemodel`. Registered like the others.
+- **Schema:** a list of `1..N` thoughts (so the being can drop several notions in one call — cheaper than N calls, and natural). Each entry:
+  - `content` (required string) — what to return to.
+  - `salience` (the being's **own rough sense** of how much it matters). **Owner decision A (2026-07-18):** the being provides this even though it is imprecise — an in-the-moment estimate beats a flat `0` placeholder, and it avoids a cross-kind envelope refactor (see §5). Optional; a neutral non-zero default if omitted. Coarse is fine (a small felt scale mapped to the envelope `salience`); the plan picks the exact shape, biased to LOW cognitive load on the reply turn.
+- **No** other valuation fields (`actionability`/`other_regarding_value` stay at their envelope defaults; the arbiter/processing refine later).
+- **Description (English prose — the ride-the-tail instruction, 0 extra LLM, language-agnostic content).** Draft:
+  > *Capture a thought you want to return to later. When something in this exchange leaves a thread worth revisiting — a question you want to sit with, something you noticed about them or about yourself, an idea not yet finished — write it here in a sentence (in whatever language is natural), with a rough sense of how much it tugs at you. Your reply is your thinking; this only drops a bookmark your quieter, later mind will pick up and think through. Not every turn — only when something genuinely tugs. You may capture more than one at once.*
+- **Hermes contract (like `check_in`/`commitment`, `hooks.py:1621`):** returns a `json.dumps` STRING, `{"error": …}` on failure, **never raises**.
+- **Honest result (codex Minor #8).** Because the restricted path (§3) runs `ThoughtCapture` directly, the handler CAN see real created-vs-duplicate counts and return `{"accepted": N, "deduped": M}` truthfully (unlike `run_frame`, whose `TickReport` exposes no component result).
+- **Metric:** a per-call outcome counter (e.g. `lifemodel_thought_tool_total{outcome=captured|deduped|empty|error}`), so "did the being drop a thought, how often" is answerable from `metrics.sqlite`, not a grep.
 
-## 5. Honest thought schema — appraisal is absent until judged
+## 5. Salience — the tool provides it; NO envelope refactor
 
-The current `Thought` carries flat valuation fields born at `0.0` (`build_thought` defaults `salience=0.0`, `attention_score=0.0`, `actionability=0.0`, `other_regarding_value=0.0`, `core/thought_view.py:81`). This conflates two different meanings: **"weighed, and genuinely unimportant (zero)"** vs **"not yet weighed"**. That is a lie in the model — a placeholder zero masquerading as a measurement (owner: *"как мы поймём, это ноль потому что пофиг или потому что ещё не оценили?"*).
+The earlier plan (v1 spec) proposed replacing the flat thought valuation with an optional nested `appraisal`, born absent. **Codex Major #2 (self-verified) killed that as scoped:** `salience` is not a thought-payload field — it is a `BaseObject` **envelope** field (`domain/objects/base.py`), copied into `MemoryDraft`, persisted as a `REAL NOT NULL DEFAULT 0` column and used for cross-kind ordering (`state/sqlite_store.py`, `salience_desc = "salience DESC, id ASC"`). Making it optional is a storage refactor across desires/intentions/commitments/beliefs + a row migration + noticing/renderer changes — far beyond this task, and `_crystallize` requires a concrete `float` anyway (`core/thought_processing.py:401`).
 
-**Decision — a raw thought carries no valuation; the valuation is a separate, optional structure produced later:**
-- Introduce an `Appraisal` value object holding `salience` (+ `actionability`, `other_regarding_value`).
-- `Thought` gains `appraisal: Appraisal | None`, **replacing** the three flat valuation fields. Born `None` — honestly "not yet weighed". A present `Appraisal` (even with a low salience) honestly means "weighed, and this is its weight". Absence ≠ zero.
-- `attention_score` gets the same honesty: it is not intrinsic to a thought — it is the arbiter's dynamic competition weight — so it becomes optional/absent until the arbiter (lm-705.4) computes it, rather than a persisted `0.0`.
-- **Nested sub-structure, NOT a child durable row** (the owner's "дочернюю структуру" realized without object proliferation). A separate durable row would split identity: dedup keys off the raw thought, provenance/lineage descend from it, crystallization references it — a second row doubles all of that for no gain. `appraisal` hangs *on* the thought. The store is JSON-payload (`domain/objects/thought.py` `req_float(payload, "attention_score")`, `:111`), so an optional nested object is a straightforward `opt_*` decode.
+**Resolution (owner decision A):** do **not** refactor. The being provides a rough `salience` through the tool (§4); the thought is born with a real value on the existing envelope column. The envelope `salience` is best understood as a **scheduling projection** (0 = "not yet placed in the queue"), not a claim that the being judged the thought worthless — so a thought born with the being's own estimate is honest, and a thought that somehow lacks one sits at a neutral default, not at the degenerate bottom. Noticing already supplies `salience` the same way (`core/noticing.py:775`), so **both producers are uniform** — no asymmetry, no noticing change, no migration, no renderer change.
 
-**Who fills `appraisal`, and when.** Importance is *discovered by attention*, not declared at birth. The natural moment is the **deliberate rumination pass** (`thought_processing`, `core/thought_processing.py`) — the being, thinking a thought over with budget, forms and records its salience. This is the "moment salience is born" the owner asked about. **Both** producers (tool and curator) therefore create thoughts with `appraisal=None`; a single locus fills it.
+**Deferred (own follow-up, §12):** a deliberate appraisal pass that *refines* the being's rough in-the-moment number with a more considered judgment (the "importance is discovered by attention" idea), and — only if ever wanted — separating the being's semantic judgment from the scheduling projection. Neither is needed to light up the vector.
 
-**v1 scope of the appraisal change.** v1 ships the honest *schema* (appraisal optional, born absent) so no zero-placeholders ever land, and the selection sort tolerates absence. v1 does **not** yet build the appraisal-fill pass — so all v1 thoughts are unappraised and the selector picks among them FIFO (honestly "nothing to rank on yet", see §6). Filling `appraisal` in processing is the immediate follow-up (§13), landing where we already touch that code.
-
-## 6. Selection with unappraised thoughts
-
-The processing selector picks the top-salience ACTIVE thought (`live_thoughts` sorts `(-salience, id)`, `core/thought_view.py:141`; `_pick` returns `actives[0]`, `core/thought_processing.py:336`). With `appraisal` optional, the sort MUST handle absence:
-- **v1:** absent appraisal ranks as the lowest salience (sentinel), ties broken by id. Since all v1 thoughts are unappraised, selection is uniformly **FIFO-by-id** — honest: there is nothing to prioritize on until appraisal-fill lands. This matches the accepted v1 tradeoff (low volume, one thought chewed per heartbeat, all eventually processed).
-- **Follow-up (when appraisal-fill exists):** decide the ordering of unappraised vs appraised. Recommended: **unappraised-first** (a fresh, unweighed thought demands first evaluation — novelty captures attention), so a new thought is appraised promptly, then competes normally on re-processing by its now-real salience. Deadlock-avoidance note for the plan: unappraised thoughts must NOT sort last, or they would never be picked to be appraised.
-
-## 7. Retire the post-hoc appraiser seam (keep the transport + consumer)
+## 6. Retire the post-hoc appraiser seam (keep the transport + consumer)
 
 Because the producer is now the tool, the post-hoc judgment is dead:
 - **Remove:** the `Appraiser` protocol (`core/appraisal.py`), `_maybe_capture_thought` (`hooks.py:752`), and the `appraiser=` parameter on `make_post_llm_observer` (`hooks.py:581`) + its no-op wiring intent in `__init__.py`.
-- **Keep:** `ThoughtSeed` (repurposed as the tool→signal payload shape), `thought_seed_signal` (`core/taxonomy.py:192`), and `ThoughtCapture` (`core/thought_capture.py`) — the tool now feeds them. `ThoughtSeed.salience` (currently required) is dropped/made optional in step with §5; the tool supplies content only.
-- The `post_llm` observer keeps its OTHER jobs unchanged (proactive read-back resolution, buffer close, turn-observability close).
+- **Keep:** `ThoughtSeed` (the tool→signal payload shape — now carrying content + salience + producer), `thought_seed_signal` (`core/taxonomy.py:192`), and `ThoughtCapture` (`core/thought_capture.py`) — the tool + the restricted path now feed them.
+- The `post_llm` observer keeps its OTHER jobs unchanged (proactive read-back resolution, buffer close, turn-observability close — codex-confirmed independent).
 
-## 8. Remove the `commitment` tool (keep the object)
+## 7. Commitment tool + curator KEPT — this change is purely additive
 
-The being's single reply-time creative act becomes "notice a thought" (owner: *"дать существу только один инструмент… обязательства, суждения и прочие вещи — что ж теперь, для каждого создавать отдельный инструмент?"*). Commitments are born by **crystallization** from a thought (already built: the processing pass's `crystallize_commitment` outcome → `_crystallize`, `core/thought_processing.py:383`), not by a dedicated tool.
-- **Remove:** the `commitment` tool — `make_commitment_tool` (`hooks.py:1609`), its schema/description, the `commitment` `register_tool` (`__init__.py:867`), and the tool-only metric `COMMITMENT_TOOL_TOTAL` (`core/tick_metrics.py:62`). Update the creation-boundary safety prose that lived in the tool description + `PROCESSING_INSTRUCTIONS` accordingly (crystallization remains the sole boundary).
-- **Keep, untouched:** the `Commitment` domain object, `commitment_view`, `read_active_commitments`, and `make_commitment_injector` (commitments still exist and are surfaced into live turns).
-- **Accepted consequence:** with the tool gone and no "thought → discharge/defer" path yet, the being cannot manually retire a live commitment mid-life; the injector keeps surfacing active ones (bounded, `max_surfaced=8` + overflow notice). Acceptable for v1 (commitments are rare and deliberate); "thought → discharge/defer" folds into the commitment-lifecycle bead (lm-705.12).
-- **Final being tool surface:** `check_in`, `write_soul`, `create_thought`.
+**Owner decision B (2026-07-18):** keep the `commitment` tool **entirely** (create / discharge / defer) and keep `noticing`. Codex Major #7 (self-verified) showed removing the tool would **leak** live commitments: the tool is the ONLY path for `honoured`/`dropped`/`deferred` transitions (`hooks.py:1687`); crystallization only *creates* commitments, cannot close them — so completed/obsolete commitments would stay `active` and be injected every turn forever, degrading the injector's accuracy. So `create_thought` is **additive only**: nothing about commitments, beliefs, `noticing`, the injectors, `PROCESSING_INSTRUCTIONS`, or the creation-boundary prose changes.
 
-## 9. Observability — comparable producers
+**Final being tool surface:** `check_in`, `write_soul`, `commitment` (unchanged), `create_thought` (new).
 
-Both producers write to the same thought store, so to later judge "which path is more effective" (owner: *"посмотрим на деле какой из них эффективней"*) the source MUST be distinguishable. `build_thought` already takes a `source` + provenance; the tool tags its thoughts with a distinct source (e.g. `source="create-thought-tool"` / a `thought:live:` id namespace, mirroring commitment's `live`/`seed` split) vs the curator's `noticing` source. That lets a read-only query attribute captures, crystallizations, and drops per producer — the empirical comparison the owner wants, from durable data, no live instrumentation.
+## 8. Observability — comparable producers
 
-**Cross-producer dedup is intentionally per-producer.** Because tool thoughts carry a `thought:live:` id namespace and curator thoughts their own, the SAME content noticed by BOTH the being (in the moment) and the curator (later batch) yields TWO rows — one per producer. This is deliberate: at v1's low volume it is what makes the effectiveness comparison possible (you can see each producer's independent catch), and the cost is negligible. Dedup remains exact within a producer. If cross-producer duplication ever becomes noisy, it folds into the semantic-dedup follow-up (§13), which is the layer that can reconcile across namespaces.
+Both producers write to the same thought store; to later judge "which path is more effective" (owner: *"посмотрим на деле какой из них эффективней"*) the source MUST be distinguishable. Add a validated `producer` field to the thought-seed (`create-thought-tool` vs `noticing`) that `ThoughtCapture` records into the thought's `source`/provenance (it currently hardcodes `source="thought-capture"`, `core/thought_capture.py:63` — codex Minor #5a). Then a read-only query attributes captures, crystallizations, and drops per producer, from durable data, no live instrumentation. (Ids stay content-global; a producer that re-notices content another already stored is a dedup no-op per §3.1, and provenance records the first creator — sufficient for a rough effectiveness comparison. Per-producer id namespacing, if ever needed for exact overlap counts, is a follow-up.)
 
-## 10. Alignment with the "everything through the bus" invariant
+## 9. Alignment with the "everything through the bus" invariant
 
-Owner principle (2026-07-18): **all impulses and events flow through the signal bus, in layer order (AUTONOMIC → AGGREGATION → COGNITION); nothing bypasses it or writes state directly.** The frame pipeline already enforces layer order under one lock. This work advances the invariant (`create_thought` uses the bus; the commitment tool's direct `memory.put` is removed). Technical channels that are neither impulses nor events — notably `write_soul` writing identity to disk (`core/frame.py` `state_actor_lock` docstring) — are a **separate category**, out of the invariant's scope, not exceptions to force through the bus. Enforcing the invariant in code (a lint/test that only the frame committer + sanctioned lock-holders call the mutating store methods) is a follow-up hardening task (§13), not part of v1.
+Owner principle (2026-07-18): impulses and events flow through the signal bus, in layer order, under one lock; nothing writes state directly or bypasses aggregation. The restricted capture path (§3) honors this — capture flows through the aggregation layer under the lock — while avoiding the full-brain side-effects a naive `run_frame` would cause. Technical channels that are neither impulses nor events (e.g. `write_soul` writing identity to disk) are a separate category, out of the invariant's scope. Enforcing the invariant in code (a lint/test that only the committer + sanctioned lock-holders mutate the store) is a follow-up hardening task (§12).
 
-## 11. Thought lifecycle (recap — mostly already built)
+## 10. Thought lifecycle (recap — unchanged, already built)
 
-`ACTIVE` (born) → selector picks one per heartbeat under gates (single-flight, min-interval, FR20 budget) → non-delivering rumination pass → `ThoughtProcessingApply` transitions it:
-- `resolve` → `RESOLVED`; `park` → `PARKED` (6h/24h/72h backoff ladder, re-armed when due, `EXPIRED` after 3 park cycles); `drop` / 3 no-progress → `DROPPED`;
-- `crystallize_commitment` → a `Commitment` is born (durable child, inherits the thought's salience + lineage) and the thought → `RESOLVED` (`core/thought_processing.py:420`).
+`ACTIVE` (born, with the being's rough salience) → selector picks the top-salience ACTIVE thought per heartbeat under gates (single-flight, min-interval, FR20 budget) → non-delivering rumination pass → `ThoughtProcessingApply` transitions it: `resolve`→`RESOLVED`; `park`→`PARKED` (6h/24h/72h ladder, re-armed when due, `EXPIRED` after 3 cycles); `drop`/3-no-progress→`DROPPED`; `crystallize_commitment`→ a `Commitment` is born (inherits the thought's salience + lineage) and the thought→`RESOLVED` (`core/thought_processing.py:420`). No v1 change here — real salience from the tool means the selector's salience-desc ordering is meaningful from day one (no FIFO-among-zeros).
 
-The only v1 changes to this recap: the thought is born with `appraisal=None` (§5); a v1 thought that crystallizes passes an absent/flat salience to its commitment (real salience arrives once appraisal-fill lands).
+## 11. Scope (v1, lm-705.11)
 
-## 12. Scope
+1. `create_thought` tool — `content` + rough being-`salience`, array-capable, English description, Hermes contract, honest `{accepted, deduped}` result, folded metric (§4).
+2. **Restricted capture path** — a scoped entrypoint that runs only `ThoughtCapture` + commits only its intents under the lock; NO full-registry frame, NO tick advance, NO launches (§3). The must-fix that makes the tool safe.
+3. **Resurrection fix** — the capture path checks the authoritative store for any-state existence and no-ops on a duplicate (§3.1).
+4. **Producer tagging** — thought-seed carries `producer`; `ThoughtCapture` records it into source/provenance (§8).
+5. Retire the post-hoc `Appraiser` seam; keep transport + consumer (§6).
+6. **No** removal of the commitment tool; **no** envelope/appraisal refactor; **no** noticing change (§5, §7).
 
-**In v1 (lm-705.11):**
-1. `create_thought` tool — text-only, array-capable, English description, Hermes contract, folded metric (§4).
-2. Handler conducts `thought_seed_signal` impulses via `run_frame(EVENT)`; aggregation dedups + persists (§3); nested-frame safety verified by test (§3.2).
-3. Honest schema — `Thought.appraisal: Appraisal | None`, born absent; `attention_score` optional; selector sort tolerates absence, v1 = FIFO (§5, §6).
-4. Retire the post-hoc appraiser seam; keep transport + consumer (§7).
-5. Remove the `commitment` tool; keep the object/view/injector (§8).
-6. Source-tag tool thoughts for producer comparison (§9).
+## 12. Follow-up beads (filed, not built here)
 
-**Explicitly NOT in v1 (follow-ups, §13).**
-
-## 13. Follow-up beads (filed, not built here)
-
-- **Appraisal-fill in processing** — the rumination pass records the being's salience judgment (the "moment salience is born"). Lands where §5 leaves off; decides unappraised-vs-appraised sort ordering (§6).
-- **Belief unification** — add a `crystallize_belief` outcome to processing (mirror `crystallize_commitment`) and make `noticing` produce only thoughts (retire the direct `belief` seed, `core/noticing.py:864`), so *all* durable types are born via thought processing (owner principle). Touches shipped belief-track — its own reviewable bead.
-- **"Everything through the bus" invariant + linter** — enforce single write-path; `write_soul` exempt as a technical channel (§10).
+- **Deliberate salience refinement** — a processing-side pass that refines the being's rough in-the-moment salience with a considered judgment ("importance discovered by attention"); optionally separates semantic judgment from the scheduling projection.
+- **Belief unification** — add a `crystallize_belief` outcome to processing (mirror `crystallize_commitment`) and make `noticing` produce only thoughts, so all durable types are born via thought processing (owner principle). Touches shipped belief-track — its own reviewable bead.
+- **"Everything through the bus" invariant + linter** — enforce single write-path; `write_soul` exempt as a technical channel (§9).
 - **Semantic (better-than-hash) dedup in aggregation** (§3.1).
 - **Cheap-aux-model routing** — already tracked (lm-705.10).
 - **Arbiter fills dynamic `attention_score`** — already tracked (lm-705.4), last by design.
-- **Live baseline read** — read-only `python -m lifemodel.activity` on the live being to record whether the curator is already producing, as the comparison's starting point (verification-phase, not a code bead).
+- **Live baseline read** — read-only `python -m lifemodel.activity` on the live being to record whether the curator already produces, as the comparison's starting point (verification-phase, not a code bead).
 
-## 14. Testing
+## 13. Testing
 
-- **Handler contract:** returns a JSON string; `{"error": …}` on a forced failure; never raises; empty/whitespace input handled; array of N; folded metric increments per outcome.
-- **Impulse → durable thought (real-code, mirrors `test_thought_capture.py`):** a `create_thought` call results in N `ACTIVE` thoughts in the store with the tool source; identical content across two calls upserts ONE row (dedup); two identical strings in one array collapse to one.
-- **Nested-frame safety (§3.2):** an `EVENT` frame conducted from a tool-handler context commits cleanly, emits no `LaunchInternalCognition` into a live-turn dispatch, and does not corrupt in-flight turn state.
-- **Honest schema:** a thought round-trips with `appraisal=None` (absent, not zero) through encode/decode; the selector picks unappraised thoughts (FIFO) without a sort crash; a legacy row (pre-refactor, with flat fields) decodes without loss.
-- **Removals:** `make_post_llm_observer` with no `appraiser=` still resolves proactive read-backs / closes the buffer / closes the turn; the `commitment` tool is gone from the toolset while the commitment injector still surfaces active commitments.
+- **Handler contract:** returns a JSON string; `{"error": …}` on a forced failure; never raises; empty/whitespace input handled; array of N; folded metric increments per outcome; honest `{accepted, deduped}` counts.
+- **Restricted-path SAFETY (codex-required, the load-bearing test):** a `create_thought` call creates the thought rows AND leaves **everything else unchanged** — assert every `State` field, `tick_count`/`last_tick_at`, all non-thought rows, and BOTH launch collections (`launches`, `internal_launches`) are untouched, and that with an already-active desire NO `LaunchProactive` is produced or stranded.
+- **Dedup + resurrection:** identical content across two calls → ONE row; two identical strings in one array → one; re-capturing content whose prior row is `resolved`/`dropped`/`expired` is a **no-op** (the terminal row is NOT resurrected and its provenance is intact) — tested against active, parked, AND terminal rows in the real SQLite store.
+- **Salience:** a thought is born with the being-provided salience on the envelope; the selector's salience-desc ordering reflects it.
+- **Producer tagging:** tool thoughts carry the tool producer/source; a coexistence test with a noticing-created thought shows distinguishable sources.
+- **Retire:** `make_post_llm_observer` with no `appraiser=` still resolves proactive read-backs / closes buffer / closes turn.
 - **`make check` green** (ruff format+check, mypy, pytest) before commit; deploy is its own gated step.
 
-## 15. Non-goals
+## 14. Non-goals
 
 - No heuristic/keyword appraiser (owner principle — rejected form).
-- No self-scoring of salience/importance at capture.
-- No merge of the reactive inbound EVENT frame and the tool's capture frame.
-- No semantic dedup, no appraisal-fill, no belief unification, no arbiter — all §13.
+- No full `run_frame` from the tool handler (codex Critical #1 — the reason for the restricted path).
+- No envelope/`salience` refactor, no nested `appraisal`, no migration (§5).
+- No removal or change of the commitment tool, the injectors, or noticing (§7).
+- No semantic dedup, no salience-refinement pass, no belief unification, no arbiter, no bus-invariant linter — all §12.
 - No touching `write_soul` / `check_in`.
