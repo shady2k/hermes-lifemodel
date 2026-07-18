@@ -407,3 +407,73 @@ def build_noticing_lifemodel(
         )
     )
     return lm
+
+
+@dataclass
+class _RecordingEgress:
+    """Records launches without sending anything — for the capture-path safety test."""
+
+    sent: list[object] = field(default_factory=list)
+
+    def reach_out(self, target: object, impulse: str) -> object:
+        from ..domain.egress import ReachOutcome
+
+        self.sent.append((target, impulse))
+        return ReachOutcome.DELIVERED
+
+
+def build_capture_harness() -> object:
+    """A lightweight ``CoreLoop`` over fakes for testing the restricted capture path.
+
+    Returns a plain object with ``.coreloop``, ``.state_store``, ``.memory``, and
+    ``.egress`` — enough for the ``capture_thoughts`` safety test (lm-705.11 Task 3).
+    The store is seeded with one active ``desire`` row so the \"no LaunchProactive
+    stranded\" assertion is meaningful.
+    """
+    from ..core.component import ComponentLayer
+    from ..core.coreloop import CoreLoop
+    from ..core.registry import ComponentManifest, ComponentRegistry
+    from ..core.state_actor import StateActor
+    from ..core.thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
+    from ..domain.memory import MemoryDraft
+    from ..ports.tracer import TracerPort
+    from .fakes import FakeClock, FakeMemoryStore, FakeStateStore, FakeTracer
+
+    clock = FakeClock(datetime(2026, 7, 18, tzinfo=UTC))
+    memory = FakeMemoryStore(clock=clock)
+    state_store = FakeStateStore(initial=State(), memory=memory)
+    # Seed one active desire so the "no LaunchProactive stranded" check is real.
+    memory.put(MemoryDraft(kind="desire", id="d1", state="active", payload={}, source="test"))
+
+    registry = ComponentRegistry()
+    registry.register(
+        ThoughtCapture(),
+        ComponentManifest(
+            id=THOUGHT_CAPTURE_ID,
+            type="thought-capture",
+            layer=ComponentLayer.AGGREGATION,
+            metric_surface=(),
+            accepts_signals=True,
+        ),
+    )
+
+    actor = StateActor(state_store)
+    tracer: TracerPort = FakeTracer()
+    egress = _RecordingEgress()
+
+    coreloop = CoreLoop(
+        registry=registry,
+        state_actor=actor,
+        clock=clock,
+        tracer=tracer,
+        memory=memory,
+    )
+    # The load-bearing field: the fail-closed test swaps a double onto this.
+    coreloop._capture_component = ThoughtCapture()
+
+    result = type("CaptureHarness", (), {})()
+    result.coreloop = coreloop
+    result.state_store = state_store
+    result.memory = memory
+    result.egress = egress
+    return result

@@ -37,7 +37,7 @@ from ..state.model import State
 from ..state.trace_store import NULL_TRACE_SINK, TraceSink
 from .component import TickContext
 from .contact_sensor import CONTACT_SENSOR_ID
-from .frame import FrameTrigger, SignalFrame
+from .frame import FrameTrigger, SignalFrame, state_actor_lock
 from .idempotency import filter_external_events, record_external_events
 from .intents import (
     EmitSignal,
@@ -53,6 +53,7 @@ from .observer import ComponentObserver
 from .registry import ComponentManifest, ComponentRegistry, UnknownComponent
 from .state_actor import StateActor
 from .suppression import SuppressionReason, emit_suppression_span
+from .thought_capture import THOUGHT_CAPTURE_ID, ThoughtCapture
 from .tick_metrics import (
     BRAIN_HEARTBEAT,
     BRAIN_LAST_TICK_EPOCH,
@@ -104,6 +105,15 @@ class TickReport:
     trigger: FrameTrigger = FrameTrigger.HEARTBEAT
 
 
+@dataclass(frozen=True)
+class CaptureResult:
+    """The outcome of one restricted capture (thought-capture spec §3)."""
+
+    accepted: int  # valid seeds persisted-or-deduped this call
+    deduped: int  # of those, already present (create-if-absent no-op)
+    thought_ids: tuple[str, ...]
+
+
 class CoreLoop:
     def __init__(
         self,
@@ -143,6 +153,7 @@ class CoreLoop:
         self._pressure_sensor = pressure_sensor
         self._memory = memory
         self._live_states = live_states if live_states is not None else _DEFAULT_LIVE_STATES
+        self._capture_component = ThoughtCapture()
         self._failures: dict[str, int] = {}
         self._broken: set[str] = set()
         # The shared source of CURRENT metric state (telemetry-core §4.1/§4.2): the
@@ -194,6 +205,66 @@ class CoreLoop:
             status=span.status,
             attrs=dict(span.attrs) or None,
         )
+
+    def _live_objects_snapshot(self, now: datetime, logger: SpanLogger) -> tuple[MemoryRecord, ...]:
+        """The live (non-terminal) objects snapshot — one bounded find per live state.
+
+        Reused by both ``_run_tick`` and ``capture_thoughts`` so both paths see
+        the same consistent view (lm-705.11 spec §3).
+        """
+        if self._memory is None:
+            return ()
+        try:
+            found: list[MemoryRecord] = []
+            for live_state in sorted(self._live_states):
+                found.extend(self._memory.find(state=live_state, limit=OBJECTS_SNAPSHOT_LIMIT))
+            return tuple(found)
+        except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
+            logger.info("objects_snapshot_failed", error=repr(exc))
+            return ()
+
+    def capture_thoughts(self, seeds: Sequence[Signal]) -> CaptureResult:
+        """Persist thought-seed impulses via ONLY ``ThoughtCapture``, under the one
+        state-actor lock, mutation-only — no other component, no tick advance, no
+        launches (spec §3). Opens + persists its own ``thought-capture`` span so
+        provenance points at a real span (D10). Fail-closed: a non-thought
+        ``PutRecord`` intent aborts before any commit."""
+        if not seeds:
+            return CaptureResult(accepted=0, deduped=0, thought_ids=())
+        with state_actor_lock():
+            now = self._clock.now()
+            state = self._state_actor.state
+            root = self._tracer.start_root()
+            span = start_span(root, component=THOUGHT_CAPTURE_ID, tick=None, started_at=to_iso(now))
+            logger = self._span_logger(span)
+            objects = self._live_objects_snapshot(now, logger)
+            ctx = TickContext(
+                state=state,
+                now=now,
+                trace=root,
+                signals=tuple(seeds),
+                objects=objects,
+                logger=logger,
+                tracer=self._tracer,
+                trace_writer=self._writer,
+                metrics=self._metrics,
+            )
+            intents = list(self._capture_component.step(ctx))
+            for intent in intents:  # fail-closed (spec §3)
+                if not isinstance(intent, PutRecord):
+                    raise AssertionError(f"capture emitted a non-PutRecord intent: {intent!r}")
+            # created-vs-deduped for observability — under the lock (consistent)
+            deduped = 0
+            if self._memory is not None:
+                for intent in intents:
+                    assert isinstance(intent, PutRecord)  # narrowed above
+                    if self._memory.get(intent.op.draft.kind, intent.op.draft.id) is not None:
+                        deduped += 1
+            ids = tuple(intent.op.draft.id for intent in intents if isinstance(intent, PutRecord))
+            self._state_actor.apply(intents)  # PutRecord-only → commit_tick(None, mutations)
+            span.set(captured=len(ids) - deduped, deduped=deduped, thoughts=len(ids))
+            self._persist_span(span, ended_at=to_iso(now))
+        return CaptureResult(accepted=len(ids), deduped=deduped, thought_ids=ids)
 
     def tick(
         self,
@@ -271,15 +342,7 @@ class CoreLoop:
         # rows (satisfied/dropped/expired/archived/...) are absence, never fetched.
         # Fail-soft like the pressure read: a transient DB error degrades to an
         # empty snapshot rather than failing the tick before component isolation.
-        objects: tuple[MemoryRecord, ...] = ()
-        if self._memory is not None:
-            try:
-                found: list[MemoryRecord] = []
-                for live_state in sorted(self._live_states):
-                    found.extend(self._memory.find(state=live_state, limit=OBJECTS_SNAPSHOT_LIMIT))
-                objects = tuple(found)
-            except Exception as exc:  # noqa: BLE001 - fail-soft snapshot read
-                root_logger.info("objects_snapshot_failed", error=repr(exc))
+        objects = self._live_objects_snapshot(now, root_logger)
         # External-event idempotency (spec §8): the intake path checks the durable
         # ring BEFORE seeding the frame. A duplicate external event — a Telegram/Hermes
         # retry of the SAME inbound, keyed by its ``contact_observed`` origin_id — is
