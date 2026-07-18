@@ -56,8 +56,12 @@ _EXCLUDE_PARTS = {"tests", "testing", "__pycache__", "docs", ".git", ".beads", "
 #: completed soul write), the internal-cognition runner (``adapters/internal_runner.py``,
 #: lm-705.6 — an adapter-owned asyncio task with no ambient span either: the aux call and
 #: its completion frame run off the gateway loop, not inside a tick, so a call/completion
-#: failure has nowhere to bind a ``SpanBoundLogger`` and is logged here instead), and the
-#: adapters that have no ambient span. Everything else — every ``core/`` tick component
+#: failure has nowhere to bind a ``SpanBoundLogger`` and is logged here instead), the turn
+#: recorder (``core/turn_recorder.py``, lm-hg7 — a process-lifetime service that mints its
+#: OWN per-turn root spans for asynchronous, cross-thread host work OUTSIDE any
+#: ``ExecutionFrame``; it never receives an ambient tick span to bind a ``SpanBoundLogger``
+#: to, and every public method is fail-soft — a tracing hiccup must log, never raise), and
+#: the adapters that have no ambient span. Everything else — every ``core/`` tick component
 #: above all — must log ONLY through a ``SpanBoundLogger``.
 _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
     {
@@ -67,6 +71,7 @@ _LOGGING_ALLOWLIST: frozenset[str] = frozenset(
         "hooks.py",
         "state_commands.py",
         "core/timeutil.py",
+        "core/turn_recorder.py",
         "adapters/being_platform.py",
         "adapters/delivery.py",
         "adapters/session_end.py",
