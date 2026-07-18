@@ -33,22 +33,26 @@ Two intended producers (the epic's §8 open question — "classifier vs ride-the
 ```
 create_thought([{content, salience}, …])       # the being, mid-reply
   → capture_thoughts(coreloop, seeds)           # NEW restricted entrypoint (not run_frame)
+      → open + PERSIST a `thought-capture` span (child of the turn/tool trace); pass its
+        TraceContext into a minimal TickContext (ThoughtCapture needs ctx.trace for provenance)
       → under _STATE_ACTOR_LOCK:
-          run ONLY ThoughtCapture.step over a minimal context (the seeds + current object snapshot)
-          collect its PutRecord intents
-          commit ONLY those intents (the same committer)
+          run ONLY ThoughtCapture.step over that context (the seeds + live object snapshot)
+          ASSERT every returned intent is a thought PutRecord (fail-closed — abort otherwise)
+          commit ONLY those mutations via commit_tick(None, mutations) — never with a loaded State
       → durable Thought row(s), state=ACTIVE; NO launches produced, NO tick advance, NO other State mutated
 ```
 
-This preserves the owner's principle — **impulse → aggregation dedups → durable memory** — with zero side effects. The impulse is transient; the thought is durable. The plan settles the exact entrypoint shape (a scoped committer call over a filtered intent set, or a dedicated `CoreLoop.capture(...)` method); §12/§14 name the required guarantee + test.
+This preserves the owner's principle — **impulse → aggregation dedups → durable memory** — with zero side effects. The impulse is transient; the thought is durable. Codex re-review (`019f767c`) confirms: the restricted path eliminates the Critical hazard *if implemented exactly this way*, and mutation-only commits (`StateActor.apply` / `commit_tick(None, …)`, `core/state_actor.py:105`, `state/sqlite_store.py:663`) advance neither tick nor runtime state. Two guardrails the codex pass added, folded above: (a) the entrypoint must **open + persist its own span** — `ThoughtCapture` requires `ctx.trace` for provenance (`core/thought_capture.py:55`) and tracing is structurally mandatory (`core/trace.py:25`); minting a bare unpersisted trace id would leave provenance pointing at a nonexistent span. (b) the commit is **fail-closed** — assert the intent batch is thought `PutRecord`s only, never silently filter (a future non-`PutRecord` emission would be a violated safety invariant, not something to drop quietly). The plan settles the exact entrypoint shape (a scoped `StateActor.apply` over the asserted intent set, or a dedicated `CoreLoop.capture(...)` method); §11/§13 name the required guarantee + test.
 
 **Alignment note (§9 invariant).** This is the bus discipline done *correctly*: capture still flows through the aggregation layer under the one lock, but scoped to the one component that subscribes to the impulse — not a bypass, and not a full-brain side-effect.
 
 ### 3.1 Dedup — done by aggregation, hardened against resurrection
 
-`ThoughtCapture` dedups by content digest: the thought id is `seed_thought_id` (`core/thought_view.py:66` — `sha256(strip(content))[:16]`); an in-frame `seen` set collapses same-call duplicates; a re-notice / host retry upserts ONE row.
+`ThoughtCapture` dedups by content digest: the thought id is `seed_thought_id` (`core/thought_view.py:66` — `sha256(strip(content))[:16]`); an in-frame `seen` set collapses same-call duplicates.
 
-**Must-fix (codex Major #5, a real pre-existing bug the tool would expose).** `ThoughtCapture` currently checks only the **live** snapshot (`live_thoughts`, `core/thought_capture.py:40`). Re-capturing content whose prior row is **terminal** (`resolved`/`dropped`/`expired`) finds nothing live → it upserts a fresh `active` row with the same id, **resurrecting** the dead thought and overwriting its provenance. Noticing already avoids this by checking the authoritative store across ALL states (`core/noticing.py:759`). Fix: the capture path checks the authoritative store for **any-state** existence of the id and treats a duplicate as a **no-op** (never an active upsert, never a provenance overwrite).
+**Must-fix — atomic create-if-absent, not check-then-put (codex, this pass).** `ThoughtCapture` currently checks only the **live** snapshot (`live_thoughts`, `core/thought_capture.py:40`) and emits an **unconditional** `PutRecord` (an upsert that replaces state/payload/salience/provenance on conflict, `state/sqlite_store.py:365`). Re-capturing content whose prior row is **terminal** (`resolved`/`dropped`/`expired`) finds nothing live → it upserts a fresh `active` row with the same id, **resurrecting** the dead thought. A check-then-put in the component would not close this: `get` and the commit are separate ops (a TOCTOU gap), the live snapshot excludes terminal rows anyway (`core/coreloop.py:263`), `ThoughtCapture` holds no `MemoryPort` (`composition.py:353`), and another writer can race — concretely `/lifemodel think` commits the same content-global id **without** the lock (`state_commands.py:795`).
+
+Fix at the store layer, atomically: add **create-if-absent** semantics — a `PutOp(create_only=True)` (or `InsertRecord`) committed as `INSERT … ON CONFLICT DO NOTHING`. `ThoughtCapture` emits create-only `PutRecord`s; the commit then (a) **never resurrects** (a conflict on ANY existing state, incl. terminal, is a no-op — no state/provenance overwrite), (b) is **race-safe** against concurrent thought writers, and (c) yields honest **created vs deduped** counts from the transaction result — which is what the tool returns (§4). This keeps dedup where it belongs — the persistence boundary — without injecting a `MemoryPort` into the component or reading all states from a snapshot. (The `/lifemodel think` admin writer should also adopt create-only; folds into the bus-invariant follow-up, §12.)
 
 **Accepted limitation (v1):** dedup is exact-content only; near-duplicates in different words become separate thoughts, and downstream does not merge them. Acceptable at v1 volume; semantic (better-than-hash) dedup — the aggregation layer's job, since it sees the whole live set — is a follow-up (§12).
 
@@ -58,11 +62,11 @@ This preserves the owner's principle — **impulse → aggregation dedups → du
 - **Schema:** a list of `1..N` thoughts (so the being can drop several notions in one call — cheaper than N calls, and natural). Each entry:
   - `content` (required string) — what to return to.
   - `salience` (the being's **own rough sense** of how much it matters). **Owner decision A (2026-07-18):** the being provides this even though it is imprecise — an in-the-moment estimate beats a flat `0` placeholder, and it avoids a cross-kind envelope refactor (see §5). Optional; a neutral non-zero default if omitted. Coarse is fine (a small felt scale mapped to the envelope `salience`); the plan picks the exact shape, biased to LOW cognitive load on the reply turn.
-- **No** other valuation fields (`actionability`/`other_regarding_value` stay at their envelope defaults; the arbiter/processing refine later).
+- **No** other valuation fields (`actionability`/`other_regarding_value` are thought **payload** fields, `domain/objects/thought.py:83` — they stay at their payload defaults; the arbiter/processing refine later).
 - **Description (English prose — the ride-the-tail instruction, 0 extra LLM, language-agnostic content).** Draft:
   > *Capture a thought you want to return to later. When something in this exchange leaves a thread worth revisiting — a question you want to sit with, something you noticed about them or about yourself, an idea not yet finished — write it here in a sentence (in whatever language is natural), with a rough sense of how much it tugs at you. Your reply is your thinking; this only drops a bookmark your quieter, later mind will pick up and think through. Not every turn — only when something genuinely tugs. You may capture more than one at once.*
 - **Hermes contract (like `check_in`/`commitment`, `hooks.py:1621`):** returns a `json.dumps` STRING, `{"error": …}` on failure, **never raises**.
-- **Honest result (codex Minor #8).** Because the restricted path (§3) runs `ThoughtCapture` directly, the handler CAN see real created-vs-duplicate counts and return `{"accepted": N, "deduped": M}` truthfully (unlike `run_frame`, whose `TickReport` exposes no component result).
+- **Honest result.** The create-if-absent commit (§3.1) reports created vs deduped from the transaction result, so the handler returns `{"accepted": N, "deduped": M}` truthfully (unlike `run_frame`, whose `TickReport` exposes no component result).
 - **Metric:** a per-call outcome counter (e.g. `lifemodel_thought_tool_total{outcome=captured|deduped|empty|error}`), so "did the being drop a thought, how often" is answerable from `metrics.sqlite`, not a grep.
 
 ## 5. Salience — the tool provides it; NO envelope refactor
@@ -88,7 +92,11 @@ Because the producer is now the tool, the post-hoc judgment is dead:
 
 ## 8. Observability — comparable producers
 
-Both producers write to the same thought store; to later judge "which path is more effective" (owner: *"посмотрим на деле какой из них эффективней"*) the source MUST be distinguishable. Add a validated `producer` field to the thought-seed (`create-thought-tool` vs `noticing`) that `ThoughtCapture` records into the thought's `source`/provenance (it currently hardcodes `source="thought-capture"`, `core/thought_capture.py:63` — codex Minor #5a). Then a read-only query attributes captures, crystallizations, and drops per producer, from durable data, no live instrumentation. (Ids stay content-global; a producer that re-notices content another already stored is a dedup no-op per §3.1, and provenance records the first creator — sufficient for a rough effectiveness comparison. Per-producer id namespacing, if ever needed for exact overlap counts, is a follow-up.)
+Both producers write to the same thought store; to later judge "which path is more effective" (owner: *"посмотрим на деле какой из них эффективней"*) the source MUST be distinguishable. The two producers reach the store by **different** mechanisms, so this is asymmetric by design:
+- **The tool** is signal-based (tool → `thought_seed` → `ThoughtCapture`). Add a validated `producer` field to the thought-seed and have `ThoughtCapture` record it as the thought's `source` (it currently hardcodes `source="thought-capture"`, `core/thought_capture.py:63`) — e.g. `source="create-thought-tool"`.
+- **The curator** does NOT use `thought_seed`/`ThoughtCapture`; it builds and puts thoughts directly, already tagged `source="noticing"` (`core/noticing.py:775`). Unchanged.
+
+Then a read-only query attributes captures, crystallizations, and drops per `source`, from durable data, no live instrumentation. Ids stay content-global; if the tool re-captures content the curator already stored, it is a create-if-absent no-op (§3.1) and the first creator's `source` stands — sufficient for a rough effectiveness comparison. Per-producer id namespacing (exact overlap counts) is a follow-up if ever needed.
 
 ## 9. Alignment with the "everything through the bus" invariant
 
@@ -101,8 +109,8 @@ Owner principle (2026-07-18): impulses and events flow through the signal bus, i
 ## 11. Scope (v1, lm-705.11)
 
 1. `create_thought` tool — `content` + rough being-`salience`, array-capable, English description, Hermes contract, honest `{accepted, deduped}` result, folded metric (§4).
-2. **Restricted capture path** — a scoped entrypoint that runs only `ThoughtCapture` + commits only its intents under the lock; NO full-registry frame, NO tick advance, NO launches (§3). The must-fix that makes the tool safe.
-3. **Resurrection fix** — the capture path checks the authoritative store for any-state existence and no-ops on a duplicate (§3.1).
+2. **Restricted capture path** — a scoped entrypoint that opens+persists a `thought-capture` span, runs only `ThoughtCapture`, asserts thought-`PutRecord`-only (fail-closed), and commits mutation-only under the lock; NO full-registry frame, NO tick advance, NO launches (§3). The must-fix that makes the tool safe.
+3. **Atomic create-if-absent** — a `PutOp(create_only=True)` / `ON CONFLICT DO NOTHING` store primitive; kills resurrection (conflict on any state, incl. terminal), is race-safe, and yields honest created/deduped counts (§3.1).
 4. **Producer tagging** — thought-seed carries `producer`; `ThoughtCapture` records it into source/provenance (§8).
 5. Retire the post-hoc `Appraiser` seam; keep transport + consumer (§6).
 6. **No** removal of the commitment tool; **no** envelope/appraisal refactor; **no** noticing change (§5, §7).
@@ -120,8 +128,8 @@ Owner principle (2026-07-18): impulses and events flow through the signal bus, i
 ## 13. Testing
 
 - **Handler contract:** returns a JSON string; `{"error": …}` on a forced failure; never raises; empty/whitespace input handled; array of N; folded metric increments per outcome; honest `{accepted, deduped}` counts.
-- **Restricted-path SAFETY (codex-required, the load-bearing test):** a `create_thought` call creates the thought rows AND leaves **everything else unchanged** — assert every `State` field, `tick_count`/`last_tick_at`, all non-thought rows, and BOTH launch collections (`launches`, `internal_launches`) are untouched, and that with an already-active desire NO `LaunchProactive` is produced or stranded.
-- **Dedup + resurrection:** identical content across two calls → ONE row; two identical strings in one array → one; re-capturing content whose prior row is `resolved`/`dropped`/`expired` is a **no-op** (the terminal row is NOT resurrected and its provenance is intact) — tested against active, parked, AND terminal rows in the real SQLite store.
+- **Restricted-path SAFETY (codex-required, the load-bearing test):** a `create_thought` call creates the thought rows AND leaves **everything else unchanged** — assert every `State` field, `tick_count`/`last_tick_at`, all non-thought rows, and BOTH launch collections (`launches`, `internal_launches`) are untouched, and that with an already-active desire NO `LaunchProactive` is produced or stranded. Assert the `thought-capture` span is persisted (provenance points at a real span). Assert the commit fails closed if a non-thought-`PutRecord` intent appears.
+- **Atomic create-if-absent + resurrection:** identical content across two calls → ONE row + the second reports `deduped`; two identical strings in one array → one; re-capturing content whose prior row is `resolved`/`dropped`/`expired` is a **no-op** (the terminal row is NOT resurrected, state/provenance intact) — tested against active, parked, AND terminal rows in the real SQLite store; `create_only` `ON CONFLICT DO NOTHING` verified at the store layer.
 - **Salience:** a thought is born with the being-provided salience on the envelope; the selector's salience-desc ordering reflects it.
 - **Producer tagging:** tool thoughts carry the tool producer/source; a coexistence test with a noticing-created thought shows distinguishable sources.
 - **Retire:** `make_post_llm_observer` with no `appraiser=` still resolves proactive read-backs / closes buffer / closes turn.
