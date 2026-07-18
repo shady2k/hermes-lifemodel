@@ -16,6 +16,7 @@ though nothing had happened while remaining unborn.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,10 +25,15 @@ from lifemodel.adapters.soul_file import SoulFile
 from lifemodel.core.genesis import GENESIS_TAG, NEWBORN_STANCE
 from lifemodel.core.metrics import MetricRegistry
 from lifemodel.core.tick_metrics import OBSERVER_ERRORS, register_universal_metrics
+from lifemodel.core.turn_metrics import TURN_INJECTOR_TOTAL
+from lifemodel.core.turn_recorder import TurnRecorder
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.hooks import make_genesis_injector
 from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
+from lifemodel.testing import FakeClock, FakeTracer
+
+_NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
 HERMES_DEFAULT = "# Identity\nYou are Hermes.\n"
 
@@ -59,6 +65,37 @@ def _registry() -> MetricRegistry:
     return reg
 
 
+class _CapturingSink:
+    """Minimal :class:`~lifemodel.state.trace_store.TraceSink` fake — mirrors
+    ``tests/test_felt_state_hooks.py``'s local one, just enough for a
+    :class:`TurnRecorder` to persist spans into and for a test to inspect them.
+    """
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, object]] = []
+
+    def submit_span(self, **kw: object) -> bool:
+        self.spans.append(kw)
+        return True
+
+    def submit_event(self, **kw: object) -> bool:
+        return True
+
+    def submit_correlation(self, **kw: object) -> bool:
+        return True
+
+
+def _recorder(reg: MetricRegistry) -> tuple[TurnRecorder, _CapturingSink]:
+    """A real :class:`TurnRecorder` over a capturing sink + the SAME shared *reg* —
+    the genesis injector's ``turn_injector_total`` bump lands in the registry the test
+    already reads, and the sink lets a test assert the ``turn.injector.genesis``
+    child span was actually opened (lm-hg7 Task 8, mirroring Task 7's felt-state
+    recorder helper)."""
+    sink = _CapturingSink()
+    rec = TurnRecorder(tracer=FakeTracer(), writer=sink, metrics=reg, clock=FakeClock(_NOW))
+    return rec, sink
+
+
 # --- the ritual reaches the being it was written for ------------------------
 
 
@@ -78,14 +115,31 @@ def test_the_ritual_is_shown_to_an_existing_hermes_user(tmp_path: Path, build_lm
 
 def test_the_ritual_is_shown_on_a_truly_fresh_install(tmp_path: Path, build_lm) -> None:
     build_lm().state.commit(State())
-    inject = _injector(build_lm, _soul(tmp_path))
-    assert GENESIS_TAG in inject(user_message="hi", conversation_history=[])["context"]
+    reg = _registry()
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    inject = _injector(build_lm, _soul(tmp_path), recorder=rec, metrics=reg)
+
+    result = inject(session_id="s1", turn_id="t1", user_message="hi", conversation_history=[])
+
+    assert result is not None
+    assert GENESIS_TAG in result["context"]
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="genesis", outcome="injected") == 1.0
+    # …and this call opened its own turn.injector.genesis child span (lm-hg7 Task 8).
+    assert any(s["component"] == "turn.injector.genesis" for s in sink.spans)
 
 
 def test_a_born_being_is_never_told_it_just_began(tmp_path: Path, build_lm) -> None:
     build_lm().state.commit(State(genesis_completed_at="2026-07-13T10:00:00+00:00"))
-    inject = _injector(build_lm, _soul(tmp_path))
-    assert inject(user_message="hi", conversation_history=[]) is None
+    reg = _registry()
+    rec, _sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    inject = _injector(build_lm, _soul(tmp_path), recorder=rec, metrics=reg)
+
+    result = inject(session_id="s1", turn_id="t1", user_message="hi", conversation_history=[])
+
+    assert result is None
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="genesis", outcome="born") == 1.0
 
 
 # --- …and exactly once, while the conversation carries it --------------------

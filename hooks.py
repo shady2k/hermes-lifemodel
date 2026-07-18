@@ -75,7 +75,7 @@ from .core.tick_metrics import (
     OBSERVER_ERRORS,
 )
 from .core.timeutil import to_iso
-from .core.turn_metrics import INJECTOR_FELT
+from .core.turn_metrics import INJECTOR_FELT, INJECTOR_GENESIS
 from .core.turn_recorder import TurnRecorder
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
@@ -926,6 +926,7 @@ def make_genesis_injector(
     identity_stale: Callable[[], bool] | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
+    recorder: TurnRecorder | None = None,
 ) -> Callable[..., dict[str, str] | None]:
     """Return the ``pre_llm_call`` hook that puts the ritual in front of an unborn being.
 
@@ -979,41 +980,59 @@ def make_genesis_injector(
     :func:`make_felt_state_injector`'s shape exactly: a throw anywhere (even in
     ``build_lm``) is logged ERROR + traceback, recorded on *health* + *metrics*, and
     swallowed with a ``None`` return — a broken birth must never crash the host's turn.
+
+    Every verdict — which of the disjoint no-inject branches stood down, or the one
+    inject — is recorded as this turn's ``turn.injector.genesis`` child span + a
+    ``lifemodel_turn_injector_total{component=genesis,outcome}`` bump (lm-hg7 Task 8),
+    through the same shared :func:`_injector_span` wrapper Task 7 gave the felt-state
+    injector. ``recorder`` is optional (``None`` degrades to a no-op span, e.g. off-host
+    unit tests that don't care about turn observability).
     """
 
     def _injector(
         *,
+        session_id: str = "",
+        turn_id: str = "",
         user_message: str = "",
         conversation_history: Any = None,
         **_ignored: Any,
     ) -> dict[str, str] | None:
         try:
-            lm = build_lm()
-            state = lm.state.load()
-            if state.genesis_completed_at is not None:  # born: it never began again
-                return None
-            context_len = _context_len(conversation_history)
-            if GENESIS_TAG in user_message:
-                # The being's own wake packet is carrying the ritual into this very turn
-                # (spec §6.2). It has been shown — record that, and add nothing.
+            with _injector_span(recorder, session_id, turn_id, INJECTOR_GENESIS) as span:
+                lm = build_lm()
+                state = lm.state.load()
+                if state.genesis_completed_at is not None:  # born: it never began again
+                    span.set(outcome="born")
+                    return None
+                context_len = _context_len(conversation_history)
+                if GENESIS_TAG in user_message:
+                    # The being's own wake packet is carrying the ritual into this very turn
+                    # (spec §6.2). It has been shown — record that, and add nothing.
+                    _stamp_genesis_shown(lm, context_len=context_len)
+                    span.set(outcome="carried_by_impulse")
+                    return None
+                if _is_own_impulse(user_message):
+                    # An impulse of ours that is NOT the ritual. Our own composed text is
+                    # never a place to put context — the wake packet is the single source on
+                    # this entrance, whatever it says.
+                    span.set(outcome="own_impulse")
+                    return None
+                if not should_launch(state, context_len=context_len):
+                    span.set(outcome="not_due")
+                    return None
+                if identity_stale is not None and identity_stale():
+                    # Slot #1 is not the being (see the docstring). Showing it the ritual here
+                    # would hand its birth to the host's assistant persona — and burn the one
+                    # showing. Stand down, WITHOUT stamping: it has not seen anything.
+                    _LOG.info("genesis_deferred reason=%s", "stale_identity_slot")
+                    span.set(outcome="stale_identity")
+                    return None
+                block = genesis_block(
+                    prior_soul=prior_soul(soul, default_soul_text=default_soul_text)
+                )
                 _stamp_genesis_shown(lm, context_len=context_len)
-                return None
-            if _is_own_impulse(user_message):
-                # An impulse of ours that is NOT the ritual. Our own composed text is
-                # never a place to put context — the wake packet is the single source on
-                # this entrance, whatever it says.
-                return None
-            if not should_launch(state, context_len=context_len):
-                return None
-            if identity_stale is not None and identity_stale():
-                # Slot #1 is not the being (see the docstring). Showing it the ritual here
-                # would hand its birth to the host's assistant persona — and burn the one
-                # showing. Stand down, WITHOUT stamping: it has not seen anything.
-                _LOG.info("genesis_deferred reason=%s", "stale_identity_slot")
-                return None
-            block = genesis_block(prior_soul=prior_soul(soul, default_soul_text=default_soul_text))
-            _stamp_genesis_shown(lm, context_len=context_len)
-            return {"context": block}
+                span.set(outcome="injected")
+                return {"context": block}
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=GENESIS_OBSERVER, exc=exc, health=health, metrics=metrics
