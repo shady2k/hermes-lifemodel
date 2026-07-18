@@ -457,6 +457,47 @@ def test_turn_detail_shows_completion_final_output_in_full(tmp_path: Path) -> No
     assert long_output in out
 
 
+def test_turn_detail_shows_completion_reasoning_in_full(tmp_path: Path) -> None:
+    """lm-hg7: the being's own reasoning (the "why did it answer that") must show
+    in full in the turn deep-dive — the same untruncated treatment as final_output."""
+    long_reasoning = (
+        "they seem tired tonight, so a short warm reply is kinder than a question. " * 4
+    )
+    assert len(long_reasoning) > 200
+    trace_id = "aa11bb22cc33dd44ee55ff6600778899"
+    db = observability_db_path(tmp_path)
+    writer = acquire_trace_writer(db)
+    try:
+        writer.submit_span(
+            trace_id=trace_id,
+            span_id="turn-root",
+            parent_span_id=None,
+            component="turn",
+            tick=None,
+            started_at=_T1,
+            ended_at=_T1_END,
+            status="ok",
+            attrs={"frame_kind": "turn", "turn_id": "t9", "session_id": "s9", "origin": "reactive"},
+        )
+        writer.submit_span(
+            trace_id=trace_id,
+            span_id="completion",
+            parent_span_id="turn-root",
+            component="turn.completion",
+            tick=None,
+            started_at=_T1_END,
+            ended_at=_T1_END,
+            status="ok",
+            attrs={"final_output": "Привет.", "reasoning": long_reasoning},
+        )
+        writer.flush(timeout=5.0)
+    finally:
+        release_trace_writer(db)
+    out = activity_for_dir(tmp_path, f"turn {trace_id}")
+    assert "reasoning (full):" in out
+    assert long_reasoning in out  # untruncated, not clipped to 200 chars
+
+
 # --------------------------------------------------------------------------- #
 # codex re-review wave C (lm-hg7): C-I1 read-only metrics read, C-I2 BDI
 # header, C-M2 backfill pagination edge

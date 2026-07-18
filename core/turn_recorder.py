@@ -349,12 +349,16 @@ class TurnRecorder:
         turn_id: str,
         *,
         final_output: str = "",
+        reasoning: str = "",
         status: str = "ok",
         model: str = "",
         platform: str = "",
     ) -> None:
         """Close ``(session_id, turn_id)`` — a ``turn.completion`` child persisting
-        the bounded final text, then the root span itself (``ended_at``=now,
+        the bounded final text (plus the being's own ``reasoning`` for the turn when
+        the model emitted any — the "why did it answer that", extracted by the caller
+        from ``conversation_history``; omitted when empty), then the root span itself
+        (``ended_at``=now,
         terminal ``status``, carrying forward the ``origin``/``model``/``platform``
         :meth:`ensure_turn` stamped at open — the store's ``submit_span`` upserts
         ``attrs_json`` wholesale, so re-emitting them here is what stops the close
@@ -389,13 +393,16 @@ class TurnRecorder:
                 return
             child = self._child_span_id(entry.ctx)
             now_iso = to_iso(self._clock.now())
+            completion_attrs: dict[str, Any] = {"final_output": final_output[:_MAX_TEXT]}
+            if reasoning:  # only when the model actually emitted reasoning (no empty noise)
+                completion_attrs["reasoning"] = reasoning[:_MAX_TEXT]
             self._submit(
                 child,
                 component="turn.completion",
                 started_at=now_iso,
                 ended_at=now_iso,
                 status="ok",
-                attrs={"final_output": final_output[:_MAX_TEXT]},
+                attrs=completion_attrs,
             )
             self._submit(
                 entry.ctx,

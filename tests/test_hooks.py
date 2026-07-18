@@ -24,6 +24,8 @@ from lifemodel.core.desire_view import (
     encode_contact_desire,
     read_live_contact_desire,
 )
+from lifemodel.core.metrics import MetricRegistry
+from lifemodel.core.turn_recorder import TurnRecorder
 from lifemodel.core.wake_packet import IMPULSE_LABEL_PREFIX
 from lifemodel.domain.objects import DesireState
 from lifemodel.hooks import _is_no_reply, make_inbound_observer, make_post_llm_observer
@@ -31,6 +33,7 @@ from lifemodel.ports.memory import MemoryPort
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.testing import FakeClock
+from lifemodel.testing.fakes import FakeTracer
 
 #: A being that has been BORN — the precondition of the contact drive. ``u`` models a
 #: contact deficit inside an EXISTING relationship, so an UNBORN being's drive does not
@@ -144,6 +147,55 @@ def test_post_llm_sent_resolves_pending_and_starts_action_pending(tmp_path: Path
     assert final.pending_proactive_id is None  # turn resolved in its own frame
     assert final.action_pending_since is not None  # ActionPending inhibition started
     assert final.proactive_send_log  # backstop counter recorded the send
+
+
+class _CapturingSink:
+    """A trace sink that records every submitted span (for the wiring assertion)."""
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, Any]] = []
+
+    def submit_span(self, **kw: Any) -> bool:
+        self.spans.append(kw)
+        return True
+
+    def submit_event(self, **kw: Any) -> bool:
+        return True
+
+    def submit_correlation(self, **kw: Any) -> bool:
+        return True
+
+
+def test_post_llm_extracts_turn_reasoning_onto_the_completion_span(tmp_path: Path) -> None:
+    # lm-hg7: the observer pulls the being's reasoning off conversation_history
+    # (msg["reasoning"], the way agent/turn_finalizer.py does) and hands it to
+    # close_turn, so the turn.completion span answers "why did it reply that", not
+    # just "what". This is the seam between _extract_turn_reasoning and close_turn.
+    sink = _CapturingSink()
+    rec = TurnRecorder(
+        tracer=FakeTracer(),
+        writer=sink,
+        metrics=MetricRegistry(),
+        clock=FakeClock(datetime(2026, 7, 18, tzinfo=UTC)),
+    )
+    rec.ensure_turn("s1", "t1")
+    make_post_llm_observer(lambda: build_lifemodel(base_dir=tmp_path), recorder=rec)(
+        session_id="s1",
+        turn_id="t1",
+        user_message="привет",
+        assistant_response="Привет.",
+        conversation_history=[
+            {"role": "user", "content": "привет"},
+            {
+                "role": "assistant",
+                "reasoning": "they greeted me; keep it warm",
+                "content": "Привет.",
+            },
+        ],
+    )
+    completion = [s for s in sink.spans if s["component"] == "turn.completion"][0]
+    assert completion["attrs"]["reasoning"] == "they greeted me; keep it warm"
+    assert completion["attrs"]["final_output"] == "Привет."
 
 
 def test_post_llm_silent_drops_desire_with_decline_backoff(tmp_path: Path) -> None:

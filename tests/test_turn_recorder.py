@@ -303,7 +303,7 @@ def test_close_turn_writes_completion_and_closes_root() -> None:
     rec.close_turn("s1", "t1", final_output="ok, talk soon")
     completion = [s for s in rec._writer.spans if s["component"] == "turn.completion"][0]
     assert "talk soon" in completion["attrs"]["final_output"]
-    assert "reasoning" not in completion["attrs"]  # YAGNI: the host never had one to give
+    assert "reasoning" not in completion["attrs"]  # omitted when empty (this call passes none)
     closed_root = [s for s in rec._writer.spans if s["component"] == "turn" and s["status"] == "ok"]
     assert closed_root and closed_root[-1]["ended_at"] is not None
     assert ("s1", "t1") not in rec._ledger  # entry removed
@@ -326,6 +326,20 @@ def test_close_turn_preserves_the_open_root_attrs_not_just_ended_at() -> None:
     assert closed_root[-1]["attrs"]["origin"] == "reactive"
     assert closed_root[-1]["attrs"]["model"] == "opus"
     assert closed_root[-1]["attrs"]["platform"] == "telegram"
+
+
+def test_close_turn_persists_reasoning_on_the_completion_child_when_present() -> None:
+    # The being's own "why did I answer that" (lm-hg7): when the caller extracts a
+    # non-empty reasoning from conversation_history, it rides the turn.completion span
+    # (bounded) — the one place a turn's decision, not just its words, is answerable.
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    rec.close_turn(
+        "s1", "t1", final_output="Привет.", reasoning="they greeted me — keep it warm and short"
+    )
+    completion = [s for s in rec._writer.spans if s["component"] == "turn.completion"][0]
+    assert completion["attrs"]["reasoning"] == "they greeted me — keep it warm and short"
+    assert completion["attrs"]["final_output"] == "Привет."
 
 
 def test_close_turn_fills_model_platform_supplied_only_at_close() -> None:

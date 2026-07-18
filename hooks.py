@@ -431,6 +431,31 @@ def _summarize_reasoning_message(message: Any) -> dict[str, Any]:
     }
 
 
+def _extract_turn_reasoning(conversation_history: Any) -> str:
+    """The being's own chain of thought for THIS turn — as ``post_llm_call`` exposes it.
+
+    The reasoning is NOT a top-level ``post_llm_call`` kwarg; it rides on the assistant
+    message inside ``conversation_history`` (``msg["reasoning"]``). This mirrors
+    ``agent/turn_finalizer.py``'s current-turn extraction: providers that emit it (Claude
+    thinking, DeepSeek, …) often put it on the tool-call step and leave the final-answer
+    step ``reasoning=None``, so we take the MOST RECENT non-empty reasoning, walking
+    backwards but STOPPING at the ``user`` message that opened this turn so a prior turn's
+    reasoning can never leak in. Defensive on the untrusted host shape; ``""`` when
+    unavailable (a non-list, no assistant reasoning, or a model with thinking off). Its
+    home is the ``turn.completion`` span, not a log (lm-hg7): the reasoning is the being's
+    own "why did I answer that", shown in its owner's read-only debug view."""
+    if not isinstance(conversation_history, list):
+        return ""
+    for msg in reversed(conversation_history):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            break  # turn boundary — never cross into a prior turn's reasoning
+        if msg.get("role") == "assistant" and msg.get("reasoning"):
+            return str(msg["reasoning"])
+    return ""
+
+
 def _log_proactive_reasoning(
     logger: SpanBoundLogger, *, correlation_id: str, conversation_history: Any
 ) -> None:
@@ -583,10 +608,11 @@ def make_post_llm_observer(
     :meth:`~lifemodel.core.turn_recorder.TurnRecorder.close_turn` — REGARDLESS of
     which branch below ran (the ordinary reactive exchange, or the pending-proactive
     read-back, whether or not it actually resolved a desire). ``post_llm_call`` has
-    no separate ``reasoning`` kwarg (only ``assistant_response``), so
-    ``final_output=assistant_response`` (``close_turn`` no longer takes a
-    ``reasoning`` param at all — codex review M3/YAGNI: the host never had one to
-    give it). It DOES always carry ``model``/``platform`` (verified against
+    no separate ``reasoning`` kwarg, but the being's reasoning for the turn is NOT
+    lost: it rides on the assistant message inside ``conversation_history`` (which the
+    host DOES pass), so ``_extract_turn_reasoning`` pulls it the way
+    ``agent/turn_finalizer.py`` does and ``close_turn`` persists it on the
+    ``turn.completion`` span (lm-hg7). It DOES always carry ``model``/``platform`` (verified against
     ``agent/turn_finalizer.py``'s ``invoke_hook("post_llm_call", ...,
     model=agent.model, platform=...)``) — unlike ``pre_llm_call``, which does not
     (see ``make_open_turn_observer``) — so THIS is where the root's ``model``/
@@ -689,6 +715,7 @@ def make_post_llm_observer(
                     session_id,
                     turn_id,
                     final_output=assistant_response,
+                    reasoning=_extract_turn_reasoning(conversation_history),
                     model=str(_ignored.get("model", "")),
                     platform=str(_ignored.get("platform", "")),
                 )

@@ -360,18 +360,18 @@ def _lookup_ref_states(base_dir: Path, ref_ids: Sequence[str]) -> dict[str, str]
     return found
 
 
-def _completion_final_output(spans: Sequence[_Span]) -> str | None:
-    """The ``turn.completion`` child's full ``final_output`` attr, or ``None``.
+def _completion_attr(spans: Sequence[_Span], attr: str) -> str | None:
+    """The ``turn.completion`` child's full *attr* value (``final_output`` /
+    ``reasoning``), or ``None``.
 
-    ``turn_recorder.py``'s :func:`~lifemodel.core.turn_recorder` stores up to
-    ``_MAX_TEXT`` (4000) chars there; :func:`~lifemodel.trace_view.render_trace`'s
-    generic attr formatter (``_fmt_value``) truncates every value to 200 —
-    fine for the tree's other attrs, but not for the one place a turn's actual
-    words live (M2). This is read directly from the span, bypassing that
-    truncation entirely."""
+    ``turn_recorder.py`` stores up to ``_MAX_TEXT`` (4000) chars there;
+    :func:`~lifemodel.trace_view.render_trace`'s generic attr formatter (``_fmt_value``)
+    truncates every value to 200 — fine for the tree's other attrs, but not for the two
+    places a turn's actual words + the being's own reasoning live (M2 + the reasoning
+    follow-up). This reads the value directly from the span, bypassing that truncation."""
     for span in spans:
         if span.component == "turn.completion":
-            value = span.attrs.get("final_output")
+            value = span.attrs.get(attr)
             return value if isinstance(value, str) else None
     return None
 
@@ -394,11 +394,20 @@ def _turn_detail(conn: sqlite3.Connection, trace_id: str, base_dir: Path) -> str
     if not spans:
         return f"lifemodel activity: no turn {trace_id}\n"
     lines = [f"turn {trace_id}"]
-    full_output = _completion_final_output(spans)
-    tree_spans = (
-        _strip_attr(spans, "turn.completion", "final_output") if full_output is not None else spans
-    )
+    full_output = _completion_attr(spans, "final_output")
+    reasoning = _completion_attr(spans, "reasoning")
+    # Strip the two long values from the tree so render_trace never ALSO prints a
+    # 200-char-truncated duplicate — they're shown in full below.
+    tree_spans = list(spans)
+    if full_output is not None:
+        tree_spans = _strip_attr(tree_spans, "turn.completion", "final_output")
+    if reasoning is not None:
+        tree_spans = _strip_attr(tree_spans, "turn.completion", "reasoning")
     lines += render_trace(trace_id, tree_spans, ())
+    if reasoning is not None:  # the "why did it answer that" — first, it leads to the words
+        lines.append("")
+        lines.append("turn.completion reasoning (full):")
+        lines.append(reasoning)
     if full_output is not None:
         lines.append("")
         lines.append("turn.completion final_output (full):")
