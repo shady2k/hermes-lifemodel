@@ -15,8 +15,10 @@ The ledger is keyed by the host's ``(session_id, turn_id)`` and bounded (TTL + m
 entries, lazy cleanup) — a restart simply loses it, and an open root left by a
 crash/interrupt ages out or is reconciled ``failed`` by the next turn of the session.
 
-This task builds construction + :meth:`TurnRecorder.ensure_turn` only; later tasks
-add ``injector_span``, per-tool spans, and ``close_turn`` to this SAME class.
+This task adds :meth:`TurnRecorder.injector_span` (a per-``pre_llm_call``-injector
+CHILD span + the ``turn_injector_total`` metric) on top of Task 3's construction +
+:meth:`TurnRecorder.ensure_turn`; a later task adds per-tool spans and ``close_turn``
+to this SAME class.
 """
 
 from __future__ import annotations
@@ -24,7 +26,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,13 +36,35 @@ from ..ports.tracer import TraceContext, TracerPort
 from ..state.trace_store import TraceSink
 from .metrics import MetricRegistry
 from .timeutil import to_iso
-from .turn_metrics import register_turn_metrics
+from .turn_metrics import TURN_INJECTOR_TOTAL, register_turn_metrics
 
 _LOG = logging.getLogger("lifemodel.turn_recorder")
 
 #: The ``trace_spans.component`` value for a turn's ROOT span (spec §4.3 shape,
 #: mirroring the tick's own root component naming).
 _TURN_ROOT_COMPONENT = "turn"
+
+
+class InjectorSpan:
+    """The mutable handle an injector stamps its verdict onto (set-then-close).
+
+    Deliberately NOT the tracer's :class:`~lifemodel.ports.tracer.ActiveSpan` (no
+    ``context``/``tick``/``end`` surface to satisfy) — an injector only ever needs
+    to record its per-call verdict (``outcome``) plus a few closed-vocabulary
+    attrs before :meth:`TurnRecorder.injector_span` closes the child span itself.
+    The last :meth:`set` wins if an injector calls it more than once.
+    """
+
+    __slots__ = ("_outcome", "_attrs")
+
+    def __init__(self) -> None:
+        self._outcome: str = "unknown"
+        self._attrs: dict[str, Any] = {}
+
+    def set(self, *, outcome: str, **attrs: Any) -> None:
+        """Record this call's verdict — ``outcome`` plus any extra attrs."""
+        self._outcome = outcome
+        self._attrs.update(attrs)
 
 
 @dataclass
@@ -54,7 +79,8 @@ class _Entry:
 
 
 class TurnRecorder:
-    """Opens/reconciles/bounds per-turn trace roots; later tasks add spans + close.
+    """Opens/reconciles/bounds per-turn trace roots + per-injector child spans; a
+    later task adds per-tool spans + ``close_turn``.
 
     Constructed once (in ``register()``) over the live being's already-acquired
     :class:`~lifemodel.state.trace_store.TraceWriter`,
@@ -146,6 +172,41 @@ class TurnRecorder:
         except Exception:  # noqa: BLE001 - opening a turn trace must never crash the host turn
             _LOG.exception("ensure_turn failed session=%s turn=%s", session_id, turn_id)
 
+    # --- the per-injector door ----------------------------------------------- #
+    @contextmanager
+    def injector_span(
+        self, session_id: str, turn_id: str, component: str
+    ) -> Iterator[InjectorSpan]:
+        """Wrap one ``pre_llm_call`` injector's run in a CHILD span of the turn root.
+
+        Yields an :class:`InjectorSpan` the injector stamps its verdict onto with
+        :meth:`~InjectorSpan.set` before returning. On a clean exit the child is
+        persisted ``status="ok"`` and :data:`~lifemodel.core.turn_metrics.TURN_INJECTOR_TOTAL`
+        is incremented with ``outcome`` (``"unknown"`` if the injector never called
+        :meth:`~InjectorSpan.set`). On a body exception the child is persisted
+        ``status="failed"``/``outcome="error"`` instead, and the exception is
+        RE-RAISED (this context manager never swallows it — the injector's own
+        fail-soft ``except`` around its call site is what actually contains it).
+
+        If ``(session_id, turn_id)`` has no open turn (``ensure_turn`` was never
+        called, or the ledger already evicted it), the span degrades to a bare
+        parentless root rather than raising — best-effort tracing, never a crash.
+        """
+        parent = self._ledger_ctx(session_id, turn_id)
+        child = self._child_span_id(parent) if parent is not None else self._tracer.start_root()
+        span = InjectorSpan()
+        started = to_iso(self._clock.now())
+        comp = f"turn.injector.{component}"
+        try:
+            yield span
+        except Exception:
+            self._close_injector(child, comp, started, status="failed", outcome="error", span=span)
+            raise  # re-propagate so the injector's own fail-soft except runs
+        else:
+            self._close_injector(
+                child, comp, started, status="ok", outcome=span._outcome, span=span
+            )
+
     # --- internals ---------------------------------------------------------- #
     def _reconcile_session_locked(self, session_id: str, now_iso: str) -> None:
         """Close any OTHER still-open turn of this session as failed/abandoned — the
@@ -184,5 +245,43 @@ class TurnRecorder:
         except Exception:  # noqa: BLE001 - fail-open, exactly like the tick's _persist_span
             _LOG.exception("submit_span failed")
 
+    def _ledger_ctx(self, session_id: str, turn_id: str) -> TraceContext | None:
+        """The open turn's root :class:`TraceContext` for this key, or ``None`` if
+        no turn is currently open (never opened, already closed, or evicted)."""
+        with self._lock:
+            entry = self._ledger.get((session_id, turn_id))
+            return entry.ctx if entry is not None else None
+
     def _child_span_id(self, parent: TraceContext) -> TraceContext:
         return self._tracer.child_of(parent)
+
+    def _close_injector(
+        self,
+        ctx: TraceContext,
+        comp: str,
+        started: str,
+        *,
+        status: str,
+        outcome: str,
+        span: InjectorSpan,
+    ) -> None:
+        """Persist the injector's child span + emit the shared outcome counter.
+
+        Wrapped so a tracing/metric hiccup on CLOSE never masks or replaces the
+        body's own exception — :meth:`injector_span` already re-raises around
+        this call.
+        """
+        try:
+            self._submit(
+                ctx,
+                component=comp,
+                started_at=started,
+                ended_at=to_iso(self._clock.now()),
+                status=status,
+                attrs={"outcome": outcome, **span._attrs},
+            )
+            self._metrics.inc(
+                TURN_INJECTOR_TOTAL, component=comp.rsplit(".", 1)[-1], outcome=outcome
+            )
+        except Exception:  # noqa: BLE001 - never let the tracing close mask/replace the body
+            _LOG.exception("injector span close failed component=%s", comp)

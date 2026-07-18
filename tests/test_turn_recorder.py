@@ -1,6 +1,7 @@
-"""Tests for ``core/turn_recorder.py`` — ``TurnRecorder`` construction + ``ensure_turn`` (lm-hg7).
+"""Tests for ``core/turn_recorder.py`` — ``TurnRecorder`` construction, ``ensure_turn``
+and ``injector_span`` (lm-hg7).
 
-Contract under test (task 3 of the turn-observability plan):
+Contract under test (tasks 3 + 4 of the turn-observability plan):
 
 * ``ensure_turn`` persists an OPEN root span (``ended_at``/``status`` both
   ``None``) tagged ``frame_kind="turn"`` — outside the internal ledger lock;
@@ -12,7 +13,13 @@ Contract under test (task 3 of the turn-observability plan):
 * ``origin="reactive"`` mints a fresh trace; ``origin="proactive"`` with an
   ``upstream_traceparent`` CONTINUES the parsed upstream trace id;
 * the ledger is bounded (TTL + max entries, lazy) and ``ensure_turn`` never
-  raises even when the underlying sink's ``submit_span`` blows up (fail-soft).
+  raises even when the underlying sink's ``submit_span`` blows up (fail-soft);
+* ``injector_span`` persists a ``turn.injector.<component>`` CHILD span of the
+  open turn root and increments ``lifemodel_turn_injector_total`` — ``status="ok"``
+  / the injector's own ``outcome`` on a clean exit, ``status="failed"`` /
+  ``outcome="error"`` (and a RE-RAISE) on a body exception;
+* with no open turn for the key, the span degrades to a bare parentless root
+  rather than raising.
 
 Stdlib only.
 """
@@ -22,7 +29,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 from lifemodel.core.metrics import MetricRegistry
+from lifemodel.core.turn_metrics import TURN_INJECTOR_TOTAL
 from lifemodel.core.turn_recorder import TurnRecorder
 from lifemodel.testing.fakes import FakeClock, FakeTracer
 
@@ -112,3 +122,48 @@ def test_ledger_is_bounded_and_never_raises_on_a_broken_sink() -> None:
     )
     for i in range(5):
         rec.ensure_turn("s1", f"t{i}")  # must not raise despite the sink blowing up
+
+
+def test_injector_span_success_persists_ok_child_and_increments_outcome() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    with rec.injector_span("s1", "t1", "belief") as span:
+        span.set(outcome="surfaced", count=2, ids=["belief:ab", "belief:cd"])
+    child = [s for s in rec._writer.spans if s["component"] == "turn.injector.belief"][0]
+    assert child["status"] == "ok" and child["attrs"]["outcome"] == "surfaced"
+    assert child["attrs"]["count"] == 2
+    assert (
+        rec._metrics.get(TURN_INJECTOR_TOTAL).value(component="belief", outcome="surfaced") == 1.0
+    )
+
+
+def test_injector_span_reraises_and_marks_failed_with_error_outcome() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    with pytest.raises(RuntimeError), rec.injector_span("s1", "t1", "belief") as span:
+        span.set(outcome="surfaced")  # then the body blows up before completing
+        raise RuntimeError("boom")
+    child = [s for s in rec._writer.spans if s["component"] == "turn.injector.belief"][0]
+    assert child["status"] == "failed" and child["attrs"]["outcome"] == "error"
+    assert rec._metrics.get(TURN_INJECTOR_TOTAL).value(component="belief", outcome="error") == 1.0
+
+
+def test_injector_span_never_called_set_closes_with_unknown_outcome() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    with rec.injector_span("s1", "t1", "genesis"):
+        pass  # the injector never called span.set — the default outcome ships
+    child = [s for s in rec._writer.spans if s["component"] == "turn.injector.genesis"][0]
+    assert child["status"] == "ok" and child["attrs"]["outcome"] == "unknown"
+    assert (
+        rec._metrics.get(TURN_INJECTOR_TOTAL).value(component="genesis", outcome="unknown") == 1.0
+    )
+
+
+def test_injector_span_with_no_open_turn_degrades_to_a_bare_parentless_child() -> None:
+    rec = _recorder()  # no ensure_turn call — the ledger has no entry for this key
+    with rec.injector_span("s1", "t1", "belief") as span:
+        span.set(outcome="empty")
+    child = [s for s in rec._writer.spans if s["component"] == "turn.injector.belief"][0]
+    assert child["parent_span_id"] is None  # a fresh root, not a crash
+    assert child["status"] == "ok" and child["attrs"]["outcome"] == "empty"
