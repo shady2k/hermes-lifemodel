@@ -7,6 +7,7 @@ import pytest
 
 from lifemodel.core.component import TickContext, layer_for_type
 from lifemodel.core.coreloop import CoreLoop, TickReport
+from lifemodel.core.frame import FrameTrigger
 from lifemodel.core.intents import EmitSignal, Intent, LaunchProactive, UpdateState
 from lifemodel.core.registry import ComponentManifest, ComponentRegistry
 from lifemodel.core.state_actor import StateActor
@@ -777,6 +778,27 @@ def test_component_failure_is_a_suppression_span_under_the_child_span(tmp_path) 
     assert supp["span_id"] == child.span_id  # bound to the failing child span
     assert supp["span_id"] != root.span_id  # not the tick root
     assert supp["tick"] == 1
+
+
+def test_tick_root_span_carries_frame_kind_and_trigger(tmp_path) -> None:
+    # lm-hg7: the unified timeline must distinguish a TICK from a TURN by reading
+    # attrs ON THE SPAN ITSELF — today ``trigger`` lives only in ``TickReport``,
+    # invisible to anything that only sees ``trace_spans``. The root span must
+    # self-stamp frame_kind="execution" + the FrameTrigger that fired it.
+    reg = ComponentRegistry()
+    sink = _CapturingSink()
+    loop = CoreLoop(
+        registry=reg,
+        state_actor=StateActor(RecordingStore()),
+        clock=_clock(),
+        trace_writer=sink,
+        tracer=FakeTracer(),
+    )
+    loop.tick(trigger=FrameTrigger.EVENT)
+
+    root = next(s for s in sink.spans if s["parent_span_id"] is None)
+    assert root["attrs"]["frame_kind"] == "execution"
+    assert root["attrs"]["trigger"] == "event"
 
 
 # --- lm-fib.7.1: spans close at their REAL end instant (non-zero duration) ---

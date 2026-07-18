@@ -245,6 +245,12 @@ class CoreLoop:
         # The tick's ROOT span + its logger: tick-level bookkeeping (snapshot/intake
         # failures, trace export) binds here; each component rebinds to its own child.
         root_span = start_span(root, tick=tick_no, started_at=started)
+        # Stamp WHY this frame ran directly onto the root span's own attrs (lm-hg7):
+        # frame_kind distinguishes a tick (this) from a turn in the unified timeline,
+        # and trigger was previously visible only on TickReport — invisible to
+        # anything reading trace_spans alone. Set before any component runs so it is
+        # present no matter how the tick ends.
+        root_span.set(frame_kind="execution", trigger=trigger.value)
         root_logger = self._span_logger(root_span)
         # Start-of-tick snapshot: read once, before any component runs, so every
         # component this tick sees one consistent view (HLA §4.1). Pure reads —
