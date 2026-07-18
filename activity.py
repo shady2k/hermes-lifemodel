@@ -33,9 +33,33 @@ re-implemented:
   see ``hooks.py``'s belief/commitment injectors). A missing/unresolvable ref
   just leaves the bare id showing (no enrichment line for it) — never a crash.
 
-The :func:`~lifemodel.debug.render_dump_for_dir` state header is prepended to
-both views (the being's vitals are always useful context for "what was
-happening").
+A COMPACT state header is prepended to both views (the being's vitals are
+always useful context for "what was happening"): plain columns read straight
+off ``lifemodel.sqlite``'s ``runtime_state`` singleton row (``tick_count``,
+``last_tick_at``, ``energy``, ``fatigue``, ``u``, the affect axes,
+``last_exchange_at``) via a ``?mode=ro`` connection — **never**
+:func:`~lifemodel.debug.render_dump_for_dir`. That path builds a full
+``LifeModel`` graph, which constructs
+:class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` — a READ-WRITE
+constructor (creates dirs, switches WAL, runs migrations, and can
+quarantine/rebootstrap the file on a failed ``quick_check``). This reader's
+whole premise is running from the working tree against the LIVE being's db
+*before* deploying a change (spec workflow) — a newer build's migrations must
+never run against that file out from under the running gateway. So NO code
+path in this module may ever construct ``SQLiteRuntimeStore``; the header
+shows only plain fields already sitting in the row, never the derived
+``u``/gates/phase ``render_dump`` computes (that stays ``/lifemodel debug``'s
+job).
+
+The ``last [N]`` timeline also shows a **writer-drop health** line —
+``lifemodel_trace_writer_dropped_records``/``_write_errors``, the durable
+gauges the trace-writer snapshots into ``metrics.sqlite`` — so a MISSING turn
+span reads as "the writer silently dropped/erred", not "nothing happened",
+when those counters are non-zero. And root-span selection for the timeline
+BACKFILLS past a long run of heartbeat roots (bounded by a scan cap) rather
+than taking a flat ``LIMIT N``, so a turn parked behind more than ``N``
+heartbeats is never dropped off the end of the page before the heartbeat
+collapse ever sees it.
 
 **Read-only + fail-soft, like every other reader in this module family**
 (:mod:`lifemodel.trace_view`, :mod:`lifemodel.stats_view`): ``observability.sqlite``
@@ -53,11 +77,11 @@ import sqlite3
 import sys
 from collections.abc import Mapping, Sequence
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
-from .debug import local_time, render_dump_for_dir
+from .debug import local_time
 from .state.trace_store import observability_db_path
 from .trace_view import _loads, _read_spans, _Span, render_trace
 
@@ -72,6 +96,26 @@ _MAX_LAST_N = 100
 #: ``trigger="heartbeat"`` root ticks collapses into one summary line — short
 #: runs (1-2) still render individually, since collapsing those buys nothing.
 _HEARTBEAT_COLLAPSE_MIN_RUN = 3
+
+#: I3 fix — a flat ``LIMIT N`` root fetch can return N roots that are ALL
+#: heartbeats, silently dropping a turn parked just past them (the exact
+#: drowning this reader exists to prevent). :func:`_timeline_lines` instead
+#: backfills: fetch progressively more roots (each retry multiplying the
+#: fetch size by this factor) until N RENDERED units (a collapsed heartbeat
+#: run counts as one) are in hand, or the scan cap below is hit.
+_ROOT_FETCH_MULTIPLIER: Final = 4
+#: Hard cap on how many roots one ``last N`` call will ever scan while
+#: backfilling past a heartbeat run — "a few thousand", per the fix brief —
+#: so a pathological store (a years-long heartbeat run with no other
+#: activity) can never turn one command into an unbounded table scan.
+_ROOT_SCAN_CAP: Final = 2000
+
+#: I5 — the durable trace-writer health gauges (``core/tick_metrics.py``),
+#: snapshotted into ``metrics.sqlite`` by the metrics sampler (bead 7.6).
+#: Surfaced in the ``last [N]`` timeline header: a MISSING turn span can be a
+#: silent queue-drop/write-error, not "nothing happened" (spec §9).
+_WRITER_DROPPED_METRIC: Final = "lifemodel_trace_writer_dropped_records"
+_WRITER_ERRORS_METRIC: Final = "lifemodel_trace_writer_write_errors"
 
 #: Self-qualified id prefixes this reader knows how to enrich (see
 #: ``domain/objects/base.py:derive_id`` — a Belief/Commitment's OWN id already
@@ -304,12 +348,49 @@ def _lookup_ref_states(base_dir: Path, ref_ids: Sequence[str]) -> dict[str, str]
     return found
 
 
+def _completion_final_output(spans: Sequence[_Span]) -> str | None:
+    """The ``turn.completion`` child's full ``final_output`` attr, or ``None``.
+
+    ``turn_recorder.py``'s :func:`~lifemodel.core.turn_recorder` stores up to
+    ``_MAX_TEXT`` (4000) chars there; :func:`~lifemodel.trace_view.render_trace`'s
+    generic attr formatter (``_fmt_value``) truncates every value to 200 —
+    fine for the tree's other attrs, but not for the one place a turn's actual
+    words live (M2). This is read directly from the span, bypassing that
+    truncation entirely."""
+    for span in spans:
+        if span.component == "turn.completion":
+            value = span.attrs.get("final_output")
+            return value if isinstance(value, str) else None
+    return None
+
+
+def _strip_attr(spans: Sequence[_Span], component: str, attr: str) -> list[_Span]:
+    """*spans* with *attr* removed from the ONE *component* span's attrs.
+
+    So the generic tree renderer never ALSO prints a truncated duplicate of a
+    value this reader is about to show in full separately (M2)."""
+    return [
+        replace(span, attrs={k: v for k, v in span.attrs.items() if k != attr})
+        if span.component == component and attr in span.attrs
+        else span
+        for span in spans
+    ]
+
+
 def _turn_detail(conn: sqlite3.Connection, trace_id: str, base_dir: Path) -> str:
     spans = _read_spans(conn, trace_id)
     if not spans:
         return f"lifemodel activity: no turn {trace_id}\n"
     lines = [f"turn {trace_id}"]
-    lines += render_trace(trace_id, spans, ())
+    full_output = _completion_final_output(spans)
+    tree_spans = (
+        _strip_attr(spans, "turn.completion", "final_output") if full_output is not None else spans
+    )
+    lines += render_trace(trace_id, tree_spans, ())
+    if full_output is not None:
+        lines.append("")
+        lines.append("turn.completion final_output (full):")
+        lines.append(full_output)
     enriched = _lookup_ref_states(base_dir, _collect_ref_ids(spans))
     if enriched:
         lines.append("")
@@ -351,13 +432,168 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
 
-def _safe_header(base_dir: Path) -> str:
-    """The ``/lifemodel debug`` state block, degrading to a friendly line on any
-    hiccup — this reader's own state must never crash the whole command."""
+# --------------------------------------------------------------------------- #
+# State header (C1) — a GENUINELY read-only projection of runtime_state.
+#
+# Never :func:`~lifemodel.debug.render_dump_for_dir`: that path builds a full
+# ``LifeModel`` graph, which constructs
+# :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore` — a READ-WRITE
+# constructor (creates dirs, switches WAL, runs migrations, can
+# quarantine/rebootstrap a corrupt file). This reader's whole premise is
+# running from the working tree against the LIVE being's db before deploying —
+# a newer build's migrations must never run against that file out from under
+# the running gateway. So nothing below may EVER construct
+# ``SQLiteRuntimeStore``; only plain columns already sitting in the row are
+# shown, never the derived u/gates/phase ``render_dump`` computes.
+# --------------------------------------------------------------------------- #
+
+_STATE_HEADER_TITLE = "🫀 **lifemodel activity** (read-only state)"
+
+
+def _read_runtime_state_row(base_dir: Path) -> dict[str, Any] | None:
+    """The raw ``runtime_state.state_json`` blob, parsed — or ``None``.
+
+    ``None`` covers every way this can come back empty: no ``lifemodel.sqlite``
+    yet, no ``runtime_state`` row yet (a being that has never ticked), a
+    locked/corrupt file, or a malformed/non-dict JSON body (:func:`_loads`
+    already swallows that to ``{}``, folded to ``None`` here too — a real row
+    is never empty, it always carries at least ``schema_version``).
+
+    Opened via :func:`_connect_ro` (``?mode=ro``) — a plain ``SELECT`` against
+    a row that, if present, already exists. This is the one function standing
+    between the C1 fix and a regression: it must never construct
+    :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`.
+    """
+    db_path = _lifemodel_db_path(base_dir)
+    if not db_path.exists():
+        return None
     try:
-        return render_dump_for_dir(base_dir)
+        with closing(_connect_ro(db_path)) as conn:
+            row = conn.execute("SELECT state_json FROM runtime_state WHERE id = 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or not isinstance(row[0], str):
+        return None
+    data = _loads(row[0])
+    return data or None
+
+
+def _fmt_state_float(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    return f"{value:.2f}" if is_number else "n/a"
+
+
+def _fmt_state_int(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else "n/a"
+
+
+def _fmt_state_ts(data: Mapping[str, Any], key: str) -> str:
+    value = data.get(key)
+    return local_time(value) if isinstance(value, str) else "n/a"
+
+
+def _render_state_header(base_dir: Path) -> str:
+    """The compact read-only vitals header (C1): plain ``runtime_state``
+    columns only (``tick_count``, ``last_tick_at``, ``energy``, ``fatigue``,
+    ``u``, the affect axes, ``last_exchange_at``) — never the derived
+    u/gates/phase ``/lifemodel debug`` computes (out of scope for this fix;
+    that reconstruction also needs the read-write ``SQLiteRuntimeStore`` this
+    reader must never touch, see the section banner above)."""
+    data = _read_runtime_state_row(base_dir)
+    if data is None:
+        return f"{_STATE_HEADER_TITLE}\n\n<unavailable: no readable runtime_state row>\n"
+    lines = [
+        _STATE_HEADER_TITLE,
+        "",
+        f"**tick_count:** {_fmt_state_int(data, 'tick_count')}",
+        f"**last_tick_at:** {_fmt_state_ts(data, 'last_tick_at')}",
+        f"**energy:** {_fmt_state_float(data, 'energy')}",
+        f"**fatigue:** {_fmt_state_float(data, 'fatigue')}",
+        f"**u:** {_fmt_state_float(data, 'u')}",
+        "**affect:** v="
+        f"{_fmt_state_float(data, 'affect_valence')} a={_fmt_state_float(data, 'affect_arousal')}",
+        f"**last_exchange_at:** {_fmt_state_ts(data, 'last_exchange_at')}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _safe_header(base_dir: Path) -> str:
+    """:func:`_render_state_header`, degrading to a friendly line on any
+    hiccup — this reader's own state must never crash the whole command.
+    Deliberately never ``debug.render_dump_for_dir`` — see the C1 section
+    banner above."""
+    try:
+        return _render_state_header(base_dir)
     except Exception as exc:  # noqa: BLE001 - a read-only view must never crash (§7)
-        return f"🫀 **lifemodel debug** (read-only)\n\n<unavailable: {exc}>\n"
+        return f"{_STATE_HEADER_TITLE}\n\n<unavailable: {exc}>\n"
+
+
+# --------------------------------------------------------------------------- #
+# Timeline backfill (I3) + writer-drop health (I5)
+# --------------------------------------------------------------------------- #
+
+
+def _timeline_lines(conn: sqlite3.Connection, n: int) -> list[str]:
+    """Up to *n* newest activity units (turns + non-heartbeat ticks + collapsed
+    heartbeat runs), newest first — never silently dropping a turn parked
+    behind more than *n* heartbeat roots (I3).
+
+    A flat ``LIMIT n`` root fetch can return *n* roots that are ALL
+    heartbeats, so a turn just past them is never even fetched, let alone
+    rendered — the exact drowning this reader exists to prevent. This instead
+    backfills: fetch progressively more roots (each retry multiplying by
+    :data:`_ROOT_FETCH_MULTIPLIER`) until *n* rendered units are in hand, the
+    store is exhausted (fewer roots came back than were asked for), or
+    :data:`_ROOT_SCAN_CAP` is hit — whichever comes first, so a pathological
+    store can never turn one call into an unbounded scan.
+    """
+    fetch = min(max(n * _ROOT_FETCH_MULTIPLIER, n), _ROOT_SCAN_CAP)
+    while True:
+        roots = _root_rows(conn, fetch)
+        lines = _render_timeline_body(conn, roots)
+        if len(lines) >= n or len(roots) < fetch or fetch >= _ROOT_SCAN_CAP:
+            return lines[:n]
+        fetch = min(fetch * _ROOT_FETCH_MULTIPLIER, _ROOT_SCAN_CAP)
+
+
+def _latest_gauge_value(db_path: Path, name: str) -> float | None:
+    """The most recent ``metrics.sqlite`` sample for gauge *name* within the
+    newest ``run_id``, or ``None`` when nothing has ever been sampled for it."""
+    from .state.metrics_store import read_samples
+
+    samples = read_samples(db_path, name=name, latest_run=True, limit=1)
+    return samples[-1].value if samples else None
+
+
+def _writer_health_line(base_dir: Path) -> str | None:
+    """``trace-writer: dropped=<N> write_errors=<N>`` from ``metrics.sqlite``'s
+    durable gauges (I5, spec §9) — a MISSING turn span can be a silent
+    queue-drop/write-error, not "nothing happened"; this makes that visible in
+    the ``last [N]`` timeline.
+
+    Fail-soft: an unimportable ``state.metrics_store``, a missing
+    ``metrics.sqlite``, or any read hiccup returns ``None`` — the caller simply
+    omits the line (this one line is optional, unlike a whole section, so
+    there is no friendly placeholder to show in its place)."""
+    try:
+        from .state.metrics_store import metrics_db_path
+    except Exception:  # noqa: BLE001 - optional subtree; omit the line, never crash
+        return None
+    db_path = metrics_db_path(base_dir)
+    if not db_path.exists():
+        return None
+    try:
+        dropped = _latest_gauge_value(db_path, _WRITER_DROPPED_METRIC)
+        errors = _latest_gauge_value(db_path, _WRITER_ERRORS_METRIC)
+    except Exception:  # noqa: BLE001 - a read-only view must never crash (§7)
+        return None
+    if dropped is None and errors is None:
+        return None  # nothing sampled yet — omit rather than show a bare n/a pair
+    dropped_s = "n/a" if dropped is None else f"{dropped:.0f}"
+    errors_s = "n/a" if errors is None else f"{errors:.0f}"
+    return f"trace-writer: dropped={dropped_s} write_errors={errors_s}"
 
 
 def activity_for_dir(base_dir: Path, raw_args: str) -> str:
@@ -388,11 +624,16 @@ def activity_for_dir(base_dir: Path, raw_args: str) -> str:
                 body = _turn_detail(conn, arg, base_dir)
             else:
                 assert isinstance(arg, int)
-                roots = _root_rows(conn, arg)
-                if not roots:
-                    body = "lifemodel activity: no activity recorded yet.\n"
-                else:
-                    body = "\n".join(_render_timeline_body(conn, roots)) + "\n"
+                lines = _timeline_lines(conn, arg)
+                body_lines: list[str] = []
+                health = _writer_health_line(base_dir)
+                if health is not None:
+                    body_lines.append(health)
+                    body_lines.append("")
+                body_lines.extend(
+                    lines if lines else ["lifemodel activity: no activity recorded yet."]
+                )
+                body = "\n".join(body_lines) + "\n"
     except sqlite3.Error as exc:
         return header + f"\nlifemodel activity: trace store unreadable ({exc}).\n"
 

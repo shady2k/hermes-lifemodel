@@ -13,7 +13,10 @@ from pathlib import Path
 
 from lifemodel.activity import activity_for_dir
 from lifemodel.adapters.clock import SystemClock
+from lifemodel.core.metrics import MetricRegistry
 from lifemodel.domain.memory import MemoryDraft
+from lifemodel.state.metrics_store import MetricsSampler, metrics_db_path
+from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
 from lifemodel.state.trace_store import (
     acquire_trace_writer,
@@ -23,6 +26,7 @@ from lifemodel.state.trace_store import (
 
 SEEDED_TURN_TRACE_ID = "turntrace0000000000000000000001"
 SEEDED_BELIEF_ID = "belief:seed:abc123"
+LONG_COMPLETION_TRACE_ID = "turntracelong00000000000000001"
 
 _T0 = "2026-07-18T09:00:00.000000+00:00"
 _T0_END = "2026-07-18T09:00:01.000000+00:00"
@@ -167,6 +171,41 @@ def _seed_belief_row(tmp_path: Path) -> None:
     )
 
 
+def _seed_long_completion(tmp_path: Path) -> str:
+    """A turn whose ``turn.completion`` ``final_output`` is > 200 chars (M2)."""
+    long_output = "the quick brown fox jumps over the lazy dog. " * 6  # > 200 chars
+    assert len(long_output) > 200
+    db = observability_db_path(tmp_path)
+    writer = acquire_trace_writer(db)
+    try:
+        writer.submit_span(
+            trace_id=LONG_COMPLETION_TRACE_ID,
+            span_id="turn-root",
+            parent_span_id=None,
+            component="turn",
+            tick=None,
+            started_at=_T1,
+            ended_at=_T1_END,
+            status="ok",
+            attrs={"frame_kind": "turn", "turn_id": "t2", "session_id": "s2", "origin": "reactive"},
+        )
+        writer.submit_span(
+            trace_id=LONG_COMPLETION_TRACE_ID,
+            span_id="completion",
+            parent_span_id="turn-root",
+            component="turn.completion",
+            tick=None,
+            started_at=_T1_END,
+            ended_at=_T1_END,
+            status="ok",
+            attrs={"final_output": long_output, "reasoning": "short"},
+        )
+        writer.flush(timeout=5.0)
+    finally:
+        release_trace_writer(db)
+    return long_output
+
+
 # --------------------------------------------------------------------------- #
 # The four behaviors named by the task brief
 # --------------------------------------------------------------------------- #
@@ -294,3 +333,119 @@ def test_heartbeat_run_collapses_but_turn_stays_visible(tmp_path: Path) -> None:
     assert "collapsed" in out
     assert "turn" in out
     assert out.count("trigger=heartbeat") == 0  # the run collapsed, not rendered per-line
+
+
+# --------------------------------------------------------------------------- #
+# codex review wave B (lm-hg7): C1 read-only header, I3 un-drowned timeline,
+# I5 writer-drop health, M2 full completion output
+# --------------------------------------------------------------------------- #
+
+
+def test_state_header_is_read_only_never_constructs_sqlite_runtime_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C1: the state header must NEVER construct ``SQLiteRuntimeStore`` — that
+    constructor is a read-write path (dir creation, WAL switch, migrations,
+    quarantine-on-corrupt) that must not run against a live being's db from a
+    bystander reader. Seeds a real ``runtime_state`` row through the actual
+    store BEFORE patching (so the read-only header has real data to show),
+    then patches ``__init__`` to explode and asserts the header still renders
+    the real value — not merely "didn't crash" (a crash here would be
+    swallowed by the header's own broad fail-soft ``except``, which would
+    mask a regression as an ``<unavailable: ...>`` line instead of failing
+    the test)."""
+    SQLiteRuntimeStore(tmp_path, clock=SystemClock()).commit(
+        State(tick_count=42, energy=0.75, last_tick_at=_T1)
+    )
+
+    def _boom(self, *args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("activity's state header must never construct SQLiteRuntimeStore (C1)")
+
+    monkeypatch.setattr(SQLiteRuntimeStore, "__init__", _boom)
+
+    out = activity_for_dir(tmp_path, "last 10")
+
+    assert "42" in out  # the real tick_count, read directly off runtime_state
+    assert "unavailable" not in out.lower()  # not the broad-except fallback masking a raise
+
+
+def test_state_header_missing_db_is_a_friendly_line_not_a_crash(tmp_path: Path) -> None:
+    out = activity_for_dir(tmp_path, "last 10")
+    assert "unavailable" in out.lower()
+
+
+def test_timeline_last_n_still_shows_turn_behind_many_heartbeats(tmp_path: Path) -> None:
+    """I3: a flat ``LIMIT N`` root fetch used to return N roots that were ALL
+    heartbeats, so a turn parked just past them was never even fetched. Seeds
+    30 heartbeat roots newer than one turn root and asks for ``last 5`` —
+    the turn must still surface."""
+    db = observability_db_path(tmp_path)
+    writer = acquire_trace_writer(db)
+    try:
+        writer.submit_span(
+            trace_id=SEEDED_TURN_TRACE_ID,
+            span_id="turn-root",
+            parent_span_id=None,
+            component="turn",
+            tick=None,
+            started_at="2026-07-18T08:00:00.000000+00:00",
+            ended_at="2026-07-18T08:00:01.000000+00:00",
+            status="ok",
+            attrs={
+                "frame_kind": "turn",
+                "turn_id": "t1",
+                "session_id": "s1",
+                "origin": "reactive",
+            },
+        )
+        for i in range(30):
+            writer.submit_span(
+                trace_id=f"heartbeattrace000000000000{i:04d}",
+                span_id="root",
+                parent_span_id=None,
+                component="tick",
+                tick=i + 1,
+                # all newer than the turn above
+                started_at=f"2026-07-18T08:{i + 1:02d}:00.000000+00:00",
+                ended_at=f"2026-07-18T08:{i + 1:02d}:00.000000+00:00",
+                status="ok",
+                attrs={"frame_kind": "execution", "trigger": "heartbeat"},
+            )
+        writer.flush(timeout=5.0)
+    finally:
+        release_trace_writer(db)
+
+    out = activity_for_dir(tmp_path, "last 5")
+    assert SEEDED_TURN_TRACE_ID in out  # not drowned by the 30 newer heartbeats
+    assert "collapsed" in out  # the heartbeat run still collapses
+
+
+def test_timeline_shows_writer_drop_health_from_metrics_sqlite(tmp_path: Path) -> None:
+    """I5: dropped/write_errors gauges snapshotted into ``metrics.sqlite`` are
+    surfaced in the ``last N`` timeline — a missing turn span can be a silent
+    writer drop, not "nothing happened"."""
+    _seed(tmp_path)
+    reg = MetricRegistry()
+    reg.gauge("lifemodel_trace_writer_dropped_records").set(3.0)
+    reg.gauge("lifemodel_trace_writer_write_errors").set(1.0)
+    sampler = MetricsSampler(reg, metrics_db_path(tmp_path), run_id="R", heartbeat_every=1)
+    sampler.sample_once(now=_T1)
+    sampler.close()
+
+    out = activity_for_dir(tmp_path, "last 10")
+    assert "dropped=3" in out
+    assert "write_errors=1" in out
+
+
+def test_timeline_omits_writer_health_line_when_metrics_store_absent(tmp_path: Path) -> None:
+    _seed(tmp_path)
+    out = activity_for_dir(tmp_path, "last 10")
+    assert "trace-writer" not in out  # no metrics.sqlite at all — the line is omitted
+
+
+def test_turn_detail_shows_completion_final_output_in_full(tmp_path: Path) -> None:
+    """M2: ``turn.completion``'s ``final_output`` must show in full, not
+    truncated to ``render_trace``'s generic 200-char attr limit."""
+    long_output = _seed_long_completion(tmp_path)
+    out = activity_for_dir(tmp_path, f"turn {LONG_COMPLETION_TRACE_ID}")
+    assert long_output in out
