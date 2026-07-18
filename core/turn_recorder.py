@@ -21,6 +21,14 @@ CHILD span + the ``turn_injector_total`` metric) on top of Task 3's construction
 :meth:`TurnRecorder.tool_close` (per-tool CHILD spans keyed by ``tool_call_id``).
 This task adds :meth:`TurnRecorder.close_turn` — a ``turn.completion`` CHILD span
 plus the root span's terminal close — completing the service.
+
+Task 13's real-code end-to-end harness (``tests/test_turn_observability_harness.py``)
+caught a real composition gap the per-method unit tests never exercised: the store's
+``submit_span`` upserts ``attrs_json`` wholesale (no partial merge), so
+:meth:`close_turn`'s own attrs dict was silently erasing the
+``origin``/``model``/``platform`` :meth:`ensure_turn` had already persisted at open —
+every turn's closed root would read back with no origin at all. :class:`_Entry` now
+carries those three forward so the closing/reconciling writes re-emit them.
 """
 
 from __future__ import annotations
@@ -76,13 +84,26 @@ class InjectorSpan:
 
 @dataclass
 class _Entry:
-    """One open turn's ledger row — enough to reconcile or persist it later."""
+    """One open turn's ledger row — enough to reconcile or persist it later.
+
+    ``origin``/``model``/``platform`` are the OPEN-time attrs :meth:`ensure_turn`
+    already persisted onto the root span — stashed here too so a later
+    ``close_turn``/reconcile can carry them forward. ``submit_span`` UPSERTS by
+    ``(trace_id, span_id)`` and overwrites ``attrs_json`` wholesale on every
+    call (there is no partial-attrs merge at the store layer), so a close that
+    persisted only its OWN new attrs would silently erase the open's — the
+    root's origin, otherwise unrecoverable once closed, is exactly what
+    ``activity.py``'s timeline line reads back.
+    """
 
     ctx: TraceContext
     opened_at_iso: str
     opened_mono: float
     session_id: str
     turn_id: str
+    origin: str
+    model: str
+    platform: str
 
 
 class TurnRecorder:
@@ -160,7 +181,9 @@ class TurnRecorder:
                 self._reconcile_session_locked(session_id, now_iso)
                 self._evict_locked()
                 ctx = self._tracer.start_root(upstream_traceparent=upstream_traceparent)
-                self._ledger[key] = _Entry(ctx, now_iso, self._monotonic(), session_id, turn_id)
+                self._ledger[key] = _Entry(
+                    ctx, now_iso, self._monotonic(), session_id, turn_id, origin, model, platform
+                )
             # Persist OUTSIDE the lock (the sink is thread-safe + async): eager, with
             # ended_at/status NULL, so a crash still leaves a discoverable parent.
             self._submit(
@@ -268,7 +291,10 @@ class TurnRecorder:
     ) -> None:
         """Close ``(session_id, turn_id)`` — a ``turn.completion`` child persisting
         the bounded final text, then the root span itself (``ended_at``=now,
-        terminal ``status``) — and drop the ledger entry.
+        terminal ``status``, carrying forward the ``origin``/``model``/``platform``
+        :meth:`ensure_turn` stamped at open — the store's ``submit_span`` upserts
+        ``attrs_json`` wholesale, so re-emitting them here is what stops the close
+        from erasing what open already persisted) — and drop the ledger entry.
 
         An unknown key (never opened via :meth:`ensure_turn`, or already closed by
         an earlier call) is a best-effort no-op: the ledger pop returns ``None``
@@ -303,7 +329,14 @@ class TurnRecorder:
                 started_at=entry.opened_at_iso,
                 ended_at=now_iso,
                 status=status if status in ("ok", "suppressed", "failed") else "ok",
-                attrs={"frame_kind": "turn", "turn_id": turn_id, "session_id": session_id},
+                attrs={
+                    "frame_kind": "turn",
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "origin": entry.origin,
+                    "model": entry.model,
+                    "platform": entry.platform,
+                },
             )
         except Exception:  # noqa: BLE001 - closing a turn must never crash the host turn
             _LOG.exception("close_turn failed session=%s turn=%s", session_id, turn_id)
@@ -322,7 +355,12 @@ class TurnRecorder:
                 started_at=entry.opened_at_iso,
                 ended_at=now_iso,
                 status="failed",
-                attrs={"frame_kind": "turn", "turn_id": entry.turn_id, "outcome": "abandoned"},
+                attrs={
+                    "frame_kind": "turn",
+                    "turn_id": entry.turn_id,
+                    "origin": entry.origin,
+                    "outcome": "abandoned",
+                },
             )
 
     def _evict_locked(self) -> None:

@@ -204,6 +204,30 @@ def test_close_turn_writes_completion_and_closes_root() -> None:
     assert len(closed_ok) == 1  # the second close persisted nothing more
 
 
+def test_close_turn_preserves_the_open_root_attrs_not_just_ended_at() -> None:
+    # submit_span UPSERTS attrs_json wholesale (no partial merge at the store
+    # layer, state/trace_store.py's ON CONFLICT clause), so a close that
+    # persisted only ITS OWN new attrs would silently erase what ensure_turn
+    # already wrote — origin/model/platform are otherwise unrecoverable once
+    # closed, and activity.py's timeline line reads origin back from exactly
+    # this closed row.
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1", model="opus", platform="telegram", origin="reactive")
+    rec.close_turn("s1", "t1", final_output="ok, talk soon")
+    closed_root = [s for s in rec._writer.spans if s["component"] == "turn" and s["status"] == "ok"]
+    assert closed_root[-1]["attrs"]["origin"] == "reactive"
+    assert closed_root[-1]["attrs"]["model"] == "opus"
+    assert closed_root[-1]["attrs"]["platform"] == "telegram"
+
+
+def test_reconcile_abandoned_turn_preserves_its_origin() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1", origin="proactive")
+    rec.ensure_turn("s1", "t2")  # t1 never closed — reconciled abandoned
+    closed = [s for s in rec._writer.spans if s["component"] == "turn" and s["status"] == "failed"]
+    assert closed[0]["attrs"]["origin"] == "proactive"
+
+
 def test_close_turn_truncates_oversized_text_and_clamps_bad_status() -> None:
     rec = _recorder()
     rec.ensure_turn("s1", "t1")
