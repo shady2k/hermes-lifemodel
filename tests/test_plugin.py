@@ -195,14 +195,17 @@ def test_register_wires_felt_state_injector_and_check_in_tool(
 def test_register_wires_commitment_injector_and_tool(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # lm-705.21: the 4th pre_llm_call hook (the commitment injector, beside felt-state,
-    # genesis, belief) and the 5th lifemodel tool (`commitment`) coexist.
+    # lm-705.21: the 4th pre_llm_call INJECTOR (the commitment injector, beside
+    # felt-state, genesis, belief) and the 5th lifemodel tool (`commitment`) coexist.
+    # A 5th pre_llm_call CALLBACK altogether now also rides this hook name (lm-hg7
+    # Task 11's open-turn observer, registered FIRST — see
+    # test_register_wires_turn_observability below), so the total count is 5, not 4.
     monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
     ctx = FakeCtx()
 
     lifemodel.register(ctx)
 
-    assert sum(1 for name, _ in ctx.hooks if name == "pre_llm_call") == 4
+    assert sum(1 for name, _ in ctx.hooks if name == "pre_llm_call") == 5
     assert "commitment" in ctx.tools
     schema = ctx.tools["commitment"]["kwargs"]["schema"]
     assert schema["name"] == "commitment"
@@ -323,6 +326,164 @@ def test_register_genesis_injector_stands_down_for_the_beings_own_wake_packet(
     callback = _pre_llm_callback(ctx, from_factory="make_genesis_injector")
     impulse = f"{IMPULSE_LABEL_PREFIX}\nI have just begun.\n</internal_impulse>"
     assert callback(user_message=impulse, conversation_history=[]) is None
+
+
+# --- Turn observability wiring (lm-hg7 Task 11) ------------------------------
+
+
+class _CapturingSink:
+    """A ``TraceSink`` stand-in recording every ``submit_span`` call, swapped in for
+    the real ``acquire_trace_writer`` (a background-thread-backed sqlite writer) so
+    these wiring tests can assert on trace content SYNCHRONOUSLY, without a real
+    ``observability.sqlite`` file. Mirrors the ``CapturingSink`` in
+    ``tests/test_turn_recorder.py``/``tests/test_tool_spans.py``."""
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, Any]] = []
+
+    def submit_span(self, **kw: Any) -> bool:
+        self.spans.append(kw)
+        return True
+
+    def submit_event(self, **kw: Any) -> bool:
+        return True
+
+    def submit_correlation(self, **kw: Any) -> bool:
+        return True
+
+
+def _register_with_capturing_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[FakeCtx, _CapturingSink]:
+    """``register(ctx)`` with the same ``_hermes_home`` monkeypatch every other test
+    here uses, PLUS ``acquire_trace_writer`` swapped for a capturing sink: the
+    ``TurnRecorder`` register() builds is wired straight onto it (the ``writer``
+    kwarg), so every span the turn-observability hooks persist lands in
+    ``sink.spans`` — inspectable without touching a real sqlite file."""
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    sink = _CapturingSink()
+    monkeypatch.setattr(lifemodel, "acquire_trace_writer", lambda *_a, **_kw: sink)
+    ctx = FakeCtx()
+    lifemodel.register(ctx)
+    return ctx, sink
+
+
+def test_register_wires_pre_and_post_tool_call_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ctx, _sink = _register_with_capturing_sink(monkeypatch, tmp_path)
+
+    assert any(name == "pre_tool_call" for name, _ in ctx.hooks)
+    assert any(name == "post_tool_call" for name, _ in ctx.hooks)
+
+
+def test_the_first_pre_llm_call_callback_is_the_open_turn_observer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Registration order IS call order for a given hook name (Hermes' invoke_hook),
+    # so the open-turn observer must be registered — and therefore run — BEFORE the
+    # four injectors: their turn.injector.* child spans need the root it mints.
+    ctx, _sink = _register_with_capturing_sink(monkeypatch, tmp_path)
+
+    pre_llm_callbacks = [cb for name, cb in ctx.hooks if name == "pre_llm_call"]
+    assert pre_llm_callbacks[0].__qualname__.startswith("make_open_turn_observer.")
+
+
+def test_a_full_fake_turn_leaves_one_trace_with_every_expected_span(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Simulates one real turn end-to-end through the ACTUAL callables register(ctx)
+    wired (not a hand-built TurnRecorder): open (pre_llm_call) -> the felt-state
+    injector (pre_llm_call) -> a tool call (pre_tool_call/post_tool_call) -> close
+    (post_llm_call). Every span this produces must land under ONE trace_id in the
+    capturing sink: the turn root, the felt-state injector's child, the tool's
+    child, and the completion child."""
+    ctx, sink = _register_with_capturing_sink(monkeypatch, tmp_path)
+
+    open_observer = [cb for name, cb in ctx.hooks if name == "pre_llm_call"][0]
+    felt_state_injector = _pre_llm_callback(ctx, from_factory="make_felt_state_injector")
+    pre_tool = next(cb for name, cb in ctx.hooks if name == "pre_tool_call")
+    post_tool = next(cb for name, cb in ctx.hooks if name == "post_tool_call")
+    post_llm_close = next(cb for name, cb in ctx.hooks if name == "post_llm_call")
+
+    session_id, turn_id = "sess-1", "turn-1"
+
+    assert open_observer(session_id=session_id, turn_id=turn_id, user_message="hi there") is None
+    felt_state_injector(
+        session_id=session_id,
+        turn_id=turn_id,
+        user_message="hi there",
+        conversation_history=[],
+    )
+    pre_tool(
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_name="commitment",
+        tool_call_id="call-1",
+        args={},
+        task_id="",
+        api_request_id="",
+        middleware_trace=[],
+    )
+    post_tool(
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_name="commitment",
+        tool_call_id="call-1",
+        args={},
+        result="{}",
+        task_id="",
+        api_request_id="",
+        duration_ms=7,
+        status="ok",
+        error_type=None,
+        error_message=None,
+        middleware_trace=[],
+    )
+    post_llm_close(
+        session_id=session_id,
+        turn_id=turn_id,
+        user_message="hi there",
+        assistant_response="hello!",
+        conversation_history=[],
+    )
+
+    components = {s["component"] for s in sink.spans}
+    assert "turn" in components
+    assert "turn.injector.felt_state" in components
+    assert "turn.tool.commitment" in components
+    assert "turn.completion" in components
+
+    trace_ids = {s["trace_id"] for s in sink.spans}
+    assert len(trace_ids) == 1  # every span shares the one root's trace_id
+
+    # The root is actually closed (not left dangling open) by the post_llm close.
+    closed_roots = [s for s in sink.spans if s["component"] == "turn" and s["status"] == "ok"]
+    assert closed_roots and closed_roots[-1]["ended_at"] is not None
+
+
+def test_a_raise_inside_the_recorder_does_not_crash_the_injector(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tracing hiccup inside ``TurnRecorder.injector_span`` (e.g. a broken tracer)
+    must never crash the felt-state injector's own turn — the injector's own
+    fail-soft ``except`` around ``_injector_span`` catches it and the call still
+    returns its ordinary context/None, exactly as if no recorder had been wired at
+    all."""
+    from lifemodel.core.turn_recorder import TurnRecorder
+
+    ctx, _sink = _register_with_capturing_sink(monkeypatch, tmp_path)
+
+    def _boom(self: TurnRecorder, *_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("tracer exploded")
+
+    monkeypatch.setattr(TurnRecorder, "injector_span", _boom)
+    felt_state_injector = _pre_llm_callback(ctx, from_factory="make_felt_state_injector")
+
+    # A cold-start being would surface nothing regardless — the point under test is
+    # that this does not raise, not what the (still None) return value is.
+    result = felt_state_injector(user_message="hi", conversation_history=[])
+    assert result is None
 
 
 # --- LIVE-TEST fix (B): the newborn stands up before it is ever asked to speak ------

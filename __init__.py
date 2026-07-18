@@ -25,11 +25,13 @@ from .adapters.session_end import (
     home_session_key_accessor,
 )
 from .adapters.soul_file import SoulFile, seed_newborn_stance
+from .adapters.tracer import StdlibTracer
 from .composition import build_lifemodel
 from .config import read_log_level, set_log_level_for_dir
 from .core.metrics import get_metric_registry
 from .core.noticing_buffer import NoticingBuffer
 from .core.tick_metrics import register_universal_metrics
+from .core.turn_recorder import TurnRecorder
 from .debug import render_dump_for_dir
 from .events import EventRing
 from .hooks import (
@@ -40,7 +42,10 @@ from .hooks import (
     make_felt_state_injector,
     make_genesis_injector,
     make_inbound_observer,
+    make_open_turn_observer,
     make_post_llm_observer,
+    make_tool_span_close,
+    make_tool_span_open,
     make_write_soul_tool,
 )
 from .log import apply_log_level, parse_log_level
@@ -573,6 +578,22 @@ def register(ctx: Any) -> None:
         # cycle, so the hook can always write regardless of loop state.
         _outcome_writer = acquire_trace_writer(observability_db_path(sdir), clock=SystemClock())
         _outcome_ring = EventRing()
+        # The turn-observability service (lm-hg7 Task 11) — ONE process-owned
+        # TurnRecorder, built over the SAME acquired writer + SAME singleton-per-
+        # base_dir metric registry (``metrics``, resolved above) every other wiring
+        # in this function reads, plus a fresh stdlib ``StdlibTracer`` (stateless —
+        # a CSPRNG id minter, so a fresh instance is behaviourally identical to a
+        # shared one; unlike the writer/metrics there is no per-base_dir state to
+        # share). Threaded into the open-turn observer + tool-span hooks below and
+        # into every ``pre_llm_call`` injector / the post_llm close seam further
+        # down, so a turn's root + injector/tool children + completion all land in
+        # the SAME ``observability.sqlite`` under ONE ``trace_id``.
+        _turn_recorder = TurnRecorder(
+            tracer=StdlibTracer(),
+            writer=_outcome_writer,
+            metrics=metrics,
+            clock=SystemClock(),
+        )
         ctx.register_hook(
             "post_llm_call",
             make_post_llm_observer(
@@ -593,8 +614,31 @@ def register(ctx: Any) -> None:
                 buffer=noticing_buffer,
                 health=health,
                 metrics=metrics,
+                # The turn-observability close seam (lm-hg7 Task 11): closes the ROOT
+                # span the open-turn observer below opened, regardless of which branch
+                # of this observer ran.
+                recorder=_turn_recorder,
             ),
         )
+
+    # --- Turn-observability seams (lm-hg7 Task 11) — REQUIRED ------------------
+    # The FIRST ``pre_llm_call`` callback (registration order is call order): opens
+    # the turn's ROOT span before any injector below runs, so every
+    # ``turn.injector.<component>`` child those mint this turn has a parent to
+    # attach to. REQUIRED like every other register_hook call here: the host never
+    # fails on an unknown hook, so a throw during THIS wiring is our bug; the hook
+    # body itself is fail-soft at RUNTIME (``TurnRecorder.ensure_turn`` never raises).
+    with wire("open_turn_observer", required=True, health=health, logger=_LOG):
+        ctx.register_hook("pre_llm_call", make_open_turn_observer(_turn_recorder))
+
+    # The per-tool CHILD spans (``turn.tool.<tool_name>``), keyed by the host's own
+    # ``tool_call_id`` — pure observers, never a block/approve directive (see
+    # ``make_tool_span_open``'s docstring). REQUIRED for the same reason as above;
+    # both hook bodies are fail-soft at RUNTIME (``TurnRecorder.tool_open``/
+    # ``tool_close`` never raise).
+    with wire("tool_span_hooks", required=True, health=health, logger=_LOG):
+        ctx.register_hook("pre_tool_call", make_tool_span_open(_turn_recorder))
+        ctx.register_hook("post_tool_call", make_tool_span_close(_turn_recorder))
 
     # --- Inbound observation wiring (Task 6, spec §4/§6) — REQUIRED -----------
     # On a genuine user message, satiate the drive + stamp last_exchange_at + clear
@@ -634,6 +678,9 @@ def register(ctx: Any) -> None:
                 buffer=noticing_buffer,
                 health=health,
                 metrics=metrics,
+                # The turn-observability child span (lm-hg7 Task 7/11): the SAME
+                # ``TurnRecorder`` the open-turn observer/tool hooks above share.
+                recorder=_turn_recorder,
             ),
         )
     with wire("check_in_tool", required=True, health=health, logger=_LOG):
@@ -718,6 +765,9 @@ def register(ctx: Any) -> None:
                 identity_stale=GatewayStaleIdentity(soul_mtime=soul.mtime),
                 health=health,
                 metrics=metrics,
+                # The turn-observability child span (lm-hg7 Task 8/11): the SAME
+                # ``TurnRecorder`` every other pre_llm_call injector shares.
+                recorder=_turn_recorder,
             ),
         )
 
@@ -738,7 +788,12 @@ def register(ctx: Any) -> None:
         ctx.register_hook(
             "pre_llm_call",
             make_belief_injector(
-                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
+                lambda: build_lifemodel(base_dir=sdir),
+                health=health,
+                metrics=metrics,
+                # The turn-observability child span (lm-hg7 Task 9/11): the SAME
+                # ``TurnRecorder`` every other pre_llm_call injector shares.
+                recorder=_turn_recorder,
             ),
         )
 
@@ -754,7 +809,12 @@ def register(ctx: Any) -> None:
         ctx.register_hook(
             "pre_llm_call",
             make_commitment_injector(
-                lambda: build_lifemodel(base_dir=sdir), health=health, metrics=metrics
+                lambda: build_lifemodel(base_dir=sdir),
+                health=health,
+                metrics=metrics,
+                # The turn-observability child span (lm-hg7 Task 10/11): the SAME
+                # ``TurnRecorder`` every other pre_llm_call injector shares.
+                recorder=_turn_recorder,
             ),
         )
 

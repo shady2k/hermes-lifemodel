@@ -186,6 +186,131 @@ def _injector_span(
         yield span
 
 
+def make_open_turn_observer(recorder: TurnRecorder) -> Callable[..., None]:
+    """Return the FIRST ``pre_llm_call`` callback (lm-hg7 Task 11): open the
+    turn's ROOT span before any injector runs.
+
+    Registration order is call order for a given hook name (Hermes'
+    ``invoke_hook`` runs registered callbacks in the order ``register_hook`` saw
+    them), so ``__init__.py`` registers this one FIRST, ahead of the four
+    ``pre_llm_call`` injectors (felt-state/genesis/belief/commitment) — every
+    ``turn.injector.<component>`` child those mint via :func:`_injector_span`
+    this turn then has this call's root to attach to, via
+    :meth:`~lifemodel.core.turn_recorder.TurnRecorder.ensure_turn`'s idempotent
+    open (the first caller for a ``(session_id, turn_id)`` key mints it; every
+    later one this turn is a no-op).
+
+    Distinguishes proactive from reactive the SAME way the rest of the plugin's
+    sensor band-pass does (:func:`_is_own_impulse`): our own composed impulse
+    text is a proactive wake, everything else is a reactive owner turn.
+    ``model``/``platform`` are NOT guaranteed kwargs at ``pre_llm_call`` time
+    (unlike ``post_llm_call``, which always carries them) — defaulted to ``""``
+    here, so the root's ``model``/``platform`` attrs stay best-effort/empty at
+    open and are not corrected later (``ensure_turn`` is idempotent and does not
+    update an already-open root).
+
+    ``upstream_traceparent`` — the trace a REACH-IN proactive turn would
+    CONTINUE rather than root fresh — is DEGRADED to ``None`` here: this seam's
+    kwargs (``session_id``, ``turn_id``, ``user_message``, ``conversation_history``)
+    carry no origin-traceparent field to read one from, so a proactive turn
+    still gets a fresh root rather than this callback blocking on a
+    continuation it cannot currently supply (see the Task 11 report).
+
+    Always returns ``None`` — this callback injects no ``{"context": …}``, it
+    only opens the trace. Never raises:
+    :meth:`~lifemodel.core.turn_recorder.TurnRecorder.ensure_turn` is itself
+    fail-soft (a tracing hiccup must never crash the host's turn), so no extra
+    try/except is needed at this call site.
+    """
+
+    def _open(
+        *, session_id: str = "", turn_id: str = "", user_message: str = "", **kw: Any
+    ) -> None:
+        origin = "proactive" if _is_own_impulse(user_message) else "reactive"
+        recorder.ensure_turn(
+            session_id,
+            turn_id,
+            model=str(kw.get("model", "")),
+            platform=str(kw.get("platform", "")),
+            origin=origin,
+            # Proactive trace continuation deferred — see docstring above.
+            upstream_traceparent=None,
+        )
+        return None
+
+    return _open
+
+
+def make_tool_span_open(recorder: TurnRecorder) -> Callable[..., None]:
+    """Return the ``pre_tool_call`` observer (lm-hg7 Task 11): open a
+    ``turn.tool.<tool_name>`` child span keyed by the host's own
+    ``tool_call_id``, via :meth:`~lifemodel.core.turn_recorder.TurnRecorder.tool_open`.
+
+    Kwargs verified against ``hermes_cli/plugins.py``'s
+    ``_get_pre_tool_call_directive_details`` — the ``invoke_hook("pre_tool_call",
+    ...)`` call every registered ``pre_tool_call`` callback shares (reached via
+    ``resolve_pre_tool_block`` at the one dispatch site, ``model_tools.py``'s
+    ``handle_function_call``): ``tool_name``, ``args``, ``task_id``,
+    ``session_id``, ``tool_call_id``, ``turn_id``, ``api_request_id``,
+    ``middleware_trace`` — the kwarg is ``tool_name``, NOT ``function_name``
+    (that host-internal parameter name is renamed at the ``invoke_hook`` call
+    site itself).
+
+    Always returns ``None``: a ``pre_tool_call`` callback is only treated as a
+    block/approve DIRECTIVE when it returns a dict with ``action`` in
+    ``{"block", "approve"}`` (``_get_pre_tool_call_directive_details``'s own
+    docstring) — anything else, ``None`` included, is silently ignored, exactly
+    like every other observer-only ``pre_tool_call`` hook already coexisting on
+    this channel. This callback is pure observation and never vetoes a tool.
+
+    Never raises: :meth:`~lifemodel.core.turn_recorder.TurnRecorder.tool_open`
+    is itself fail-soft (a tracing hiccup must never crash the host's tool
+    call).
+    """
+
+    def _pre(
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        tool_name: str = "",
+        tool_call_id: str = "",
+        **_kw: Any,
+    ) -> None:
+        recorder.tool_open(session_id, turn_id, tool=tool_name, tool_call_id=tool_call_id)
+        return None
+
+    return _pre
+
+
+def make_tool_span_close(recorder: TurnRecorder) -> Callable[..., None]:
+    """Return the ``post_tool_call`` observer (lm-hg7 Task 11): close the
+    ``turn.tool.<tool_name>`` child :func:`make_tool_span_open` opened, keyed by
+    the SAME ``tool_call_id``, via
+    :meth:`~lifemodel.core.turn_recorder.TurnRecorder.tool_close`.
+
+    Kwargs verified against ``model_tools.py``'s ``_emit_post_tool_call_hook``
+    — the exact ``invoke_hook("post_tool_call", ...)`` call every registered
+    ``post_tool_call`` callback receives: ``tool_name``, ``args``, ``result``,
+    ``task_id``, ``session_id``, ``tool_call_id``, ``turn_id``,
+    ``api_request_id``, ``duration_ms``, ``status`` (``"ok"``/``"error"``
+    derived from the result, or an explicit ``"blocked"`` on a plugin veto),
+    ``error_type``, ``error_message``, ``middleware_trace``.
+
+    Always returns ``None`` (observer-only, like :func:`make_tool_span_open`).
+    Never raises: :meth:`~lifemodel.core.turn_recorder.TurnRecorder.tool_close`
+    is itself fail-soft, and an unknown/already-closed ``tool_call_id`` is a
+    best-effort no-op there.
+    """
+
+    def _post(
+        *, tool_call_id: str = "", status: str = "ok", duration_ms: Any = None, **_kw: Any
+    ) -> None:
+        recorder.tool_close(tool_call_id, status=str(status), duration_ms=duration_ms)
+        return None
+
+    return _post
+
+
 #: The two disjoint concepts that map a proactive turn to SILENT (spec §5). They
 #: are matched DIFFERENTLY on purpose (lm-md6.5):
 #:
@@ -435,6 +560,7 @@ def make_post_llm_observer(
     buffer: NoticingBuffer | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
+    recorder: TurnRecorder | None = None,
 ) -> Callable[..., None]:
     """Return a ``post_llm_call`` handler that starts an ASYNC_COMPLETION frame (§3/§5).
 
@@ -450,6 +576,24 @@ def make_post_llm_observer(
     source pointer this slice uses (spec §8's own lean; the platform message id is
     deferred). ``buffer`` is optional and defaults to ``None`` (a no-op) for the exact
     same back-compat reason as ``appraiser``.
+
+    Also the turn-observability CLOSE seam (lm-hg7 Task 11): whenever this hook
+    actually fires, the turn's ROOT span (opened by ``make_open_turn_observer``, the
+    FIRST ``pre_llm_call`` callback) is closed via
+    :meth:`~lifemodel.core.turn_recorder.TurnRecorder.close_turn` — REGARDLESS of
+    which branch below ran (the ordinary reactive exchange, or the pending-proactive
+    read-back, whether or not it actually resolved a desire). ``post_llm_call`` has
+    no separate ``reasoning`` kwarg (only ``assistant_response``), so
+    ``final_output=assistant_response`` and ``reasoning=""`` — see the Task 11
+    report for why. Hermes only invokes ``post_llm_call`` on a genuine
+    ``final_response`` (not on an interrupted turn), so an interrupted turn's root
+    is deliberately left open here: :meth:`~lifemodel.core.turn_recorder.
+    TurnRecorder.ensure_turn` reconciles any OTHER still-open root of the session
+    to ``failed``/``abandoned`` the next time a turn opens, which is the intended
+    recovery path for a close this hook never sees. ``recorder`` is optional and
+    defaults to ``None`` (a no-op) for the exact same back-compat reason as
+    ``appraiser``/``buffer``; :meth:`close_turn` is itself fail-soft (a tracing
+    hiccup must never crash the host's turn), so no extra guard is needed here.
 
     The whole body is plugin-owned fail-loud (spec §4.3/MAJOR-4): a throw anywhere
     in it (even in ``build_lm``) is logged ERROR + traceback, recorded on
@@ -483,47 +627,56 @@ def make_post_llm_observer(
                     user_message=user_message,
                     assistant_response=assistant_response,
                 )
-                return
-            memory = lm.state if isinstance(lm.state, MemoryPort) else None
-            desire = read_live_contact_desire(memory) if memory is not None else None
-            if desire is None or desire.state != DesireState.ACTIVE:
-                return
-            outcome = (
-                ProactiveOutcome.SILENT
-                if _is_no_reply(assistant_response)
-                else ProactiveOutcome.SENT
-            )
-            correlation_id = state.pending_proactive_id or ""
-            # Weave the outcome onto the ORIGIN trace (§4.4). Best-effort: the async
-            # trace is observability, NEVER the outcome control flow below — a trace
-            # hiccup (or a lost origin anchor) must not stop the desire from resolving.
-            with contextlib.suppress(Exception):  # advisory: must never break a turn
-                _emit_async_outcome(
-                    lm,
-                    origin_traceparent=state.pending_proactive_origin_traceparent,
-                    correlation_id=correlation_id,
-                    outcome=outcome,
-                    assistant_response=assistant_response,
-                    conversation_history=conversation_history,
-                    extra=_ignored,
-                )
-            now = lm.clock.now()
-            assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
-            # The async turn finished → its OWN frame commits the outcome immediately
-            # (spec §3): aggregation resolves the pending desire + writes action_pending
-            # / backoff to AgentState. Not deferred to the next heartbeat.
-            run_frame(
-                lm.coreloop,
-                [
-                    proactive_outcome_signal(
-                        origin_id=f"outcome-{correlation_id}",
-                        outcome=outcome,
-                        timestamp=to_iso(now),
-                        correlation_id=correlation_id,
+            else:
+                memory = lm.state if isinstance(lm.state, MemoryPort) else None
+                desire = read_live_contact_desire(memory) if memory is not None else None
+                if desire is not None and desire.state == DesireState.ACTIVE:
+                    outcome = (
+                        ProactiveOutcome.SILENT
+                        if _is_no_reply(assistant_response)
+                        else ProactiveOutcome.SENT
                     )
-                ],
-                trigger=FrameTrigger.ASYNC_COMPLETION,
-            )
+                    correlation_id = state.pending_proactive_id or ""
+                    # Weave the outcome onto the ORIGIN trace (§4.4). Best-effort: the
+                    # async trace is observability, NEVER the outcome control flow below
+                    # — a trace hiccup (or a lost origin anchor) must not stop the
+                    # desire from resolving.
+                    with contextlib.suppress(Exception):  # advisory: must never break a turn
+                        _emit_async_outcome(
+                            lm,
+                            origin_traceparent=state.pending_proactive_origin_traceparent,
+                            correlation_id=correlation_id,
+                            outcome=outcome,
+                            assistant_response=assistant_response,
+                            conversation_history=conversation_history,
+                            extra=_ignored,
+                        )
+                    now = lm.clock.now()
+                    assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+                    # The async turn finished → its OWN frame commits the outcome
+                    # immediately (spec §3): aggregation resolves the pending desire +
+                    # writes action_pending/backoff to AgentState. Not deferred to the
+                    # next heartbeat.
+                    run_frame(
+                        lm.coreloop,
+                        [
+                            proactive_outcome_signal(
+                                origin_id=f"outcome-{correlation_id}",
+                                outcome=outcome,
+                                timestamp=to_iso(now),
+                                correlation_id=correlation_id,
+                            )
+                        ],
+                        trigger=FrameTrigger.ASYNC_COMPLETION,
+                    )
+            # The turn-observability close (lm-hg7 Task 11) — ALWAYS, regardless of
+            # which branch above ran (see the docstring). A no-op when ``recorder``
+            # is unwired (back-compat) or the turn was never opened/already closed
+            # (``close_turn`` itself is idempotent + fail-soft).
+            if recorder is not None:
+                recorder.close_turn(
+                    session_id, turn_id, final_output=assistant_response, reasoning=""
+                )
         except Exception as exc:  # plugin-owned observability — do not crash the caller
             _record_observer_failure(
                 observer_name=POST_LLM_OBSERVER, exc=exc, health=health, metrics=metrics
