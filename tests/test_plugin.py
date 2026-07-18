@@ -486,6 +486,37 @@ def test_a_raise_inside_the_recorder_does_not_crash_the_injector(
     assert result is None
 
 
+def test_post_llm_close_fills_model_platform_onto_the_closed_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex review M5: ``pre_llm_call`` (where ``ensure_turn`` runs) does not
+    reliably carry ``model``/``platform``, but ``post_llm_call`` (where
+    ``close_turn`` runs) always does — verified against
+    ``agent/turn_finalizer.py``'s ``invoke_hook`` call. This proves the wiring
+    through the ACTUAL registered callables, not just ``TurnRecorder`` in
+    isolation."""
+    ctx, sink = _register_with_capturing_sink(monkeypatch, tmp_path)
+
+    open_observer = [cb for name, cb in ctx.hooks if name == "pre_llm_call"][0]
+    post_llm_close = next(cb for name, cb in ctx.hooks if name == "post_llm_call")
+
+    session_id, turn_id = "sess-model", "turn-model"
+    open_observer(session_id=session_id, turn_id=turn_id, user_message="hi there")
+    post_llm_close(
+        session_id=session_id,
+        turn_id=turn_id,
+        user_message="hi there",
+        assistant_response="hello!",
+        conversation_history=[],
+        model="claude-sonnet",
+        platform="telegram",
+    )
+
+    closed_roots = [s for s in sink.spans if s["component"] == "turn" and s["status"] == "ok"]
+    assert closed_roots[-1]["attrs"]["model"] == "claude-sonnet"
+    assert closed_roots[-1]["attrs"]["platform"] == "telegram"
+
+
 # --- LIVE-TEST fix (B): the newborn stands up before it is ever asked to speak ------
 #
 # ``register()`` is the seam, and it has to be: Hermes builds the system prompt at TURN

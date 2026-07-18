@@ -97,7 +97,8 @@ def test_real_turn_is_written_and_read_back_from_the_durable_store(
             _SESSION_ID,
             _TURN_ID,
             final_output="Noted — here's what I'm carrying for you.",
-            reasoning="surfaced a belief, discharged a commitment",
+            model="opus",
+            platform="telegram",
         )
 
         assert writer.flush(timeout=5.0)  # read-your-writes, mirroring trace_view/activity
@@ -109,14 +110,19 @@ def test_real_turn_is_written_and_read_back_from_the_durable_store(
     # --------------------------------------------------------------------- #
     root_rows = _read(
         db_path,
-        "SELECT trace_id, span_id, parent_span_id, status, ended_at "
+        "SELECT trace_id, span_id, parent_span_id, status, ended_at, attrs_json "
         "FROM trace_spans WHERE component = 'turn'",
     )
     assert len(root_rows) == 1  # the ONE turn root this harness wrote
-    trace_id, root_span_id, root_parent, root_status, root_ended = root_rows[0]
+    trace_id, root_span_id, root_parent, root_status, root_ended, root_attrs_json = root_rows[0]
     assert root_parent is None
     assert root_status == "ok"
     assert root_ended is not None  # closed, never left open
+    # M5: post_llm_call's model/platform (unknown to pre_llm_call's ensure_turn)
+    # actually land on the closed root, filled in at close_turn.
+    root_attrs = json.loads(root_attrs_json)
+    assert root_attrs["model"] == "opus"
+    assert root_attrs["platform"] == "telegram"
 
     components = {
         row[0]

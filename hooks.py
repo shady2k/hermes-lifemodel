@@ -584,16 +584,25 @@ def make_post_llm_observer(
     which branch below ran (the ordinary reactive exchange, or the pending-proactive
     read-back, whether or not it actually resolved a desire). ``post_llm_call`` has
     no separate ``reasoning`` kwarg (only ``assistant_response``), so
-    ``final_output=assistant_response`` and ``reasoning=""`` — see the Task 11
-    report for why. Hermes only invokes ``post_llm_call`` on a genuine
-    ``final_response`` (not on an interrupted turn), so an interrupted turn's root
-    is deliberately left open here: :meth:`~lifemodel.core.turn_recorder.
-    TurnRecorder.ensure_turn` reconciles any OTHER still-open root of the session
-    to ``failed``/``abandoned`` the next time a turn opens, which is the intended
-    recovery path for a close this hook never sees. ``recorder`` is optional and
-    defaults to ``None`` (a no-op) for the exact same back-compat reason as
-    ``appraiser``/``buffer``; :meth:`close_turn` is itself fail-soft (a tracing
-    hiccup must never crash the host's turn), so no extra guard is needed here.
+    ``final_output=assistant_response`` (``close_turn`` no longer takes a
+    ``reasoning`` param at all — codex review M3/YAGNI: the host never had one to
+    give it). It DOES always carry ``model``/``platform`` (verified against
+    ``agent/turn_finalizer.py``'s ``invoke_hook("post_llm_call", ...,
+    model=agent.model, platform=...)``) — unlike ``pre_llm_call``, which does not
+    (see ``make_open_turn_observer``) — so THIS is where the root's ``model``/
+    ``platform`` attrs actually get filled in (codex review M5): pulled from
+    ``_ignored`` (mirroring ``make_open_turn_observer``'s own ``kw.get(...)``
+    pattern) rather than named params, so they stay part of the generic extra-kwarg
+    bag ``_log_outcome_detail`` also reads from. Hermes only invokes
+    ``post_llm_call`` on a genuine ``final_response`` (not on an interrupted turn),
+    so an interrupted turn's root is deliberately left open here:
+    :meth:`~lifemodel.core.turn_recorder.TurnRecorder.ensure_turn` reconciles any
+    OTHER still-open root of the session to ``failed``/``abandoned`` the next time
+    a turn opens, which is the intended recovery path for a close this hook never
+    sees. ``recorder`` is optional and defaults to ``None`` (a no-op) for the exact
+    same back-compat reason as ``appraiser``/``buffer``; :meth:`close_turn` is
+    itself fail-soft (a tracing hiccup must never crash the host's turn), so no
+    extra guard is needed here.
 
     The whole body is plugin-owned fail-loud (spec §4.3/MAJOR-4): a throw anywhere
     in it (even in ``build_lm``) is logged ERROR + traceback, recorded on
@@ -672,10 +681,16 @@ def make_post_llm_observer(
             # The turn-observability close (lm-hg7 Task 11) — ALWAYS, regardless of
             # which branch above ran (see the docstring). A no-op when ``recorder``
             # is unwired (back-compat) or the turn was never opened/already closed
-            # (``close_turn`` itself is idempotent + fail-soft).
+            # (``close_turn`` itself is idempotent + fail-soft). model/platform come
+            # from ``_ignored`` (post_llm_call always carries them — codex review
+            # M5) so the root's attrs are no longer left blank at close.
             if recorder is not None:
                 recorder.close_turn(
-                    session_id, turn_id, final_output=assistant_response, reasoning=""
+                    session_id,
+                    turn_id,
+                    final_output=assistant_response,
+                    model=str(_ignored.get("model", "")),
+                    platform=str(_ignored.get("platform", "")),
                 )
         except Exception as exc:  # plugin-owned observability — do not crash the caller
             _record_observer_failure(

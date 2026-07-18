@@ -25,10 +25,15 @@ INJECTOR_GENESIS = "genesis"
 INJECTOR_BELIEF = "belief"
 INJECTOR_COMMITMENT = "commitment"
 
-#: felt-state's per-call gate verdict (the retired FELT_DISPLAY_TOTAL vocabulary) + error.
-FELT_OUTCOMES = frozenset(
-    {"light", "not_warmed", "not_salient", "task", "cooldown_unchanged", "error"}
-)
+#: felt-state's per-call gate verdict + error. Exactly
+#: ``{d.value for d in core.felt_display.Decision} | {"error"}`` — kept as a
+#: literal set (not an import) to avoid a core.turn_metrics -> core.felt_display
+#: dependency, but ``tests/test_turn_metrics.py`` asserts the two never drift.
+#: Codex review M3: this used to also carry ``"cooldown_unchanged"``, a value
+#: from the RETIRED ``lifemodel_felt_display_total`` counter that
+#: :func:`~lifemodel.core.felt_display.decide` has never actually emitted since
+#: — false assurance the frozenset was ever checked against, removed here.
+FELT_OUTCOMES = frozenset({"light", "not_warmed", "not_salient", "task", "error"})
 #: genesis's disjoint no-inject branches + the one inject + error.
 GENESIS_OUTCOMES = frozenset(
     {"injected", "born", "carried_by_impulse", "own_impulse", "not_due", "stale_identity", "error"}

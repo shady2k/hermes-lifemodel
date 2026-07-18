@@ -124,6 +124,42 @@ def test_injector_injects_light_cue_and_stamps_state(tmp_path: Path) -> None:
     assert any(s["component"] == "turn.injector.felt_state" for s in sink.spans)
 
 
+class _ChildOfBoomTracer(FakeTracer):
+    """A tracer whose ``child_of`` blows up — a tracing-layer hiccup happening in
+    ``TurnRecorder.injector_span``'s SETUP, distinct from a body exception."""
+
+    def child_of(self, parent: object) -> object:
+        raise RuntimeError("tracer exploded")
+
+
+def test_injector_still_injects_when_the_tracers_child_of_blows_up(tmp_path: Path) -> None:
+    """Codex review I4: ``injector_span``'s SETUP (ledger lookup, ``child_of``/
+    ``start_root``, the clock read) used to run BEFORE its own ``try``, so a
+    tracer failure there raised straight out of ``with recorder.injector_span(...)``
+    and was caught by the felt-state injector's OWN outer fail-soft ``except`` —
+    indistinguishable from a genuine BODY failure, silently discarding the whole
+    injection on nothing worse than a broken tracer. Only ``child_of`` is broken
+    here (``ensure_turn``'s ``start_root`` already ran fine) — the injector's body
+    must still compose and return the felt-state cue, not degrade to ``None``."""
+    lm = _lm(tmp_path)
+    lm.state.commit(_warmed_salient())
+    reg = _registry()
+    sink = _CapturingSink()
+    rec = TurnRecorder(tracer=_ChildOfBoomTracer(), writer=sink, metrics=reg, clock=FakeClock(_NOW))
+    rec.ensure_turn("s1", "t1")  # succeeds — start_root() is not the boomed method
+    injector = make_felt_state_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
+
+    result = injector(
+        session_id="s1", turn_id="t1", user_message="how are you?", conversation_history=[]
+    )
+
+    assert isinstance(result, dict)  # NOT suppressed by the broken tracer
+    assert result["context"].startswith("<felt-state>")
+    assert "sore and settled" in result["context"]
+    # setup never got a context to persist a child span under — but the body ran.
+    assert not any(s["component"] == "turn.injector.felt_state" for s in sink.spans)
+
+
 def test_injector_silent_on_cold_start_and_leaves_state_untouched(tmp_path: Path) -> None:
     lm = _lm(tmp_path)
     lm.state.commit(State())  # cold start

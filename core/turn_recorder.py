@@ -54,10 +54,31 @@ _LOG = logging.getLogger("lifemodel.turn_recorder")
 #: mirroring the tick's own root component naming).
 _TURN_ROOT_COMPONENT = "turn"
 
-#: Hard cap on any free-text attr value persisted onto a span (``final_output``,
-#: ``reasoning``) — a turn's text is host-supplied and unbounded; the trace store
-#: is not a transcript archive, so it is sliced rather than stored whole.
+#: Hard cap on any free-text attr value persisted onto a span (``final_output``) —
+#: a turn's text is host-supplied and unbounded; the trace store is not a
+#: transcript archive, so it is sliced rather than stored whole.
 _MAX_TEXT = 4000
+
+
+def _map_host_status(status: str) -> str:
+    """Map a Hermes-supplied status string onto the recorder's own closed span
+    vocabulary (:data:`~lifemodel.ports.tracer.SpanStatus` — ``ok``/``suppressed``/
+    ``failed``) — FAIL-CLOSED: an unrecognized value NEVER reads back ``"ok"`` (a
+    failed/blocked tool call, or a bug in the caller, must never look like success).
+
+    Hermes' own ``post_tool_call`` vocabulary (``agent/shell_hooks.py``: ``status
+    "ok" | "error" | "blocked"``) maps ``"ok"`` → ``"ok"``, ``"blocked"`` (a plugin
+    veto — a deliberate no-act) → ``"suppressed"``, ``"error"`` → ``"failed"``.
+    Anything else — an unrecognized host value, or a caller passing some OTHER
+    string entirely — also maps to ``"failed"`` rather than being trusted verbatim;
+    the raw value is preserved separately (``host_status`` attr) so it is never
+    actually lost, just never allowed to read back as a false ``"ok"``.
+    """
+    if status == "ok":
+        return "ok"
+    if status == "blocked":
+        return "suppressed"
+    return "failed"
 
 
 class InjectorSpan:
@@ -171,6 +192,16 @@ class TurnRecorder:
         an ``upstream_traceparent`` CONTINUES that parsed trace (a reach-in turn
         joins the caller's trace). Never raises — a tracing hiccup, including a
         broken sink, must never crash the host turn.
+
+        The open write is submitted (enqueued to the writer) BEFORE the ledger
+        entry is inserted, and BOTH happen under the SAME lock :meth:`close_turn`
+        acquires just to pop it (M1 fix): a racing ``close_turn`` can only see this
+        key once the open write is already enqueued, and the writer applies its
+        single queue strictly FIFO (state/trace_store.py) — so the open write can
+        never land at the sink AFTER a subsequent close and stomp its
+        ``ended_at``/``status`` back to open. The writer's own ``submit_span`` is
+        a non-blocking ``put_nowait``, so holding the lock across it never risks
+        a stall.
         """
         try:
             key = (session_id, turn_id)
@@ -179,28 +210,31 @@ class TurnRecorder:
                 if key in self._ledger:  # idempotent — the first injector already opened it
                     return
                 self._reconcile_session_locked(session_id, now_iso)
-                self._evict_locked()
                 ctx = self._tracer.start_root(upstream_traceparent=upstream_traceparent)
+                # Persist BEFORE the ledger entry becomes visible (M1 fix) — eager,
+                # with ended_at/status NULL, so a crash still leaves a discoverable
+                # parent.
+                self._submit(
+                    ctx,
+                    component=_TURN_ROOT_COMPONENT,
+                    started_at=now_iso,
+                    ended_at=None,
+                    status=None,
+                    attrs={
+                        "frame_kind": "turn",
+                        "turn_id": turn_id,
+                        "session_id": session_id,
+                        "origin": origin,
+                        "model": model,
+                        "platform": platform,
+                    },
+                )
                 self._ledger[key] = _Entry(
                     ctx, now_iso, self._monotonic(), session_id, turn_id, origin, model, platform
                 )
-            # Persist OUTSIDE the lock (the sink is thread-safe + async): eager, with
-            # ended_at/status NULL, so a crash still leaves a discoverable parent.
-            self._submit(
-                ctx,
-                component=_TURN_ROOT_COMPONENT,
-                started_at=now_iso,
-                ended_at=None,
-                status=None,
-                attrs={
-                    "frame_kind": "turn",
-                    "turn_id": turn_id,
-                    "session_id": session_id,
-                    "origin": origin,
-                    "model": model,
-                    "platform": platform,
-                },
-            )
+                # Evict AFTER inserting (M4 fix): the post-insert ledger size is
+                # bounded to max_entries, never max_entries + 1.
+                self._evict_locked()
         except Exception:  # noqa: BLE001 - opening a turn trace must never crash the host turn
             _LOG.exception("ensure_turn failed session=%s turn=%s", session_id, turn_id)
 
@@ -223,11 +257,26 @@ class TurnRecorder:
         If ``(session_id, turn_id)`` has no open turn (``ensure_turn`` was never
         called, or the ledger already evicted it), the span degrades to a bare
         parentless root rather than raising — best-effort tracing, never a crash.
+
+        The SETUP (ledger lookup, ``child_of``/``start_root``, the clock read) is
+        itself wrapped in its own ``try`` (I4 fix): if the tracer/clock/ledger
+        blows up here, this degrades to a NO-OP span — the injector's body still
+        runs and returns its ordinary result — rather than letting the setup
+        failure propagate up and be mistaken for a BODY failure by the injector's
+        own fail-soft ``except``, which would silently suppress the whole
+        injection (felt/genesis/belief/commitment) on nothing worse than a broken
+        tracer. Only the body's OWN exception (raised after a successful setup)
+        is persisted ``failed``/``error`` and re-raised.
         """
-        parent = self._ledger_ctx(session_id, turn_id)
-        child = self._child_span_id(parent) if parent is not None else self._tracer.start_root()
+        try:
+            parent = self._ledger_ctx(session_id, turn_id)
+            child = self._child_span_id(parent) if parent is not None else self._tracer.start_root()
+            started = to_iso(self._clock.now())
+        except Exception:  # noqa: BLE001 - a broken tracer must never suppress the injection
+            _LOG.exception("injector_span setup failed component=%s", component)
+            yield InjectorSpan()  # no-op: the body still runs; nothing gets persisted
+            return
         span = InjectorSpan()
-        started = to_iso(self._clock.now())
         comp = f"turn.injector.{component}"
         try:
             yield span
@@ -261,6 +310,14 @@ class TurnRecorder:
         """Persist the ``turn.tool.<tool>`` child opened by :meth:`tool_open` and
         drop it from the ledger. An unknown ``tool_call_id`` (never opened, or
         already closed) is a best-effort no-op — never raises.
+
+        *status* is the RAW host value (``make_tool_span_close`` passes Hermes'
+        own ``post_tool_call`` status straight through: ``"ok"``/``"error"``/
+        ``"blocked"``) and is mapped through :func:`_map_host_status` onto the
+        span's closed vocabulary — FAIL-CLOSED (I1 fix): an unrecognized status
+        NEVER persists as ``"ok"``, so a failed or blocked tool can no longer
+        read back as a success. The raw value survives as the ``host_status``
+        attr regardless of the mapped outcome.
         """
         try:
             with self._lock:
@@ -273,8 +330,8 @@ class TurnRecorder:
                 component=f"turn.tool.{tool}",
                 started_at=started,
                 ended_at=to_iso(self._clock.now()),
-                status=status if status in ("ok", "suppressed", "failed") else "ok",
-                attrs=dict(attrs),
+                status=_map_host_status(status),
+                attrs={"host_status": status, **attrs},
             )
         except Exception:  # noqa: BLE001 - closing a tool span must never crash the host call
             _LOG.exception("tool_close failed id=%s", tool_call_id)
@@ -286,8 +343,9 @@ class TurnRecorder:
         turn_id: str,
         *,
         final_output: str = "",
-        reasoning: str = "",
         status: str = "ok",
+        model: str = "",
+        platform: str = "",
     ) -> None:
         """Close ``(session_id, turn_id)`` — a ``turn.completion`` child persisting
         the bounded final text, then the root span itself (``ended_at``=now,
@@ -296,13 +354,22 @@ class TurnRecorder:
         ``attrs_json`` wholesale, so re-emitting them here is what stops the close
         from erasing what open already persisted) — and drop the ledger entry.
 
+        ``model``/``platform`` (M5 fix): ``pre_llm_call`` (where :meth:`ensure_turn`
+        runs) does NOT reliably carry them, but ``post_llm_call`` (where this runs)
+        ALWAYS does — verified against ``agent/turn_finalizer.py``'s
+        ``invoke_hook("post_llm_call", ..., model=agent.model, platform=...)``. A
+        non-empty value passed here WINS over whatever :meth:`ensure_turn` stashed
+        (which is ``""`` on every real reactive turn today); an empty one (the
+        default, e.g. a caller that never learned them) falls back to the entry's
+        own stashed value, so a close never REGRESSES a value open already had.
+
         An unknown key (never opened via :meth:`ensure_turn`, or already closed by
         an earlier call) is a best-effort no-op: the ledger pop returns ``None``
         and this returns immediately — idempotent, so a duplicate close (e.g. a
-        retried ``post_llm_call``) never double-closes the root or raises. An
-        out-of-vocabulary ``status`` falls back to ``"ok"`` rather than persisting
-        a value the reader can't interpret. Never raises — a tracing hiccup on the
-        way out must never crash the host turn.
+        retried ``post_llm_call``) never double-closes the root or raises. *status*
+        is mapped through :func:`_map_host_status` — FAIL-CLOSED (I1 fix): an
+        out-of-vocabulary value now persists ``"failed"``, never ``"ok"``. Never
+        raises — a tracing hiccup on the way out must never crash the host turn.
         """
         try:
             key = (session_id, turn_id)
@@ -318,24 +385,21 @@ class TurnRecorder:
                 started_at=now_iso,
                 ended_at=now_iso,
                 status="ok",
-                attrs={
-                    "final_output": final_output[:_MAX_TEXT],
-                    "reasoning": reasoning[:_MAX_TEXT],
-                },
+                attrs={"final_output": final_output[:_MAX_TEXT]},
             )
             self._submit(
                 entry.ctx,
                 component=_TURN_ROOT_COMPONENT,
                 started_at=entry.opened_at_iso,
                 ended_at=now_iso,
-                status=status if status in ("ok", "suppressed", "failed") else "ok",
+                status=_map_host_status(status),
                 attrs={
                     "frame_kind": "turn",
                     "turn_id": turn_id,
                     "session_id": session_id,
                     "origin": entry.origin,
-                    "model": entry.model,
-                    "platform": entry.platform,
+                    "model": model or entry.model,
+                    "platform": platform or entry.platform,
                 },
             )
         except Exception:  # noqa: BLE001 - closing a turn must never crash the host turn
@@ -345,7 +409,17 @@ class TurnRecorder:
     def _reconcile_session_locked(self, session_id: str, now_iso: str) -> None:
         """Close any OTHER still-open turn of this session as failed/abandoned — the
         next turn is the only reliable signal a prior one died (post_llm_call is not
-        guaranteed). Caller holds the lock; the submit is best-effort after."""
+        guaranteed). Caller holds the lock; the submit is best-effort after.
+
+        Re-emits the FULL opening attr set (I2 fix) — ``session_id``/``model``/
+        ``platform`` alongside ``frame_kind``/``turn_id``/``origin`` — not just the
+        four this used to send: the store's ``submit_span`` upserts ``attrs_json``
+        WHOLESALE (no partial merge), so a reconcile that persisted only its own
+        new keys would silently ERASE what :meth:`ensure_turn` already wrote,
+        leaving an abandoned root unreadable by ``session_id``/``model``/
+        ``platform`` forever (:class:`_Entry` already stashes all three for
+        exactly this reason).
+        """
         dead = [e for (sid, _), e in self._ledger.items() if sid == session_id]
         for entry in dead:
             self._ledger.pop((entry.session_id, entry.turn_id), None)
@@ -358,7 +432,10 @@ class TurnRecorder:
                 attrs={
                     "frame_kind": "turn",
                     "turn_id": entry.turn_id,
+                    "session_id": entry.session_id,
                     "origin": entry.origin,
+                    "model": entry.model,
+                    "platform": entry.platform,
                     "outcome": "abandoned",
                 },
             )
