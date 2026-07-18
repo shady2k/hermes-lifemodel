@@ -39,6 +39,7 @@ from .hooks import (
     make_check_in_tool,
     make_commitment_injector,
     make_commitment_tool,
+    make_create_thought_tool,
     make_felt_state_injector,
     make_genesis_injector,
     make_inbound_observer,
@@ -218,6 +219,40 @@ _COMMITMENT_SCHEMA: dict[str, Any] = {
             },
         },
         "required": ["action"],
+    },
+}
+
+_CREATE_THOUGHT_DESCRIPTION = (
+    "Capture a thought you want to return to later. When something in this exchange "
+    "leaves a thread worth revisiting — a question you want to sit with, something you "
+    "noticed about them or about yourself, an idea not yet finished — write it here in a "
+    "sentence (in whatever language is natural), with a rough sense of how much it tugs "
+    "at you (salience 0..1). Your reply is your thinking; this only drops a bookmark your "
+    "quieter, later mind will pick up. Not every turn — only when something genuinely "
+    "tugs. You may capture more than one at once."
+)
+_CREATE_THOUGHT_SCHEMA: dict[str, Any] = {
+    "name": "create_thought",
+    "description": _CREATE_THOUGHT_DESCRIPTION,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "thoughts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "the thought to return to"},
+                        "salience": {
+                            "type": "number",
+                            "description": "0..1, how much it tugs (optional)",
+                        },
+                    },
+                    "required": ["content"],
+                },
+            }
+        },
+        "required": ["thoughts"],
     },
 }
 
@@ -870,6 +905,22 @@ def register(ctx: Any) -> None:
             schema=_COMMITMENT_SCHEMA,
             handler=make_commitment_tool(lambda: build_lifemodel(base_dir=sdir), metrics=metrics),
             description=_COMMITMENT_DESCRIPTION,
+        )
+
+    # --- create_thought tool wiring (lm-705.11) — REQUIRED --------------------
+    # The being's ride-the-tail thought capture: drops a thought mid-reply via the
+    # restricted capture path (spec §3). REQUIRED like commitment above:
+    # register_tool doesn't fail on the host side, so a throw here is our bug; the
+    # handler honours the Hermes contract (a JSON string, {\"error\": …}, never raises).
+    with wire("create_thought_tool", required=True, health=health, logger=_LOG):
+        ctx.register_tool(
+            "create_thought",
+            toolset="lifemodel",
+            schema=_CREATE_THOUGHT_SCHEMA,
+            handler=make_create_thought_tool(
+                lambda: build_lifemodel(base_dir=sdir), metrics=metrics
+            ),
+            description=_CREATE_THOUGHT_DESCRIPTION,
         )
 
     # --- Internal-cognition seam wiring (lm-705.6) — OPTIONAL/DEGRADED --------

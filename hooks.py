@@ -73,6 +73,7 @@ from .core.tick_metrics import (
     COMMITMENT_INJECTOR_OVERFLOW,
     COMMITMENT_TOOL_TOTAL,
     OBSERVER_ERRORS,
+    THOUGHT_TOOL_TOTAL,
 )
 from .core.timeutil import to_iso
 from .core.turn_metrics import (
@@ -87,6 +88,7 @@ from .domain.egress import ProactiveOutcome
 from .domain.memory import StaleTransition
 from .domain.objects import Belief, Commitment, CommitmentState, DesireState, InvalidPayload
 from .domain.session import SessionEnd
+from .domain.signal import Signal
 from .log import SpanBoundLogger
 from .ports.memory import MemoryPort
 from .state.brain_health import BrainHealth
@@ -2168,3 +2170,92 @@ def _stamp_soul(lm: LifeModel, state: State, *, soul_sha: str, born_at: str) -> 
         return
     born = state.genesis_completed_at or born_at
     lm.state.commit(replace(state, genesis_completed_at=born, soul_sha=soul_sha))
+
+
+# --- create_thought tool (lm-705.11) ------------------------------------------
+
+#: The producer tag carried on every thought-seed this tool emits (spec §8).
+THOUGHT_PRODUCER_TOOL = "create-thought-tool"
+#: The neutral non-zero default salience for a thought the being didn't weigh.
+DEFAULT_THOUGHT_SALIENCE = 0.5
+
+
+def _thought_seeds_from_args(args: dict[str, Any], *, now_iso: str | None) -> list[Signal]:
+    """Turn tool args into thought_seed signals (in-call dedup by content digest)."""
+    raw = args.get("thoughts")
+    seeds: list[Signal] = []
+    seen: set[str] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        tid = seed_thought_id(content)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        salience = item.get("salience")
+        salience = (
+            float(salience) if isinstance(salience, (int, float)) else DEFAULT_THOUGHT_SALIENCE
+        )
+        salience = max(0.0, min(1.0, salience))
+        seeds.append(
+            thought_seed_signal(
+                origin_id=f"thought-seed-{tid}",
+                content=content,
+                salience=salience,
+                producer=THOUGHT_PRODUCER_TOOL,
+                timestamp=now_iso,
+            )
+        )
+    return seeds
+
+
+def make_create_thought_tool(
+    build_lm: Callable[[], LifeModel], *, metrics: MetricRegistry | None = None
+) -> Callable[..., str]:
+    """The ``create_thought`` tool: the being drops thought(s) it wants to return to,
+    captured via the restricted path (spec §3). Honours the Hermes contract (a
+    ``json.dumps`` STRING, ``{\"error\": …}`` on failure, NEVER raises). Logs
+    counts/producer, NEVER ``content`` (D10)."""
+
+    def _handler(args: Any = None, **_ignored: Any) -> str:
+        try:
+            if not isinstance(args, dict):
+                _record_thought_tool(metrics, "error")
+                return json.dumps({"error": "expected an arguments object"}, ensure_ascii=False)
+            lm = build_lm()
+            assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
+            seeds = _thought_seeds_from_args(args, now_iso=to_iso(lm.clock.now()))
+            result = lm.coreloop.capture_thoughts(seeds)
+            outcome = "captured" if result.accepted else "empty"
+            _record_thought_tool(metrics, outcome)
+            _LOG.info(
+                "create_thought accepted=%d deduped=%d producer=%s",
+                result.accepted,
+                result.deduped,
+                THOUGHT_PRODUCER_TOOL,
+            )
+            return json.dumps(
+                {"accepted": result.accepted, "deduped": result.deduped},
+                ensure_ascii=False,
+            )
+        except Exception as exc:  # Hermes tool contract: return {"error": …}, never raise
+            _LOG.error(
+                "create_thought_failed error=%s",
+                f"{type(exc).__name__}: {exc}",
+                exc_info=True,
+            )
+            _record_thought_tool(metrics, "error")
+            return json.dumps(
+                {"error": "the create_thought tool is unavailable right now"},
+                ensure_ascii=False,
+            )
+
+    return _handler
+
+
+def _record_thought_tool(metrics: MetricRegistry | None, outcome: str) -> None:
+    if metrics is not None:
+        metrics.inc(THOUGHT_TOOL_TOTAL, outcome=outcome)

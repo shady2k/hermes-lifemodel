@@ -60,6 +60,9 @@ COMMITMENT_INJECTOR_OVERFLOW = "lifemodel_commitment_injector_overflow_total"
 #: ``action`` × ``outcome`` (created / already_held / ok / not_found / already_deferred /
 #: already_terminal / invalid / error). Emitted from the tool handler, fail-open.
 COMMITMENT_TOOL_TOTAL = "lifemodel_commitment_tool_total"
+#: The create_thought tool (lm-705.11): capture calls by ``outcome`` (captured /
+#: empty / error). Emitted from the tool handler, fail-open. NEVER carries content.
+THOUGHT_TOOL_TOTAL = "lifemodel_thought_tool_total"
 #: The brain HEARTBEAT (spec §4.4, codex MAJOR-8): a monotonic counter advanced once
 #: per completed tick, plus a gauge holding the last tick's wall-clock epoch. These
 #: are SUPPORTING evidence only — the PRIMARY liveness stays the durable
@@ -163,6 +166,12 @@ UNIVERSAL_SPECS: tuple[MetricSpec, ...] = (
         help="commitment tool calls by action-folded outcome (e.g. create_created / "
         "create_already_held / create_exists / discharge_honoured / discharge_not_found / "
         "defer_deferred / defer_already_deferred / <action>_invalid / unavailable / error).",
+        label_keys=("outcome",),
+    ),
+    MetricSpec(
+        name=THOUGHT_TOOL_TOTAL,
+        kind="counter",
+        help="create_thought tool calls by outcome (captured / empty / error).",
         label_keys=("outcome",),
     ),
     MetricSpec(

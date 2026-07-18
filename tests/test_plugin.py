@@ -215,6 +215,24 @@ def test_register_wires_commitment_injector_and_tool(
     assert "self-authored intention" in schema["description"].lower()
 
 
+def test_register_wires_create_thought_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # lm-705.11: the create_thought tool is registered in the lifemodel toolset.
+    monkeypatch.setattr(lifemodel, "_hermes_home", lambda: tmp_path)
+    ctx = FakeCtx()
+
+    lifemodel.register(ctx)
+
+    assert "create_thought" in ctx.tools
+    schema = ctx.tools["create_thought"]["kwargs"]["schema"]
+    assert schema["name"] == "create_thought"
+    assert schema["parameters"]["required"] == ["thoughts"]
+    assert "thoughts" in schema["parameters"]["properties"]
+    assert "content" in schema["parameters"]["properties"]["thoughts"]["items"]["properties"]
+    assert "bookmark" in schema["description"].lower()
+
+
 def test_register_check_in_tool_schema_and_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
