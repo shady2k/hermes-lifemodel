@@ -337,7 +337,14 @@ class SQLiteRuntimeStore:
             self._put_on(conn, draft, now)
         return draft.id
 
-    def _put_on(self, conn: sqlite3.Connection, draft: MemoryDraft, now: datetime) -> None:
+    def _put_on(
+        self,
+        conn: sqlite3.Connection,
+        draft: MemoryDraft,
+        now: datetime,
+        *,
+        create_only: bool = False,
+    ) -> None:
         """Apply *draft*'s UPSERT on *conn* using the single passed *now*.
 
         No connection management, no clock read — the caller owns both (so one
@@ -362,17 +369,23 @@ class SQLiteRuntimeStore:
         payload_json = json.dumps(draft.payload, allow_nan=False)
         expires_at = normalize_expires_at(draft.expires_at)
         now_iso = stamp_iso_utc(now)
+        conflict = (
+            "ON CONFLICT(kind, id) DO NOTHING"
+            if create_only
+            else (
+                "ON CONFLICT(kind, id) DO UPDATE SET "
+                "state=excluded.state, recipient_id=excluded.recipient_id, "
+                "payload_json=excluded.payload_json, salience=excluded.salience, "
+                "confidence=excluded.confidence, expires_at=excluded.expires_at, "
+                "source=excluded.source, updated_at=excluded.updated_at, "
+                "revision=memory_records.revision + 1"
+            )
+        )
         conn.execute(
             "INSERT INTO memory_records ("
             "kind, id, state, recipient_id, payload_json, salience, confidence, "
             "expires_at, source, created_at, updated_at, revision, schema_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?) "
-            "ON CONFLICT(kind, id) DO UPDATE SET "
-            "state=excluded.state, recipient_id=excluded.recipient_id, "
-            "payload_json=excluded.payload_json, salience=excluded.salience, "
-            "confidence=excluded.confidence, expires_at=excluded.expires_at, "
-            "source=excluded.source, updated_at=excluded.updated_at, "
-            "revision=memory_records.revision + 1",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?) " + conflict,
             (
                 draft.kind,
                 draft.id,
@@ -731,7 +744,7 @@ class SQLiteRuntimeStore:
             for mutation in batch:
                 match mutation:
                     case PutOp():
-                        self._put_on(conn, mutation.draft, now)
+                        self._put_on(conn, mutation.draft, now, create_only=mutation.create_only)
                     case TransitionOp():
                         self._transition_on(
                             conn,

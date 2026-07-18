@@ -159,6 +159,11 @@ class PutOp:
     a batch without importing the core; see :data:`MemoryMutation`."""
 
     draft: MemoryDraft
+    #: Create-if-absent: when True the committer inserts only if no ``(kind, id)``
+    #: row exists in ANY state, and is a no-op on conflict (never an upsert). The
+    #: atomic dedup primitive for the capture path (thought-capture spec §3.1):
+    #: it never resurrects a terminal row and never overwrites provenance.
+    create_only: bool = False
 
 
 @dataclass(frozen=True)

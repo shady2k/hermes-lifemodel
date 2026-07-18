@@ -309,7 +309,7 @@ class FakeStateStore:
                 match mutation:
                     case PutOp():
                         assert self._memory is not None  # guarded above
-                        self._memory.put(mutation.draft)
+                        self._memory.put(mutation.draft, create_only=mutation.create_only)
                     case TransitionOp():
                         assert self._memory is not None  # guarded above
                         self._memory.transition(
@@ -349,12 +349,14 @@ class FakeMemoryStore:
         self._clock = clock
         self._rows: dict[tuple[str, str], MemoryRecord] = {}
 
-    def put(self, draft: MemoryDraft) -> str:
+    def put(self, draft: MemoryDraft, *, create_only: bool = False) -> str:
         ensure_json_serializable(draft.payload)
         expires_at = normalize_expires_at(draft.expires_at)  # validate + normalize on write
         now = stamp_iso_utc(self._clock.now())  # canonical fixed-width UTC; rejects a naive clock
         key = (draft.kind, draft.id)
         existing = self._rows.get(key)
+        if create_only and existing is not None:
+            return draft.id  # create-if-absent: any-state conflict is a no-op
         created_at = existing.created_at if existing is not None else now
         revision = existing.revision + 1 if existing is not None else 0
         self._rows[key] = MemoryRecord(
