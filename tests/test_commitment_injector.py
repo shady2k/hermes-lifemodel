@@ -10,6 +10,7 @@ surfaces ALL active (cap-backstopped, overflow notice), self-authored framing (n
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +20,13 @@ import pytest
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.commitment_view import commitment_from_live_fields, encode_commitment
 from lifemodel.core.metrics import MetricRegistry
-from lifemodel.core.tick_metrics import OBSERVER_ERRORS, register_universal_metrics
+from lifemodel.core.tick_metrics import (
+    COMMITMENT_INJECTOR_OVERFLOW,
+    OBSERVER_ERRORS,
+    register_universal_metrics,
+)
+from lifemodel.core.turn_metrics import TURN_INJECTOR_TOTAL
+from lifemodel.core.turn_recorder import TurnRecorder
 from lifemodel.hooks import (
     _COMMITMENT_BLOCK_CLOSE,
     _COMMITMENT_BLOCK_OPEN,
@@ -28,7 +35,7 @@ from lifemodel.hooks import (
 )
 from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
-from lifemodel.testing import FakeClock
+from lifemodel.testing import FakeClock, FakeTracer
 
 _NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
@@ -41,6 +48,35 @@ def _registry() -> MetricRegistry:
     reg = MetricRegistry()
     register_universal_metrics(reg)
     return reg
+
+
+class _CapturingSink:
+    """Minimal :class:`~lifemodel.state.trace_store.TraceSink` fake — mirrors
+    ``tests/test_belief_injector.py``'s local one, just enough for a
+    :class:`TurnRecorder` to persist spans into and for a test to inspect them."""
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, object]] = []
+
+    def submit_span(self, **kw: object) -> bool:
+        self.spans.append(kw)
+        return True
+
+    def submit_event(self, **kw: object) -> bool:
+        return True
+
+    def submit_correlation(self, **kw: object) -> bool:
+        return True
+
+
+def _recorder(reg: MetricRegistry) -> tuple[TurnRecorder, _CapturingSink]:
+    """A real :class:`TurnRecorder` over a capturing sink + the SAME shared *reg* —
+    the commitment injector's ``turn_injector_total`` bump lands in the registry the
+    test already reads, and the sink lets a test assert the ``turn.injector.commitment``
+    child span was actually opened (lm-hg7 Task 10, mirroring Task 9's belief helper)."""
+    sink = _CapturingSink()
+    rec = TurnRecorder(tracer=FakeTracer(), writer=sink, metrics=reg, clock=FakeClock(_NOW))
+    return rec, sink
 
 
 def _put(store, content, *, trigger_kind="condition", trigger_value="he brings it up"):
@@ -136,3 +172,75 @@ def test_raising_read_is_fail_soft_and_recorded(
         assert injector(session_id="s", user_message="hi") is None  # never raises
     assert health.last_observer_error.get("commitment_injector") is not None
     assert reg.get(OBSERVER_ERRORS).value(component="commitment_injector") == 1.0
+
+
+# ---- lm-hg7 Task 10: turn.injector.commitment child span + turn_injector_total ----
+
+
+def test_surfaced_commitment_emits_child_span_and_metric_with_ids_but_no_content(
+    tmp_path: Path,
+) -> None:
+    lm = _lm(tmp_path)
+    lm.state.commit(State())
+    content = "reflect the spending question back"
+    cid = _put(lm.state, content, trigger_value="he asks to spend on himself")
+    reg = _registry()
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_commitment_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
+
+    result = injector(session_id="s1", turn_id="t1", user_message="hi")
+
+    assert result is not None and content in result["context"]
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="commitment", outcome="surfaced") == 1.0
+    span = next(s for s in sink.spans if s["component"] == "turn.injector.commitment")
+    attrs = span["attrs"]
+    assert attrs["outcome"] == "surfaced"
+    assert attrs["count"] == 1
+    assert attrs["ids"] == [cid]
+    assert attrs["overflow"] is False
+    # D10 redaction: only the opaque id rides the span, NEVER the commitment content
+    assert content not in json.dumps(span)
+
+
+def test_no_active_commitments_emits_empty_outcome_and_child_span(tmp_path: Path) -> None:
+    lm = _lm(tmp_path)
+    lm.state.commit(State())
+    reg = _registry()
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_commitment_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
+
+    result = injector(session_id="s1", turn_id="t1", user_message="hi")
+
+    assert result is None
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="commitment", outcome="empty") == 1.0
+    span = next(s for s in sink.spans if s["component"] == "turn.injector.commitment")
+    assert span["attrs"]["outcome"] == "empty"
+
+
+def test_overflow_still_increments_overflow_metric_and_sets_overflow_attr_on_child(
+    tmp_path: Path,
+) -> None:
+    """The over-cap case is a `surfaced` outcome (overflow is orthogonal to outcome,
+    per lm-hg7 Task 10) — the pre-existing `COMMITMENT_INJECTOR_OVERFLOW` bump stays
+    untouched AND the child span carries `overflow=True` alongside it."""
+    lm = _lm(tmp_path)
+    lm.state.commit(State())
+    for i in range(10):  # > max_surfaced (8)
+        _put(lm.state, f"standing intention number {i}")
+    reg = _registry()
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_commitment_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
+
+    result = injector(session_id="s1", turn_id="t1", user_message="hi")
+
+    assert result is not None
+    assert reg.get(COMMITMENT_INJECTOR_OVERFLOW).value() == 1.0
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="commitment", outcome="surfaced") == 1.0
+    span = next(s for s in sink.spans if s["component"] == "turn.injector.commitment")
+    attrs = span["attrs"]
+    assert attrs["outcome"] == "surfaced"
+    assert attrs["overflow"] is True
+    assert attrs["count"] == 8

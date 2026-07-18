@@ -75,7 +75,12 @@ from .core.tick_metrics import (
     OBSERVER_ERRORS,
 )
 from .core.timeutil import to_iso
-from .core.turn_metrics import INJECTOR_BELIEF, INJECTOR_FELT, INJECTOR_GENESIS
+from .core.turn_metrics import (
+    INJECTOR_BELIEF,
+    INJECTOR_COMMITMENT,
+    INJECTOR_FELT,
+    INJECTOR_GENESIS,
+)
 from .core.turn_recorder import TurnRecorder
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
@@ -1311,6 +1316,7 @@ def make_commitment_injector(
     params: CommitmentInjectParams = DEFAULT_COMMITMENT_INJECT_PARAMS,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
+    recorder: TurnRecorder | None = None,
 ) -> Callable[..., dict[str, str] | None]:
     """Return the 4th ``pre_llm_call`` hook — the being's held DIRECTIVES carried into its
     live turn (lm-705.21). Once per turn it reads ALL active commitments (bounded, most-
@@ -1321,34 +1327,53 @@ def make_commitment_injector(
     the felt-state/genesis/belief injectors on the one ``pre_llm_call`` channel. Fully fail-
     soft (spec §8): any throw is logged + recorded on its OWN ``commitment_injector`` observer
     and swallowed with ``None`` — the host's turn is never crashed. Logs count/ids/overflow/
-    latency — never ``content`` (D10)."""
+    latency — never ``content`` (D10).
+
+    Every verdict — ``"unavailable"`` (no memory door), ``"empty"`` (nothing active) or
+    ``"surfaced"`` (+ ``count``/``ids``/``overflow``, the same opaque ids the log line
+    carries — NEVER content, D10) — is recorded as this turn's ``turn.injector.commitment``
+    child span + a ``lifemodel_turn_injector_total{component=commitment,outcome}`` bump
+    (lm-hg7 Task 10), through the same shared :func:`_injector_span` wrapper Tasks 7/8/9 gave
+    the felt-state/genesis/belief injectors. The pre-existing ``COMMITMENT_INJECTOR_OVERFLOW``
+    counter is UNCHANGED — overflow is a flood-backstop signal orthogonal to the outcome, so
+    an over-cap turn is still ``outcome="surfaced"`` (just with ``overflow=True``), not a
+    distinct outcome value. ``recorder`` is optional (``None`` degrades to a no-op span, e.g.
+    off-host unit tests that don't care about turn observability)."""
 
     def _injector(
-        *, session_id: str = "", user_message: str = "", **_ignored: Any
+        *,
+        session_id: str = "",
+        turn_id: str = "",
+        user_message: str = "",
+        **_ignored: Any,
     ) -> dict[str, str] | None:
         started = time.monotonic()
         try:
-            lm = build_lm()
-            memory = lm.state if isinstance(lm.state, MemoryPort) else None
-            if memory is None:  # no memory door → nothing to surface (degrade, not crash)
-                return None
-            fetched = read_active_commitments(memory, limit=params.max_surfaced)
-            if not fetched:
-                return None
-            overflow = len(fetched) > params.max_surfaced
-            surfaced = fetched[: params.max_surfaced]
-            block = _compose_commitment_block(surfaced, overflow=overflow)
-            ids = [c.id for c in surfaced]
-            if overflow and metrics is not None:
-                metrics.inc(COMMITMENT_INJECTOR_OVERFLOW)
-            _LOG.info(
-                "commitment_injector surfaced count=%d ids=%s overflow=%s latency_ms=%.1f",
-                len(ids),
-                ids,  # opaque record ids only — NEVER content (D10)
-                overflow,
-                (time.monotonic() - started) * 1000.0,
-            )
-            return {"context": block}
+            with _injector_span(recorder, session_id, turn_id, INJECTOR_COMMITMENT) as span:
+                lm = build_lm()
+                memory = lm.state if isinstance(lm.state, MemoryPort) else None
+                if memory is None:  # no memory door → nothing to surface (degrade, not crash)
+                    span.set(outcome="unavailable")
+                    return None
+                fetched = read_active_commitments(memory, limit=params.max_surfaced)
+                if not fetched:
+                    span.set(outcome="empty")
+                    return None
+                overflow = len(fetched) > params.max_surfaced
+                surfaced = fetched[: params.max_surfaced]
+                block = _compose_commitment_block(surfaced, overflow=overflow)
+                ids = [c.id for c in surfaced]
+                if overflow and metrics is not None:
+                    metrics.inc(COMMITMENT_INJECTOR_OVERFLOW)
+                span.set(outcome="surfaced", count=len(ids), ids=ids, overflow=overflow)
+                _LOG.info(
+                    "commitment_injector surfaced count=%d ids=%s overflow=%s latency_ms=%.1f",
+                    len(ids),
+                    ids,  # opaque record ids only — NEVER content (D10)
+                    overflow,
+                    (time.monotonic() - started) * 1000.0,
+                )
+                return {"context": block}
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=COMMITMENT_INJECTOR_OBSERVER,
