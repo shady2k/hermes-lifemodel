@@ -635,13 +635,6 @@ def register(ctx: Any) -> None:
                 lambda: build_lifemodel(
                     base_dir=sdir, trace_writer=_outcome_writer, event_ring=_outcome_ring
                 ),
-                # The waking-mind appraisal seam (lm-705.1, spec §4.1) is the being's
-                # OWN judgment (rides-the-tail), NOT a heuristic — deciding "worth a
-                # thought?" is cognition, not pattern-matching. That appraiser is not
-                # wired yet, so no ``appraiser=`` is passed and the capture pipeline
-                # stays dormant (``_maybe_capture_thought`` no-ops on ``None``) until it
-                # lands.
-                #
                 # The noticing-buffer CLOSE seam (lm-705.5 Task 3/E3): the SAME
                 # ``noticing_buffer`` instance the pre_llm injector below opens against —
                 # on a genuine reactive turn this closes its per-session pending slot,

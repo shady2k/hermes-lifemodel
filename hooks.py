@@ -36,7 +36,6 @@ from .adapters.session_end import sleep_soft
 from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite, prior_soul
 from .composition import LifeModel
 from .core.affect import felt_word
-from .core.appraisal import Appraiser
 from .core.belief_view import read_active_beliefs
 from .core.commitment_view import (
     COMMITMENT_KIND,
@@ -583,7 +582,6 @@ def _emit_async_outcome(
 def make_post_llm_observer(
     build_lm: Callable[[], LifeModel],
     *,
-    appraiser: Appraiser | None = None,
     buffer: NoticingBuffer | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
@@ -652,10 +650,6 @@ def make_post_llm_observer(
             state = lm.state.load()
             if not _is_pending_proactive_turn(state.pending_proactive_id, user_message):
                 # NOT a proactive read-back → an ordinary owner↔being exchange.
-                # Appraise it (out-of-band) and, on a seed, capture a thought via a
-                # core component in its own EVENT frame (spec §4.1). This hook never
-                # writes the store itself; it only seeds a signal.
-                _maybe_capture_thought(lm, appraiser, user_message, assistant_response)
                 _maybe_complete_buffer_entry(
                     lm,
                     buffer,
@@ -749,47 +743,6 @@ def _is_genuine_reactive_exchange(user_message: str, assistant_response: str) ->
     if not text or _is_own_impulse(text) or _is_control_command(text):
         return False
     return not _is_no_reply(assistant_response)
-
-
-def _maybe_capture_thought(
-    lm: LifeModel,
-    appraiser: Appraiser | None,
-    user_message: str,
-    assistant_response: str,
-) -> None:
-    """Appraise a completed reactive exchange; on a seed, run an EVENT frame that
-    carries a ``thought_seed`` signal for ``ThoughtCapture`` (spec §4.1).
-
-    Runs INSIDE the caller's fail-loud ``try`` (so a throw here is logged + swallowed
-    like any other observer failure, never crashes the host turn). ``appraiser is
-    None`` is the documented no-op (no live wiring passed yet, or the caller chose to
-    opt out); :func:`_is_genuine_reactive_exchange` is the shared band-pass every
-    other guard here mirrors (own impulse / control command / declined response are
-    not a genuine exchange).
-    """
-    if appraiser is None:
-        return
-    if not _is_genuine_reactive_exchange(user_message, assistant_response):
-        return
-    seed = appraiser.appraise(user_message=user_message, assistant_response=assistant_response)
-    if seed is None:
-        return
-    assert lm.coreloop is not None, "coreloop must be wired by build_lifemodel"
-    now = lm.clock.now()
-    run_frame(
-        lm.coreloop,
-        [
-            thought_seed_signal(
-                origin_id=f"thought-seed-{seed_thought_id(seed.content)}",
-                content=seed.content,
-                salience=seed.salience,
-                actionability=seed.actionability,
-                other_regarding_value=seed.other_regarding_value,
-                timestamp=to_iso(now),
-            )
-        ],
-        trigger=FrameTrigger.EVENT,
-    )
 
 
 def _maybe_complete_buffer_entry(

@@ -476,4 +476,9 @@ def build_capture_harness() -> object:
     result.state_store = state_store
     result.memory = memory
     result.egress = egress
+    # A LightModel stand-in for the tool handler: exposes coreloop + clock.
+    result.lm = type("LightModel", (), {})()
+    result.lm.coreloop = coreloop
+    result.lm.clock = clock
+    result.metrics = coreloop._metrics
     return result
