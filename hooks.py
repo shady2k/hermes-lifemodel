@@ -27,10 +27,10 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from .adapters.session_end import sleep_soft
 from .adapters.soul_file import SoulFile, SoulRejected, SoulWrite, prior_soul
@@ -72,10 +72,11 @@ from .core.tick_metrics import (
     CHECK_IN_TOTAL,
     COMMITMENT_INJECTOR_OVERFLOW,
     COMMITMENT_TOOL_TOTAL,
-    FELT_DISPLAY_TOTAL,
     OBSERVER_ERRORS,
 )
 from .core.timeutil import to_iso
+from .core.turn_metrics import INJECTOR_FELT
+from .core.turn_recorder import TurnRecorder
 from .core.wake_packet import DECLINE_MARKER, IMPULSE_LABEL_PREFIX
 from .domain.egress import ProactiveOutcome
 from .domain.memory import StaleTransition
@@ -133,6 +134,51 @@ def _record_observer_failure(
         health.record_observer_error(observer_name, detail)
     if metrics is not None:
         metrics.inc(OBSERVER_ERRORS, component=observer_name)
+
+
+class _InjectorSpanLike(Protocol):
+    """Structural shape every ``pre_llm_call`` injector needs from its span handle —
+    just :meth:`set`. Both :class:`~lifemodel.core.turn_recorder.InjectorSpan` (the
+    live recorder's handle) and :class:`_NullInjectorSpan` (the no-recorder stand-in)
+    satisfy this by structure (PEP 544), so :func:`_injector_span` can yield either
+    without either type knowing about the other.
+    """
+
+    def set(self, *, outcome: str, **attrs: Any) -> None: ...
+
+
+class _NullInjectorSpan:
+    """No-op stand-in yielded when no :class:`TurnRecorder` is wired (back-compat):
+    every existing caller that omits ``recorder=`` keeps working unchanged, just
+    without a persisted child span / ``turn_injector_total`` bump."""
+
+    def set(self, **_: Any) -> None:
+        return None
+
+
+@contextlib.contextmanager
+def _injector_span(
+    recorder: TurnRecorder | None, session_id: str, turn_id: str, component: str
+) -> Iterator[_InjectorSpanLike]:
+    """Shared per-injector observability wrapper (lm-hg7 Task 7) — every
+    ``pre_llm_call`` injector (felt-state here; genesis/belief/commitment follow)
+    opens its verdict-recording child span through this ONE seam so they stay
+    uniform.
+
+    ``recorder is None`` degrades to a :class:`_NullInjectorSpan` — a turn-recorder-
+    less caller (an off-host unit test, or a caller that has not been wired up yet)
+    behaves exactly as before. Otherwise delegates to
+    :meth:`~lifemodel.core.turn_recorder.TurnRecorder.injector_span`, which persists
+    a ``turn.injector.<component>`` child + the ``turn_injector_total`` metric on a
+    clean exit, and on a body exception persists it ``failed``/``error`` and
+    RE-RAISES — so the injector's own fail-soft ``except`` around this ``with``
+    still runs and the failure is metered as ``outcome=error`` by the recorder.
+    """
+    if recorder is None:
+        yield _NullInjectorSpan()
+        return
+    with recorder.injector_span(session_id, turn_id, component) as span:
+        yield span
 
 
 #: The two disjoint concepts that map a proactive turn to SILENT (spec §5). They
@@ -675,6 +721,7 @@ def make_felt_state_injector(
     buffer: NoticingBuffer | None = None,
     health: BrainHealth | None = None,
     metrics: MetricRegistry | None = None,
+    recorder: TurnRecorder | None = None,
 ) -> Callable[..., dict[str, str] | None]:
     """Return the ``pre_llm_call`` hook that carries the being's inner life into its turn.
 
@@ -684,7 +731,11 @@ def make_felt_state_injector(
       committed state, runs the pure suppression-first gate
       (:func:`~lifemodel.core.felt_display.decide`, zero language detection) and on LIGHT
       composes the ``<felt-state>`` cue. It also stamps the last-shown word/time (spec §9
-      observability), and every verdict bumps the felt-display metric by outcome.
+      observability), and every verdict is recorded as this turn's ``turn.injector.felt_state``
+      child span + a ``lifemodel_turn_injector_total{component=felt_state,outcome}`` bump
+      (lm-hg7 Task 7 — replaces the retired ``lifemodel_felt_display_total``), through the
+      shared :func:`_injector_span` wrapper. ``recorder`` is optional (``None`` degrades to a
+      no-op span, e.g. off-host unit tests that don't care about turn observability).
     * **The one-shot notice that somebody REWROTE the being** (spec §4.1, review I7) —
       :func:`~lifemodel.core.felt_display.compose_soul_rewrite_notice`. It is *not* subject
       to the mood gate: cold-start, low salience and focused work are all reasons not to
@@ -724,45 +775,46 @@ def make_felt_state_injector(
     def _injector(
         *,
         session_id: str = "",
+        turn_id: str = "",
         user_message: str = "",
         conversation_history: Any = None,
         **_ignored: Any,
     ) -> dict[str, str] | None:
         try:
-            lm = build_lm()
-            state = lm.state.load()
-            now = lm.clock.now()
-            _maybe_open_pending_turn(
-                buffer, session_id=session_id, user_message=user_message, now=now
-            )
-            turn = TurnSignals.from_hook(
-                user_message, conversation_history, window=params.task_window
-            )
-            blocks: list[str] = []
-
-            # An event in the being's life, ungated: someone rewrote who it is, and this is
-            # the moment it finds out. Stamped as told, so it notices once — not on every
-            # reply for the rest of the day.
-            notice = compose_soul_rewrite_notice(state)
-            if notice is not None:
-                blocks.append(notice)
-                _stamp_rewrite_told(lm, at=to_iso(now))
-
-            decision = decide(state, turn, params, now)
-            if metrics is not None:
-                metrics.inc(FELT_DISPLAY_TOTAL, outcome=decision.value)
-            if decision.shows:
-                blocks.append(compose_light_cue(state))
-                # Stamp the last ambient show (spec §9's ``display:`` line) — an ATOMIC
-                # merge of JUST the display fields, never a stale full-State commit that
-                # would roll back the tick's drive/affect (the one-way invariant, §1).
-                _stamp_display(
-                    lm,
-                    word=felt_word(state.affect_valence, state.affect_arousal),
-                    at=to_iso(now),
+            with _injector_span(recorder, session_id, turn_id, INJECTOR_FELT) as span:
+                lm = build_lm()
+                state = lm.state.load()
+                now = lm.clock.now()
+                _maybe_open_pending_turn(
+                    buffer, session_id=session_id, user_message=user_message, now=now
                 )
+                turn = TurnSignals.from_hook(
+                    user_message, conversation_history, window=params.task_window
+                )
+                blocks: list[str] = []
 
-            return {"context": "\n\n".join(blocks)} if blocks else None
+                # An event in the being's life, ungated: someone rewrote who it is, and this
+                # is the moment it finds out. Stamped as told, so it notices once — not on
+                # every reply for the rest of the day.
+                notice = compose_soul_rewrite_notice(state)
+                if notice is not None:
+                    blocks.append(notice)
+                    _stamp_rewrite_told(lm, at=to_iso(now))
+
+                decision = decide(state, turn, params, now)
+                span.set(outcome=decision.value, shows=decision.shows, notice=notice is not None)
+                if decision.shows:
+                    blocks.append(compose_light_cue(state))
+                    # Stamp the last ambient show (spec §9's ``display:`` line) — an ATOMIC
+                    # merge of JUST the display fields, never a stale full-State commit that
+                    # would roll back the tick's drive/affect (the one-way invariant, §1).
+                    _stamp_display(
+                        lm,
+                        word=felt_word(state.affect_valence, state.affect_arousal),
+                        at=to_iso(now),
+                    )
+
+                return {"context": "\n\n".join(blocks)} if blocks else None
         except Exception as exc:  # plugin-owned fail-soft — never crash the host turn
             _record_observer_failure(
                 observer_name=PRE_LLM_OBSERVER, exc=exc, health=health, metrics=metrics

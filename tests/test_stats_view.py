@@ -119,7 +119,9 @@ def test_now_renders_seeded_registry() -> None:
         3.0, reason="quiet_hours"
     )
     reg.counter("lifemodel_signals_intake_total", label_keys=("outcome",)).inc(9.0, outcome="kept")
-    reg.counter("lifemodel_felt_display_total", label_keys=("outcome",)).inc(1.0, outcome="light")
+    reg.counter("lifemodel_turn_injector_total", label_keys=("component", "outcome")).inc(
+        1.0, component="felt_state", outcome="light"
+    )
     reg.counter("lifemodel_check_in_total", label_keys=("outcome",)).inc(2.0, outcome="read")
 
     text = "\n".join(render_now(reg))
@@ -138,17 +140,23 @@ def test_now_shows_the_felt_display_outcome_split() -> None:
     # indistinguishable from a broken one unless the owner can see WHY it stayed quiet.
     # These counters were being recorded but never surfaced, which is why the first live
     # runs had to be diagnosed by reading metrics.sqlite by hand.
+    #
+    # Since lm-hg7 Task 7 the felt-display line is a filtered read of the SHARED
+    # ``turn_injector_total`` counter (``component=felt_state``), not a metric of its
+    # own — so this also seeds an unrelated component's series to prove the filter
+    # actually excludes it rather than merely happening to sum to the right number.
     reg = MetricRegistry()
-    felt = reg.counter("lifemodel_felt_display_total", label_keys=("outcome",))
-    felt.inc(2.0, outcome="light")
-    felt.inc(9.0, outcome="not_salient")
-    felt.inc(1.0, outcome="task")
+    felt = reg.counter("lifemodel_turn_injector_total", label_keys=("component", "outcome"))
+    felt.inc(2.0, component="felt_state", outcome="light")
+    felt.inc(9.0, component="felt_state", outcome="not_salient")
+    felt.inc(1.0, component="felt_state", outcome="task")
+    felt.inc(5.0, component="genesis", outcome="light")  # a DIFFERENT injector — must not bleed in
     reg.counter("lifemodel_check_in_total", label_keys=("outcome",)).inc(3.0, outcome="read")
 
     text = "\n".join(render_now(reg))
 
     assert "felt_display" in text
-    assert "shown 2" in text  # the mood surfaced twice
+    assert "shown 2" in text  # the mood surfaced twice — NOT 7 (genesis's series excluded)
     assert "not_salient 9" in text  # …and stayed quiet for these reasons
     assert "task 1" in text
     assert "check_in" in text and "read 3" in text

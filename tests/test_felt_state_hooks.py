@@ -24,19 +24,16 @@ import pytest
 from lifemodel.composition import build_lifemodel
 from lifemodel.core.desire_view import build_contact_desire, encode_contact_desire
 from lifemodel.core.metrics import MetricRegistry
-from lifemodel.core.tick_metrics import (
-    CHECK_IN_TOTAL,
-    FELT_DISPLAY_TOTAL,
-    OBSERVER_ERRORS,
-    register_universal_metrics,
-)
+from lifemodel.core.tick_metrics import CHECK_IN_TOTAL, OBSERVER_ERRORS, register_universal_metrics
+from lifemodel.core.turn_metrics import TURN_INJECTOR_TOTAL
+from lifemodel.core.turn_recorder import TurnRecorder
 from lifemodel.domain.objects import DesireState
 from lifemodel.hooks import make_check_in_tool, make_felt_state_injector
 from lifemodel.ports.memory import MemoryPort
 from lifemodel.state.brain_health import BrainHealth
 from lifemodel.state.model import State
 from lifemodel.state.sqlite_store import SQLiteRuntimeStore
-from lifemodel.testing import FakeClock
+from lifemodel.testing import FakeClock, FakeTracer
 
 _NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
@@ -45,6 +42,36 @@ def _registry() -> MetricRegistry:
     reg = MetricRegistry()
     register_universal_metrics(reg)
     return reg
+
+
+class _CapturingSink:
+    """Minimal :class:`~lifemodel.state.trace_store.TraceSink` fake — mirrors
+    ``tests/test_turn_recorder.py``'s local one, just enough for a
+    :class:`TurnRecorder` to persist spans into and for a test to inspect them.
+    """
+
+    def __init__(self) -> None:
+        self.spans: list[dict[str, object]] = []
+
+    def submit_span(self, **kw: object) -> bool:
+        self.spans.append(kw)
+        return True
+
+    def submit_event(self, **kw: object) -> bool:
+        return True
+
+    def submit_correlation(self, **kw: object) -> bool:
+        return True
+
+
+def _recorder(reg: MetricRegistry) -> tuple[TurnRecorder, _CapturingSink]:
+    """A real :class:`TurnRecorder` over a capturing sink + the SAME shared *reg* —
+    the felt injector's ``turn_injector_total`` bump lands in the registry the test
+    already reads, and the sink lets a test assert the ``turn.injector.felt_state``
+    child span was actually opened."""
+    sink = _CapturingSink()
+    rec = TurnRecorder(tracer=FakeTracer(), writer=sink, metrics=reg, clock=FakeClock(_NOW))
+    return rec, sink
 
 
 def _boom() -> object:
@@ -77,9 +104,13 @@ def test_injector_injects_light_cue_and_stamps_state(tmp_path: Path) -> None:
     lm = _lm(tmp_path)
     lm.state.commit(_warmed_salient())
     reg = _registry()
-    injector = make_felt_state_injector(lambda: _lm(tmp_path), metrics=reg)
+    rec, sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_felt_state_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
 
-    result = injector(user_message="how are you?", conversation_history=[])
+    result = injector(
+        session_id="s1", turn_id="t1", user_message="how are you?", conversation_history=[]
+    )
 
     assert isinstance(result, dict)
     assert result["context"].startswith("<felt-state>")
@@ -88,31 +119,42 @@ def test_injector_injects_light_cue_and_stamps_state(tmp_path: Path) -> None:
     after = lm.state.load()
     assert after.affect_display_last_word == "lonely"
     assert after.affect_display_last_at is not None
-    assert reg.get(FELT_DISPLAY_TOTAL).value(outcome="light") == 1.0
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="felt_state", outcome="light") == 1.0
+    # …and this call opened its own turn.injector.felt_state child span (lm-hg7 Task 7).
+    assert any(s["component"] == "turn.injector.felt_state" for s in sink.spans)
 
 
 def test_injector_silent_on_cold_start_and_leaves_state_untouched(tmp_path: Path) -> None:
     lm = _lm(tmp_path)
     lm.state.commit(State())  # cold start
     reg = _registry()
-    injector = make_felt_state_injector(lambda: _lm(tmp_path), metrics=reg)
+    rec, _sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_felt_state_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
 
-    assert injector(user_message="how are you?", conversation_history=[]) is None
+    result = injector(
+        session_id="s1", turn_id="t1", user_message="how are you?", conversation_history=[]
+    )
+    assert result is None
     after = lm.state.load()
     assert after.affect_display_last_word is None
     assert after.affect_display_last_at is None
-    assert reg.get(FELT_DISPLAY_TOTAL).value(outcome="not_warmed") == 1.0
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="felt_state", outcome="not_warmed") == 1.0
 
 
 def test_injector_silent_and_counted_on_task_context(tmp_path: Path) -> None:
     lm = _lm(tmp_path)
     lm.state.commit(_warmed_salient())
     reg = _registry()
-    injector = make_felt_state_injector(lambda: _lm(tmp_path), metrics=reg)
+    rec, _sink = _recorder(reg)
+    rec.ensure_turn("s1", "t1")
+    injector = make_felt_state_injector(lambda: _lm(tmp_path), recorder=rec, metrics=reg)
 
-    result = injector(user_message="```py\nx = 1\n```", conversation_history=[])
+    result = injector(
+        session_id="s1", turn_id="t1", user_message="```py\nx = 1\n```", conversation_history=[]
+    )
     assert result is None
-    assert reg.get(FELT_DISPLAY_TOTAL).value(outcome="task") == 1.0
+    assert reg.get(TURN_INJECTOR_TOTAL).value(component="felt_state", outcome="task") == 1.0
     # not shown → not stamped
     assert lm.state.load().affect_display_last_word is None
 

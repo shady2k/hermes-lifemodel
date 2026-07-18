@@ -40,8 +40,13 @@ from .core.metrics import Counter, Gauge, Histogram, MetricRegistry, get_metric_
 # source (``core.tick_metrics``, where they are registered). A second hand-kept copy is
 # exactly the kind of parallel list that rots — see the `set` whitelist that silently lost
 # the affect axes for a whole phase.
-from .core.tick_metrics import CHECK_IN_TOTAL, FELT_DISPLAY_TOTAL
+from .core.tick_metrics import CHECK_IN_TOTAL
 from .core.timeutil import from_iso
+
+# felt-state's ambient gate verdict no longer has its own counter (lm-hg7 Task 7 retired
+# ``FELT_DISPLAY_TOTAL``) — it is one series of the shared per-injector
+# ``turn_injector_total`` counter, selected by ``component=felt_state`` below.
+from .core.turn_metrics import INJECTOR_FELT, TURN_INJECTOR_TOTAL
 
 if TYPE_CHECKING:
     # Imported lazily at call time inside ``_safe_window`` (NOT at module load):
@@ -150,8 +155,15 @@ def _read_scalar(registry: MetricRegistry, name: str) -> float | None:
     return sum(value for _lk, _labels, value in items)
 
 
-def _read_by_label(registry: MetricRegistry, name: str, label: str) -> dict[str, float]:
-    """Per-label-value totals of counter *name* (e.g. felt_display split by ``outcome``).
+def _read_by_label(
+    registry: MetricRegistry, name: str, label: str, *, where: tuple[str, str] | None = None
+) -> dict[str, float]:
+    """Per-label-value totals of counter *name* (e.g. check_in split by ``outcome``).
+
+    ``where=(key, value)`` restricts the sum to series whose *key* label equals *value*
+    first — e.g. selecting only the ``component="felt_state"`` series out of the shared
+    ``turn_injector_total`` counter (lm-hg7 Task 7), which also carries every OTHER
+    injector's series under the same name.
 
     Empty when the metric is unregistered or never emitted — the caller renders ``n/a``
     rather than asserting a zero telemetry does not actually have.
@@ -161,6 +173,8 @@ def _read_by_label(registry: MetricRegistry, name: str, label: str) -> dict[str,
         return {}
     totals: dict[str, float] = {}
     for _lk, labels, value in metric.items():
+        if where is not None and labels.get(where[0]) != where[1]:
+            continue
         key = labels.get(label) or "?"
         totals[key] = totals.get(key, 0.0) + value
     return totals
@@ -236,8 +250,13 @@ def render_now(registry: MetricRegistry) -> list[str]:
     # quiet is indistinguishable from one that is broken, and the whole point of the gate is
     # that it *chooses* silence. The metrics were being recorded and never surfaced (spec §9
     # asked for them here) — which is why the first live runs had to be diagnosed by reading
-    # metrics.sqlite by hand.
-    shows = _read_by_label(registry, FELT_DISPLAY_TOTAL, "outcome")
+    # metrics.sqlite by hand. Since lm-hg7 Task 7 this reads the ``component=felt_state``
+    # slice of the shared ``turn_injector_total`` counter (the retired standalone
+    # ``felt_display_total`` was exactly this one series before the turn-observability
+    # surface unified every injector onto one counter).
+    shows = _read_by_label(
+        registry, TURN_INJECTOR_TOTAL, "outcome", where=("component", INJECTOR_FELT)
+    )
     if not shows:
         lines.append(f"**felt_display:** {_NA}")
     else:
