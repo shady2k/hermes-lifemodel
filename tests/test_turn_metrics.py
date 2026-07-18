@@ -26,9 +26,14 @@ that does not require faking a live call per injector:
 * genesis/belief/commitment have no such enum (each ``outcome=`` is a literal
   string dropped straight into ``hooks.py``), so those are checked by
   INTROSPECTING each injector factory's own source for every literal
-  ``outcome="..."`` call site and asserting that set is a SUBSET of the
-  declared frozenset — a typo'd or renamed outcome the injector actually emits
-  would no longer be covered, and the test catches it.
+  ``outcome="..."`` call site and asserting that set, plus ``"error"`` (the
+  fail-soft branch's home, never a literal call site in the factory itself),
+  is EQUAL to the declared frozenset — not merely a subset. A subset check
+  only catches a typo'd/renamed outcome the injector emits that the frozenset
+  doesn't cover; it says nothing about the OTHER direction — a dead value
+  sitting in the frozenset that no code path emits (exactly the class of bug
+  ``FELT_OUTCOMES``' retired ``"cooldown_unchanged"`` was) survives a subset
+  check forever. Equality catches both directions.
 
 Stdlib only.
 """
@@ -89,16 +94,18 @@ def _literal_outcomes(factory: Any) -> set[str]:
 def test_genesis_outcomes_cover_every_literal_outcome_the_injector_emits():
     literal = _literal_outcomes(hooks_module.make_genesis_injector)
     assert literal  # sanity: the scan actually found real span.set(outcome=...) calls
-    assert literal <= GENESIS_OUTCOMES
+    # C-M3: EQUAL, not a subset — a subset check would let a dead value (one the
+    # frozenset declares but no code path ever emits) survive undetected forever.
+    assert literal | {"error"} == GENESIS_OUTCOMES
 
 
 def test_belief_outcomes_cover_every_literal_outcome_the_injector_emits():
     literal = _literal_outcomes(hooks_module.make_belief_injector)
     assert literal
-    assert literal <= BELIEF_OUTCOMES
+    assert literal | {"error"} == BELIEF_OUTCOMES
 
 
 def test_commitment_outcomes_cover_every_literal_outcome_the_injector_emits():
     literal = _literal_outcomes(hooks_module.make_commitment_injector)
     assert literal
-    assert literal <= COMMITMENT_OUTCOMES
+    assert literal | {"error"} == COMMITMENT_OUTCOMES

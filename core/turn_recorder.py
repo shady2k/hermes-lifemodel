@@ -318,6 +318,12 @@ class TurnRecorder:
         NEVER persists as ``"ok"``, so a failed or blocked tool can no longer
         read back as a success. The raw value survives as the ``host_status``
         attr regardless of the mapped outcome.
+
+        ``host_status`` is placed AFTER ``**attrs`` (C-M1 fix) so the real raw
+        status always wins: a caller-supplied ``attrs`` dict happening to carry
+        its own ``host_status`` key (e.g. echoed from the tool's own return
+        payload) can no longer clobber the one this method is actually
+        recording.
         """
         try:
             with self._lock:
@@ -331,7 +337,7 @@ class TurnRecorder:
                 started_at=started,
                 ended_at=to_iso(self._clock.now()),
                 status=_map_host_status(status),
-                attrs={"host_status": status, **attrs},
+                attrs={**attrs, "host_status": status},
             )
         except Exception:  # noqa: BLE001 - closing a tool span must never crash the host call
             _LOG.exception("tool_close failed id=%s", tool_call_id)
@@ -368,8 +374,12 @@ class TurnRecorder:
         and this returns immediately — idempotent, so a duplicate close (e.g. a
         retried ``post_llm_call``) never double-closes the root or raises. *status*
         is mapped through :func:`_map_host_status` — FAIL-CLOSED (I1 fix): an
-        out-of-vocabulary value now persists ``"failed"``, never ``"ok"``. Never
-        raises — a tracing hiccup on the way out must never crash the host turn.
+        out-of-vocabulary value now persists ``"failed"``, never ``"ok"``. The raw
+        pre-map value is ALSO kept as the root's own ``host_status`` attr (C-M1
+        fix — :meth:`tool_close` already did this; the root close used to map-and-
+        discard it, so a turn closed on an out-of-vocabulary host status had no
+        way to recover what that raw value actually was). Never raises — a
+        tracing hiccup on the way out must never crash the host turn.
         """
         try:
             key = (session_id, turn_id)
@@ -400,6 +410,7 @@ class TurnRecorder:
                     "origin": entry.origin,
                     "model": model or entry.model,
                     "platform": platform or entry.platform,
+                    "host_status": status,
                 },
             )
         except Exception:  # noqa: BLE001 - closing a turn must never crash the host turn

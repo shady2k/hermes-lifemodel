@@ -375,6 +375,33 @@ def test_close_turn_truncates_oversized_text_and_fails_closed_on_bad_status() ->
     closed_root = [s for s in rec._writer.spans if s["component"] == "turn" and s["ended_at"]]
     # I1: an out-of-vocabulary status now fails CLOSED — never "ok".
     assert closed_root[-1]["status"] == "failed"
+    # C-M1: the raw pre-map value survives as host_status even on the ROOT close
+    # (tool_close already kept this; close_turn used to map-and-discard it).
+    assert closed_root[-1]["attrs"]["host_status"] == "bogus"
+
+
+def test_close_turn_root_carries_host_status_on_a_recognized_value_too() -> None:
+    # C-M1: host_status is the RAW pre-map value on every close, not just the
+    # out-of-vocabulary case above.
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    rec.close_turn("s1", "t1", final_output="hi", status="blocked")
+    closed_root = [s for s in rec._writer.spans if s["component"] == "turn" and s["ended_at"]]
+    assert closed_root[-1]["status"] == "suppressed"
+    assert closed_root[-1]["attrs"]["host_status"] == "blocked"
+
+
+def test_tool_close_real_host_status_wins_over_a_caller_supplied_attr() -> None:
+    # C-M1: attrs assembly used to be {"host_status": status, **attrs}, letting a
+    # caller-supplied attrs["host_status"] silently override the real mapped-from
+    # value. It must now be the other way around: **attrs first, host_status=status
+    # last, so the real raw status always wins.
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    rec.tool_open("s1", "t1", tool="commitment", tool_call_id="call_x")
+    rec.tool_close("call_x", status="ok", host_status="forged-by-caller")
+    (child,) = [s for s in rec._writer.spans if s["component"] == "turn.tool.commitment"]
+    assert child["attrs"]["host_status"] == "ok"
 
 
 def test_close_turn_on_unknown_key_is_a_no_op() -> None:

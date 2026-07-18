@@ -51,6 +51,14 @@ shows only plain fields already sitting in the row, never the derived
 ``u``/gates/phase ``render_dump`` computes (that stays ``/lifemodel debug``'s
 job).
 
+The header also carries a COMPACT **BDI** section (C-I2): the live contact
+desire (state + spring), the live contact intention (state), and the top few
+live thoughts (most-salient first) — all bounded ``?mode=ro`` queries against
+``lifemodel.sqlite``'s ``memory_records`` table (never the registry's full
+decode, never ``SQLiteRuntimeStore``), "live" meaning the same non-terminal
+states :mod:`~lifemodel.core.desire_view`/:mod:`~lifemodel.core.intention_view`/
+:mod:`~lifemodel.core.thought_view` already define.
+
 The ``last [N]`` timeline also shows a **writer-drop health** line —
 ``lifemodel_trace_writer_dropped_records``/``_write_errors``, the durable
 gauges the trace-writer snapshots into ``metrics.sqlite`` — so a MISSING turn
@@ -81,7 +89,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
 
+from .core.desire_view import DESIRE_KIND, LIVE_DESIRE_STATES
+from .core.intention_view import INTENTION_KIND, LIVE_INTENTION_STATES
+from .core.thought_view import LIVE_THOUGHT_STATES, THOUGHT_KIND
 from .debug import local_time
+from .domain.objects import CONTACT_DESIRE_ID, CONTACT_INTENTION_ID
 from .state.trace_store import observability_db_path
 from .trace_view import _loads, _read_spans, _Span, render_trace
 
@@ -494,28 +506,136 @@ def _fmt_state_ts(data: Mapping[str, Any], key: str) -> str:
     return local_time(value) if isinstance(value, str) else "n/a"
 
 
+# --------------------------------------------------------------------------- #
+# BDI section (C-I2) — the compact desire/intention/thoughts read.
+#
+# The spec calls for "current vitals/BDI" in this unified reader; C1 only
+# restored the vitals half. This queries ``lifemodel.sqlite``'s
+# ``memory_records`` table directly through :func:`_connect_ro` — same rule as
+# everywhere else in this module: NEVER the registry's full decode (that would
+# need a complete :class:`~lifemodel.domain.memory.MemoryRecord`, dragging in
+# more machinery than a compact header needs) and NEVER
+# :class:`~lifemodel.state.sqlite_store.SQLiteRuntimeStore`. "Live" states are
+# the desire/intention/thought VIEWS' own frozensets
+# (:data:`~lifemodel.core.desire_view.LIVE_DESIRE_STATES` et al.) — imported,
+# never hand-copied, so a state added there can never silently drift out of
+# sync here (the exact class of vocab-drift bug C-M3 fixes elsewhere in this
+# same pass). ``content``/``spring`` come out of ``payload_json`` via
+# :func:`~lifemodel.trace_view._loads` (already fail-soft — a malformed/absent
+# blob decodes to ``{}``, never raises), so one bad row never sinks the rest.
+# --------------------------------------------------------------------------- #
+
+#: How many live thoughts the compact header shows, most-salient first.
+_MAX_THOUGHTS_SHOWN: Final = 5
+
+
+def _desire_line(conn: sqlite3.Connection) -> str | None:
+    """``desire: <state> (spring=<spring>)`` for the live contact desire, or
+    ``None`` when absent/terminal (never shows a satisfied/dropped/expired row)."""
+    row = conn.execute(
+        "SELECT state, payload_json FROM memory_records WHERE kind = ? AND id = ?",
+        (DESIRE_KIND, CONTACT_DESIRE_ID),
+    ).fetchone()
+    if row is None:
+        return None
+    state, payload_json = row
+    if not isinstance(state, str) or state not in LIVE_DESIRE_STATES:
+        return None
+    spring = _loads(payload_json if isinstance(payload_json, str) else None).get("spring")
+    spring_s = spring if isinstance(spring, str) and spring else "?"
+    return f"**desire:** {state} (spring={spring_s})"
+
+
+def _intention_line(conn: sqlite3.Connection) -> str | None:
+    """``intention: <state>`` for the live contact intention, or ``None`` when
+    absent/terminal."""
+    row = conn.execute(
+        "SELECT state FROM memory_records WHERE kind = ? AND id = ?",
+        (INTENTION_KIND, CONTACT_INTENTION_ID),
+    ).fetchone()
+    if row is None:
+        return None
+    state = row[0]
+    if not isinstance(state, str) or state not in LIVE_INTENTION_STATES:
+        return None
+    return f"**intention:** {state}"
+
+
+def _thought_lines(conn: sqlite3.Connection) -> list[str]:
+    """Up to :data:`_MAX_THOUGHTS_SHOWN` live thoughts, most-salient first — a
+    malformed row (bad JSON, non-string ``content``) is skipped, never a crash,
+    and never stops the rest of the rows from rendering."""
+    placeholders = ", ".join("?" for _ in LIVE_THOUGHT_STATES)
+    rows = conn.execute(
+        "SELECT payload_json FROM memory_records WHERE kind = ? AND state IN "
+        f"({placeholders}) ORDER BY salience DESC LIMIT ?",
+        (THOUGHT_KIND, *LIVE_THOUGHT_STATES, _MAX_THOUGHTS_SHOWN),
+    ).fetchall()
+    lines: list[str] = []
+    for (payload_json,) in rows:
+        content = _loads(payload_json if isinstance(payload_json, str) else None).get("content")
+        if isinstance(content, str) and content:
+            lines.append(f"- {content}")
+    return lines
+
+
+def _bdi_lines(base_dir: Path) -> list[str]:
+    """The compact BDI section's lines (C-I2): live desire/intention/top
+    thoughts, read straight off ``lifemodel.sqlite``'s ``memory_records`` table
+    via :func:`_connect_ro`. Fail-soft: a missing db or a locked/corrupt/
+    schema-less file degrades to an empty list — the header simply omits the
+    section (never crashes, and never takes down the vitals half above it)."""
+    db_path = _lifemodel_db_path(base_dir)
+    if not db_path.exists():
+        return []
+    try:
+        with closing(_connect_ro(db_path)) as conn:
+            desire = _desire_line(conn)
+            intention = _intention_line(conn)
+            thoughts = _thought_lines(conn)
+    except sqlite3.Error:
+        return []
+    lines: list[str] = []
+    if desire is not None:
+        lines.append(desire)
+    if intention is not None:
+        lines.append(intention)
+    if thoughts:
+        lines.append("**thoughts:**")
+        lines.extend(thoughts)
+    return lines
+
+
 def _render_state_header(base_dir: Path) -> str:
-    """The compact read-only vitals header (C1): plain ``runtime_state``
-    columns only (``tick_count``, ``last_tick_at``, ``energy``, ``fatigue``,
-    ``u``, the affect axes, ``last_exchange_at``) — never the derived
-    u/gates/phase ``/lifemodel debug`` computes (out of scope for this fix;
-    that reconstruction also needs the read-write ``SQLiteRuntimeStore`` this
-    reader must never touch, see the section banner above)."""
+    """The compact read-only vitals + BDI header (C1 + C-I2): plain
+    ``runtime_state`` columns (``tick_count``, ``last_tick_at``, ``energy``,
+    ``fatigue``, ``u``, the affect axes, ``last_exchange_at``) — never the
+    derived u/gates/phase ``/lifemodel debug`` computes (out of scope for this
+    fix; that reconstruction also needs the read-write ``SQLiteRuntimeStore``
+    this reader must never touch, see the section banner above) — plus the
+    compact live desire/intention/thoughts section (C-I2, see the BDI section
+    banner above). The BDI section is independent of the vitals row's own
+    availability (:func:`_bdi_lines` is always attempted) — a being could in
+    principle have live BDI rows without (yet) a ``runtime_state`` row, and the
+    two sections read two different tables/failure surfaces, so one's absence
+    should never suppress the other."""
     data = _read_runtime_state_row(base_dir)
     if data is None:
-        return f"{_STATE_HEADER_TITLE}\n\n<unavailable: no readable runtime_state row>\n"
-    lines = [
-        _STATE_HEADER_TITLE,
-        "",
-        f"**tick_count:** {_fmt_state_int(data, 'tick_count')}",
-        f"**last_tick_at:** {_fmt_state_ts(data, 'last_tick_at')}",
-        f"**energy:** {_fmt_state_float(data, 'energy')}",
-        f"**fatigue:** {_fmt_state_float(data, 'fatigue')}",
-        f"**u:** {_fmt_state_float(data, 'u')}",
-        "**affect:** v="
-        f"{_fmt_state_float(data, 'affect_valence')} a={_fmt_state_float(data, 'affect_arousal')}",
-        f"**last_exchange_at:** {_fmt_state_ts(data, 'last_exchange_at')}",
-    ]
+        lines = [_STATE_HEADER_TITLE, "", "<unavailable: no readable runtime_state row>"]
+    else:
+        lines = [
+            _STATE_HEADER_TITLE,
+            "",
+            f"**tick_count:** {_fmt_state_int(data, 'tick_count')}",
+            f"**last_tick_at:** {_fmt_state_ts(data, 'last_tick_at')}",
+            f"**energy:** {_fmt_state_float(data, 'energy')}",
+            f"**fatigue:** {_fmt_state_float(data, 'fatigue')}",
+            f"**u:** {_fmt_state_float(data, 'u')}",
+            f"**affect:** v={_fmt_state_float(data, 'affect_valence')} "
+            f"a={_fmt_state_float(data, 'affect_arousal')}",
+            f"**last_exchange_at:** {_fmt_state_ts(data, 'last_exchange_at')}",
+        ]
+    lines.extend(_bdi_lines(base_dir))
     return "\n".join(lines) + "\n"
 
 
@@ -535,6 +655,23 @@ def _safe_header(base_dir: Path) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _trailing_heartbeat_run_len(roots: Sequence[_Root]) -> int:
+    """The length of the run of consecutive heartbeat roots ending *roots*
+    (newest-first) — i.e. the OLDEST roots in the fetched page, which may be
+    only a PREFIX of a longer run that continues further back than this page
+    reaches (C-M2). ``0`` when the oldest fetched root is not itself a
+    heartbeat."""
+    count = 0
+    for root in reversed(roots):
+        is_heartbeat = _frame_kind_of(root.attrs) == "execution" and (
+            _str_attr(root.attrs, "trigger", "?") == "heartbeat"
+        )
+        if not is_heartbeat:
+            break
+        count += 1
+    return count
+
+
 def _timeline_lines(conn: sqlite3.Connection, n: int) -> list[str]:
     """Up to *n* newest activity units (turns + non-heartbeat ticks + collapsed
     heartbeat runs), newest first — never silently dropping a turn parked
@@ -548,23 +685,55 @@ def _timeline_lines(conn: sqlite3.Connection, n: int) -> list[str]:
     store is exhausted (fewer roots came back than were asked for), or
     :data:`_ROOT_SCAN_CAP` is hit — whichever comes first, so a pathological
     store can never turn one call into an unbounded scan.
+
+    C-M2 fix: "*n* rendered units are in hand" is not, by itself, enough to
+    stop. If the fetched page ENDS with the first 1-2 roots of a longer
+    heartbeat run (the rest of that run sits just past this page's edge,
+    unfetched), :func:`_render_timeline_body` cannot yet tell it is short of
+    :data:`_HEARTBEAT_COLLAPSE_MIN_RUN` and renders those 1-2 roots as
+    individual lines rather than folding them into the single collapsed line
+    they would become once the rest of the run is in hand — inflating the
+    rendered-unit count and stopping the backfill one fetch too early. So this
+    keeps fetching past a nominally-sufficient count while the store is not yet
+    exhausted AND the trailing (oldest-fetched) heartbeat run in hand is still
+    shorter than the collapse threshold — it might still grow into a full
+    collapse on the next, larger fetch.
     """
     fetch = min(max(n * _ROOT_FETCH_MULTIPLIER, n), _ROOT_SCAN_CAP)
     while True:
         roots = _root_rows(conn, fetch)
+        exhausted = len(roots) < fetch or fetch >= _ROOT_SCAN_CAP
+        trailing_run = _trailing_heartbeat_run_len(roots)
+        incomplete_trailing_run = 0 < trailing_run < _HEARTBEAT_COLLAPSE_MIN_RUN
         lines = _render_timeline_body(conn, roots)
-        if len(lines) >= n or len(roots) < fetch or fetch >= _ROOT_SCAN_CAP:
+        if exhausted or (len(lines) >= n and not incomplete_trailing_run):
             return lines[:n]
         fetch = min(fetch * _ROOT_FETCH_MULTIPLIER, _ROOT_SCAN_CAP)
 
 
-def _latest_gauge_value(db_path: Path, name: str) -> float | None:
-    """The most recent ``metrics.sqlite`` sample for gauge *name* within the
-    newest ``run_id``, or ``None`` when nothing has ever been sampled for it."""
-    from .state.metrics_store import read_samples
+def _latest_gauge_value(conn: sqlite3.Connection, name: str) -> float | None:
+    """The most recent ``metric_samples`` value for gauge *name* within the
+    newest ``run_id``, or ``None`` when nothing has ever been sampled for it.
 
-    samples = read_samples(db_path, name=name, latest_run=True, limit=1)
-    return samples[-1].value if samples else None
+    C-I1 fix: a direct, bounded ``SELECT`` against the already-open (``?mode=ro``,
+    see :func:`_connect_ro`) *conn* — deliberately NEVER
+    :func:`~lifemodel.state.metrics_store.read_samples`, which opens its OWN
+    plain ``sqlite3.connect(str(db_path))`` (state/metrics_store.py — no
+    ``mode=ro``, no ``uri=True``). That is a genuine read-WRITE handle: on a
+    file that does not exist yet it silently creates an empty one (the exact
+    exists-check/connect race this reader must never risk against the live
+    being's db), and it is a second, unnecessary writer on a file the metrics
+    sampler thread already owns. Mirrors the newest-sample-of-the-newest-run
+    shape ``read_samples(name=name, latest_run=True, limit=1)`` computes, just
+    inlined as one read-only query.
+    """
+    row = conn.execute(
+        "SELECT value FROM metric_samples WHERE name = ? AND run_id = "
+        "(SELECT run_id FROM metric_samples ORDER BY ts DESC, rowid DESC LIMIT 1) "
+        "ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (name,),
+    ).fetchone()
+    return float(row[0]) if row is not None else None
 
 
 def _writer_health_line(base_dir: Path) -> str | None:
@@ -572,6 +741,13 @@ def _writer_health_line(base_dir: Path) -> str | None:
     durable gauges (I5, spec §9) — a MISSING turn span can be a silent
     queue-drop/write-error, not "nothing happened"; this makes that visible in
     the ``last [N]`` timeline.
+
+    Opens ``metrics.sqlite`` itself via :func:`_connect_ro` (C-I1 fix) — the
+    SAME read-only discipline every other source this reader touches already
+    holds to (``observability.sqlite``, ``lifemodel.sqlite``); the store's
+    filename comes from the public :func:`~lifemodel.state.metrics_store.metrics_db_path`
+    helper, imported lazily so an unimportable/absent metrics subtree degrades
+    this ONE optional line rather than the whole reader.
 
     Fail-soft: an unimportable ``state.metrics_store``, a missing
     ``metrics.sqlite``, or any read hiccup returns ``None`` — the caller simply
@@ -585,9 +761,10 @@ def _writer_health_line(base_dir: Path) -> str | None:
     if not db_path.exists():
         return None
     try:
-        dropped = _latest_gauge_value(db_path, _WRITER_DROPPED_METRIC)
-        errors = _latest_gauge_value(db_path, _WRITER_ERRORS_METRIC)
-    except Exception:  # noqa: BLE001 - a read-only view must never crash (§7)
+        with closing(_connect_ro(db_path)) as conn:
+            dropped = _latest_gauge_value(conn, _WRITER_DROPPED_METRIC)
+            errors = _latest_gauge_value(conn, _WRITER_ERRORS_METRIC)
+    except sqlite3.Error:
         return None
     if dropped is None and errors is None:
         return None  # nothing sampled yet — omit rather than show a bare n/a pair
