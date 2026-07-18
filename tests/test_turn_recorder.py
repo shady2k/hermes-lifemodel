@@ -167,3 +167,14 @@ def test_injector_span_with_no_open_turn_degrades_to_a_bare_parentless_child() -
     child = [s for s in rec._writer.spans if s["component"] == "turn.injector.belief"][0]
     assert child["parent_span_id"] is None  # a fresh root, not a crash
     assert child["status"] == "ok" and child["attrs"]["outcome"] == "empty"
+
+
+def test_tool_open_close_persists_child_keyed_by_call_id() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    rec.tool_open("s1", "t1", tool="commitment", tool_call_id="call_7")
+    rec.tool_open("s1", "t1", tool="check_in", tool_call_id="call_8")  # concurrent, distinct id
+    rec.tool_close("call_7", status="ok", action="discharge")
+    child = [s for s in rec._writer.spans if s["component"] == "turn.tool.commitment"][0]
+    assert child["status"] == "ok" and child["attrs"]["action"] == "discharge"
+    rec.tool_close("nope")  # unknown id — best-effort no-op, no raise

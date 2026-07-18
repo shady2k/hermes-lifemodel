@@ -15,10 +15,11 @@ The ledger is keyed by the host's ``(session_id, turn_id)`` and bounded (TTL + m
 entries, lazy cleanup) — a restart simply loses it, and an open root left by a
 crash/interrupt ages out or is reconciled ``failed`` by the next turn of the session.
 
-This task adds :meth:`TurnRecorder.injector_span` (a per-``pre_llm_call``-injector
+Task 4 added :meth:`TurnRecorder.injector_span` (a per-``pre_llm_call``-injector
 CHILD span + the ``turn_injector_total`` metric) on top of Task 3's construction +
-:meth:`TurnRecorder.ensure_turn`; a later task adds per-tool spans and ``close_turn``
-to this SAME class.
+:meth:`TurnRecorder.ensure_turn`. This task adds :meth:`TurnRecorder.tool_open` /
+:meth:`TurnRecorder.tool_close` (per-tool CHILD spans keyed by ``tool_call_id``);
+a later task adds ``close_turn`` to this SAME class.
 """
 
 from __future__ import annotations
@@ -79,8 +80,8 @@ class _Entry:
 
 
 class TurnRecorder:
-    """Opens/reconciles/bounds per-turn trace roots + per-injector child spans; a
-    later task adds per-tool spans + ``close_turn``.
+    """Opens/reconciles/bounds per-turn trace roots, per-injector child spans, and
+    per-tool child spans (keyed by ``tool_call_id``); a later task adds ``close_turn``.
 
     Constructed once (in ``register()``) over the live being's already-acquired
     :class:`~lifemodel.state.trace_store.TraceWriter`,
@@ -110,6 +111,7 @@ class TurnRecorder:
         self._monotonic = monotonic
         self._lock = threading.Lock()
         self._ledger: dict[tuple[str, str], _Entry] = {}
+        self._tools: dict[str, tuple[TraceContext, str, str]] = {}
         # Declare the turn metric into the shared registry (idempotent) so a later
         # injector close lands on a real metric rather than failing open as unknown.
         try:
@@ -206,6 +208,46 @@ class TurnRecorder:
             self._close_injector(
                 child, comp, started, status="ok", outcome=span._outcome, span=span
             )
+
+    # --- the per-tool door ---------------------------------------------------- #
+    def tool_open(self, session_id: str, turn_id: str, *, tool: str, tool_call_id: str) -> None:
+        """Stash an open ``turn.tool.<tool>`` child, keyed by ``tool_call_id``.
+
+        Tool calls can run concurrently within a turn, so — unlike the single
+        per-turn root — spans are tracked in a small separate map keyed by the
+        host's own call id rather than ``(session_id, turn_id)``. Degrades to a
+        bare parentless root if no turn is open for this key. Never raises — a
+        tracing hiccup must never crash the host tool call.
+        """
+        try:
+            parent = self._ledger_ctx(session_id, turn_id)
+            child = self._child_span_id(parent) if parent is not None else self._tracer.start_root()
+            with self._lock:
+                self._tools[tool_call_id] = (child, tool, to_iso(self._clock.now()))
+        except Exception:  # noqa: BLE001 - opening a tool span must never crash the host call
+            _LOG.exception("tool_open failed tool=%s", tool)
+
+    def tool_close(self, tool_call_id: str, *, status: str = "ok", **attrs: Any) -> None:
+        """Persist the ``turn.tool.<tool>`` child opened by :meth:`tool_open` and
+        drop it from the ledger. An unknown ``tool_call_id`` (never opened, or
+        already closed) is a best-effort no-op — never raises.
+        """
+        try:
+            with self._lock:
+                found = self._tools.pop(tool_call_id, None)
+            if found is None:
+                return
+            child, tool, started = found
+            self._submit(
+                child,
+                component=f"turn.tool.{tool}",
+                started_at=started,
+                ended_at=to_iso(self._clock.now()),
+                status=status if status in ("ok", "suppressed", "failed") else "ok",
+                attrs=dict(attrs),
+            )
+        except Exception:  # noqa: BLE001 - closing a tool span must never crash the host call
+            _LOG.exception("tool_close failed id=%s", tool_call_id)
 
     # --- internals ---------------------------------------------------------- #
     def _reconcile_session_locked(self, session_id: str, now_iso: str) -> None:
