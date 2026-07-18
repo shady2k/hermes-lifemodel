@@ -17,9 +17,10 @@ crash/interrupt ages out or is reconciled ``failed`` by the next turn of the ses
 
 Task 4 added :meth:`TurnRecorder.injector_span` (a per-``pre_llm_call``-injector
 CHILD span + the ``turn_injector_total`` metric) on top of Task 3's construction +
-:meth:`TurnRecorder.ensure_turn`. This task adds :meth:`TurnRecorder.tool_open` /
-:meth:`TurnRecorder.tool_close` (per-tool CHILD spans keyed by ``tool_call_id``);
-a later task adds ``close_turn`` to this SAME class.
+:meth:`TurnRecorder.ensure_turn`. Task 5 added :meth:`TurnRecorder.tool_open` /
+:meth:`TurnRecorder.tool_close` (per-tool CHILD spans keyed by ``tool_call_id``).
+This task adds :meth:`TurnRecorder.close_turn` — a ``turn.completion`` CHILD span
+plus the root span's terminal close — completing the service.
 """
 
 from __future__ import annotations
@@ -44,6 +45,11 @@ _LOG = logging.getLogger("lifemodel.turn_recorder")
 #: The ``trace_spans.component`` value for a turn's ROOT span (spec §4.3 shape,
 #: mirroring the tick's own root component naming).
 _TURN_ROOT_COMPONENT = "turn"
+
+#: Hard cap on any free-text attr value persisted onto a span (``final_output``,
+#: ``reasoning``) — a turn's text is host-supplied and unbounded; the trace store
+#: is not a transcript archive, so it is sliced rather than stored whole.
+_MAX_TEXT = 4000
 
 
 class InjectorSpan:
@@ -80,8 +86,9 @@ class _Entry:
 
 
 class TurnRecorder:
-    """Opens/reconciles/bounds per-turn trace roots, per-injector child spans, and
-    per-tool child spans (keyed by ``tool_call_id``); a later task adds ``close_turn``.
+    """Opens/reconciles/bounds per-turn trace roots, per-injector child spans,
+    per-tool child spans (keyed by ``tool_call_id``), and the turn's own close
+    (a ``turn.completion`` child + the root span's terminal status).
 
     Constructed once (in ``register()``) over the live being's already-acquired
     :class:`~lifemodel.state.trace_store.TraceWriter`,
@@ -248,6 +255,58 @@ class TurnRecorder:
             )
         except Exception:  # noqa: BLE001 - closing a tool span must never crash the host call
             _LOG.exception("tool_close failed id=%s", tool_call_id)
+
+    # --- the close door ------------------------------------------------------- #
+    def close_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        final_output: str = "",
+        reasoning: str = "",
+        status: str = "ok",
+    ) -> None:
+        """Close ``(session_id, turn_id)`` — a ``turn.completion`` child persisting
+        the bounded final text, then the root span itself (``ended_at``=now,
+        terminal ``status``) — and drop the ledger entry.
+
+        An unknown key (never opened via :meth:`ensure_turn`, or already closed by
+        an earlier call) is a best-effort no-op: the ledger pop returns ``None``
+        and this returns immediately — idempotent, so a duplicate close (e.g. a
+        retried ``post_llm_call``) never double-closes the root or raises. An
+        out-of-vocabulary ``status`` falls back to ``"ok"`` rather than persisting
+        a value the reader can't interpret. Never raises — a tracing hiccup on the
+        way out must never crash the host turn.
+        """
+        try:
+            key = (session_id, turn_id)
+            with self._lock:
+                entry = self._ledger.pop(key, None)
+            if entry is None:
+                return
+            child = self._child_span_id(entry.ctx)
+            now_iso = to_iso(self._clock.now())
+            self._submit(
+                child,
+                component="turn.completion",
+                started_at=now_iso,
+                ended_at=now_iso,
+                status="ok",
+                attrs={
+                    "final_output": final_output[:_MAX_TEXT],
+                    "reasoning": reasoning[:_MAX_TEXT],
+                },
+            )
+            self._submit(
+                entry.ctx,
+                component=_TURN_ROOT_COMPONENT,
+                started_at=entry.opened_at_iso,
+                ended_at=now_iso,
+                status=status if status in ("ok", "suppressed", "failed") else "ok",
+                attrs={"frame_kind": "turn", "turn_id": turn_id, "session_id": session_id},
+            )
+        except Exception:  # noqa: BLE001 - closing a turn must never crash the host turn
+            _LOG.exception("close_turn failed session=%s turn=%s", session_id, turn_id)
 
     # --- internals ---------------------------------------------------------- #
     def _reconcile_session_locked(self, session_id: str, now_iso: str) -> None:

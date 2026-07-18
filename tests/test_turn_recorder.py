@@ -1,7 +1,8 @@
-"""Tests for ``core/turn_recorder.py`` — ``TurnRecorder`` construction, ``ensure_turn``
-and ``injector_span`` (lm-hg7).
+"""Tests for ``core/turn_recorder.py`` — the full ``TurnRecorder`` service
+(construction, ``ensure_turn``, ``injector_span``, ``tool_open``/``tool_close``,
+``close_turn``; lm-hg7).
 
-Contract under test (tasks 3 + 4 of the turn-observability plan):
+Contract under test (tasks 3-6 of the turn-observability plan):
 
 * ``ensure_turn`` persists an OPEN root span (``ended_at``/``status`` both
   ``None``) tagged ``frame_kind="turn"`` — outside the internal ledger lock;
@@ -19,7 +20,15 @@ Contract under test (tasks 3 + 4 of the turn-observability plan):
   / the injector's own ``outcome`` on a clean exit, ``status="failed"`` /
   ``outcome="error"`` (and a RE-RAISE) on a body exception;
 * with no open turn for the key, the span degrades to a bare parentless root
-  rather than raising.
+  rather than raising;
+* ``tool_open``/``tool_close`` persist a ``turn.tool.<tool>`` CHILD span keyed
+  by ``tool_call_id``, independent of the single per-turn ledger; an unknown
+  ``tool_call_id`` is a best-effort no-op;
+* ``close_turn`` persists a ``turn.completion`` CHILD (``final_output``/
+  ``reasoning`` sliced to a bounded length) then closes the root
+  (``ended_at``=now, ``status`` clamped to the closed vocabulary) and drops the
+  ledger entry — idempotent (a second close / an unknown key is a no-op) and
+  fail-soft even when the sink blows up.
 
 Stdlib only.
 """
@@ -178,3 +187,47 @@ def test_tool_open_close_persists_child_keyed_by_call_id() -> None:
     child = [s for s in rec._writer.spans if s["component"] == "turn.tool.commitment"][0]
     assert child["status"] == "ok" and child["attrs"]["action"] == "discharge"
     rec.tool_close("nope")  # unknown id — best-effort no-op, no raise
+
+
+def test_close_turn_writes_completion_and_closes_root() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    rec.close_turn("s1", "t1", final_output="ok, talk soon", reasoning="short and warm")
+    completion = [s for s in rec._writer.spans if s["component"] == "turn.completion"][0]
+    assert "talk soon" in completion["attrs"]["final_output"]
+    assert completion["attrs"]["reasoning"] == "short and warm"
+    closed_root = [s for s in rec._writer.spans if s["component"] == "turn" and s["status"] == "ok"]
+    assert closed_root and closed_root[-1]["ended_at"] is not None
+    assert ("s1", "t1") not in rec._ledger  # entry removed
+    rec.close_turn("s1", "t1")  # second close — no raise, no duplicate root close
+    closed_ok = [s for s in rec._writer.spans if s["component"] == "turn" and s["status"] == "ok"]
+    assert len(closed_ok) == 1  # the second close persisted nothing more
+
+
+def test_close_turn_truncates_oversized_text_and_clamps_bad_status() -> None:
+    rec = _recorder()
+    rec.ensure_turn("s1", "t1")
+    rec.close_turn("s1", "t1", final_output="x" * 5000, status="bogus")
+    completion = [s for s in rec._writer.spans if s["component"] == "turn.completion"][0]
+    assert len(completion["attrs"]["final_output"]) == 4000
+    closed_root = [s for s in rec._writer.spans if s["component"] == "turn" and s["ended_at"]]
+    assert closed_root[-1]["status"] == "ok"  # out-of-vocabulary status clamped, not persisted raw
+
+
+def test_close_turn_on_unknown_key_is_a_no_op() -> None:
+    rec = _recorder()
+    rec.close_turn("nope", "nope")  # never opened — no raise, nothing persisted
+    assert rec._writer.spans == []
+
+
+def test_close_turn_never_raises_on_a_broken_sink() -> None:
+    class BoomSink(CapturingSink):
+        def submit_span(self, **kw: Any) -> bool:
+            raise RuntimeError("disk gone")
+
+    rec = TurnRecorder(
+        tracer=FakeTracer(), writer=BoomSink(), metrics=MetricRegistry(), clock=FakeClock(_NOW)
+    )
+    rec.ensure_turn("s1", "t1")
+    rec.close_turn("s1", "t1", final_output="hi")  # must not raise despite the sink blowing up
+    assert ("s1", "t1") not in rec._ledger  # still removed even though persistence failed
